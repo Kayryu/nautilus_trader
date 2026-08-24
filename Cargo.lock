@@ -6121,6 +6121,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-deepx"
+version = "0.62.0"
+dependencies = [
+ "nautilus-model",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "ustr",
+]
+
+[[package]]
 name = "nautilus-deribit"
 version = "0.62.0"
 dependencies = [
