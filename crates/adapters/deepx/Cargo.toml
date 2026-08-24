@@ -22,6 +22,8 @@ crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
+extension-module = ["pyo3/extension-module", "python"]
+python = ["nautilus-model/python", "pyo3", "pyo3-stub-gen"]
 high-precision = ["nautilus-model/high-precision"]
 
 [dependencies]
@@ -29,8 +31,11 @@ nautilus-model = { workspace = true }
 
 rust_decimal = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 ustr = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
-serde_json = { workspace = true }

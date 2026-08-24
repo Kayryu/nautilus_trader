@@ -225,6 +225,11 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
 
+    let n = "deepx";
+    let submodule = pyo3::wrap_pymodule!(nautilus_deepx::python::deepx);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+
     let n = "deribit";
     let submodule = pyo3::wrap_pymodule!(nautilus_deribit::python::deribit);
     m.add_wrapped(submodule)?;

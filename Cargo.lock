@@ -6125,6 +6125,8 @@ name = "nautilus-deepx"
 version = "0.62.0"
 dependencies = [
  "nautilus-model",
+ "pyo3",
+ "pyo3-stub-gen",
  "rstest",
  "rust_decimal",
  "serde",
@@ -6890,6 +6892,7 @@ dependencies = [
  "nautilus-cryptography",
  "nautilus-data",
  "nautilus-databento",
+ "nautilus-deepx",
  "nautilus-deribit",
  "nautilus-derive",
  "nautilus-dydx",

@@ -3048,10 +3048,27 @@ def inject_module_constants(root: Path, workspace_root: Path) -> None:
         content = _add_names_to_all(content, new_names)
 
         const_block = "\n".join(f"{c.name}: {c.python_type}" for c in const_list)
+        if any(c.python_type.startswith("model.") for c in const_list):
+            content = _ensure_model_import(content)
         content = _insert_constants_after_all(content, const_block)
 
         if content != original:
             stub_file.write_text(content, encoding="utf-8")
+
+
+def _ensure_model_import(content: str) -> str:
+    """
+    Add the model import required by adapter identity constants.
+    """
+    model_import = "from nautilus_trader import model"
+    if model_import in content:
+        return content
+
+    all_match = re.search(r"^__all__\s*=", content, re.MULTILINE)
+    if all_match is None:
+        return content
+
+    return f"{content[: all_match.start()].rstrip()}\n\n{model_import}\n\n{content[all_match.start() :]}"
 
 
 def _add_names_to_all(content: str, names: list[str]) -> str:

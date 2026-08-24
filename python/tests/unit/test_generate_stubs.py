@@ -1407,6 +1407,27 @@ class Foo:
     assert all_pos < const_pos < class_pos
 
 
+def test_ensure_model_import_adds_missing_import_once():
+    # Arrange
+    content = """
+import typing
+
+__all__ = [
+    "DEEPX_CLIENT_ID",
+]
+
+DEEPX_CLIENT_ID: model.ClientId
+""".strip()
+
+    # Act
+    updated = generate_stubs._ensure_model_import(content)
+    unchanged = generate_stubs._ensure_model_import(updated)
+
+    # Assert
+    assert updated.count("from nautilus_trader import model") == 1
+    assert unchanged == updated
+
+
 def test_binance_stub_exposes_python_migration_surface():
     stub = (STUB_ROOT / "adapters" / "binance" / "__init__.pyi").read_text()
     stub_module = ast.parse(stub)

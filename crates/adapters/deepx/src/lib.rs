@@ -25,6 +25,8 @@
 pub mod common;
 pub mod execution;
 pub mod http;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod websocket;
 
 pub use common::consts::{DEEPX, DEEPX_CLIENT_ID, DEEPX_VENUE};
