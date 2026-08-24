@@ -16,19 +16,13 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::http::models::DeepXOrderBookLevel;
+pub use super::enums::{DeepXBookUpdateType, DeepXTakerSide};
+use crate::common::models::DeepXOrderBookLevel;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeepXWsMessage<T> {
     pub channel: String,
     pub data: T,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeepXBookUpdateType {
-    Snapshot,
-    Delta,
 }
 
 /// DeepX order book update. Delta sizes are absolute and zero removes a level.
@@ -56,13 +50,6 @@ impl DeepXOrderBookUpdate {
             }
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum DeepXTakerSide {
-    Buy,
-    Sell,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

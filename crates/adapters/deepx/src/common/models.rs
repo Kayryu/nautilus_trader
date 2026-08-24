@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod types;
+use rust_decimal::Decimal;
 
-pub use types as models;
+/// DeepX aggregated price level encoded as `[price, size]`.
+pub type DeepXOrderBookLevel = (Decimal, Decimal);

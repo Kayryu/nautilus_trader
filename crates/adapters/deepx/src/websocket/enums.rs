@@ -13,6 +13,18 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod types;
+use serde::{Deserialize, Serialize};
 
-pub use types as models;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeepXBookUpdateType {
+    Snapshot,
+    Delta,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DeepXTakerSide {
+    Buy,
+    Sell,
+}

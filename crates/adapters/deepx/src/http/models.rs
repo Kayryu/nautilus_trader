@@ -16,6 +16,8 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+pub use crate::common::models::DeepXOrderBookLevel;
+
 /// DeepX perpetual market metadata returned by `GET /v1/perp/markets`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,9 +36,6 @@ pub struct DeepXPerpetualMarket {
     pub max_open_orders: u32,
     pub order_types: Vec<String>,
 }
-
-/// DeepX aggregated price level encoded as `[price, size]`.
-pub type DeepXOrderBookLevel = (Decimal, Decimal);
 
 /// DeepX perpetual order book snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
