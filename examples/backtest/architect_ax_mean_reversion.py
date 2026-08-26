@@ -18,26 +18,28 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+from architect_ax_mean_reversion_strategy import BBMeanReversion, BBMeanReversionConfig
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import BacktestEngineConfig, LoggerConfig
+from nautilus_trader.model import (
+    AccountType,
+    AssetClass,
+    BarType,
+    Currency,
+    InstrumentId,
+    Money,
+    OmsType,
+    PerpetualContract,
+    Price,
+    Quantity,
+    Symbol,
+    TraderId,
+    Venue,
+)
+from nautilus_trader.persistence import QuoteTickDataWrangler
 
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.config import BacktestEngineConfig
-from nautilus_trader.config import LoggingConfig
-from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversion
-from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversionConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.identifiers import Symbol
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.instruments import PerpetualContract
-from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
+USD = Currency.from_str("USD")
 
 
 # *** THIS IS A TEST STRATEGY WITH NO ALPHA ADVANTAGE WHATSOEVER. ***
@@ -48,7 +50,7 @@ if __name__ == "__main__":
 
     # Download free CSV data from https://www.truefx.com/truefx-historical-downloads/
     # The raw format has no headers: pair,timestamp,bid,ask
-    data_path = Path("EURUSD-2025-12.csv")
+    data_path = Path("EURUSD-2026-01.csv")
 
     if not data_path.exists():
         raise FileNotFoundError(
@@ -93,7 +95,7 @@ if __name__ == "__main__":
 
     config = BacktestEngineConfig(
         trader_id=TraderId("BACKTESTER-001"),
-        logging=LoggingConfig(log_level="INFO"),
+        logging=LoggerConfig(stdout_level=LogLevel.INFO),
     )
 
     engine = BacktestEngine(config=config)
