@@ -43,7 +43,7 @@
 //! connection. Registered authentication state can hold or discard that replay before it reaches
 //! the replacement sink.
 //!
-//! Ownership‑bound sends wait for the writer result, require the expected connection epoch, and
+//! Ownership-bound sends wait for the writer result, require the expected connection epoch, and
 //! never enter the reconnect buffer. The writer advances the epoch only when it installs a
 //! replacement sink, so inbound attribution and bound sends share one transport ownership boundary.
 
@@ -175,6 +175,13 @@ pub struct WebSocketClientInner {
     auth_tracker: Arc<OnceLock<AuthTracker>>,
     reconnect_buffer_waits_for_auth: Arc<AtomicBool>,
     state_sink: Option<SocketStateSink>,
+    connection_rate_limit: Option<ConnectionRateLimit>,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionRateLimit {
+    limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    keys: Arc<[Ustr]>,
 }
 
 impl WebSocketClientInner {
@@ -293,6 +300,7 @@ impl WebSocketClientInner {
             auth_tracker,
             reconnect_buffer_waits_for_auth,
             state_sink,
+            connection_rate_limit: None,
         })
     }
 
@@ -313,6 +321,7 @@ impl WebSocketClientInner {
             message_handler.map(IncomingHandler::Message),
             ping_handler.map(IncomingPingHandler::Ping),
             None,
+            None,
         )
         .await
     }
@@ -322,6 +331,7 @@ impl WebSocketClientInner {
         handler: Option<IncomingHandler>,
         ping_handler: Option<IncomingPingHandler>,
         state_sink: Option<SocketStateSink>,
+        connection_rate_limit: Option<ConnectionRateLimit>,
     ) -> Result<Self, TransportError> {
         install_cryptographic_provider();
 
@@ -364,6 +374,13 @@ impl WebSocketClientInner {
         })?;
 
         let reconnect_headers = ReconnectHeaders::new(config.headers.clone());
+
+        if let Some(rate_limit) = &connection_rate_limit {
+            rate_limit
+                .limiter
+                .await_keys_ready(Some(&rate_limit.keys))
+                .await;
+        }
 
         // Bound the connection attempt: a server that accepts TCP but never upgrades must not hang the caller
         let (writer, reader) = dst::time::timeout(
@@ -466,6 +483,7 @@ impl WebSocketClientInner {
             auth_tracker,
             reconnect_buffer_waits_for_auth,
             state_sink,
+            connection_rate_limit,
         })
     }
 
@@ -976,8 +994,8 @@ impl WebSocketClientInner {
     /// Make a new connection with server. Use the new read and write halves
     /// to update self writer and read and heartbeat tasks.
     ///
-    /// For stream-based clients (created via `connect_stream`), reconnection is disabled
-    /// because the reader is owned by the caller and cannot be replaced. Stream users
+    /// For stream-based clients (created via [`WebSocketClient::stream_builder`]), reconnection is
+    /// disabled because the reader is owned by the caller and cannot be replaced. Stream users
     /// should handle disconnections by creating a new connection.
     ///
     /// The reconnect timeout bounds only connection establishment. Once the
@@ -1042,6 +1060,18 @@ impl WebSocketClientInner {
 
         if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
             log::debug!("Reconnect aborted due to disconnect state");
+            return Ok(ReconnectOutcome::Aborted);
+        }
+
+        if let Some(rate_limit) = &self.connection_rate_limit {
+            rate_limit
+                .limiter
+                .await_keys_ready(Some(&rate_limit.keys))
+                .await;
+        }
+
+        if ConnectionMode::from_atomic(&self.connection_mode).is_disconnect() {
+            log::debug!("Reconnect aborted during connection rate-limit wait");
             return Ok(ReconnectOutcome::Aborted);
         }
 
@@ -2335,38 +2365,33 @@ impl Debug for WebSocketClient {
     }
 }
 
+#[bon::bon]
 impl WebSocketClient {
-    /// Creates a websocket client in **stream mode** that returns a [`MessageReader`].
+    /// Returns a builder for a websocket client in **stream mode**.
     ///
-    /// Returns a stream that the caller owns and reads from directly. Automatic reconnection
-    /// is **disabled** because the reader cannot be replaced internally. On disconnection, the
-    /// client transitions to CLOSED state and the caller must manually reconnect by calling
-    /// `connect_stream` again.
+    /// Calling `connect` returns a stream that the caller owns and reads from directly. Automatic
+    /// reconnection is **disabled** because the reader cannot be replaced internally. On
+    /// disconnection, the client transitions to CLOSED state and the caller must manually create a
+    /// new connection.
     ///
     /// Use stream mode when you need custom reconnection logic, direct control over message
     /// reading, or fine-grained backpressure handling.
+    ///
+    /// `default_quota` and `keyed_quotas` limit outgoing messages. `state_sink` reports transport
+    /// availability changes.
     ///
     /// See [`WebSocketConfig`] documentation for comparison with handler mode.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection cannot be established.
-    pub async fn connect_stream(
+    #[builder(
+        builder_type = WebSocketClientStreamBuilder,
+        finish_fn = connect
+    )]
+    pub async fn stream_builder(
         config: WebSocketConfig,
-        keyed_quotas: Vec<(String, Quota)>,
-        default_quota: Option<Quota>,
-    ) -> Result<(MessageReader, Self), TransportError> {
-        Self::connect_stream_with_state_sink(config, keyed_quotas, default_quota, None).await
-    }
-
-    /// Creates a websocket client in stream mode and reports transport availability changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established.
-    pub async fn connect_stream_with_state_sink(
-        config: WebSocketConfig,
-        keyed_quotas: Vec<(String, Quota)>,
+        #[builder(default)] keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
         state_sink: Option<SocketStateSink>,
     ) -> Result<(MessageReader, Self), TransportError> {
@@ -2409,11 +2434,7 @@ impl WebSocketClient {
         let reconnect_buffer_waits_for_auth = Arc::clone(&inner.reconnect_buffer_waits_for_auth);
         let reconnect_headers = inner.reconnect_headers.clone();
         let state_sink = inner.state_sink.clone();
-        let keyed_quotas = keyed_quotas
-            .into_iter()
-            .map(|(key, quota)| (Ustr::from(&key), quota))
-            .collect();
-        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
+        let rate_limiter = Self::resolve_rate_limiter(default_quota, keyed_quotas, None)?;
         let writer_tx = inner.writer_tx.clone();
         let controller_lifecycle = Arc::new(ControllerLifecycle::new());
 
@@ -2450,7 +2471,7 @@ impl WebSocketClient {
         ))
     }
 
-    /// Creates a websocket client in **handler mode** with automatic reconnection.
+    /// Returns a builder for a websocket client in **handler mode**.
     ///
     /// The handler is called for each incoming message on an internal task.
     /// Automatic reconnection is **enabled** with exponential backoff. On disconnection,
@@ -2462,177 +2483,169 @@ impl WebSocketClient {
     ///
     /// See [`WebSocketConfig`] documentation for comparison with stream mode.
     ///
+    /// Set `rate_limiter` to share message quota state across clients. Otherwise, the client
+    /// creates one from `default_quota` and `keyed_quotas`. `connection_rate_limiter` gates the
+    /// initial connection and reconnects using `connection_rate_keys`.
+    ///
+    /// The message handler is required:
+    ///
+    /// ```compile_fail
+    /// use nautilus_network::websocket::{WebSocketClient, WebSocketConfig};
+    ///
+    /// let config: WebSocketConfig = unimplemented!();
+    /// let _ = WebSocketClient::builder().config(config).connect();
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The connection cannot be established.
-    /// - `message_handler` is `None` (use `connect_stream` instead).
-    pub async fn connect(
+    /// - The configuration is invalid or the connection cannot be established.
+    /// - A shared rate limiter is combined with quota configuration.
+    /// - The connection rate limiter and its keys are not configured together.
+    #[builder(finish_fn = connect)]
+    pub async fn builder(
         config: WebSocketConfig,
-        message_handler: Option<MessageHandler>,
+        message_handler: MessageHandler,
         ping_handler: Option<PingHandler>,
-        keyed_quotas: Vec<(String, Quota)>,
+        #[builder(default)] keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_state_sink(
-            config,
-            message_handler,
-            ping_handler,
-            keyed_quotas,
-            default_quota,
-            None,
-        )
-        .await
-    }
-
-    /// Creates a handler-mode client and reports transport availability changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established or `message_handler` is `None`.
-    pub async fn connect_with_state_sink(
-        config: WebSocketConfig,
-        message_handler: Option<MessageHandler>,
-        ping_handler: Option<PingHandler>,
-        keyed_quotas: Vec<(String, Quota)>,
-        default_quota: Option<Quota>,
+        rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
         state_sink: Option<SocketStateSink>,
+        connection_rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+        #[builder(default)] connection_rate_keys: Arc<[Ustr]>,
     ) -> Result<Self, TransportError> {
-        let keyed_quotas = keyed_quotas
-            .into_iter()
-            .map(|(key, quota)| (Ustr::from(&key), quota))
-            .collect();
-        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
-        let message_handler = message_handler.ok_or_else(|| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Handler mode requires message_handler to be set. Use connect_stream() for stream mode without a handler.",
-            ))
-        })?;
-        Self::connect_with_handler(
+        let rate_limiter = Self::resolve_rate_limiter(default_quota, keyed_quotas, rate_limiter)?;
+        let connection_rate_limit =
+            Self::resolve_connection_rate_limit(connection_rate_limiter, connection_rate_keys)?;
+        Self::connect_with_handler_scoped(
             config,
             IncomingHandler::Message(message_handler),
             ping_handler.map(IncomingPingHandler::Ping),
             rate_limiter,
             state_sink,
+            connection_rate_limit,
         )
         .await
     }
 
-    /// Creates a websocket client in **handler mode** sharing an externally-owned rate limiter.
-    ///
-    /// Use this constructor to share a single [`RateLimiter`] across multiple
-    /// [`WebSocketClient`] instances (for example, the WebSocket clients owned
-    /// by an exchange adapter's data and execution clients). All quota state
-    /// lives inside the limiter, so passing the same `Arc` produces a single
-    /// shared bucket - the only way to honour a venue's per-IP / per-account
-    /// WS message cap when more than one connection is opened in-process.
-    ///
-    /// Behavior otherwise matches [`Self::connect`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The connection cannot be established.
-    /// - `message_handler` is `None` (use `connect_stream` instead).
-    pub async fn connect_with_rate_limiter(
-        config: WebSocketConfig,
-        message_handler: Option<MessageHandler>,
-        ping_handler: Option<PingHandler>,
-        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
-    ) -> Result<Self, TransportError> {
-        let message_handler = message_handler.ok_or_else(|| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Handler mode requires message_handler to be set. Use connect_stream() for stream mode without a handler.",
-            ))
-        })?;
-        Self::connect_with_handler(
-            config,
-            IncomingHandler::Message(message_handler),
-            ping_handler.map(IncomingPingHandler::Ping),
-            rate_limiter,
-            None,
-        )
-        .await
-    }
-
-    /// Creates a handler-mode client whose incoming messages carry connection ownership.
+    /// Returns a builder for a handler-mode client whose messages carry connection ownership.
     ///
     /// The initial connection has epoch `0`. Each replacement connection increments the epoch,
     /// and both its incoming messages and `RECONNECTED` notification carry that new value. Use
     /// [`Self::send_text_on_connection`] to bind an outgoing message to one of those epochs.
+    /// Rate-limit and state options match [`Self::builder`].
+    /// Set either `ping_handler` or `epoch_ping_handler` when custom ping handling is required.
+    ///
+    /// The epoch handler is required:
+    ///
+    /// ```compile_fail
+    /// use nautilus_network::websocket::{WebSocketClient, WebSocketConfig};
+    ///
+    /// let config: WebSocketConfig = unimplemented!();
+    /// let _ = WebSocketClient::epoch_builder().config(config).connect();
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection cannot be established.
-    pub async fn connect_with_rate_limiter_and_epoch_handler(
+    /// Returns an error if:
+    /// - The configuration is invalid or the connection cannot be established.
+    /// - A shared rate limiter is combined with quota configuration.
+    /// - The connection rate limiter and its keys are not configured together.
+    /// - Both `ping_handler` and `epoch_ping_handler` are configured.
+    #[builder(
+        builder_type = WebSocketClientEpochBuilder,
+        finish_fn = connect
+    )]
+    pub async fn epoch_builder(
         config: WebSocketConfig,
         epoch_handler: EpochMessageHandler,
         ping_handler: Option<PingHandler>,
-        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+        epoch_ping_handler: Option<EpochPingHandler>,
+        #[builder(default)] keyed_quotas: Vec<(String, Quota)>,
+        default_quota: Option<Quota>,
+        rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+        state_sink: Option<SocketStateSink>,
+        connection_rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+        #[builder(default)] connection_rate_keys: Arc<[Ustr]>,
     ) -> Result<Self, TransportError> {
-        Self::connect_with_rate_limiter_and_epoch_handler_and_state_sink(
+        let ping_handler = match (ping_handler, epoch_ping_handler) {
+            (Some(_), Some(_)) => {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cannot configure both ping_handler and epoch_ping_handler",
+                )));
+            }
+            (Some(handler), None) => Some(IncomingPingHandler::Ping(handler)),
+            (None, Some(handler)) => Some(IncomingPingHandler::Epoch(handler)),
+            (None, None) => None,
+        };
+        let rate_limiter = Self::resolve_rate_limiter(default_quota, keyed_quotas, rate_limiter)?;
+        let connection_rate_limit =
+            Self::resolve_connection_rate_limit(connection_rate_limiter, connection_rate_keys)?;
+        Self::connect_with_handler_scoped(
             config,
-            epoch_handler,
+            IncomingHandler::Epoch(epoch_handler),
             ping_handler,
             rate_limiter,
-            None,
-        )
-        .await
-    }
-
-    // TODO: Marked for builder pattern refactor
-
-    /// Creates an epoch-handler client and reports transport availability changes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established or the config fails validation.
-    pub async fn connect_with_rate_limiter_and_epoch_handler_and_state_sink(
-        config: WebSocketConfig,
-        epoch_handler: EpochMessageHandler,
-        ping_handler: Option<PingHandler>,
-        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
-        state_sink: Option<SocketStateSink>,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_handler(
-            config,
-            IncomingHandler::Epoch(epoch_handler),
-            ping_handler.map(IncomingPingHandler::Ping),
-            rate_limiter,
             state_sink,
+            connection_rate_limit,
         )
         .await
     }
 
-    /// Creates a handler-mode client whose incoming messages and pings carry connection ownership.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established.
-    pub async fn connect_with_rate_limiter_and_epoch_handlers(
-        config: WebSocketConfig,
-        epoch_handler: EpochMessageHandler,
-        epoch_ping_handler: Option<EpochPingHandler>,
-        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
-    ) -> Result<Self, TransportError> {
-        Self::connect_with_handler(
-            config,
-            IncomingHandler::Epoch(epoch_handler),
-            epoch_ping_handler.map(IncomingPingHandler::Epoch),
-            rate_limiter,
-            None,
-        )
-        .await
+    fn resolve_connection_rate_limit(
+        rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+        keys: Arc<[Ustr]>,
+    ) -> Result<Option<ConnectionRateLimit>, TransportError> {
+        if rate_limiter.is_none() && !keys.is_empty() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Connection rate keys require a connection rate limiter",
+            )));
+        }
+
+        if rate_limiter.is_some() && keys.is_empty() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Connection rate limiter requires at least one connection rate key",
+            )));
+        }
+
+        Ok(rate_limiter.map(|limiter| ConnectionRateLimit { limiter, keys }))
     }
 
-    async fn connect_with_handler(
+    fn resolve_rate_limiter(
+        default_quota: Option<Quota>,
+        keyed_quotas: Vec<(String, Quota)>,
+        rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
+    ) -> Result<Arc<RateLimiter<Ustr, MonotonicClock>>, TransportError> {
+        if let Some(rate_limiter) = rate_limiter {
+            if default_quota.is_some() || !keyed_quotas.is_empty() {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Cannot combine a shared rate limiter with quota configuration",
+                )));
+            }
+            return Ok(rate_limiter);
+        }
+
+        let keyed_quotas = keyed_quotas
+            .into_iter()
+            .map(|(key, quota)| (Ustr::from(&key), quota))
+            .collect();
+        Ok(Arc::new(RateLimiter::new_with_quota(
+            default_quota,
+            keyed_quotas,
+        )))
+    }
+
+    async fn connect_with_handler_scoped(
         config: WebSocketConfig,
         handler: IncomingHandler,
         ping_handler: Option<IncomingPingHandler>,
         rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
         state_sink: Option<SocketStateSink>,
+        connection_rate_limit: Option<ConnectionRateLimit>,
     ) -> Result<Self, TransportError> {
         log::debug!("Connecting");
         let inner = WebSocketClientInner::connect_url_with_handler(
@@ -2640,6 +2653,7 @@ impl WebSocketClient {
             Some(handler),
             ping_handler,
             state_sink,
+            connection_rate_limit,
         )
         .await?;
         let connection_mode = inner.connection_mode.clone();
@@ -3619,7 +3633,10 @@ mod tests {
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
         };
-        WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, vec![], None)
+        WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .connect()
             .await
             .expect("Failed to connect")
     }
@@ -3641,7 +3658,10 @@ mod tests {
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
         };
-        WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, vec![], None)
+        WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .connect()
             .await
             .expect("client should connect")
     }
@@ -3728,10 +3748,11 @@ mod tests {
         let (http_task, http_port) = setup_http_test_server().await;
         let invalid_headers =
             HashMap::from([("x-secret-default".to_string(), format!("{SECRET_MARKER}\n"))]);
-        let invalid_header_error =
-            HttpClient::new(invalid_headers, vec![], vec![], None, None, None).unwrap_err();
-        let http_client =
-            HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).unwrap();
+        let invalid_header_error = HttpClient::builder()
+            .headers(invalid_headers)
+            .build()
+            .unwrap_err();
+        let http_client = HttpClient::builder().build().unwrap();
         let params = HashMap::from([("secret".to_string(), vec![SECRET_MARKER.to_string()])]);
         let headers = HashMap::from([
             (
@@ -4065,15 +4086,12 @@ mod tests {
             states_callback.lock().unwrap().push(state);
         });
 
-        let res = WebSocketClient::connect_with_state_sink(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await;
+        let res = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .state_sink(sink)
+            .connect()
+            .await;
         assert!(res.is_err(), "Should fail quickly with no server");
         assert_eq!(*states.lock().unwrap(), Vec::new());
     }
@@ -4126,16 +4144,13 @@ mod tests {
             states_callback.lock().unwrap().push(state);
         });
 
-        let client = WebSocketClient::connect_with_state_sink(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
 
         assert_eq!(*states.lock().unwrap(), vec![SocketState::Connected]);
 
@@ -4187,16 +4202,13 @@ mod tests {
             states_callback.lock().unwrap().push(state);
         });
 
-        let client = WebSocketClient::connect_with_state_sink(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
 
         drop(client);
         crate::dst::time::sleep(Duration::from_millis(25)).await;
@@ -4230,10 +4242,12 @@ mod tests {
             states_callback.lock().unwrap().push(state);
         });
 
-        let (_reader, client) =
-            WebSocketClient::connect_stream_with_state_sink(config, vec![], None, Some(sink))
-                .await
-                .unwrap();
+        let (_reader, client) = WebSocketClient::stream_builder()
+            .config(config)
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
 
         client.notify_closed();
 
@@ -4281,16 +4295,13 @@ mod tests {
             states_callback.lock().unwrap().push(state);
         });
 
-        let client = WebSocketClient::connect_with_state_sink(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
 
         client.send_text("close-now".into(), None).await.unwrap();
         wait_until_async(
@@ -4360,7 +4371,10 @@ mod tests {
             backend: TransportBackend::Tungstenite,
             proxy_url: None,
         };
-        let client = WebSocketClient::connect(config, Some(Arc::new(|_| {})), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .connect()
             .await
             .unwrap();
 
@@ -4410,15 +4424,13 @@ mod tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(
-            config,
-            Some(Arc::new(|_| {})),
-            None,
-            vec![("default".into(), quota)],
-            None,
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(Arc::new(|_| {}))
+            .keyed_quotas(vec![("default".into(), quota)])
+            .connect()
+            .await
+            .unwrap();
 
         // Burst of 2 passes immediately; the third send must wait for the
         // ~500ms replenish interval (keys=None would bypass the limiter)
@@ -4590,6 +4602,57 @@ mod rust_tests {
     }
 
     #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn connection_rate_limit_gates_initial_connect_and_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _first = accept_async(stream).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let _second = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let key = Ustr::from("connection-attempt");
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(key, Quota::with_period(Duration::from_secs(1)).unwrap())],
+        ));
+        limiter.await_keys_ready(Some(&[key])).await;
+        let rate_limit = ConnectionRateLimit {
+            limiter,
+            keys: Arc::from([key]),
+        };
+        let (handler, _rx) = channel_message_handler();
+        let mut config = reconnect_test_config(port);
+        config.connect_timeout_ms = Some(10_000);
+        let initial = WebSocketClientInner::connect_url_with_handler(
+            config,
+            Some(IncomingHandler::Message(handler)),
+            None,
+            None,
+            Some(rate_limit),
+        );
+        tokio::pin!(initial);
+        assert!(futures_util::poll!(&mut initial).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let mut inner = initial.await.unwrap();
+
+        inner
+            .connection_mode
+            .store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
+        let reconnect = inner.reconnect_with_outcome();
+        tokio::pin!(reconnect);
+        assert!(futures_util::poll!(&mut reconnect).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reconnect.await.unwrap(), ReconnectOutcome::Reconnected);
+
+        server.abort();
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_reconnect_outcome_is_aborted_before_connect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4664,6 +4727,7 @@ mod rust_tests {
         let mut inner = WebSocketClientInner::connect_url_with_handler(
             reconnect_test_config(port),
             Some(IncomingHandler::Epoch(epoch_handler)),
+            None,
             None,
             None,
         )
@@ -4908,16 +4972,13 @@ mod rust_tests {
             }
         });
         let (handler, mut handler_rx) = channel_message_handler();
-        let client = WebSocketClient::connect_with_state_sink(
-            reconnect_test_config(server.port),
-            Some(handler),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(reconnect_test_config(server.port))
+            .message_handler(handler)
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
         client.set_auth_tracker(tracker.clone(), true);
         server.wait_for_connections(1).await;
 
@@ -5012,15 +5073,12 @@ mod rust_tests {
     async fn test_reconnect_handle_is_closed_after_client_drop() {
         let server = RecordingServer::setup().await;
         let (handler, _handler_rx) = channel_message_handler();
-        let client = WebSocketClient::connect(
-            reconnect_test_config(server.port),
-            Some(handler),
-            None,
-            vec![],
-            None,
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(reconnect_test_config(server.port))
+            .message_handler(handler)
+            .connect()
+            .await
+            .unwrap();
         let tracker = AuthTracker::new();
         let pending_auth = tracker.begin();
         client.set_auth_tracker(tracker.clone(), true);
@@ -5066,16 +5124,13 @@ mod rust_tests {
             }
         });
         let (handler, _handler_rx) = channel_message_handler();
-        let client = WebSocketClient::connect_with_state_sink(
-            reconnect_test_config(server.port),
-            Some(handler),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(reconnect_test_config(server.port))
+            .message_handler(handler)
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
         client.set_auth_tracker(tracker.clone(), true);
         let controller_abort = client.controller_task.abort_handle();
         let connection_mode = Arc::clone(&client.connection_mode);
@@ -5126,16 +5181,13 @@ mod rust_tests {
             }
         });
         let (handler, _handler_rx) = channel_message_handler();
-        let client = WebSocketClient::connect_with_state_sink(
-            reconnect_test_config(server.port),
-            Some(handler),
-            None,
-            vec![],
-            None,
-            Some(sink),
-        )
-        .await
-        .unwrap();
+        let client = WebSocketClient::builder()
+            .config(reconnect_test_config(server.port))
+            .message_handler(handler)
+            .state_sink(sink)
+            .connect()
+            .await
+            .unwrap();
         let tracker = AuthTracker::new();
         let _initial_auth = tracker.begin();
         tracker.succeed();
@@ -5210,7 +5262,10 @@ mod rust_tests {
         };
 
         // Connect the client
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5257,7 +5312,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5310,13 +5368,15 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let (_reader, _client) = WebSocketClient::connect_stream(config, vec![], None)
+        let (_reader, _client) = WebSocketClient::stream_builder()
+            .config(config)
+            .connect()
             .await
             .unwrap();
 
         // Note: We can't easily test the reconnect behavior from the outside since
         // the inner client is private. The key fix is that WebSocketClientInner
-        // now has no internal handler for connect_stream, and reconnect() will
+        // now has no internal handler in stream mode, and reconnect() will
         // transition to CLOSED state instead of creating a new reader that gets dropped.
         // This is tested implicitly by the fact that stream users won't get stuck
         // in an infinite reconnect loop.
@@ -5360,7 +5420,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5436,7 +5499,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5499,7 +5565,9 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let (mut reader, client) = WebSocketClient::connect_stream(config, vec![], None)
+        let (mut reader, client) = WebSocketClient::stream_builder()
+            .config(config)
+            .connect()
             .await
             .unwrap();
 
@@ -5585,7 +5653,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5672,7 +5743,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5766,15 +5840,13 @@ mod rust_tests {
             .allow_burst(NonZeroU32::new(1).unwrap());
 
         let client = Arc::new(
-            WebSocketClient::connect(
-                config,
-                Some(handler),
-                None,
-                vec![("test_key".to_string(), quota)],
-                None,
-            )
-            .await
-            .unwrap(),
+            WebSocketClient::builder()
+                .config(config)
+                .message_handler(handler)
+                .keyed_quotas(vec![("test_key".to_string(), quota)])
+                .connect()
+                .await
+                .unwrap(),
         );
 
         // First send exhausts burst capacity and triggers connection close
@@ -5853,7 +5925,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -5928,15 +6003,13 @@ mod rust_tests {
             .allow_burst(NonZeroU32::new(1).unwrap());
 
         let client = Arc::new(
-            WebSocketClient::connect(
-                config,
-                Some(handler),
-                None,
-                vec![("test_key".to_string(), quota)],
-                None,
-            )
-            .await
-            .unwrap(),
+            WebSocketClient::builder()
+                .config(config)
+                .message_handler(handler)
+                .keyed_quotas(vec![("test_key".to_string(), quota)])
+                .connect()
+                .await
+                .unwrap(),
         );
 
         // Wait for disconnection
@@ -5979,40 +6052,75 @@ mod rust_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_connect_rejects_none_message_handler() {
-        // Test that connect() properly rejects None message_handler
-        // to prevent zombie connections that appear alive but never detect disconnections
+    async fn test_builder_rejects_shared_rate_limiter_with_quotas() {
+        let (handler, _rx) = channel_message_handler();
+        let rate_limiter = Arc::new(RateLimiter::new_with_quota(None, Vec::new()));
+        let result = WebSocketClient::builder()
+            .config(reconnect_test_config(1))
+            .message_handler(handler)
+            .default_quota(Quota::with_period(Duration::from_secs(1)).unwrap())
+            .rate_limiter(rate_limiter)
+            .connect()
+            .await;
 
-        let config = WebSocketConfig {
-            url: "ws://127.0.0.1:9999".to_string(),
-            headers: vec![],
-            heartbeat_interval_secs: None,
-            heartbeat_payload: None,
-            connect_timeout_ms: Some(1_000),
-            reconnect_delay_initial_ms: Some(100),
-            reconnect_delay_max_ms: Some(500),
-            reconnect_backoff_factor: Some(1.5),
-            reconnect_jitter_ms: Some(0),
-            reconnect_max_attempts: None,
-            heartbeat_timeout_secs: None,
-            idle_timeout_ms: None,
-            backend: TransportBackend::Tungstenite,
-            proxy_url: None,
-        };
-
-        // Pass None for message_handler - should be rejected
-        let result = WebSocketClient::connect(config, None, None, vec![], None).await;
-
-        assert!(
-            result.is_err(),
-            "connect() should reject None message_handler"
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "I/O error: Cannot combine a shared rate limiter with quota configuration"
         );
+    }
 
-        let err = result.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("Handler mode requires message_handler"),
-            "Error should mention missing message_handler, was: {err_msg}"
+    #[rstest]
+    #[tokio::test]
+    async fn test_builder_rejects_connection_keys_without_limiter() {
+        let (handler, _rx) = channel_message_handler();
+        let result = WebSocketClient::builder()
+            .config(reconnect_test_config(1))
+            .message_handler(handler)
+            .connection_rate_keys(Arc::from([Ustr::from("connect")]))
+            .connect()
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "I/O error: Connection rate keys require a connection rate limiter"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_builder_rejects_connection_limiter_without_keys() {
+        let (handler, _rx) = channel_message_handler();
+        let rate_limiter = Arc::new(RateLimiter::new_with_quota(None, Vec::new()));
+        let result = WebSocketClient::builder()
+            .config(reconnect_test_config(1))
+            .message_handler(handler)
+            .connection_rate_limiter(rate_limiter)
+            .connect()
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "I/O error: Connection rate limiter requires at least one connection rate key"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_epoch_builder_rejects_both_ping_handler_types() {
+        let (handler, _rx) = channel_epoch_message_handler();
+        let ping_handler: PingHandler = Arc::new(|_| {});
+        let epoch_ping_handler: EpochPingHandler = Arc::new(|_, _| {});
+        let result = WebSocketClient::epoch_builder()
+            .config(reconnect_test_config(1))
+            .epoch_handler(handler)
+            .ping_handler(ping_handler)
+            .epoch_ping_handler(epoch_ping_handler)
+            .connect()
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "I/O error: Cannot configure both ping_handler and epoch_ping_handler"
         );
     }
 
@@ -6191,7 +6299,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -6252,7 +6363,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -6313,7 +6427,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -6383,7 +6500,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -6444,7 +6564,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -6522,15 +6645,13 @@ mod rust_tests {
             .allow_burst(NonZeroU32::new(1).unwrap());
 
         let client = Arc::new(
-            WebSocketClient::connect(
-                config,
-                Some(handler),
-                None,
-                vec![("rate_key".to_string(), quota)],
-                None,
-            )
-            .await
-            .unwrap(),
+            WebSocketClient::builder()
+                .config(config)
+                .message_handler(handler)
+                .keyed_quotas(vec![("rate_key".to_string(), quota)])
+                .connect()
+                .await
+                .unwrap(),
         );
 
         let test_key: [Ustr; 1] = [Ustr::from("rate_key")];
@@ -6612,7 +6733,9 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let (_reader, client) = WebSocketClient::connect_stream(config, vec![], None)
+        let (_reader, client) = WebSocketClient::stream_builder()
+            .config(config)
+            .connect()
             .await
             .unwrap();
 
@@ -7691,7 +7814,10 @@ mod rust_tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            WebSocketClient::connect(config, Some(handler), None, vec![], None),
+            WebSocketClient::builder()
+                .config(config)
+                .message_handler(handler)
+                .connect(),
         )
         .await
         .expect("connect should not hang on a silent server");
@@ -7716,23 +7842,37 @@ mod rust_tests {
         // connection establishment.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
 
         let server = task::spawn(async move {
-            // First connection: accept and immediately drop
+            // Keep the first socket until connect() returns; an immediate drop
+            // can fail the initial handshake
             if let Ok((stream, _)) = listener.accept().await
                 && let Ok(ws) = accept_async(stream).await
             {
+                let _ = release_first_rx.await;
                 drop(ws);
             }
 
-            // Second connection: announce and keep alive
-            if let Ok((stream, _)) = listener.accept().await
-                && let Ok(mut ws) = accept_async(stream).await
-            {
-                let _ = ws
-                    .send(WsMessage::Text("reconnected-msg".to_string().into()))
-                    .await;
-                sleep(Duration::from_secs(5)).await;
+            // A timed-out reconnect can consume an accept without completing the
+            // handshake, so keep accepting and announce on every replacement
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                if let Ok(mut ws) = accept_async(stream).await {
+                    loop {
+                        if ws
+                            .send(WsMessage::Text("reconnected-msg".to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
             }
         });
 
@@ -7755,24 +7895,32 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
+        wait_until_async(|| async { client.is_active() }, Duration::from_secs(2)).await;
+        release_first_tx
+            .send(())
+            .expect("server should still be holding the first connection");
 
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(WsMessage::Text(text)) = rx.try_recv()
-                    && text.as_str() == "reconnected-msg"
-                {
-                    return true;
+                match rx.recv().await {
+                    Some(WsMessage::Text(text)) if text.as_str() == "reconnected-msg" => {
+                        return true;
+                    }
+                    Some(_) => {}
+                    None => return false,
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
 
         assert!(
-            received.is_ok(),
+            matches!(received, Ok(true)),
             "Reconnect should complete despite a timeout shorter than the swap ceremony"
         );
 
@@ -7821,7 +7969,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .unwrap();
 
@@ -8328,7 +8479,11 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let result = WebSocketClient::connect(config, Some(handler), None, vec![], None).await;
+        let result = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
+            .await;
 
         assert!(result.is_err(), "Zero idle timeout should be rejected");
         let err_msg = result.unwrap_err().to_string();
@@ -8360,7 +8515,11 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let result = WebSocketClient::connect(config, Some(handler), None, vec![], None).await;
+        let result = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
+            .await;
 
         assert!(result.is_err(), "Zero heartbeat timeout should be rejected");
         let err_msg = result.unwrap_err().to_string();
@@ -8393,7 +8552,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let err = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let err = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect_err("reserved header should fail before TCP connect");
 
@@ -8452,7 +8614,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("sockudo connect without custom headers");
 
@@ -8531,7 +8696,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("sockudo connect with custom headers");
 
@@ -8607,7 +8775,10 @@ mod rust_tests {
             proxy_url: None,
         };
 
-        let client = WebSocketClient::connect(config, Some(handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connect()
             .await
             .expect("sockudo connect");
 
@@ -9303,15 +9474,12 @@ mod turmoil_tests {
         sim.client("client", async move {
             let tracker = AuthTracker::new();
             let (handler, _rx) = channel_message_handler();
-            let client = WebSocketClient::connect(
-                turmoil_websocket_config(),
-                Some(handler),
-                None,
-                vec![],
-                None,
-            )
-            .await
-            .expect("Should connect");
+            let client = WebSocketClient::builder()
+                .config(turmoil_websocket_config())
+                .message_handler(handler)
+                .connect()
+                .await
+                .expect("Should connect");
 
             client.set_auth_tracker(tracker.clone(), true);
             assert!(client.is_active(), "Client should start active");
@@ -9373,15 +9541,12 @@ mod turmoil_tests {
         sim.client("client", async move {
             let tracker = AuthTracker::new();
             let (handler, _rx) = channel_message_handler();
-            let client = WebSocketClient::connect(
-                turmoil_websocket_config(),
-                Some(handler),
-                None,
-                vec![],
-                None,
-            )
-            .await
-            .expect("Should connect");
+            let client = WebSocketClient::builder()
+                .config(turmoil_websocket_config())
+                .message_handler(handler)
+                .connect()
+                .await
+                .expect("Should connect");
 
             client.set_auth_tracker(tracker.clone(), true);
             assert!(client.is_active(), "Client should start active");

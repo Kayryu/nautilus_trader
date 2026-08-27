@@ -355,6 +355,26 @@ pub fn reconcile_order_report_with_commission(
         return None;
     }
 
+    if is_unchanged_accepted_report_during_pending_command(order, report) {
+        log::debug!(
+            "Order {} remains inflight while venue reports an unchanged accepted snapshot",
+            order.client_order_id(),
+        );
+        return None;
+    }
+
+    if is_superseded_cancel_report(order, report) {
+        let cached_venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
+        log::info!(
+            "Suppressing Canceled for {} on previously-promoted venue_order_id {}: \
+             current venue_order_id is {}",
+            order.client_order_id(),
+            report.venue_order_id,
+            cached_venue_order_id,
+        );
+        return None;
+    }
+
     if order.status() == report.order_status && order.filled_qty() == report.filled_qty {
         if should_reconciliation_update(order, report) {
             log::info!(
@@ -394,21 +414,7 @@ pub fn reconcile_order_report_with_commission(
                 None
             }
         }
-        OrderStatus::Canceled => {
-            if is_superseded_cancel_report(order, report) {
-                let cached_venue_order_id = order.venue_order_id().unwrap_or(report.venue_order_id);
-                log::info!(
-                    "Suppressing Canceled for {} on previously-promoted venue_order_id {}: \
-                     current venue_order_id is {}",
-                    order.client_order_id(),
-                    report.venue_order_id,
-                    cached_venue_order_id,
-                );
-                return None;
-            }
-
-            Some(create_reconciliation_canceled(order, report, ts_now))
-        }
+        OrderStatus::Canceled => Some(create_reconciliation_canceled(order, report, ts_now)),
         OrderStatus::Expired => Some(create_reconciliation_expired(order, report, ts_now)),
 
         OrderStatus::PartiallyFilled | OrderStatus::Filled => {
@@ -435,6 +441,19 @@ pub fn reconcile_order_report_with_commission(
             None
         }
     }
+}
+
+fn is_unchanged_accepted_report_during_pending_command(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+) -> bool {
+    matches!(
+        order.status(),
+        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+    ) && report.order_status == OrderStatus::Accepted
+        && order.venue_order_id() == Some(report.venue_order_id)
+        && order.filled_qty() == report.filled_qty
+        && !should_reconciliation_update(order, report)
 }
 
 /// Generates the appropriate order events for an external order and order status report.

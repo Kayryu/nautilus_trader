@@ -35,6 +35,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use nautilus_common::live::get_runtime;
 use nautilus_core::UUID4;
+use nautilus_live::SocketControl;
 use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::clock::MonotonicClock,
@@ -74,13 +75,14 @@ use crate::{
     },
     http::{
         models::{
-            DeriveCancelByLabelResult, DeriveEmptyResult, DeriveOpenOrdersResult, DeriveOrder,
-            DeriveOrderResult, DeriveReplaceOutcome, DeriveReplaceResult,
+            DeriveCancelByInstrumentResult, DeriveCancelByLabelResult, DeriveEmptyResult,
+            DeriveOpenOrdersResult, DeriveOrder, DeriveOrderResult, DeriveReplaceOutcome,
+            DeriveReplaceResult,
         },
         query::{
-            DeriveCancelAllParams, DeriveCancelByLabelParams, DeriveCancelParams,
-            DeriveCancelTriggerOrderParams, DeriveGetTriggerOrdersParams, DeriveOrderParams,
-            DeriveReplaceParams, DeriveTriggerOrderParams,
+            DeriveCancelAllParams, DeriveCancelByInstrumentParams, DeriveCancelByLabelParams,
+            DeriveCancelParams, DeriveCancelTriggerOrderParams, DeriveGetTriggerOrdersParams,
+            DeriveOrderParams, DeriveReplaceParams, DeriveTriggerOrderParams,
         },
     },
     signing::auth::build_ws_login,
@@ -156,6 +158,7 @@ pub struct DeriveWebSocketClient {
     request_timeout: Duration,
     conn_id: Arc<ArcSwap<String>>,
     rate_limiter: Arc<WsRateLimiter>,
+    socket_control: Option<SocketControl>,
 }
 
 /// Cloneable command handle for Derive public market data subscriptions.
@@ -277,7 +280,15 @@ impl DeriveWebSocketClient {
             request_timeout: WS_REQUEST_TIMEOUT,
             conn_id: Arc::new(ArcSwap::from_pointee(UUID4::new().to_string())),
             rate_limiter,
+            socket_control: None,
         }
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Returns the configured WebSocket URL.
@@ -357,7 +368,11 @@ impl DeriveWebSocketClient {
         // Rate limiting runs caller-side via `self.rate_limiter` before frames
         // are enqueued, so the network client's own limiter is left unconfigured
         // and never sleeps inside the single feed-handler task.
-        let client = WebSocketClient::connect(cfg, Some(message_handler), None, vec![], None)
+        let client = WebSocketClient::builder()
+            .config(cfg)
+            .message_handler(message_handler)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
             .await
             .map_err(|e| DeriveWsError::transport(e.to_string()))?;
 
@@ -375,6 +390,7 @@ impl DeriveWebSocketClient {
 
         let connection_mode = client.connection_mode_atomic();
         let connection_epoch = client.connection_epoch_atomic();
+        let reconnect_handle = client.reconnect_handle();
         self.connection_mode.store(Arc::clone(&connection_mode));
         self.connection_epoch.store(Arc::clone(&connection_epoch));
         log::debug!("Derive WebSocket connected: {}", self.url);
@@ -383,6 +399,10 @@ impl DeriveWebSocketClient {
             return Err(DeriveWsError::transport(format!(
                 "failed to send SetClient command: {e}",
             )));
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let signal = Arc::clone(&self.signal);
@@ -574,6 +594,10 @@ impl DeriveWebSocketClient {
             .store(UNAUTHENTICATED_CONNECTION_EPOCH, Ordering::Release);
         self.subscriptions.clear();
         self.signal.store(false, Ordering::Relaxed);
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     /// Disconnects the WebSocket connection and awaits the handler task.
@@ -1115,6 +1139,31 @@ impl DeriveWsExecutionHandle {
         Ok(())
     }
 
+    /// Cancels every open order for one instrument via `private/cancel_by_instrument`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveWsError::JsonRpc`] for venue rejections and
+    /// [`DeriveWsError::Transport`] / [`DeriveWsError::Timeout`] when the
+    /// outcome is ambiguous.
+    pub async fn cancel_by_instrument(
+        &self,
+        params: &DeriveCancelByInstrumentParams,
+    ) -> Result<DeriveCancelByInstrumentResult> {
+        self.require_authenticated(methods::PRIVATE_CANCEL_BY_INSTRUMENT)
+            .await?;
+        let cmd_tx = self.cmd_tx.read().await.clone();
+        send_request_typed_for_instrument(
+            &self.rate_limiter,
+            &cmd_tx,
+            methods::PRIVATE_CANCEL_BY_INSTRUMENT,
+            params,
+            self.request_timeout,
+            params.instrument_name,
+        )
+        .await
+    }
+
     /// Cancels a single trigger order via `private/cancel_trigger_order`.
     ///
     /// # Errors
@@ -1438,6 +1487,31 @@ where
     )
     .await?;
     decode_default_result(value)
+}
+
+// Keep strict result decoding while reserving both matching buckets
+async fn send_request_typed_for_instrument<P, R>(
+    rate_limiter: &WsRateLimiter,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    method: &'static str,
+    params: &P,
+    timeout: Duration,
+    instrument_name: Ustr,
+) -> Result<R>
+where
+    P: Serialize + ?Sized,
+    R: DeserializeOwned,
+{
+    let value = send_raw_for_instrument(
+        rate_limiter,
+        cmd_tx,
+        method,
+        params,
+        timeout,
+        instrument_name,
+    )
+    .await?;
+    Ok(serde_json::from_value(value)?)
 }
 
 fn decode_default_result<R>(value: Value) -> Result<R>

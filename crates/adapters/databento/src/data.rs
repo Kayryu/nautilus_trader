@@ -91,6 +91,14 @@ const TRADE_SCHEMAS: &[dbn::Schema] = &[
 
 /// Configuration for the Databento data client.
 #[derive(Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.databento", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
+)]
 pub struct DatabentoDataClientConfig {
     /// Databento API credential.
     pub(crate) credential: Credential,
@@ -105,6 +113,14 @@ pub struct DatabentoDataClientConfig {
     /// Reconnection timeout in minutes (None for infinite retries).
     pub reconnect_timeout_mins: Option<u64>,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(DatabentoDataClientConfig {
+    publishers_filepath: PathBuf,
+    use_exchange_as_venue: bool,
+    bars_timestamp_on_close: bool,
+    venue_dataset_map: IndexMap<String, String>,
+});
 
 impl Debug for DatabentoDataClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1565,32 +1581,21 @@ mod tests {
 
     fn currency_pair_with_ts_init(instrument_id: &str, ts_init: UnixNanos) -> InstrumentAny {
         let instrument_id = InstrumentId::from(instrument_id);
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            instrument_id.symbol,
-            Currency::from("BTC"),
-            Currency::from("USDT"),
-            2,
-            6,
-            Price::from("0.01"),
-            Quantity::from("0.000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            ts_init,
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(instrument_id.symbol)
+                .base_currency(Currency::from("BTC"))
+                .quote_currency(Currency::from("USDT"))
+                .price_precision(2)
+                .size_precision(6)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(ts_init)
+                .build()
+                .unwrap(),
+        )
     }
 
     #[rstest]

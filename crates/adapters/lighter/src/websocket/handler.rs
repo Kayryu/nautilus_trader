@@ -27,7 +27,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::live::get_runtime;
 use nautilus_core::{AtomicTime, nanos::UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_model::{identifiers::AccountId, instruments::InstrumentAny};
+use nautilus_model::{identifiers::AccountId, instruments::InstrumentAny, types::Currency};
 use nautilus_network::{
     RECONNECTED,
     error::SendError,
@@ -286,12 +286,31 @@ enum CompletionKind {
 }
 
 impl FeedHandler {
+    #[cfg(test)]
     pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
         out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
         subscriptions: SubscriptionState,
+    ) -> Self {
+        Self::new_with_settlement_currency(
+            signal,
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            subscriptions,
+            Currency::get_or_create_crypto("USDC"),
+        )
+    }
+
+    pub(super) fn new_with_settlement_currency(
+        signal: Arc<AtomicBool>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+        out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
+        subscriptions: SubscriptionState,
+        settlement_currency: Currency,
     ) -> Self {
         Self {
             clock: get_atomic_clock_realtime(),
@@ -316,7 +335,9 @@ impl FeedHandler {
             book_states: AHashMap::new(),
             last_candles: AHashMap::new(),
             exec_account: None,
-            account_state_reconciler: LighterAccountStateReconciler::new(),
+            account_state_reconciler: LighterAccountStateReconciler::new_with_settlement_currency(
+                settlement_currency,
+            ),
         }
     }
 
@@ -1823,9 +1844,7 @@ impl FeedHandler {
                     position.market_id,
                 );
 
-                if matches!(frame_type, PositionFrameType::Snapshot) {
-                    skipped_market_ids.push(position.market_id);
-                }
+                skipped_market_ids.push(position.market_id);
                 continue;
             };
 
@@ -1834,9 +1853,7 @@ impl FeedHandler {
             ) {
                 Ok(report) => reports.push(report),
                 Err(e) => {
-                    if matches!(frame_type, PositionFrameType::Snapshot) {
-                        skipped_market_ids.push(position.market_id);
-                    }
+                    skipped_market_ids.push(position.market_id);
                     log::error!("Error parsing Lighter position status report: {e}");
                 }
             }
@@ -1853,6 +1870,7 @@ impl FeedHandler {
             PositionFrameType::Update => vec![NautilusWsMessage::PositionUpdate {
                 reports,
                 closed_market_ids,
+                skipped_market_ids,
             }],
         }
     }
@@ -2228,64 +2246,42 @@ mod tests {
 
     fn stub_eth_perp_instrument() -> InstrumentAny {
         let instrument_id = InstrumentId::new(Symbol::new("ETH-PERP"), Venue::new("LIGHTER"));
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new("ETH-PERP"),
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("ETH-PERP"))
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn stub_eth_spot_instrument() -> InstrumentAny {
         let instrument_id = InstrumentId::new(Symbol::new("ETH-SPOT"), Venue::new("LIGHTER"));
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            Symbol::new("ETH-SPOT"),
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new("ETH-SPOT"))
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn make_handler_with_account() -> FeedHandler {
@@ -2434,8 +2430,10 @@ mod tests {
             NautilusWsMessage::PositionUpdate {
                 reports,
                 closed_market_ids,
+                skipped_market_ids,
             } => {
                 assert!(closed_market_ids.is_empty());
+                assert!(skipped_market_ids.is_empty());
                 assert_eq!(reports.len(), 1);
                 assert_eq!(reports[0].quantity, Quantity::from("1.5000"));
             }
@@ -2458,8 +2456,10 @@ mod tests {
             NautilusWsMessage::PositionUpdate {
                 reports,
                 closed_market_ids,
+                skipped_market_ids,
             } => {
                 assert!(closed_market_ids.is_empty());
+                assert!(skipped_market_ids.is_empty());
                 assert_eq!(reports.len(), 1);
             }
             other => panic!("expected position update, was {other:?}"),
@@ -2486,8 +2486,10 @@ mod tests {
             NautilusWsMessage::PositionUpdate {
                 reports,
                 closed_market_ids,
+                skipped_market_ids,
             } => {
                 assert!(closed_market_ids.is_empty());
+                assert!(skipped_market_ids.is_empty());
                 assert!(reports.is_empty());
             }
             other => panic!("expected empty position update, was {other:?}"),
@@ -2509,8 +2511,10 @@ mod tests {
             NautilusWsMessage::PositionUpdate {
                 reports,
                 closed_market_ids,
+                skipped_market_ids,
             } => {
                 assert!(reports.is_empty());
+                assert!(skipped_market_ids.is_empty());
                 assert_eq!(closed_market_ids, &[0]);
             }
             other => panic!("expected closed position update, was {other:?}"),
@@ -2562,6 +2566,31 @@ mod tests {
                 assert!(reports.is_empty());
             }
             other => panic!("expected incomplete position snapshot, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn handle_frame_marks_position_update_incomplete_when_position_parse_fails() {
+        let mut handler = make_handler_with_account();
+        let mut frame_json: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        frame_json["positions"]["0"]["position"] = json!("-1.5000");
+        let frame: super::LighterWsFrame = serde_json::from_value(frame_json).unwrap();
+
+        let messages = strip_account_marker(handler.handle_frame(frame, UnixNanos::from(11)));
+
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            NautilusWsMessage::PositionUpdate {
+                reports,
+                closed_market_ids,
+                skipped_market_ids,
+            } => {
+                assert!(reports.is_empty());
+                assert!(closed_market_ids.is_empty());
+                assert_eq!(skipped_market_ids, &[0]);
+            }
+            other => panic!("expected incomplete position update, was {other:?}"),
         }
     }
 

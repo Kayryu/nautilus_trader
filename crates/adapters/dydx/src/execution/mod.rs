@@ -61,7 +61,7 @@ use nautilus_core::{
     MUTEX_POISONED, Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
@@ -251,7 +251,8 @@ impl DydxExecutionClient {
             Some(20),
             config.transport_backend,
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_factory(SocketControlFactory::new(core.client_id, Some(*DYDX_VENUE)));
 
         let grpc_client = Arc::new(tokio::sync::RwLock::new(None));
 
@@ -3090,34 +3091,23 @@ mod tests {
 
     fn test_instrument(symbol: &str, venue: &str) -> InstrumentAny {
         let instrument_id = InstrumentId::new(Symbol::new(symbol), Venue::new(venue));
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            instrument_id.symbol,
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::USD(),
-            false,
-            2,
-            3,
-            Price::new(0.01, 2),
-            Quantity::new(0.001, 3),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(instrument_id.symbol)
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::USD())
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(3)
+                .price_increment(Price::new(0.01, 2))
+                .size_increment(Quantity::new(0.001, 3))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn test_order(id: &str, clob_pair_id: u32, client_id: &str) -> Order {

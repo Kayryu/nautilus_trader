@@ -71,6 +71,7 @@ use nautilus_common::{
     testing::wait_until_async,
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
+use nautilus_live::{SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     data::{
         BarType, BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick,
@@ -702,8 +703,7 @@ async fn start_data_test_server_with_state(state: DataTestServerState) -> Socket
     });
 
     let health_url = format!("http://{addr}/fapi/v1/ping");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -908,7 +908,9 @@ async fn test_connect_emits_socket_state_changes() {
     let base_url_ws = format!("ws://{addr}/ws");
     let (system_tx, mut system_rx) = tokio::sync::mpsc::unbounded_channel();
     set_system_event_sender(system_tx);
-    let (mut client, _data_rx) = create_test_data_client(base_url_http, base_url_ws);
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, _data_rx) =
+        registry.scope(|| create_test_data_client(base_url_http, base_url_ws));
 
     client.connect().await.unwrap();
 
@@ -942,9 +944,51 @@ async fn test_connect_emits_socket_state_changes() {
     );
     assert_eq!(changes[1].state, SocketState::Connected);
 
-    client.disconnect().await.unwrap();
+    let market_endpoint = ustr::Ustr::from("binance-futures-market-streams");
+    let public_endpoint = ustr::Ustr::from("binance-futures-public-streams");
+    let market_handle = registry
+        .handle(*BINANCE_CLIENT_ID, market_endpoint)
+        .unwrap();
+    let public_handle = registry
+        .handle(*BINANCE_CLIENT_ID, public_endpoint)
+        .unwrap();
+    assert_eq!(
+        market_handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
+    assert_eq!(
+        public_handle.request_reconnect(),
+        SocketReconnectRequestOutcome::Accepted
+    );
 
-    assert!(system_rx.try_recv().is_err());
+    let mut disconnected = std::collections::HashSet::new();
+    wait_until_async(
+        || {
+            while let Ok(event) = system_rx.try_recv() {
+                let SystemEvent::SocketState(change) = event;
+                if change.state == SocketState::Disconnected {
+                    disconnected.insert(change.endpoint);
+                }
+            }
+            let done =
+                disconnected.contains(&market_endpoint) && disconnected.contains(&public_endpoint);
+            async move { done }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    client.disconnect().await.unwrap();
+    assert!(
+        registry
+            .handle(*BINANCE_CLIENT_ID, market_endpoint)
+            .is_none()
+    );
+    assert!(
+        registry
+            .handle(*BINANCE_CLIENT_ID, public_endpoint)
+            .is_none()
+    );
 }
 
 #[rstest]

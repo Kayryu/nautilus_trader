@@ -41,7 +41,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
-    ExecutionClientCore, ExecutionEventEmitter, execution::failure::CommandFailure,
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl, execution::failure::CommandFailure,
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -81,7 +81,7 @@ use crate::{
         },
         parse::truncate_cl_ord_id,
     },
-    config::KrakenExecClientConfig,
+    config::KrakenExecutionClientConfig,
     http::{
         KrakenSpotCancelOrderBatchParams, KrakenSpotCancelOrderParamsBuilder, KrakenSpotHttpClient,
         spot::client::KRAKEN_SPOT_DEFAULT_RATE_LIMIT_PER_SECOND,
@@ -109,7 +109,7 @@ use crate::{
 pub struct KrakenSpotExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: KrakenExecClientConfig,
+    config: KrakenExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http: KrakenSpotHttpClient,
     ws: KrakenSpotWebSocketClient,
@@ -126,7 +126,10 @@ pub struct KrakenSpotExecutionClient {
 
 impl KrakenSpotExecutionClient {
     /// Creates a new [`KrakenSpotExecutionClient`].
-    pub fn new(core: ExecutionClientCore, config: KrakenExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: KrakenExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -176,7 +179,12 @@ impl KrakenSpotExecutionClient {
             data_config,
             cancellation_token.clone(),
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*KRAKEN_VENUE),
+            "kraken-spot-user-streams",
+        ));
 
         let ws_dispatch_state = Arc::new(WsDispatchState::new());
         // Connect() swaps in a live cmd_tx; capture the shared handle so the
@@ -1847,7 +1855,7 @@ mod tests {
         resolve_use_ws_trade,
     };
     use crate::{
-        common::enums::KrakenProductType, config::KrakenExecClientConfig,
+        common::enums::KrakenProductType, config::KrakenExecutionClientConfig,
         factories::KrakenExecutionClientFactory, http::KrakenSpotHttpClient,
     };
 
@@ -1971,7 +1979,7 @@ mod tests {
     #[rstest]
     fn test_execution_client_constructs_with_ws_trade_enabled() {
         let factory = KrakenExecutionClientFactory::new();
-        let config = KrakenExecClientConfig {
+        let config = KrakenExecutionClientConfig {
             product_type: KrakenProductType::Spot,
             use_ws_trade: true,
             ws_request_timeout_secs: 7,
@@ -1980,7 +1988,12 @@ mod tests {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let _clock = Rc::new(RefCell::new(TestClock::new()));
 
-        let result = factory.create("KRAKEN-WS", &config, cache.into());
+        let result = factory.create(
+            TraderId::from("TRADER-001"),
+            "KRAKEN-WS",
+            &config,
+            cache.into(),
+        );
         assert!(result.is_ok(), "construction failed: {:?}", result.err());
     }
 }

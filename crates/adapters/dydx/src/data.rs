@@ -49,6 +49,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, Data as NautilusData, FundingRateUpdate,
@@ -159,6 +160,8 @@ impl DydxDataClient {
     ) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let ws_client =
+            ws_client.with_socket_factory(SocketControlFactory::new(client_id, Some(*DYDX_VENUE)));
 
         let instrument_cache = Arc::clone(http_client.instrument_cache());
 
@@ -1847,34 +1850,24 @@ mod tests {
 
     fn test_instrument() -> InstrumentAny {
         let instrument_id = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *DYDX_VENUE);
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            instrument_id.symbol,
-            Currency::BTC(),
-            Currency::USD(),
-            Currency::USD(),
-            false,
-            2,                   // price_precision
-            8,                   // size_precision (wide enough to reveal f64 rounding)
-            Price::new(0.01, 2), // price_increment
-            Quantity::new(0.00000001, 8),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(instrument_id.symbol)
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .settlement_currency(Currency::USD())
+                .is_inverse(false)
+                .price_precision(2)
+                // size_precision (wide enough to reveal f64 rounding)
+                .size_precision(8)
+                .price_increment(Price::new(0.01, 2))
+                .size_increment(Quantity::new(0.00000001, 8))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn seed_book_with_levels(

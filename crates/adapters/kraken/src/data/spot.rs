@@ -48,6 +48,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{Bar, Data, OrderBookDeltas},
     enums::{AggregationSource, BookType},
@@ -115,6 +116,7 @@ pub struct KrakenSpotDataClient {
     http: KrakenSpotHttpClient,
     ws: KrakenSpotWebSocketClient,
     ws_l3: Option<KrakenSpotWebSocketClient>,
+    socket_factory: SocketControlFactory,
     l3_handler_alive: Arc<AtomicBool>,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
@@ -127,6 +129,7 @@ impl KrakenSpotDataClient {
     /// Creates a new [`KrakenSpotDataClient`] instance.
     pub fn new(client_id: ClientId, config: KrakenDataClientConfig) -> anyhow::Result<Self> {
         let cancellation_token = CancellationToken::new();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*KRAKEN_VENUE));
 
         let http = KrakenSpotHttpClient::new(
             config.environment,
@@ -145,7 +148,8 @@ impl KrakenSpotDataClient {
             config.clone(),
             cancellation_token.clone(),
             config.proxy_url.clone(),
-        );
+        )
+        .with_socket_control(socket_factory.control("kraken-spot-data-streams"));
 
         Ok(Self {
             clock: get_atomic_clock_realtime(),
@@ -154,6 +158,7 @@ impl KrakenSpotDataClient {
             http,
             ws,
             ws_l3: None,
+            socket_factory,
             l3_handler_alive: Arc::new(AtomicBool::new(false)),
             is_connected: AtomicBool::new(false),
             cancellation_token,
@@ -238,7 +243,8 @@ impl KrakenSpotDataClient {
                 self.config.clone(),
                 self.cancellation_token.clone(),
                 self.config.proxy_url.clone(),
-            );
+            )
+            .with_socket_control(self.socket_factory.control("kraken-spot-l3-data-streams"));
 
             self.spawn_l3_handler_task(ws_l3.clone());
             self.ws_l3 = Some(ws_l3);
@@ -622,6 +628,7 @@ impl DataClient for KrakenSpotDataClient {
             task.abort();
         }
 
+        self.ws.deregister_socket_control();
         let mut ws = self.ws.clone();
         get_runtime().spawn(async move {
             let _ = ws.close().await;
@@ -1173,32 +1180,21 @@ mod tests {
     }
 
     fn make_instrument() -> InstrumentAny {
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::from("BTC/USD.KRAKEN"),
-            Symbol::from("BTC/USD"),
-            Currency::BTC(),
-            Currency::USD(),
-            1,
-            8,
-            Price::from("0.1"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("BTC/USD.KRAKEN"))
+                .raw_symbol(Symbol::from("BTC/USD"))
+                .base_currency(Currency::BTC())
+                .quote_currency(Currency::USD())
+                .price_precision(1)
+                .size_precision(8)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     #[rstest]

@@ -2026,12 +2026,13 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "cancel_all_orders")]
-    #[pyo3(signature = (instrument_id, order_side=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, order_side=None, client_id=None, strategy_only=true, params=None))]
     fn py_cancel_all_orders(
         &mut self,
         instrument_id: InstrumentId,
         order_side: Option<OrderSide>,
         client_id: Option<ClientId>,
+        strategy_only: bool,
         params: Option<Py<PyDict>>,
     ) -> PyResult<()> {
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
@@ -2045,6 +2046,7 @@ impl PyStrategy {
             instrument_id,
             order_side,
             client_id,
+            strategy_only,
             params_map,
         )
         .map_err(to_pyruntime_err)
@@ -4738,27 +4740,29 @@ class IndicatorEventStrategy:
             let comp2 = InstrumentId::from_str("ETH-USD.VENUE").unwrap();
             let symbol = Symbol::from("SYN");
             let original_formula = format!("({comp1} + {comp2}) / 2.0");
-            let synthetic = SyntheticInstrument::new(
-                symbol,
-                2,
-                vec![comp1, comp2],
-                &original_formula,
-                UnixNanos::default(),
-                UnixNanos::default(),
-            );
+            let synthetic = SyntheticInstrument::builder()
+                .symbol(symbol)
+                .price_precision(2)
+                .components(vec![comp1, comp2])
+                .formula(&original_formula)
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap();
             let synthetic_id = synthetic.id;
 
             rust_strategy.py_add_synthetic(synthetic).unwrap();
 
             let updated_formula = format!("{comp1} + {comp2}");
-            let updated = SyntheticInstrument::new(
-                symbol,
-                2,
-                vec![comp1, comp2],
-                &updated_formula,
-                UnixNanos::default(),
-                UnixNanos::default(),
-            );
+            let updated = SyntheticInstrument::builder()
+                .symbol(symbol)
+                .price_precision(2)
+                .components(vec![comp1, comp2])
+                .formula(&updated_formula)
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap();
             rust_strategy.py_update_synthetic(updated).unwrap();
 
             let cache = DataActor::cache(rust_strategy.inner());

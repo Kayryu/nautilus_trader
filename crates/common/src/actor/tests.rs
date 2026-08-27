@@ -44,8 +44,8 @@ use nautilus_model::{
         BookAction, BookType, GreeksConvention, OrderSide, OrderType, PositionSide, PriceType,
     },
     identifiers::{
-        AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OptionSeriesId, OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OptionSeriesId,
+        OrderListId, PositionId, StrategyId, Symbol, TraderId, Venue, VenueOrderId,
     },
     instruments::{CurrencyPair, Instrument, InstrumentAny, SyntheticInstrument, stubs::*},
     orderbook::{OrderBook, own::OwnOrderBook},
@@ -78,7 +78,6 @@ use crate::{
     cache::Cache,
     clock::{Clock, TestClock},
     component::Component,
-    enums::{ComponentState, ComponentTrigger},
     logging::{logger::LogGuard, logging_is_initialized},
     messages::{
         data::{
@@ -218,32 +217,7 @@ struct TestDataActor {
 
 #[derive(Debug)]
 struct FacadeOnlyActor {
-    state: ComponentState,
     started: bool,
-}
-
-impl Component for FacadeOnlyActor {
-    fn component_id(&self) -> ComponentId {
-        ComponentId::new("FacadeOnlyActor")
-    }
-
-    fn state(&self) -> ComponentState {
-        self.state
-    }
-
-    fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
-        self.state = self.state.transition(&trigger)?;
-        Ok(())
-    }
-
-    fn register(
-        &mut self,
-        _trader_id: TraderId,
-        _clock: Rc<RefCell<dyn Clock>>,
-        _cache: Rc<RefCell<Cache>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 impl DataActor for FacadeOnlyActor {
@@ -555,14 +529,11 @@ fn register_data_actor(
 
 #[rstest]
 fn test_data_actor_facade_behavior_does_not_require_native_core_access() {
-    fn assert_data_actor<T: DataActor + Component>() {}
+    fn assert_data_actor<T: DataActor>() {}
 
     assert_data_actor::<FacadeOnlyActor>();
 
-    let mut actor = FacadeOnlyActor {
-        state: ComponentState::PreInitialized,
-        started: false,
-    };
+    let mut actor = FacadeOnlyActor { started: false };
 
     DataActor::on_start(&mut actor).unwrap();
     let state = DataActor::on_save(&actor).unwrap();
@@ -854,14 +825,15 @@ fn test_data_actor_cache_api_returns_owned_market_data_point_reads(
         ts_init: UnixNanos::from(10),
     };
     let synthetic_formula = format!("{instrument_id} * 1.0");
-    let synthetic = SyntheticInstrument::new(
-        Symbol::from("SYN"),
-        5,
-        vec![instrument_id],
-        &synthetic_formula,
-        UnixNanos::from(11),
-        UnixNanos::from(12),
-    );
+    let synthetic = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN"))
+        .price_precision(5)
+        .components(vec![instrument_id])
+        .formula(&synthetic_formula)
+        .ts_event(UnixNanos::from(11))
+        .ts_init(UnixNanos::from(12))
+        .build()
+        .unwrap();
     let synthetic_id = synthetic.id;
     let usd = Currency::USD();
     let usdt = Currency::USDT();
@@ -1071,23 +1043,25 @@ fn test_data_actor_cache_api_returns_owned_market_data_collection_reads(
         ..stub_instrument_status
     };
     let synthetic_one_formula = format!("{instrument_id} * 1.0");
-    let synthetic_one = SyntheticInstrument::new(
-        Symbol::from("SYN"),
-        5,
-        vec![instrument_id],
-        &synthetic_one_formula,
-        UnixNanos::from(29),
-        UnixNanos::from(30),
-    );
+    let synthetic_one = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN"))
+        .price_precision(5)
+        .components(vec![instrument_id])
+        .formula(&synthetic_one_formula)
+        .ts_event(UnixNanos::from(29))
+        .ts_init(UnixNanos::from(30))
+        .build()
+        .unwrap();
     let synthetic_two_formula = format!("{instrument_id} * 2.0");
-    let synthetic_two = SyntheticInstrument::new(
-        Symbol::from("SYN2"),
-        5,
-        vec![instrument_id],
-        &synthetic_two_formula,
-        UnixNanos::from(31),
-        UnixNanos::from(32),
-    );
+    let synthetic_two = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN2"))
+        .price_precision(5)
+        .components(vec![instrument_id])
+        .formula(&synthetic_two_formula)
+        .ts_event(UnixNanos::from(31))
+        .ts_init(UnixNanos::from(32))
+        .build()
+        .unwrap();
     let synthetic_one_id = synthetic_one.id;
     let synthetic_two_id = synthetic_two.id;
     let expected_order_book = {
@@ -4128,14 +4102,15 @@ fn test_add_synthetic_panics_when_unregistered() {
     let comp1 = InstrumentId::from_str("BTC-USD.VENUE").unwrap();
     let comp2 = InstrumentId::from_str("ETH-USD.VENUE").unwrap();
     let formula = format!("({comp1} + {comp2}) / 2.0");
-    let synthetic = SyntheticInstrument::new(
-        Symbol::from("SYN"),
-        2,
-        vec![comp1, comp2],
-        &formula,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let synthetic = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN"))
+        .price_precision(2)
+        .components(vec![comp1, comp2])
+        .formula(&formula)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     let _ = actor.add_synthetic(synthetic);
 }
 
@@ -4153,14 +4128,15 @@ fn test_update_synthetic_panics_when_unregistered() {
     let comp1 = InstrumentId::from_str("BTC-USD.VENUE").unwrap();
     let comp2 = InstrumentId::from_str("ETH-USD.VENUE").unwrap();
     let formula = format!("({comp1} + {comp2}) / 2.0");
-    let synthetic = SyntheticInstrument::new(
-        Symbol::from("SYN"),
-        2,
-        vec![comp1, comp2],
-        &formula,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let synthetic = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN"))
+        .price_precision(2)
+        .components(vec![comp1, comp2])
+        .formula(&formula)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     let _ = actor.update_synthetic(synthetic);
 }
 
@@ -4688,14 +4664,15 @@ fn test_add_synthetic_stores_in_cache(
     let comp1 = InstrumentId::from_str("BTC-USD.VENUE").unwrap();
     let comp2 = InstrumentId::from_str("ETH-USD.VENUE").unwrap();
     let formula = format!("({comp1} + {comp2}) / 2.0");
-    let synthetic = SyntheticInstrument::new(
-        Symbol::from("SYN"),
-        2,
-        vec![comp1, comp2],
-        &formula,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let synthetic = SyntheticInstrument::builder()
+        .symbol(Symbol::from("SYN"))
+        .price_precision(2)
+        .components(vec![comp1, comp2])
+        .formula(&formula)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     let synthetic_id = synthetic.id;
 
     actor.add_synthetic(synthetic.clone()).unwrap();
@@ -4727,14 +4704,15 @@ fn test_update_synthetic_replaces_existing(
     let comp2 = InstrumentId::from_str("ETH-USD.VENUE").unwrap();
     let symbol = Symbol::from("SYN");
     let original_formula = format!("({comp1} + {comp2}) / 2.0");
-    let synthetic = SyntheticInstrument::new(
-        symbol,
-        2,
-        vec![comp1, comp2],
-        &original_formula,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let synthetic = SyntheticInstrument::builder()
+        .symbol(symbol)
+        .price_precision(2)
+        .components(vec![comp1, comp2])
+        .formula(&original_formula)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     let synthetic_id = synthetic.id;
 
     // update before add should error
@@ -4747,14 +4725,15 @@ fn test_update_synthetic_replaces_existing(
     actor.add_synthetic(synthetic).unwrap();
 
     let new_formula = format!("{comp1} + {comp2}");
-    let updated = SyntheticInstrument::new(
-        symbol,
-        2,
-        vec![comp1, comp2],
-        &new_formula,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    );
+    let updated = SyntheticInstrument::builder()
+        .symbol(symbol)
+        .price_precision(2)
+        .components(vec![comp1, comp2])
+        .formula(&new_formula)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
     actor.update_synthetic(updated).unwrap();
 
     let guard = cache.borrow();

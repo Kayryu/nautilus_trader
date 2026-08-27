@@ -2291,32 +2291,19 @@ fn test_client_order_ids_filtering(mut cache: Cache) {
 #[rstest]
 fn test_position_ids_filtering(mut cache: Cache) {
     fn make_pair(id_str: &str) -> CurrencyPair {
-        CurrencyPair::new(
-            InstrumentId::from(id_str),
-            Symbol::from(id_str),
-            Currency::USD(),
-            Currency::EUR(),
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        CurrencyPair::builder()
+            .instrument_id(InstrumentId::from(id_str))
+            .raw_symbol(Symbol::from(id_str))
+            .base_currency(Currency::USD())
+            .quote_currency(Currency::EUR())
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     let venue_a = Venue::from("VENUE-A");
@@ -3305,34 +3292,26 @@ fn test_instruments_when_some(mut cache: Cache) {
 }
 
 fn es_option_contract() -> OptionContract {
-    OptionContract::new(
-        InstrumentId::from("ESZ1 P4000.GLBX"),
-        Symbol::from("ESZ1 P4000"),
-        AssetClass::Index,
-        Some(Ustr::from("XCME")),
-        Ustr::from("ES"),
-        OptionKind::Put,
-        Price::from("4000.00"),
-        Currency::USD(),
-        UnixNanos::default(),
-        UnixNanos::default(),
-        2,
-        Price::from("0.01"),
-        Quantity::from(1),
-        Quantity::from(1),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None::<nautilus_core::Params>,
-        UnixNanos::default(),
-        UnixNanos::default(),
-    )
+    OptionContract::builder()
+        .instrument_id(InstrumentId::from("ESZ1 P4000.GLBX"))
+        .raw_symbol(Symbol::from("ESZ1 P4000"))
+        .asset_class(AssetClass::Index)
+        .exchange(Ustr::from("XCME"))
+        .underlying(Ustr::from("ES"))
+        .option_kind(OptionKind::Put)
+        .strike_price(Price::from("4000.00"))
+        .currency(Currency::USD())
+        .activation_ns(UnixNanos::default())
+        .expiration_ns(UnixNanos::default())
+        .price_precision(2)
+        .price_increment(Price::from("0.01"))
+        .multiplier(Quantity::from(1))
+        .lot_size(Quantity::from(1))
+        .maybe_info(None::<nautilus_core::Params>)
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap()
 }
 
 #[rstest]
@@ -6933,7 +6912,7 @@ fn test_force_remove_from_own_order_book(mut cache: Cache) {
 }
 
 #[rstest]
-fn test_audit_own_order_books_with_inflight_orders(mut cache: Cache) {
+fn test_audit_own_order_books_retains_initialized_and_inflight_orders(mut cache: Cache) {
     let audusd_sim = audusd_sim();
     cache
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
@@ -6945,23 +6924,80 @@ fn test_audit_own_order_books_with_inflight_orders(mut cache: Cache) {
         .quantity(Quantity::from(100_000))
         .price(Price::from("1.00000"))
         .build();
+    let client_order_id = limit_order.client_order_id();
 
     cache
         .add_order(limit_order.clone(), None, None, false)
         .unwrap();
     cache.update_own_order_book(&limit_order);
 
-    let submitted = TestOrderEventStubs::submitted(&limit_order, AccountId::new("SIM-001"));
-    let mut limit_order_mut = limit_order;
-    update_order_with_event(&mut cache, &mut limit_order_mut, submitted);
-
-    let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
-    assert!(own_book.bids().count() > 0);
+    assert!(cache.is_order_active_local(&client_order_id));
 
     cache.audit_own_order_books();
 
     let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
-    assert!(own_book.bids().count() > 0);
+    assert!(own_book.is_order_in_book(&client_order_id));
+
+    let submitted = TestOrderEventStubs::submitted(&limit_order, AccountId::new("SIM-001"));
+    let mut limit_order_mut = limit_order;
+    update_order_with_event(&mut cache, &mut limit_order_mut, submitted);
+
+    cache.audit_own_order_books();
+
+    let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
+    assert!(own_book.is_order_in_book(&client_order_id));
+    assert_eq!(own_book.bids().count(), 1);
+}
+
+#[rstest]
+#[case::emulated(false, OrderStatus::Emulated)]
+#[case::released(true, OrderStatus::Released)]
+fn test_audit_own_order_books_retains_emulated_and_released_orders(
+    mut cache: Cache,
+    audusd_sim: CurrencyPair,
+    #[case] release: bool,
+    #[case] expected_status: OrderStatus,
+) {
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(audusd_sim.id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .price(Price::from("1.00000"))
+        .emulation_trigger(TriggerType::LastPrice)
+        .build();
+    let client_order_id = order.client_order_id();
+
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    let emulated = build_order_emulated(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        client_order_id,
+    );
+    update_order_with_event(&mut cache, &mut order, OrderEventAny::Emulated(emulated));
+
+    if release {
+        let released = build_order_released(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            client_order_id,
+            Price::from("1.00000"),
+        );
+        update_order_with_event(&mut cache, &mut order, OrderEventAny::Released(released));
+    }
+
+    cache.update_own_order_book(&order);
+
+    assert_eq!(order.status(), expected_status);
+    assert!(cache.is_order_active_local(&client_order_id));
+
+    cache.audit_own_order_books();
+
+    let own_book = cache.own_order_book(&audusd_sim.id).unwrap();
+    assert!(own_book.is_order_in_book(&client_order_id));
+    assert_eq!(own_book.bids().count(), 1);
 }
 
 #[rstest]
@@ -6995,7 +7031,8 @@ fn test_audit_own_order_books_removes_closed(mut cache: Cache) {
     update_order_with_event(&mut cache, &mut limit_order_mut, accepted);
 
     let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
-    assert!(own_book.bids().count() > 0);
+    assert!(own_book.is_order_in_book(&limit_order_mut.client_order_id()));
+    assert_eq!(own_book.bids().count(), 1);
 
     let canceled = TestOrderEventStubs::canceled(
         &limit_order_mut,
@@ -7004,11 +7041,21 @@ fn test_audit_own_order_books_removes_closed(mut cache: Cache) {
     );
     update_order_with_event(&mut cache, &mut limit_order_mut, canceled);
 
-    cache.update_own_order_book(&limit_order_mut);
+    cache
+        .own_order_book_mut(&audusd_sim.id())
+        .unwrap()
+        .add(limit_order_mut.to_own_book_order());
+
+    let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
+    assert!(
+        own_book.is_order_in_book(&limit_order_mut.client_order_id()),
+        "test setup must leave a stale closed order in the own book"
+    );
 
     cache.audit_own_order_books();
 
     let own_book = cache.own_order_book(&audusd_sim.id()).unwrap();
+    assert!(!own_book.is_order_in_book(&limit_order_mut.client_order_id()));
     assert_eq!(own_book.bids().count(), 0);
 }
 
@@ -10020,32 +10067,19 @@ fn test_position_filters_with_state_and_side(mut cache: Cache) {
     // venues and a closed position on venue A; asserts filter and side branches against
     // `position_*_ids` and `positions_*_count`.
     fn make_pair(id_str: &str) -> CurrencyPair {
-        CurrencyPair::new(
-            InstrumentId::from(id_str),
-            Symbol::from(id_str),
-            Currency::USD(),
-            Currency::EUR(),
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        CurrencyPair::builder()
+            .instrument_id(InstrumentId::from(id_str))
+            .raw_symbol(Symbol::from(id_str))
+            .base_currency(Currency::USD())
+            .quote_currency(Currency::EUR())
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     let venue_a = Venue::from("VENUE-A");
@@ -10395,32 +10429,19 @@ fn assert_positions_apis_consistent(
 #[rstest]
 fn test_positions_query_apis_are_consistent(mut cache: Cache) {
     fn make_pair(id_str: &str) -> CurrencyPair {
-        CurrencyPair::new(
-            InstrumentId::from(id_str),
-            Symbol::from(id_str),
-            Currency::USD(),
-            Currency::EUR(),
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        CurrencyPair::builder()
+            .instrument_id(InstrumentId::from(id_str))
+            .raw_symbol(Symbol::from(id_str))
+            .base_currency(Currency::USD())
+            .quote_currency(Currency::EUR())
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     let venue_a = Venue::from("VENUE-A");

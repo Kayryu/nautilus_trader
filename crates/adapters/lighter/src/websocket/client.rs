@@ -27,6 +27,7 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, mapref::entry::Entry};
 use nautilus_common::live::get_runtime;
+use nautilus_live::SocketControl;
 use nautilus_model::{
     identifiers::{AccountId, InstrumentId},
     instruments::InstrumentAny,
@@ -98,6 +99,7 @@ pub struct LighterWebSocketClient {
     ws_timeout_secs: u64,
     proxy_url: Option<String>,
     socket_sink: Option<SocketStateSink>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for LighterWebSocketClient {
@@ -154,6 +156,7 @@ impl Clone for LighterWebSocketClient {
             ws_timeout_secs: self.ws_timeout_secs,
             proxy_url: self.proxy_url.clone(),
             socket_sink: self.socket_sink.clone(),
+            socket_control: self.socket_control.clone(),
         }
     }
 }
@@ -196,6 +199,7 @@ impl LighterWebSocketClient {
             ws_timeout_secs,
             proxy_url,
             socket_sink: None,
+            socket_control: None,
         }
     }
 
@@ -203,6 +207,13 @@ impl LighterWebSocketClient {
     #[must_use]
     pub fn with_state_sink(mut self, state_sink: SocketStateSink) -> Self {
         self.socket_sink = Some(state_sink);
+        self
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
         self
     }
 
@@ -300,7 +311,7 @@ impl LighterWebSocketClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying [`WebSocketClient::connect`] fails
+    /// Returns an error if the underlying [`WebSocketClient::epoch_builder`] connection fails
     /// or the handler cannot be initialized.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
         if self.is_active() {
@@ -325,14 +336,18 @@ impl LighterWebSocketClient {
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
         };
-        let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler_and_state_sink(
-            cfg,
-            message_handler,
-            None,
-            ws_message_rate_limiter(&self.url),
-            self.socket_sink.clone(),
-        )
-        .await?;
+        let client = WebSocketClient::epoch_builder()
+            .config(cfg)
+            .epoch_handler(message_handler)
+            .rate_limiter(ws_message_rate_limiter(&self.url))
+            .maybe_state_sink(
+                self.socket_control
+                    .as_ref()
+                    .map(SocketControl::sink)
+                    .or_else(|| self.socket_sink.clone()),
+            )
+            .connect()
+            .await?;
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
@@ -347,8 +362,13 @@ impl LighterWebSocketClient {
         // connection active. Otherwise a clone observing `is_active()` could
         // race in and send a Subscribe before SetClient lands, and the
         // handler would drop the subscription because `inner == None`.
+        let reconnect_handle = client.reconnect_handle();
         if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
             anyhow::bail!("Failed to send SetClient command: {e}");
+        }
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
         }
 
         let initial_instruments: Vec<(i16, InstrumentAny)> = self
@@ -377,10 +397,18 @@ impl LighterWebSocketClient {
         let subscriptions = self.subscriptions.clone();
         let subscription_args = Arc::clone(&self.subscription_args);
         let cmd_tx_for_reconnect = cmd_tx.clone();
+        let settlement_currency = self.registry.settlement_currency();
 
         let task = get_runtime().spawn(async move {
-            let mut handler =
-                FeedHandler::new(Arc::clone(&signal), cmd_rx, raw_rx, out_tx, subscriptions);
+            let mut handler = FeedHandler::new_with_settlement_currency(
+                Arc::clone(&signal),
+                cmd_rx,
+                raw_rx,
+                out_tx,
+                subscriptions,
+                settlement_currency,
+            );
+
             handler.set_command_sender(cmd_tx_for_reconnect.clone());
 
             let restore_subscriptions = || {
@@ -481,6 +509,10 @@ impl LighterWebSocketClient {
 
         self.connection_mode
             .store(Arc::new(AtomicU8::new(ConnectionMode::Closed as u8)));
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         Ok(())
     }
 
@@ -1255,33 +1287,22 @@ mod tests {
     }
 
     fn stub_instrument(id: InstrumentId) -> InstrumentAny {
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            id,
-            id.symbol,
-            Currency::from("ETH"),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(id)
+                .raw_symbol(id.symbol)
+                .base_currency(Currency::from("ETH"))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 }

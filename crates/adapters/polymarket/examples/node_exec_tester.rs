@@ -31,7 +31,7 @@
 
 use log::LevelFilter;
 use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
-use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
+use nautilus_live::{config::LiveExecutionEngineConfig, node::LiveNode};
 use nautilus_model::{
     enums::TimeInForce,
     identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
@@ -40,13 +40,18 @@ use nautilus_model::{
 use nautilus_polymarket::{
     common::{consts::POLYMARKET_CLIENT_ID, enums::SignatureType},
     config::{
-        PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
+        PolymarketDataClientConfig, PolymarketExecutionClientConfig,
+        PolymarketInstrumentProviderConfig,
     },
     factories::{PolymarketDataClientFactory, PolymarketExecutionClientFactory},
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
 use nautilus_trading::strategy::StrategyConfig;
 
+// WARNING: With `DRY_RUN = false`, this tester submits orders to the configured
+// environment and may use real funds. Set `DRY_RUN = true` to connect without
+// submitting orders or sending shutdown cancel/close commands.
+const DRY_RUN: bool = false;
 const TRADER_ID: &str = "TESTER-001";
 const ACCOUNT_ID: &str = "POLYMARKET-001";
 const NODE_NAME: &str = "POLYMARKET-EXEC-TESTER-001";
@@ -82,8 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_factory = PolymarketDataClientFactory;
 
     // PolyGnosisSafe: POLYMARKET_PK is the EOA signer, POLYMARKET_FUNDER is the Gnosis Safe proxy
-    let exec_config = PolymarketExecClientConfig {
-        trader_id,
+    let exec_config = PolymarketExecutionClientConfig {
         account_id,
         signature_type: SignatureType::PolyGnosisSafe,
         instrument_config: Some(instrument_config),
@@ -95,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout_level: LevelFilter::Info,
         ..Default::default()
     };
-    let exec_engine_config = LiveExecEngineConfig {
+    let exec_engine_config = LiveExecutionEngineConfig {
         reconciliation_instrument_ids: Some(vec![instrument_id.to_string()]),
         open_check_interval_secs: Some(10.0),
         position_check_interval_secs: Some(30.0),
@@ -127,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instrument_id(instrument_id)
         .client_id(client_id)
         .order_qty(order_qty)
+        .dry_run(DRY_RUN)
         .use_post_only(true)
         .tob_offset_ticks(5) // Offset = 5 * the instrument's current tick size
         .order_expire_time_delta_mins(3)

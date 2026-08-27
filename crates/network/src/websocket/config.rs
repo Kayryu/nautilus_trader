@@ -17,7 +17,7 @@
 //!
 //! [`WebSocketConfig`] selects the endpoint, upgrade headers, heartbeat and idle detection,
 //! reconnect policy, transport backend, and optional proxy. Runtime handlers and rate limiting are
-//! supplied to the client constructors instead.
+//! supplied through the client builders instead.
 //!
 //! # Reconnection strategy
 //!
@@ -76,22 +76,22 @@ pub enum TransportBackend {
 
 /// Static configuration for WebSocket client connections.
 ///
-/// Runtime handlers and rate limiters are passed separately to the client constructors.
+/// Runtime handlers and rate limiters are passed separately through the client builders.
 ///
 /// # Connection modes
 ///
 /// ## Handler mode
 ///
-/// - Uses [`WebSocketClient::connect`](crate::websocket::WebSocketClient::connect).
+/// - Uses [`WebSocketClient::builder`](crate::websocket::WebSocketClient::builder).
 /// - Delivers messages through the supplied callback.
 /// - Runs the reader in an internal task.
 /// - Supports automatic reconnection with exponential backoff.
 /// - Applies `reconnect_*`, `heartbeat_timeout_secs`, and `idle_timeout_ms` settings.
-/// - Suits long‑lived connections and callback‑based APIs.
+/// - Suits long-lived connections and callback-based APIs.
 ///
 /// ## Stream mode
 ///
-/// - Uses [`WebSocketClient::connect_stream`](crate::websocket::WebSocketClient::connect_stream).
+/// - Uses [`WebSocketClient::stream_builder`](crate::websocket::WebSocketClient::stream_builder).
 /// - Returns a [`MessageReader`](super::types::MessageReader) owned by the caller.
 /// - Does not support automatic reconnection because the client cannot replace the caller's reader.
 /// - Ignores `reconnect_*`, `heartbeat_timeout_secs`, and `idle_timeout_ms` settings.
@@ -131,7 +131,7 @@ pub struct WebSocketConfig {
     /// up early during a reconnect as well as failing a connection attempt faster; keep it above
     /// the reconnect backoff.
     ///
-    /// Only applies to handler mode and must be non‑zero when set. Stream mode ignores this field
+    /// Only applies to handler mode and must be non-zero when set. Stream mode ignores this field
     /// and bounds its connection attempt at 10 seconds.
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,

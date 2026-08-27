@@ -35,6 +35,7 @@ use nautilus_core::{
     AtomicMap, AtomicSet, consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt,
     time::get_atomic_clock_realtime,
 };
+use nautilus_live::SocketControl;
 use nautilus_model::{
     data::BarType,
     enums::OrderSide,
@@ -111,6 +112,7 @@ pub struct DeribitWebSocketClient {
     subscribe_errors: Arc<Mutex<Vec<String>>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    socket_control: Option<SocketControl>,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -221,7 +223,15 @@ impl DeribitWebSocketClient {
             subscribe_errors: Arc::new(Mutex::new(Vec::new())),
             transport_backend,
             proxy_url,
+            socket_control: None,
         })
+    }
+
+    /// Configures socket state reporting and reconnect control.
+    #[must_use]
+    pub fn with_socket_control(mut self, control: SocketControl) -> Self {
+        self.socket_control = Some(control);
+        self
     }
 
     /// Creates a new public (unauthenticated) client.
@@ -559,18 +569,19 @@ impl DeribitWebSocketClient {
         ];
 
         // Connect the WebSocket
-        let ws_client = WebSocketClient::connect(
-            config,
-            Some(message_handler),
-            None,
-            keyed_quotas,
-            Some(*DERIBIT_WS_SUBSCRIPTION_QUOTA), // Default quota for non-order operations
-        )
-        .await?;
+        let ws_client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .keyed_quotas(keyed_quotas)
+            .default_quota(*DERIBIT_WS_SUBSCRIPTION_QUOTA)
+            .maybe_state_sink(self.socket_control.as_ref().map(SocketControl::sink))
+            .connect()
+            .await?;
 
         // Store connection mode
         self.connection_mode
             .store(ws_client.connection_mode_atomic());
+        let reconnect_handle = ws_client.reconnect_handle();
 
         // Create message channels
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -602,6 +613,10 @@ impl DeribitWebSocketClient {
 
         // Send client to handler
         let _ = cmd_tx.send(HandlerCommand::SetClient(ws_client));
+
+        if let Some(control) = &self.socket_control {
+            control.register(move || reconnect_handle.request_reconnect());
+        }
 
         // Replay cached instruments
         let instruments: Vec<InstrumentAny> =
@@ -655,11 +670,7 @@ impl DeribitWebSocketClient {
                                 let _ = cmd_tx.send(HandlerCommand::SetHeartbeat { interval });
                             }
 
-                            let channels = subscriptions_state.all_topics();
-
-                            for channel in &channels {
-                                subscriptions_state.mark_failure(channel);
-                            }
+                            let channels = subscriptions_state.reset_after_reconnect();
 
                             // Check if we need to re-authenticate
                             if let Some(cred) = &credential {
@@ -827,6 +838,9 @@ impl DeribitWebSocketClient {
 
         self.auth_tracker.invalidate();
 
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         Ok(())
     }
 
@@ -1021,6 +1035,7 @@ impl DeribitWebSocketClient {
             for channel in &channels_to_unsubscribe {
                 self.subscriptions_state.confirm_unsubscribe(channel);
                 self.subscriptions_state.add_reference(channel);
+                self.subscriptions_state.mark_subscribe(channel);
                 self.subscriptions_state.confirm_subscribe(channel);
             }
             return Err(DeribitWsError::Send(e.to_string()));
@@ -1762,5 +1777,49 @@ impl DeribitWebSocketClient {
             .map_err(|e| DeribitWsError::Send(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_unsubscribe_send_failure_restores_subscription() {
+        let client = DeribitWebSocketClient::new_unauthenticated(
+            Some("ws://127.0.0.1:0/ws/api/v2".to_string()),
+            30,
+            DeribitEnvironment::Testnet,
+        )
+        .unwrap();
+        let channel = "trades.BTC-PERPETUAL.raw";
+        client.subscriptions_state.add_reference(channel);
+        client.subscriptions_state.mark_subscribe(channel);
+        client.subscriptions_state.confirm_subscribe(channel);
+
+        let error = client
+            .send_unsubscribe(vec![channel.to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DeribitWsError::Send(_)));
+        assert_eq!(client.subscriptions_state.get_reference_count(channel), 1);
+        assert_eq!(client.subscriptions_state.len(), 1);
+        assert_eq!(client.subscriptions_state.all_topics(), [channel]);
+        assert!(
+            client
+                .subscriptions_state
+                .pending_subscribe_topics()
+                .is_empty()
+        );
+        assert!(
+            client
+                .subscriptions_state
+                .pending_unsubscribe_topics()
+                .is_empty()
+        );
     }
 }

@@ -20,11 +20,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
-use nautilus_common::{clients::SocketReconnectRegistration, live::get_runtime};
+use nautilus_common::live::get_runtime;
+use nautilus_live::SocketControl;
 use nautilus_network::{
     SocketStateSink,
     mode::ConnectionMode,
-    ratelimiter::RateLimiter,
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
         channel_epoch_message_handler, proxy::ProxyUrl,
@@ -37,14 +37,14 @@ use super::{
 };
 use crate::common::{
     credential::Credential,
-    socket::SocketControl,
     urls::{clob_ws_market_url, clob_ws_user_url},
 };
 
 // The venue counts only the `PING` text frame, not protocol ping frames, and
 // closes with `1008 no ping received` otherwise. Cadence per venue docs:
-// https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
-const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+// https://docs.polymarket.com/api-reference/wss/market
+pub(super) const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+pub(super) const POLYMARKET_HEARTBEAT_PAYLOAD: &str = "PING";
 
 // Prediction markets go quiet for long stretches, so liveness is the venue
 // still sending frames, not data arriving. A data-silence timer cannot serve:
@@ -122,7 +122,6 @@ pub struct PolymarketWebSocketClient {
     proxy_url: Option<ProxyUrl>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
-    socket_registration: Option<SocketReconnectRegistration>,
 }
 
 impl PolymarketWebSocketClient {
@@ -215,7 +214,6 @@ impl PolymarketWebSocketClient {
             proxy_url,
             socket_sink: None,
             socket_control: None,
-            socket_registration: None,
         }
     }
 
@@ -229,7 +227,6 @@ impl PolymarketWebSocketClient {
     /// Configures state reporting and reconnect control for the underlying transport.
     #[must_use]
     pub(crate) fn with_socket_control(mut self, control: SocketControl) -> Self {
-        self.socket_sink = Some(control.sink());
         self.socket_control = Some(control);
         self
     }
@@ -253,18 +250,22 @@ impl PolymarketWebSocketClient {
         let (message_handler, raw_rx) = channel_epoch_message_handler();
         let cfg = self.websocket_config();
 
-        let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler_and_state_sink(
-            cfg,
-            message_handler,
-            None,
-            Arc::new(RateLimiter::new_with_quota(None, vec![])),
-            self.socket_sink.clone(),
-        )
-        .await?;
-        self.socket_registration = self
-            .socket_control
-            .as_ref()
-            .map(|control| control.register(client.reconnect_handle()));
+        let client = WebSocketClient::epoch_builder()
+            .config(cfg)
+            .epoch_handler(message_handler)
+            .maybe_state_sink(
+                self.socket_control
+                    .as_ref()
+                    .map(SocketControl::sink)
+                    .or_else(|| self.socket_sink.clone()),
+            )
+            .connect()
+            .await?;
+
+        if let Some(control) = &self.socket_control {
+            let handle = client.reconnect_handle();
+            control.register(move || handle.request_reconnect());
+        }
         let connection_epoch = client.connection_epoch();
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
@@ -282,7 +283,7 @@ impl PolymarketWebSocketClient {
         // path, a fresh connect() never fires resubscribe_all() inside the handler.
         let initial_market_replay = match self.channel {
             WsChannel::Market => {
-                let topics = self.subscriptions.all_topics();
+                let topics = self.subscriptions.reset_after_reconnect();
                 if !topics.is_empty() || self.discovery_subscribed.load(Ordering::Relaxed) {
                     log::debug!(
                         "Replaying market subscription state onto new session: assets={}, discovery={}",
@@ -372,11 +373,18 @@ impl PolymarketWebSocketClient {
     }
 
     fn websocket_config(&self) -> WebSocketConfig {
+        // The market endpoint rejects text PING before its initial subscription. Protocol pings
+        // keep an idle socket alive until FeedHandler starts the required text heartbeat.
+        let heartbeat_payload = match self.channel {
+            WsChannel::Market => None,
+            WsChannel::User => Some(POLYMARKET_HEARTBEAT_PAYLOAD.to_string()),
+        };
+
         WebSocketConfig {
             url: self.url.clone(),
             headers: vec![],
             heartbeat_interval_secs: Some(POLYMARKET_HEARTBEAT_SECS),
-            heartbeat_payload: Some("PING".to_string()),
+            heartbeat_payload,
             connect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
@@ -401,6 +409,10 @@ impl PolymarketWebSocketClient {
             handle.abort();
         }
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
     }
 
     /// Disconnects the WebSocket connection.
@@ -431,6 +443,10 @@ impl PolymarketWebSocketClient {
         // Invalidate after the task has stopped so any in-flight auth_tracker.succeed()
         // calls from the handler cannot race with and survive the invalidation.
         self.auth_tracker.invalidate();
+
+        if let Some(control) = &self.socket_control {
+            control.deregister();
+        }
         log::debug!("Polymarket WebSocket disconnected");
         Ok(())
     }
@@ -669,7 +685,6 @@ mod tests {
         let assert_common = |config: &WebSocketConfig| {
             assert_eq!(config.headers, Vec::<(String, String)>::new());
             assert_eq!(config.heartbeat_interval_secs, Some(10));
-            assert_eq!(config.heartbeat_payload.as_deref(), Some("PING"));
             assert_eq!(config.connect_timeout_ms, Some(15_000));
             assert_eq!(config.reconnect_delay_initial_ms, Some(250));
             assert_eq!(config.reconnect_delay_max_ms, Some(5_000));
@@ -688,6 +703,8 @@ mod tests {
         assert_eq!(user_config.url, "ws://user.example/ws");
         assert_eq!(market_config.proxy_url.as_deref(), Some(MARKET_PROXY));
         assert_eq!(user_config.proxy_url.as_deref(), Some(USER_PROXY));
+        assert_eq!(market_config.heartbeat_payload, None);
+        assert_eq!(user_config.heartbeat_payload.as_deref(), Some("PING"));
         assert_common(&market_config);
         assert_common(&user_config);
         assert!(!market_debug.contains("market-proxy-secret"));

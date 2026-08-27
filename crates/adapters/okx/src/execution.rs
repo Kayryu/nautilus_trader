@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
@@ -42,7 +42,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
-    ExecutionClientCore, ExecutionEventEmitter,
+    ExecutionClientCore, ExecutionEventEmitter, SocketControl,
     execution::{
         context::{OrderContext, OrderIdentity},
         failure::CommandFailure,
@@ -51,7 +51,8 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce, TrailingOffsetType,
+        AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
+        TimeInForce, TrailingOffsetType,
     },
     events::OrderDeniedReason,
     identifiers::{
@@ -69,8 +70,9 @@ use ustr::Ustr;
 use crate::{
     common::{
         consts::{
-            OKX_CONDITIONAL_ORDER_TYPES, OKX_SUCCESS_CODE, OKX_VENUE, OKX_WS_HEARTBEAT_SECS,
-            resolve_instrument_families, validate_okx_client_order_id,
+            OKX_CONDITIONAL_ORDER_TYPES, OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS,
+            OKX_RECONCILIATION_LOOKBACK_MAX_MINS, OKX_SUCCESS_CODE, OKX_VENUE,
+            OKX_WS_HEARTBEAT_SECS, resolve_instrument_families, validate_okx_client_order_id,
         },
         enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode, is_advance_algo_order},
         failure::{classify_okx_http_failure, classify_okx_venue_code, classify_okx_ws_failure},
@@ -79,9 +81,9 @@ use crate::{
             okx_instrument_type_from_symbol,
         },
     },
-    config::OKXExecClientConfig,
+    config::OKXExecutionClientConfig,
     http::{
-        client::{OKXHttpClient, ReportInstrumentScope},
+        client::{AlgoOrderReportSweep, FillHistory, OKXHttpClient, ReportInstrumentScope},
         models::OKXCancelAlgoOrderRequest,
     },
     websocket::{
@@ -89,6 +91,7 @@ use crate::{
         dispatch::{
             AlgoCancelContext, WsDispatchState, dispatch_ws_message, emit_algo_cancel_rejections,
         },
+        messages::OKXWsMessage,
         parse::OrderStateSnapshot,
     },
 };
@@ -97,7 +100,7 @@ use crate::{
 pub struct OKXExecutionClient {
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
-    config: OKXExecClientConfig,
+    config: OKXExecutionClientConfig,
     emitter: ExecutionEventEmitter,
     http_client: OKXHttpClient,
     ws_private: OKXWebSocketClient,
@@ -115,7 +118,10 @@ impl OKXExecutionClient {
     /// # Errors
     ///
     /// Returns an error if the client fails to initialize.
-    pub fn new(core: ExecutionClientCore, config: OKXExecClientConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        core: ExecutionClientCore,
+        config: OKXExecutionClientConfig,
+    ) -> anyhow::Result<Self> {
         let http_client = OKXHttpClient::with_credentials(
             config.api_key.clone(),
             config.api_secret.clone(),
@@ -142,7 +148,12 @@ impl OKXExecutionClient {
             config.transport_backend,
             config.proxy_url.clone(),
         )
-        .context("failed to construct OKX private websocket client")?;
+        .context("failed to construct OKX private websocket client")?
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*OKX_VENUE),
+            "okx-private-user-streams",
+        ));
 
         let ws_business = OKXWebSocketClient::with_credentials(
             Some(config.ws_business_url()),
@@ -155,7 +166,12 @@ impl OKXExecutionClient {
             config.transport_backend,
             config.proxy_url.clone(),
         )
-        .context("failed to construct OKX business websocket client")?;
+        .context("failed to construct OKX business websocket client")?
+        .with_socket_control(SocketControl::new(
+            core.client_id,
+            Some(*OKX_VENUE),
+            "okx-business-user-streams",
+        ));
 
         let trade_mode = Self::derive_default_trade_mode(core.account_type, &config);
         let clock = get_atomic_clock_realtime();
@@ -191,7 +207,7 @@ impl OKXExecutionClient {
 
     fn derive_default_trade_mode(
         account_type: AccountType,
-        config: &OKXExecClientConfig,
+        config: &OKXExecutionClientConfig,
     ) -> OKXTradeMode {
         let is_cross_margin = config.margin_mode == Some(OKXMarginMode::Cross);
 
@@ -255,13 +271,15 @@ impl OKXExecutionClient {
     async fn collect_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<(Vec<OrderStatusReport>, bool)> {
+    ) -> anyhow::Result<OrderReportSweep> {
         let instrument_types = self.instrument_types();
         let routing_types = order_routing_instrument_types(&instrument_types);
         let scope = self.report_scope(&routing_types);
         let start = nanos_to_datetime(cmd.start);
         let end = nanos_to_datetime(cmd.end);
         let mut reports = Vec::new();
+        let mut regular_by_venue_order_id = AHashMap::new();
+        let mut ambiguous_triggered_child_ids = AHashSet::new();
         let mut complete = true;
 
         if let Some(instrument_id) = cmd.instrument_id {
@@ -278,6 +296,14 @@ impl OKXExecutionClient {
                     Some(scope),
                 )
                 .await?;
+
+            regular_by_venue_order_id.extend(
+                sweep
+                    .reports
+                    .iter()
+                    .map(|report| (report.venue_order_id, report.clone())),
+            );
+
             reports.extend(sweep.reports);
             complete &= sweep.complete;
 
@@ -302,8 +328,12 @@ impl OKXExecutionClient {
                     .await
                 {
                     Ok(sweep) => {
-                        merge_order_status_reports(&mut reports, sweep.reports);
-                        complete &= sweep.complete;
+                        merge_algo_order_status_reports(
+                            &mut reports,
+                            sweep,
+                            &mut ambiguous_triggered_child_ids,
+                            &mut complete,
+                        );
                     }
                     Err(e) if is_instrument_cache_miss(&e) => return Err(e),
                     Err(e) => {
@@ -329,6 +359,14 @@ impl OKXExecutionClient {
                         Some(scope),
                     )
                     .await?;
+
+                regular_by_venue_order_id.extend(
+                    sweep
+                        .reports
+                        .iter()
+                        .map(|report| (report.venue_order_id, report.clone())),
+                );
+
                 reports.extend(sweep.reports);
                 complete &= sweep.complete;
 
@@ -349,8 +387,12 @@ impl OKXExecutionClient {
                         .await
                     {
                         Ok(sweep) => {
-                            merge_order_status_reports(&mut reports, sweep.reports);
-                            complete &= sweep.complete;
+                            merge_algo_order_status_reports(
+                                &mut reports,
+                                sweep,
+                                &mut ambiguous_triggered_child_ids,
+                                &mut complete,
+                            );
                         }
                         Err(e) if is_instrument_cache_miss(&e) => return Err(e),
                         Err(e) => {
@@ -396,19 +438,27 @@ impl OKXExecutionClient {
         }
 
         if let Some(start) = cmd.start {
-            reports.retain(|r| r.ts_last >= start);
+            // Open orders are authoritative regardless of age; only closed
+            // history respects the report window.
+            reports.retain(|r| r.ts_last >= start || r.order_status.is_open());
         }
 
         if let Some(end) = cmd.end {
-            reports.retain(|r| r.ts_last <= end);
+            reports.retain(|r| r.ts_last <= end || r.order_status.is_open());
         }
 
-        Ok((reports, complete))
+        Ok(OrderReportSweep {
+            reports,
+            complete,
+            ambiguous_triggered_child_ids,
+            regular_by_venue_order_id,
+        })
     }
 
     async fn collect_fill_reports(
         &self,
         cmd: GenerateFillReports,
+        history: FillHistory,
     ) -> anyhow::Result<(Vec<FillReport>, bool)> {
         let instrument_types = self.instrument_types();
         let routing_types = order_routing_instrument_types(&instrument_types);
@@ -428,6 +478,7 @@ impl OKXExecutionClient {
                     start_dt,
                     end_dt,
                     None,
+                    history,
                     Some(scope),
                 )
                 .await?;
@@ -444,6 +495,7 @@ impl OKXExecutionClient {
                         start_dt,
                         end_dt,
                         None,
+                        history,
                         Some(scope),
                     )
                     .await?;
@@ -461,6 +513,7 @@ impl OKXExecutionClient {
                         start_dt,
                         end_dt,
                         None,
+                        history,
                         Some(scope),
                     )
                     .await?;
@@ -590,9 +643,14 @@ impl OKXExecutionClient {
         &self,
         instrument_id: InstrumentId,
         order_state: Option<(OrderType, Option<bool>)>,
+        has_bound_child: bool,
     ) -> OrderCommandRoute {
         if is_spread_instrument(instrument_id) {
             return OrderCommandRoute::SpreadHttp;
+        }
+
+        if has_bound_child {
+            return OrderCommandRoute::RegularWs;
         }
 
         if order_state.is_some_and(|(order_type, is_triggered)| {
@@ -785,9 +843,6 @@ impl OKXExecutionClient {
         let clock = self.clock;
         let context = OrderContext::from(&order);
 
-        self.ws_dispatch_state
-            .order_identities
-            .insert(context.identity.client_order_id, context.identity);
         let client_order_id = context.identity.client_order_id;
         let strategy_id = context.identity.strategy_id;
         let instrument_id = context.identity.instrument_id;
@@ -832,6 +887,9 @@ impl OKXExecutionClient {
             (None, None)
         };
 
+        self.ws_dispatch_state.track_order_context(context);
+        let dispatch_state = Arc::clone(&self.ws_dispatch_state);
+
         self.spawn_task("submit_algo_order", async move {
             let result = http_client
                 .place_algo_order_with_domain_types(
@@ -852,16 +910,26 @@ impl OKXExecutionClient {
                 )
                 .await;
 
-            if let Err(e) = result {
-                emit_submit_failure(
-                    classify_okx_http_failure(&e),
-                    &emitter,
-                    clock,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                );
-                return Err(anyhow::Error::new(e).context("submit algo order failed"));
+            match result {
+                Ok(response) => {
+                    dispatch_state.bind_algo_parent(
+                        client_order_id,
+                        VenueOrderId::new(response.algo_id.as_str()),
+                    );
+                }
+                Err(e) => {
+                    let failure = classify_okx_http_failure(&e);
+                    dispatch_state.resolve_algo_submit_failure(client_order_id, &failure);
+                    emit_submit_failure(
+                        failure,
+                        &emitter,
+                        clock,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                    );
+                    return Err(anyhow::Error::new(e).context("submit algo order failed"));
+                }
             }
 
             Ok(())
@@ -874,7 +942,12 @@ impl OKXExecutionClient {
         self.ensure_order_identity(cmd.client_order_id, cmd.strategy_id, cmd.instrument_id);
 
         let ws_private = self.ws_private.clone();
-        let command = cmd.clone();
+        let mut command = cmd.clone();
+        command.venue_order_id = self
+            .ws_dispatch_state
+            .order_venue_binding(cmd.client_order_id)
+            .map(|(venue_order_id, _)| venue_order_id)
+            .or(cmd.venue_order_id);
 
         self.spawn_task("cancel_order", async move {
             let result = ws_private
@@ -1047,6 +1120,14 @@ impl OKXExecutionClient {
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
     ) {
+        if self
+            .ws_dispatch_state
+            .order_identity(client_order_id)
+            .is_some()
+        {
+            return;
+        }
+
         self.ws_dispatch_state
             .order_identities
             .entry(client_order_id)
@@ -1188,69 +1269,13 @@ impl OKXExecutionClient {
             }
         }
     }
-}
 
-fn derive_trade_mode_for_instrument(
-    instrument_id: InstrumentId,
-    margin_mode: Option<OKXMarginMode>,
-    use_spot_margin: bool,
-) -> OKXTradeMode {
-    let inst_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
-    let is_cross_margin = margin_mode == Some(OKXMarginMode::Cross);
-
-    match inst_type {
-        OKXInstrumentType::Spot => {
-            if use_spot_margin {
-                if is_cross_margin {
-                    OKXTradeMode::Cross
-                } else {
-                    OKXTradeMode::Isolated
-                }
-            } else {
-                OKXTradeMode::Cash
-            }
-        }
-        _ => {
-            if is_cross_margin {
-                OKXTradeMode::Cross
-            } else {
-                OKXTradeMode::Isolated
-            }
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl ExecutionClient for OKXExecutionClient {
-    fn is_connected(&self) -> bool {
-        self.core.is_connected()
-    }
-
-    fn client_id(&self) -> ClientId {
-        self.core.client_id
-    }
-
-    fn account_id(&self) -> AccountId {
-        self.core.account_id
-    }
-
-    fn venue(&self) -> Venue {
-        *OKX_VENUE
-    }
-
-    fn oms_type(&self) -> OmsType {
-        self.core.oms_type
-    }
-
-    fn get_account(&self) -> Option<AccountAny> {
-        self.core.cache().account_owned(&self.core.account_id)
-    }
-
-    async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_connected() {
-            return Ok(());
-        }
-
+    /// Establishes instrument context, both WebSocket transports, private
+    /// subscriptions, and initial account state.
+    ///
+    /// Any failure leaves partially started transports for
+    /// [`Self::teardown_session`].
+    async fn establish_session(&mut self) -> anyhow::Result<()> {
         let instrument_types = self.instrument_types();
 
         if !self.core.instruments_initialized() {
@@ -1352,18 +1377,38 @@ impl ExecutionClient for OKXExecutionClient {
 
                 pin_mut!(stream);
 
-                while let Some(message) = stream.next().await {
-                    dispatch_ws_message(
-                        message,
-                        &emitter,
-                        &state,
-                        account_id,
-                        &instruments,
-                        &mut fee_cache,
-                        &mut filled_qty_cache,
-                        &mut order_state_cache,
-                        clock,
-                    );
+                loop {
+                    tokio::select! {
+                        message = stream.next() => {
+                            let Some(message) = message else {
+                                break;
+                            };
+                            dispatch_ws_message(
+                                message,
+                                &emitter,
+                                &state,
+                                account_id,
+                                &instruments,
+                                &mut fee_cache,
+                                &mut filled_qty_cache,
+                                &mut order_state_cache,
+                                clock,
+                            );
+                        }
+                        () = state.wait_for_linked_child_route() => {
+                            dispatch_ws_message(
+                                OKXWsMessage::Orders(Vec::new()),
+                                &emitter,
+                                &state,
+                                account_id,
+                                &instruments,
+                                &mut fee_cache,
+                                &mut filled_qty_cache,
+                                &mut order_state_cache,
+                                clock,
+                            );
+                        }
+                    }
                 }
             });
             self.ws_stream_handle = Some(handle);
@@ -1462,18 +1507,13 @@ impl ExecutionClient for OKXExecutionClient {
         // Wait for account to be registered in cache before completing connect
         self.await_account_registered(30.0).await?;
 
-        self.core.set_connected();
-        log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
     }
 
-    async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.core.is_disconnected() {
-            return Ok(());
-        }
-
+    /// Closes both WebSocket transports and aborts their stream tasks without
+    /// cancelling HTTP requests, so a retried connect can still use them.
+    async fn teardown_session(&mut self) -> anyhow::Result<()> {
         self.abort_pending_tasks();
-        self.http_client.cancel_all_requests();
 
         if let Err(e) = self.ws_private.close().await {
             log::warn!("Error closing private websocket: {e:?}");
@@ -1492,6 +1532,90 @@ impl ExecutionClient for OKXExecutionClient {
         }
 
         self.core.set_disconnected();
+        Ok(())
+    }
+}
+
+fn derive_trade_mode_for_instrument(
+    instrument_id: InstrumentId,
+    margin_mode: Option<OKXMarginMode>,
+    use_spot_margin: bool,
+) -> OKXTradeMode {
+    let inst_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
+    let is_cross_margin = margin_mode == Some(OKXMarginMode::Cross);
+
+    match inst_type {
+        OKXInstrumentType::Spot => {
+            if use_spot_margin {
+                if is_cross_margin {
+                    OKXTradeMode::Cross
+                } else {
+                    OKXTradeMode::Isolated
+                }
+            } else {
+                OKXTradeMode::Cash
+            }
+        }
+        _ => {
+            if is_cross_margin {
+                OKXTradeMode::Cross
+            } else {
+                OKXTradeMode::Isolated
+            }
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl ExecutionClient for OKXExecutionClient {
+    fn is_connected(&self) -> bool {
+        self.core.is_connected()
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.core.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.core.account_id
+    }
+
+    fn venue(&self) -> Venue {
+        *OKX_VENUE
+    }
+
+    fn oms_type(&self) -> OmsType {
+        self.core.oms_type
+    }
+
+    fn get_account(&self) -> Option<AccountAny> {
+        self.core.cache().account_owned(&self.core.account_id)
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        if self.core.is_connected() {
+            return Ok(());
+        }
+
+        if let Err(e) = self.establish_session().await {
+            if let Err(teardown_error) = self.teardown_session().await {
+                log::warn!("Error tearing down partial session: {teardown_error:?}");
+            }
+            return Err(e);
+        }
+
+        self.core.set_connected();
+        log::info!("Connected: client_id={}", self.core.client_id);
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        if self.core.is_disconnected() {
+            return Ok(());
+        }
+
+        self.http_client.cancel_all_requests();
+        self.teardown_session().await?;
         log::info!("Disconnected: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -1517,15 +1641,26 @@ impl ExecutionClient for OKXExecutionClient {
                     venue_order_id: order.venue_order_id(),
                 })
         };
+
+        let venue_binding = self.ws_dispatch_state.order_venue_binding(client_order_id);
+        let authoritative_venue_order_id = venue_binding.map(|(venue_order_id, _)| venue_order_id);
+        let has_bound_child = venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child);
         let cached_venue_order_id = order_state.and_then(|state| state.venue_order_id);
-        let regular_venue_order_id = order_state.and_then(|state| {
-            if OKX_CONDITIONAL_ORDER_TYPES.contains(&state.order_type) {
-                state.venue_order_id.or(venue_order_id)
-            } else {
-                state.venue_order_id
-            }
-        });
-        let selection_venue_order_id = cached_venue_order_id.or(venue_order_id);
+        let regular_venue_order_id = if has_bound_child {
+            authoritative_venue_order_id
+        } else {
+            order_state.and_then(|state| {
+                if OKX_CONDITIONAL_ORDER_TYPES.contains(&state.order_type) {
+                    state.venue_order_id.or(venue_order_id)
+                } else {
+                    state.venue_order_id
+                }
+            })
+        };
+
+        let selection_venue_order_id = authoritative_venue_order_id
+            .or(cached_venue_order_id)
+            .or(venue_order_id);
         let route = query_order_route(
             instrument_id,
             order_state.map(|state| state.order_type),
@@ -1973,14 +2108,14 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        Ok(self.collect_order_status_reports(cmd).await?.0)
+        Ok(self.collect_order_status_reports(cmd).await?.reports)
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        Ok(self.collect_fill_reports(cmd).await?.0)
+        Ok(self.collect_fill_reports(cmd, FillHistory::Recent).await?.0)
     }
 
     async fn generate_position_status_reports(
@@ -1998,10 +2133,16 @@ impl ExecutionClient for OKXExecutionClient {
 
         let ts_now = self.clock.get_time_ns();
 
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let lookback_mins = lookback_mins
+            .unwrap_or(OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS)
+            .min(OKX_RECONCILIATION_LOOKBACK_MAX_MINS);
+        let fill_history = if lookback_mins <= OKX_RECONCILIATION_LOOKBACK_DEFAULT_MINS {
+            FillHistory::Recent
+        } else {
+            FillHistory::Extended
+        };
+        let lookback_ns = lookback_mins * 60 * 1_000_000_000;
+        let start = Some(UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns)));
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -2023,14 +2164,36 @@ impl ExecutionClient for OKXExecutionClient {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let (
-            (order_reports, orders_complete),
+            order_sweep,
             (fill_reports, fills_complete),
-            (position_reports, positions_complete),
+            (mut position_reports, positions_complete),
         ) = tokio::try_join!(
             self.collect_order_status_reports(&order_cmd),
-            self.collect_fill_reports(fill_cmd),
+            self.collect_fill_reports(fill_cmd, fill_history),
             self.collect_position_status_reports(&position_cmd),
         )?;
+        let OrderReportSweep {
+            reports: mut order_reports,
+            complete: mut orders_complete,
+            ambiguous_triggered_child_ids,
+            regular_by_venue_order_id,
+        } = order_sweep;
+        orders_complete &= self
+            .recover_triggered_child_order_reports(
+                &mut order_reports,
+                &ambiguous_triggered_child_ids,
+                &regular_by_venue_order_id,
+            )
+            .await;
+
+        if positions_complete {
+            self.add_flat_derivative_position_reports(
+                &order_reports,
+                &fill_reports,
+                &mut position_reports,
+                ts_now,
+            );
+        }
         let reports_complete = orders_complete && fills_complete && positions_complete;
 
         log::info!("Received {} OrderStatusReports", order_reports.len());
@@ -2252,7 +2415,12 @@ impl ExecutionClient for OKXExecutionClient {
         self.ensure_order_identity(cmd.client_order_id, cmd.strategy_id, cmd.instrument_id);
 
         let ws_private = self.ws_private.clone();
-        let command = cmd.clone();
+        let mut command = cmd.clone();
+        command.venue_order_id = self
+            .ws_dispatch_state
+            .order_venue_binding(cmd.client_order_id)
+            .map(|(venue_order_id, _)| venue_order_id)
+            .or(cmd.venue_order_id);
 
         let new_px_usd = get_param_as_string(&cmd.params, "px_usd");
         let new_px_vol = get_param_as_string(&cmd.params, "px_vol");
@@ -2300,14 +2468,25 @@ impl ExecutionClient for OKXExecutionClient {
         Ok(())
     }
 
-    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order(&self, mut cmd: CancelOrder) -> anyhow::Result<()> {
+        let venue_binding = self
+            .ws_dispatch_state
+            .order_venue_binding(cmd.client_order_id);
         let route = {
             let cache = self.core.cache();
             let order_state = cache
                 .order(&cmd.client_order_id)
                 .map(|order| (order.order_type(), order.is_triggered()));
-            self.cancel_order_route(cmd.instrument_id, order_state)
+            self.cancel_order_route(
+                cmd.instrument_id,
+                order_state,
+                venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
+            )
         };
+
+        cmd.venue_order_id = venue_binding
+            .map(|(venue_order_id, _)| venue_order_id)
+            .or(cmd.venue_order_id);
 
         match route {
             OrderCommandRoute::RegularWs => self.cancel_ws_order(&cmd),
@@ -2345,7 +2524,17 @@ impl ExecutionClient for OKXExecutionClient {
 
                 for order in &open_orders {
                     let order_state = Some((order.order_type(), order.is_triggered()));
-                    match self.cancel_order_route(order.instrument_id(), order_state) {
+                    let venue_binding = self
+                        .ws_dispatch_state
+                        .order_venue_binding(order.client_order_id());
+                    let authoritative_venue_order_id = venue_binding
+                        .map(|(venue_order_id, _)| venue_order_id)
+                        .or(order.venue_order_id());
+                    match self.cancel_order_route(
+                        order.instrument_id(),
+                        order_state,
+                        venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
+                    ) {
                         OrderCommandRoute::RegularWs => {
                             self.ensure_order_identity(
                                 order.client_order_id(),
@@ -2355,7 +2544,7 @@ impl ExecutionClient for OKXExecutionClient {
                             regular_payload.push((
                                 order.instrument_id(),
                                 Some(order.client_order_id()),
-                                order.venue_order_id(),
+                                authoritative_venue_order_id,
                             ));
                             regular_cancel_contexts.push((
                                 order.client_order_id(),
@@ -2367,7 +2556,7 @@ impl ExecutionClient for OKXExecutionClient {
                             algo_orders.push((
                                 order.instrument_id(),
                                 order.client_order_id(),
-                                order.venue_order_id(),
+                                authoritative_venue_order_id,
                                 order.trader_id(),
                                 order.strategy_id(),
                             ));
@@ -2452,7 +2641,17 @@ impl ExecutionClient for OKXExecutionClient {
                 .order(&cancel.client_order_id)
                 .map(|order| (order.order_type(), order.is_triggered()));
 
-            match self.cancel_order_route(cancel.instrument_id, order_state) {
+            let venue_binding = self
+                .ws_dispatch_state
+                .order_venue_binding(cancel.client_order_id);
+            let authoritative_venue_order_id = venue_binding
+                .map(|(venue_order_id, _)| venue_order_id)
+                .or(cancel.venue_order_id);
+            match self.cancel_order_route(
+                cancel.instrument_id,
+                order_state,
+                venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
+            ) {
                 OrderCommandRoute::RegularWs => {
                     self.ensure_order_identity(
                         cancel.client_order_id,
@@ -2462,10 +2661,14 @@ impl ExecutionClient for OKXExecutionClient {
                     regular_payload.push((
                         cancel.instrument_id,
                         Some(cancel.client_order_id),
-                        cancel.venue_order_id,
+                        authoritative_venue_order_id,
                     ));
                 }
-                OrderCommandRoute::AlgoHttp => algo_orders.push(cancel.clone()),
+                OrderCommandRoute::AlgoHttp => {
+                    let mut cancel = cancel.clone();
+                    cancel.venue_order_id = authoritative_venue_order_id;
+                    algo_orders.push(cancel);
+                }
                 OrderCommandRoute::SpreadHttp => {
                     self.ensure_order_identity(
                         cancel.client_order_id,
@@ -2476,7 +2679,7 @@ impl ExecutionClient for OKXExecutionClient {
                         cancel.client_order_id,
                         cancel.instrument_id,
                         cancel.strategy_id,
-                        cancel.venue_order_id,
+                        authoritative_venue_order_id,
                     ));
                 }
             }
@@ -2558,6 +2761,210 @@ impl ExecutionClient for OKXExecutionClient {
         }
 
         Ok(())
+    }
+}
+
+const MAX_TRIGGERED_CHILD_RECOVERIES: usize = 100;
+
+struct OrderReportSweep {
+    reports: Vec<OrderStatusReport>,
+    complete: bool,
+    ambiguous_triggered_child_ids: AHashSet<VenueOrderId>,
+    regular_by_venue_order_id: AHashMap<VenueOrderId, OrderStatusReport>,
+}
+
+impl OKXExecutionClient {
+    fn add_flat_derivative_position_reports(
+        &self,
+        order_reports: &[OrderStatusReport],
+        fill_reports: &[FillReport],
+        position_reports: &mut Vec<PositionStatusReport>,
+        ts_init: UnixNanos,
+    ) {
+        let mut instrument_ids: AHashSet<InstrumentId> = order_reports
+            .iter()
+            .map(|report| report.instrument_id)
+            .chain(fill_reports.iter().map(|report| report.instrument_id))
+            .collect();
+        let mut hedging_instrument_ids = AHashSet::new();
+
+        {
+            let cache = self.core.cache();
+            for position in cache.positions_open(
+                Some(&OKX_VENUE),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            ) {
+                instrument_ids.insert(position.instrument_id);
+                if cache.oms_type(&position.id) == Some(OmsType::Hedging) {
+                    hedging_instrument_ids.insert(position.instrument_id);
+                }
+            }
+        }
+
+        instrument_ids.retain(|instrument_id| {
+            !is_spread_instrument(*instrument_id)
+                && matches!(
+                    okx_instrument_type_from_symbol(instrument_id.symbol.as_str()),
+                    OKXInstrumentType::Swap
+                        | OKXInstrumentType::Futures
+                        | OKXInstrumentType::Option
+                )
+                && !hedging_instrument_ids.contains(instrument_id)
+                && !position_reports
+                    .iter()
+                    .any(|report| report.instrument_id == *instrument_id)
+        });
+
+        for instrument_id in instrument_ids {
+            // A successful OKX positions snapshot omits flat rows
+            position_reports.push(PositionStatusReport::new(
+                self.core.account_id,
+                instrument_id,
+                PositionSideSpecified::Flat,
+                Quantity::zero(0),
+                ts_init,
+                ts_init,
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+
+    async fn recover_triggered_child_order_reports(
+        &self,
+        reports: &mut Vec<OrderStatusReport>,
+        ambiguous_triggered_child_ids: &AHashSet<VenueOrderId>,
+        regular_by_venue_order_id: &AHashMap<VenueOrderId, OrderStatusReport>,
+    ) -> bool {
+        let mut recovered = Vec::with_capacity(reports.len());
+        let recovery_candidate_count = reports
+            .iter()
+            .filter(|report| {
+                report.order_status == OrderStatus::Triggered
+                    && !ambiguous_triggered_child_ids.contains(&report.venue_order_id)
+            })
+            .count();
+        let mut complete = true;
+
+        if recovery_candidate_count > MAX_TRIGGERED_CHILD_RECOVERIES {
+            log::warn!(
+                "Triggered child recovery hit {MAX_TRIGGERED_CHILD_RECOVERIES} request cap; omitting unresolved reports"
+            );
+        }
+
+        let mut request_count = 0;
+
+        for mut parent_report in reports.drain(..) {
+            if parent_report.order_status != OrderStatus::Triggered {
+                recovered.push(parent_report);
+                continue;
+            }
+
+            if ambiguous_triggered_child_ids.contains(&parent_report.venue_order_id) {
+                log::warn!(
+                    "Omitting triggered algo order with ambiguous child identifiers: {} {}",
+                    parent_report.instrument_id,
+                    parent_report.venue_order_id,
+                );
+                self.push_external_regular_order_fallback(
+                    &parent_report,
+                    regular_by_venue_order_id,
+                    &mut recovered,
+                );
+                complete = false;
+                continue;
+            }
+
+            if request_count >= MAX_TRIGGERED_CHILD_RECOVERIES {
+                self.push_external_regular_order_fallback(
+                    &parent_report,
+                    regular_by_venue_order_id,
+                    &mut recovered,
+                );
+                complete = false;
+                continue;
+            }
+            request_count += 1;
+
+            match self
+                .http_client
+                .request_order_status_report_by_venue_order_id(
+                    self.core.account_id,
+                    parent_report.instrument_id,
+                    parent_report.venue_order_id,
+                )
+                .await
+            {
+                Ok(Some(mut child_report)) => {
+                    if child_report.order_status == OrderStatus::Accepted {
+                        parent_report.quantity = child_report.quantity;
+                        parent_report.price = child_report.price.or(parent_report.price);
+                        parent_report.reduce_only |= child_report.reduce_only;
+                        parent_report.ts_last = child_report.ts_last;
+                        recovered.push(parent_report);
+                    } else {
+                        child_report.client_order_id = parent_report.client_order_id;
+                        recovered.push(child_report);
+                    }
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "Triggered child order {} {} was not found",
+                        parent_report.instrument_id,
+                        parent_report.venue_order_id,
+                    );
+                    self.push_external_regular_order_fallback(
+                        &parent_report,
+                        regular_by_venue_order_id,
+                        &mut recovered,
+                    );
+                    complete = false;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to recover triggered child order {} {}: {e}",
+                        parent_report.instrument_id,
+                        parent_report.venue_order_id,
+                    );
+                    self.push_external_regular_order_fallback(
+                        &parent_report,
+                        regular_by_venue_order_id,
+                        &mut recovered,
+                    );
+                    complete = false;
+                }
+            }
+        }
+
+        *reports = recovered;
+        complete
+    }
+
+    fn push_external_regular_order_fallback(
+        &self,
+        parent_report: &OrderStatusReport,
+        regular_by_venue_order_id: &AHashMap<VenueOrderId, OrderStatusReport>,
+        recovered: &mut Vec<OrderStatusReport>,
+    ) {
+        let cache = self.core.cache();
+        let cached_by_client = parent_report
+            .client_order_id
+            .is_some_and(|client_order_id| cache.order_exists(&client_order_id));
+        let cached_by_venue = cache
+            .client_order_id(&parent_report.venue_order_id)
+            .is_some_and(|client_order_id| cache.order_exists(client_order_id));
+
+        if !cached_by_client
+            && !cached_by_venue
+            && let Some(regular_report) =
+                regular_by_venue_order_id.get(&parent_report.venue_order_id)
+        {
+            recovered.push(regular_report.clone());
+        }
     }
 }
 
@@ -2806,6 +3213,23 @@ fn is_instrument_cache_miss(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("missing from cache"))
 }
 
+fn merge_algo_order_status_reports(
+    reports: &mut Vec<OrderStatusReport>,
+    sweep: AlgoOrderReportSweep,
+    ambiguous_triggered_child_ids: &mut AHashSet<VenueOrderId>,
+    complete: &mut bool,
+) {
+    let AlgoOrderReportSweep {
+        reports: incoming,
+        complete: sweep_complete,
+        ambiguous_triggered_child_ids: ambiguous,
+    } = sweep;
+
+    *complete &= sweep_complete && ambiguous.is_empty();
+    ambiguous_triggered_child_ids.extend(ambiguous);
+    merge_order_status_reports(reports, incoming);
+}
+
 fn merge_order_status_reports(
     reports: &mut Vec<OrderStatusReport>,
     incoming: Vec<OrderStatusReport>,
@@ -2874,14 +3298,22 @@ fn select_query_order_report(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, time::Duration};
 
-    use nautilus_common::cache::Cache;
-    use nautilus_model::{enums::OrderStatus, instruments::Instrument};
+    use axum::{Json, Router, routing::post};
+    use nautilus_common::{cache::Cache, testing::wait_until_async};
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        enums::OrderStatus,
+        instruments::Instrument,
+        orders::OrderTestBuilder,
+        types::{Price, Quantity},
+    };
     use rstest::rstest;
     use serde_json::Value;
 
     use super::*;
+    use crate::common::consts::OKX_CLIENT_ID;
 
     #[rstest]
     #[case(OrderType::Market, QueryOrderRoute::Regular)]
@@ -2933,11 +3365,11 @@ mod tests {
     fn build_config(
         margin_mode: Option<OKXMarginMode>,
         use_spot_margin: bool,
-    ) -> OKXExecClientConfig {
-        OKXExecClientConfig {
+    ) -> OKXExecutionClientConfig {
+        OKXExecutionClientConfig {
             margin_mode,
             use_spot_margin,
-            ..OKXExecClientConfig::default()
+            ..OKXExecutionClientConfig::default()
         }
     }
 
@@ -3376,16 +3808,16 @@ mod tests {
     }
 
     fn build_test_exec_client() -> OKXExecutionClient {
-        let config = OKXExecClientConfig {
+        let config = OKXExecutionClientConfig {
             api_key: Some("test_key".to_string()),
             api_secret: Some("test_secret".to_string()),
             api_passphrase: Some("test_pass".to_string()),
-            ..OKXExecClientConfig::default()
+            ..OKXExecutionClientConfig::default()
         };
 
         let cache = Rc::new(RefCell::new(Cache::default()));
         let core = ExecutionClientCore::new(
-            config.trader_id,
+            TraderId::from("TESTER-001"),
             ClientId::from("OKX-TEST"),
             *OKX_VENUE,
             OmsType::Hedging,
@@ -3396,6 +3828,161 @@ mod tests {
         );
 
         OKXExecutionClient::new(core, config).expect("failed to build test client")
+    }
+
+    #[rstest]
+    fn test_cancel_order_route_uses_bound_child_before_engine_trigger_state_updates() {
+        let client = build_test_exec_client();
+        let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+        let pending_trigger = Some((OrderType::StopLimit, Some(false)));
+
+        assert_eq!(
+            client.cancel_order_route(instrument_id, pending_trigger, false),
+            OrderCommandRoute::AlgoHttp
+        );
+        assert_eq!(
+            client.cancel_order_route(instrument_id, pending_trigger, true),
+            OrderCommandRoute::RegularWs
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_conditional_order_resolves_routing_context() {
+        let router = Router::new().route(
+            "/api/v5/trade/order-algo",
+            post(|Json(request): Json<Value>| async move {
+                let data = if request["algoClOrdId"] == "O-REST-BIND-001" {
+                    serde_json::json!([{
+                        "algoId": "3796251408639365120",
+                        "algoClOrdId": "O-REST-BIND-001",
+                        "sCode": "0",
+                        "sMsg": "",
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                Json(serde_json::json!({
+                    "code": "0",
+                    "msg": "",
+                    "data": data,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url_http = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let config = OKXExecutionClientConfig {
+            api_key: Some("test_key".to_string()),
+            api_secret: Some("test_secret".to_string()),
+            api_passphrase: Some("test_pass".to_string()),
+            base_url_http: Some(base_url_http),
+            ..OKXExecutionClientConfig::default()
+        };
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("OKX-TEST"),
+            *OKX_VENUE,
+            OmsType::Hedging,
+            config.account_id,
+            AccountType::Cash,
+            None,
+            Rc::clone(&cache),
+        );
+        let client = OKXExecutionClient::new(core, config).unwrap();
+        let client_order_id = ClientOrderId::from("O-REST-BIND-001");
+        let order = OrderTestBuilder::new(OrderType::StopLimit)
+            .client_order_id(client_order_id)
+            .strategy_id(StrategyId::from("S-REST-BIND-001"))
+            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.01"))
+            .price(Price::from("94900"))
+            .trigger_price(Price::from("95000"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+        let command = SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-001"),
+            Some(*OKX_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+
+        client.submit_conditional_order(&command).unwrap();
+        wait_until_async(
+            || async {
+                client
+                    .ws_dispatch_state
+                    .order_venue_binding(client_order_id)
+                    == Some((VenueOrderId::from("3796251408639365120"), false))
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            client.ws_dispatch_state.order_identity(client_order_id),
+            Some(OrderIdentity {
+                client_order_id,
+                strategy_id: StrategyId::from("S-REST-BIND-001"),
+                instrument_id: InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                order_side: OrderSide::Sell,
+                order_type: OrderType::StopLimit,
+            })
+        );
+
+        let ambiguous_client_order_id = ClientOrderId::from("O-REST-AMBIGUOUS-002");
+        let ambiguous_order = OrderTestBuilder::new(OrderType::StopLimit)
+            .client_order_id(ambiguous_client_order_id)
+            .strategy_id(StrategyId::from("S-REST-BIND-001"))
+            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.02"))
+            .price(Price::from("94800"))
+            .trigger_price(Price::from("95100"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(ambiguous_order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+        let ambiguous_command = SubmitOrder::from_order(
+            &ambiguous_order,
+            TraderId::from("TESTER-001"),
+            Some(*OKX_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+
+        client.submit_conditional_order(&ambiguous_command).unwrap();
+        wait_until_async(
+            || async {
+                client
+                    .ws_dispatch_state
+                    .order_identity(ambiguous_client_order_id)
+                    .is_none()
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            client
+                .ws_dispatch_state
+                .order_venue_binding(ambiguous_client_order_id),
+            None
+        );
     }
 
     #[rstest]

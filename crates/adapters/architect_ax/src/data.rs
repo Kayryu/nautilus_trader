@@ -53,6 +53,7 @@ use nautilus_core::{
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControl;
 use nautilus_model::{
     data::{Data, FundingRateUpdate, InstrumentStatus, MarkPriceUpdate},
     enums::{BookType, MarketStatusAction},
@@ -135,6 +136,11 @@ impl AxDataClient {
     ) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let ws_client = ws_client.with_socket_control(SocketControl::new(
+            client_id,
+            Some(*AX_VENUE),
+            "architect-ax-data-streams",
+        ));
 
         // Share instruments cache with HTTP client
         let instruments = http_client.instruments_cache.clone();
@@ -1416,36 +1422,26 @@ mod tests {
 
     fn ticker_test_instrument() -> InstrumentAny {
         let symbol = Symbol::new("EURUSD-PERP");
-        let instrument = PerpetualContract::new(
-            InstrumentId::new(symbol, *crate::common::consts::AX_VENUE),
-            symbol,
-            Ustr::from("EURUSD"),
-            AssetClass::FX,
-            None,
-            Currency::USD(),
-            Currency::USD(),
-            false,
-            4,
-            0,
-            Price::from("0.0001"),
-            Quantity::from("1"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(Decimal::new(1, 2)),
-            Some(Decimal::new(5, 3)),
-            Some(Decimal::new(2, 4)),
-            Some(Decimal::new(5, 4)),
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        );
+        let instrument = PerpetualContract::builder()
+            .instrument_id(InstrumentId::new(symbol, *crate::common::consts::AX_VENUE))
+            .raw_symbol(symbol)
+            .underlying(Ustr::from("EURUSD"))
+            .asset_class(AssetClass::FX)
+            .quote_currency(Currency::USD())
+            .settlement_currency(Currency::USD())
+            .is_inverse(false)
+            .price_precision(4)
+            .size_precision(0)
+            .price_increment(Price::from("0.0001"))
+            .size_increment(Quantity::from("1"))
+            .margin_init(Decimal::new(1, 2))
+            .margin_maint(Decimal::new(5, 3))
+            .maker_fee(Decimal::new(2, 4))
+            .taker_fee(Decimal::new(5, 4))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
         InstrumentAny::PerpetualContract(instrument)
     }
 

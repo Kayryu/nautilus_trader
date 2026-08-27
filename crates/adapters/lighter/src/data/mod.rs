@@ -29,13 +29,9 @@ use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use nautilus_common::{
     cache::InstrumentLookupError,
     clients::DataClient,
-    live::{
-        runner::{get_data_event_sender, try_get_system_event_sender},
-        runtime::get_runtime,
-        task::TaskHandles,
-    },
+    live::{runner::get_data_event_sender, runtime::get_runtime, task::TaskHandles},
     messages::{
-        DataEvent, SystemEvent,
+        DataEvent,
         data::{
             BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
             InstrumentsResponse, RequestBars, RequestBookDepth, RequestBookSnapshot,
@@ -55,6 +51,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{Data, InstrumentStatus, TradeTick},
     enums::{BookType, MarketStatusAction},
@@ -66,11 +63,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
-        consts::{DISCONNECT_TIMEOUT, LIGHTER_VENUE},
+        consts::DISCONNECT_TIMEOUT,
         credential::Credential,
         enums::{LighterCandleResolution, LighterMarketStatus},
         rate_limit::resolve_quota,
-        socket::{DATA_STREAMS_ENDPOINT, socket_state_sink},
         symbol::MarketRegistry,
     },
     config::LighterDataClientConfig,
@@ -80,6 +76,7 @@ use crate::{
         query::LighterOrderBookOrdersQuery,
     },
     websocket::{
+        DATA_STREAMS_ENDPOINT,
         client::LighterWebSocketClient,
         messages::{LighterMarketSelection, LighterWsChannel, NautilusWsMessage},
     },
@@ -106,11 +103,11 @@ pub struct LighterDataClient {
     http_client: LighterHttpClient,
     ws_client: LighterWebSocketClient,
     registry: Arc<MarketRegistry>,
+    socket_factory: SocketControlFactory,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: TaskHandles,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    system_sender: Option<tokio::sync::mpsc::UnboundedSender<SystemEvent>>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument_statuses: Arc<DashMap<InstrumentId, LighterMarketStatus>>,
     instrument_status_subscriptions: Arc<DashSet<InstrumentId>>,
@@ -128,7 +125,9 @@ impl LighterDataClient {
     pub fn new(client_id: ClientId, config: LighterDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
-        let system_sender = try_get_system_event_sender();
+        let venue = config.resolved_venue();
+        let settlement_currency = config.settlement_currency();
+        let socket_factory = SocketControlFactory::new(client_id, Some(venue));
 
         let credential = if config.has_credentials() {
             // Mirror `has_credentials()`: a blank or whitespace-only `private_key`
@@ -138,10 +137,11 @@ impl LighterDataClient {
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string);
-            Credential::resolve(
+            Credential::resolve_for_deployment(
                 private_key,
                 config.account_index,
                 config.api_key_index,
+                config.deployment,
                 config.environment,
             )
             .context("failed to resolve Lighter data credentials")?
@@ -149,26 +149,25 @@ impl LighterDataClient {
             None
         };
 
-        let registry = Arc::new(MarketRegistry::new());
+        let registry = Arc::new(MarketRegistry::new_with_venue_and_settlement_currency(
+            venue,
+            settlement_currency,
+        ));
 
         let raw_http = LighterRawHttpClient::new_with_quotas(
             config.environment,
-            config.base_url_http.clone(),
+            Some(config.http_url()),
             config.http_timeout_secs,
             config.proxy_url.clone(),
             resolve_quota(config.rest_quota_per_min),
             None,
         )
         .context("failed to construct Lighter raw HTTP client")?;
+
         let http_client =
             LighterHttpClient::from_raw_with_registry(raw_http, Arc::clone(&registry));
 
-        let ws_client = Self::create_ws_client(
-            &config,
-            Arc::clone(&registry),
-            client_id,
-            system_sender.as_ref(),
-        );
+        let ws_client = Self::create_ws_client(&config, Arc::clone(&registry), &socket_factory);
 
         Ok(Self {
             clock,
@@ -178,11 +177,11 @@ impl LighterDataClient {
             http_client,
             ws_client,
             registry,
+            socket_factory,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
             tasks: TaskHandles::default(),
             data_sender,
-            system_sender,
             instruments: Arc::new(AtomicMap::new()),
             instrument_statuses: Arc::new(DashMap::new()),
             instrument_status_subscriptions: Arc::new(DashSet::new()),
@@ -193,7 +192,7 @@ impl LighterDataClient {
     }
 
     fn venue(&self) -> Venue {
-        *LIGHTER_VENUE
+        self.config.resolved_venue()
     }
 
     /// Returns `true` when the data client holds resolved Lighter credentials.
@@ -205,8 +204,7 @@ impl LighterDataClient {
     fn create_ws_client(
         config: &LighterDataClientConfig,
         registry: Arc<MarketRegistry>,
-        client_id: ClientId,
-        system_sender: Option<&tokio::sync::mpsc::UnboundedSender<SystemEvent>>,
+        socket_factory: &SocketControlFactory,
     ) -> LighterWebSocketClient {
         let ws_client = LighterWebSocketClient::new(
             Some(config.ws_url()),
@@ -217,14 +215,7 @@ impl LighterDataClient {
             config.proxy_url.clone(),
         );
 
-        match system_sender {
-            Some(sender) => ws_client.with_state_sink(socket_state_sink(
-                client_id,
-                DATA_STREAMS_ENDPOINT,
-                sender.clone(),
-            )),
-            None => ws_client,
-        }
+        ws_client.with_socket_control(socket_factory.control(DATA_STREAMS_ENDPOINT))
     }
 
     fn take_ws_client(&mut self) -> LighterWebSocketClient {
@@ -233,8 +224,7 @@ impl LighterDataClient {
             Self::create_ws_client(
                 &self.config,
                 Arc::clone(&self.registry),
-                self.client_id,
-                self.system_sender.as_ref(),
+                &self.socket_factory,
             ),
         )
     }
@@ -1751,7 +1741,10 @@ mod tests {
         *,
     };
     use crate::{
-        common::enums::{LighterFundingResolution, LighterProductType},
+        common::{
+            consts::LIGHTER_VENUE,
+            enums::{LighterFundingResolution, LighterProductType},
+        },
         http::query::{LighterFundingsQuery, LighterRecentTradesQuery},
     };
 
@@ -3068,63 +3061,41 @@ mod tests {
     }
 
     fn test_perp_instrument(instrument_id: InstrumentId, venue_symbol: &str) -> InstrumentAny {
-        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            instrument_id,
-            Symbol::new(format!("{venue_symbol}-PERP")),
-            Currency::from(venue_symbol),
-            Currency::from("USDC"),
-            Currency::from("USDC"),
-            false,
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new(format!("{venue_symbol}-PERP")))
+                .base_currency(Currency::from(venue_symbol))
+                .quote_currency(Currency::from("USDC"))
+                .settlement_currency(Currency::from("USDC"))
+                .is_inverse(false)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn test_spot_instrument(instrument_id: InstrumentId, venue_symbol: &str) -> InstrumentAny {
-        InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            Symbol::new(format!("{venue_symbol}-SPOT")),
-            Currency::from(venue_symbol),
-            Currency::from("USDC"),
-            2,
-            4,
-            Price::from("0.01"),
-            Quantity::from("0.0001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        ))
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(Symbol::new(format!("{venue_symbol}-SPOT")))
+                .base_currency(Currency::from(venue_symbol))
+                .quote_currency(Currency::from("USDC"))
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn unsupported_three_minute_bar_type() -> BarType {

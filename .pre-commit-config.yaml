@@ -35,7 +35,7 @@ repos:
         args: ["-i", "2", "-ci", "-sr", "-ln", "bash", "-w"]
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.11.0.1
+    rev: v0.11.0.1-1
     hooks:
       - id: shellcheck
 
@@ -130,7 +130,7 @@ repos:
 
       - id: check-unicode-typography
         name: check Unicode typography
-        description: Reject typographic dashes, curly quotes, and emoji-style check/cross marks
+        description: Reject non-breaking hyphens, typographic dashes, curly quotes, and emoji-style check/cross marks
         entry: bash .pre-commit-hooks/check_unicode_typography.sh
         language: system
         types: [text]
@@ -456,6 +456,23 @@ repos:
       - id: uv-lock
         args: ["--project", "python"]
         files: ^python/(uv\.lock|pyproject\.toml)$
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        description: Type-checks Python examples
+        entry: bash scripts/ci/check-python-types.bash python examples
+        language: system
+        files: >-
+          (?x)^(
+            Makefile|
+            docs/tutorials/.*\.py|
+            examples/.*\.py|
+            python/(nautilus_trader/.*|pyproject\.toml|uv\.lock)|
+            scripts/ci/check-python-types\.bash
+          )$
+        pass_filenames: false
 
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.1

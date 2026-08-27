@@ -47,7 +47,7 @@ use nautilus_model::{
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{AccountId, ActorId, ClientId, ExecAlgorithmId, InstrumentId, TraderId, Venue},
     python::instruments::pyobject_to_instrument_any,
-    types::{Currency, Money, Price},
+    types::{Currency, Money},
 };
 use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
@@ -60,18 +60,17 @@ use nautilus_trading::examples::{
     },
 };
 use nautilus_trading::{
-    ImportableExecAlgorithmConfig, ImportableStrategyConfig,
+    ImportableExecutionAlgorithmConfig, ImportableStrategyConfig,
     algorithm::{TwapAlgorithm, TwapAlgorithmConfig},
     python::algorithm::PyExecutionAlgorithm,
 };
 use pyo3::prelude::*;
 use rust_decimal::Decimal;
 
-use super::node::create_config_instance;
+use super::{modules::pyobject_to_simulation_module_handle, node::create_config_instance};
 use crate::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
-    modules::{FXRolloverInterestModule, SimulationModuleAny},
     result::BacktestResult,
 };
 
@@ -164,7 +163,6 @@ impl PyBacktestEngine {
             frozen_account = false,
             oto_trigger_mode = OtoTriggerMode::Partial,
             price_protection_points = None,
-            settlement_prices = None,
             liquidation_enabled = false,
             liquidation_trigger_ratio = None,
             liquidation_cancel_open_orders = true,
@@ -208,7 +206,6 @@ impl PyBacktestEngine {
         frozen_account: bool,
         oto_trigger_mode: OtoTriggerMode,
         price_protection_points: Option<u32>,
-        settlement_prices: Option<HashMap<InstrumentId, Price>>,
         liquidation_enabled: bool,
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: bool,
@@ -216,12 +213,10 @@ impl PyBacktestEngine {
         let leverages: AHashMap<InstrumentId, Decimal> = leverages
             .map(|m| m.into_iter().collect())
             .unwrap_or_default();
-        let settlement_prices: AHashMap<InstrumentId, Price> = settlement_prices
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default();
         let margin_model = margin_model
             .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
-            .transpose()?;
+            .transpose()?
+            .map(Into::into);
         let fill_model = fill_model
             .map(|obj| Python::attach(|py| pyobject_to_fill_model_handle(obj.bind(py))))
             .transpose()?
@@ -238,15 +233,12 @@ impl PyBacktestEngine {
             .map(|objs| {
                 objs.into_iter()
                     .map(|obj| {
-                        Python::attach(|py| pyobject_to_simulation_module_any(py, obj.bind(py)))
+                        Python::attach(|py| pyobject_to_simulation_module_handle(py, obj.bind(py)))
                     })
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect();
+            .unwrap_or_default();
 
         let sim_config = SimulatedVenueConfig::builder()
             .venue(venue)
@@ -287,12 +279,6 @@ impl PyBacktestEngine {
             .map_err(config_error_to_pyvalue_err)?;
 
         self.0.add_venue(sim_config).map_err(to_pyruntime_err)?;
-
-        for (instrument_id, price) in settlement_prices {
-            self.0
-                .set_settlement_price(venue, instrument_id, price)
-                .map_err(to_pyruntime_err)?;
-        }
 
         Ok(())
     }
@@ -463,7 +449,7 @@ impl PyBacktestEngine {
     fn py_add_exec_algorithm_from_config(
         &mut self,
         _py: Python,
-        config: ImportableExecAlgorithmConfig,
+        config: ImportableExecutionAlgorithmConfig,
     ) -> PyResult<()> {
         self.ensure_can_add_exec_algorithm()?;
 
@@ -577,13 +563,13 @@ impl PyBacktestEngine {
     /// Ends the backtest run, finalizing results.
     #[pyo3(name = "end")]
     fn py_end(&mut self) -> PyResult<()> {
-        self.0.end_with_result().map_err(to_pyruntime_err)
+        self.0.end().map_err(to_pyruntime_err)
     }
 
     /// Resets the engine state for a new run.
     #[pyo3(name = "reset")]
-    fn py_reset(&mut self) {
-        self.0.reset();
+    fn py_reset(&mut self) -> PyResult<()> {
+        self.0.reset().map_err(to_pyruntime_err)
     }
 
     /// Disposes of the engine, releasing all resources.
@@ -653,7 +639,7 @@ impl PyBacktestEngine {
     fn py_add_exec_algorithms_from_configs(
         &mut self,
         py: Python,
-        configs: Vec<ImportableExecAlgorithmConfig>,
+        configs: Vec<ImportableExecutionAlgorithmConfig>,
     ) -> PyResult<()> {
         for config in configs {
             self.py_add_exec_algorithm_from_config(py, config)?;
@@ -1219,10 +1205,10 @@ fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister>
     }
 }
 
-type NativeExecAlgorithmRegister =
+type NativeExecutionAlgorithmRegister =
     for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
 
-fn native_exec_algorithm_register(type_name: &str) -> Option<NativeExecAlgorithmRegister> {
+fn native_exec_algorithm_register(type_name: &str) -> Option<NativeExecutionAlgorithmRegister> {
     match type_name {
         "TwapAlgorithm" => Some(register_twap_algorithm),
         _ => None,
@@ -1683,21 +1669,6 @@ mod tests {
     }
 }
 
-pub(crate) fn pyobject_to_simulation_module_any(
-    _py: Python,
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<SimulationModuleAny> {
-    if let Ok(cell) = obj.cast::<FXRolloverInterestModule>() {
-        let module = cell.borrow().clone();
-        return Ok(SimulationModuleAny::FXRolloverInterest(module));
-    }
-
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to SimulationModule"
-    )))
-}
-
 pub(crate) fn pyobject_to_latency_model_any(
     _py: Python,
     obj: &Bound<'_, PyAny>,
@@ -1935,7 +1906,6 @@ mod model_tests {
                     false,
                     false,
                     OtoTriggerMode::Partial,
-                    None,
                     None,
                     false,
                     None,

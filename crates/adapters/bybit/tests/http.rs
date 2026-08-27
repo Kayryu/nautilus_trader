@@ -29,10 +29,11 @@ use nautilus_bybit::{
     common::{
         consts::BYBIT_VENUE,
         enums::{
-            BybitAccountType, BybitBboSideType, BybitMarginMode, BybitOrderType, BybitPositionIdx,
-            BybitProductType, BybitRepayStatus, BybitTpSlMode, BybitTriggerType,
+            BybitAccountType, BybitBboSideType, BybitEnvironment, BybitMarginMode, BybitOrderType,
+            BybitPositionIdx, BybitProductType, BybitRepayStatus, BybitTpSlMode, BybitTriggerType,
             BybitUnifiedMarginStatus,
         },
+        urls::bybit_http_base_url,
     },
     http::{
         client::{BybitHttpClient, BybitRawHttpClient},
@@ -113,8 +114,7 @@ impl Default for TestServerState {
 /// Wait for the test server to be ready by polling a health endpoint.
 async fn wait_for_server(addr: SocketAddr, path: &str) {
     let health_url = format!("http://{addr}{path}");
-    let http_client =
-        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    let http_client = HttpClient::builder().build().unwrap();
     wait_until_async(
         || {
             let url = health_url.clone();
@@ -503,6 +503,7 @@ async fn handle_get_account_info(headers: axum::http::HeaderMap) -> Response {
     if !headers.contains_key("X-BAPI-API-KEY")
         || !headers.contains_key("X-BAPI-SIGN")
         || !headers.contains_key("X-BAPI-TIMESTAMP")
+        || !headers.contains_key("X-BAPI-RECV-WINDOW")
     {
         return (
             StatusCode::UNAUTHORIZED,
@@ -515,6 +516,29 @@ async fn handle_get_account_info(headers: axum::http::HeaderMap) -> Response {
             })),
         )
             .into_response();
+    }
+
+    let timestamp = headers["X-BAPI-TIMESTAMP"]
+        .to_str()
+        .expect("timestamp header is valid UTF-8")
+        .parse::<i64>()
+        .expect("timestamp header is milliseconds");
+    let recv_window_ms = headers["X-BAPI-RECV-WINDOW"]
+        .to_str()
+        .expect("receive window header is valid UTF-8")
+        .parse::<i64>()
+        .expect("receive window header is milliseconds");
+    let server_time_ms = Timestamp::now().as_millisecond();
+
+    if server_time_ms - timestamp > recv_window_ms {
+        return Json(json!({
+            "retCode": 10002,
+            "retMsg": "Request time exceeds the time window range",
+            "result": {},
+            "retExtInfo": {},
+            "time": server_time_ms
+        }))
+        .into_response();
     }
 
     let account_info = load_test_data("http_get_account_info.json");
@@ -1082,6 +1106,49 @@ async fn test_client_with_credentials() {
 }
 
 #[rstest]
+#[case(true, false, BybitEnvironment::Demo)]
+#[case(false, true, BybitEnvironment::Testnet)]
+#[case(false, false, BybitEnvironment::Mainnet)]
+fn test_clients_new_with_env_resolve_default_url(
+    #[case] demo: bool,
+    #[case] testnet: bool,
+    #[case] environment: BybitEnvironment,
+) {
+    let raw_client = BybitRawHttpClient::new_with_env(
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        None,
+        demo,
+        testnet,
+        60,
+        3,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+    let client = BybitHttpClient::new_with_env(
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        None,
+        demo,
+        testnet,
+        60,
+        3,
+        1000,
+        10_000,
+        5_000,
+        None,
+    )
+    .unwrap();
+    let expected = bybit_http_base_url(environment);
+
+    assert_eq!(raw_client.base_url(), expected);
+    assert_eq!(client.base_url(), expected);
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_testnet_urls() {
     let client = BybitHttpClient::new(
@@ -1402,6 +1469,38 @@ async fn test_rate_limiting_retries_then_succeeds() {
     assert_eq!(response.result.list.len(), 1);
     assert_eq!(response.result.list[0].order_id.as_str(), "abcdef123456");
     assert_eq!(response.result.list[0].order_link_id.as_str(), "client-1");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_rate_limited_requests_use_fresh_auth_timestamps() {
+    const RECV_WINDOW_MS: u64 = 250;
+    const REQUEST_COUNT: usize = 51;
+
+    let (addr, _state) = start_test_server().await.unwrap();
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1,
+        1,
+        RECV_WINDOW_MS,
+        None,
+    )
+    .unwrap();
+
+    let requests = (0..REQUEST_COUNT).map(|_| {
+        let client = client.clone();
+        async move { client.get_account_info().await }
+    });
+    let results = futures_util::future::join_all(requests).await;
+
+    assert_eq!(results.len(), REQUEST_COUNT);
+    for result in results {
+        assert!(result.is_ok(), "request failed: {result:?}");
+    }
 }
 
 #[rstest]
@@ -2590,32 +2689,19 @@ async fn test_spot_position_report_short_from_borrowed_balance() {
 
     let eth = Currency::from("ETH");
     let usdt = Currency::from("USDT");
-    let ethusdt = CurrencyPair::new(
-        "ETHUSDT-SPOT.BYBIT".into(),
-        "ETHUSDT".into(),
-        eth,
-        usdt,
-        2,
-        5,
-        Price::from("0.01"),
-        Quantity::from("0.00001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        0.into(),
-        0.into(),
-    );
+    let ethusdt = CurrencyPair::builder()
+        .instrument_id("ETHUSDT-SPOT.BYBIT".into())
+        .raw_symbol("ETHUSDT".into())
+        .base_currency(eth)
+        .quote_currency(usdt)
+        .price_precision(2)
+        .size_precision(5)
+        .price_increment(Price::from("0.01"))
+        .size_increment(Quantity::from("0.00001"))
+        .ts_event(0.into())
+        .ts_init(0.into())
+        .build()
+        .unwrap();
     client.cache_instrument(InstrumentAny::CurrencyPair(ethusdt));
 
     let account_id = AccountId::new("BYBIT-UNIFIED");

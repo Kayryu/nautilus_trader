@@ -37,7 +37,7 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 use super::{
-    order_builder::PolymarketOrderBuilder,
+    order_builder::{PolymarketOrderBuilder, signed_limit_order_quantity},
     parse::{adjust_market_buy_amount, calculate_market_price},
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
@@ -47,7 +47,7 @@ use crate::{
         clob::PolymarketClobHttpClient,
         error::{Error, Result as HttpResult, sanitize_error_text},
         models::{PolymarketOpenOrder, PolymarketOrder},
-        query::{CancelResponse, OrderResponse},
+        query::{CancelMarketOrdersParams, CancelResponse, OrderResponse},
     },
 };
 
@@ -311,6 +311,33 @@ impl OrderSubmitter {
             .await
     }
 
+    /// Cancels all orders for one outcome token with retry on transient failures.
+    pub(crate) async fn cancel_market_orders(&self, asset_id: &str) -> HttpResult<CancelResponse> {
+        let http_client = self.http_client.clone();
+        let asset_id = asset_id.to_string();
+
+        self.retry_manager
+            .execute_with_retry_with_delay(
+                "cancel_market_orders",
+                || {
+                    let http_client = http_client.clone();
+                    let asset_id = asset_id.clone();
+                    async move {
+                        http_client
+                            .cancel_market_orders(CancelMarketOrdersParams {
+                                market: None,
+                                asset_id: Some(asset_id),
+                            })
+                            .await
+                    }
+                },
+                |e| e.is_retryable(),
+                Error::retry_after,
+                |e| Error::transport(e.to_string()),
+            )
+            .await
+    }
+
     /// Cancels multiple orders with retry on transient failures.
     pub(crate) async fn cancel_orders(
         &self,
@@ -433,6 +460,7 @@ impl OrderSubmitter {
             order_type,
             post_only: request.post_only,
             expected_venue_order_id,
+            expected_base_qty: signed_limit_order_quantity(request.quantity.as_decimal()),
         })
     }
 

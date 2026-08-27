@@ -93,7 +93,7 @@ use nautilus_common::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
         data::DataCommand,
         execution::{GenerateOrderStatusReports, GeneratePositionStatusReports, TradingCommand},
-        system::{QueueStateChanged, SocketStateChange, SocketStateChanged},
+        system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
     runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
@@ -111,6 +111,7 @@ use nautilus_model::{
     orders::Order,
     reports::PositionStatusReport,
 };
+use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
 use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
@@ -130,6 +131,7 @@ use crate::{
         },
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
 
 pub mod builder;
@@ -170,6 +172,7 @@ pub struct LiveNode {
     handle: LiveNodeHandle,
     exec_manager: ExecutionManager,
     exec_clients: Vec<LiveExecutionClient>,
+    socket_registry: SocketReconnectRegistry,
     cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
     external_msgbus: Option<ExternalMessageBusIngress>,
     shutdown_deadline: Option<dst::time::Instant>,
@@ -182,12 +185,17 @@ impl LiveNode {
     ///
     /// This is an internal constructor used by `LiveNodeBuilder`.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "builder components have distinct lifecycle roles"
+    )]
     pub(crate) fn new_from_builder(
         kernel: NautilusKernel,
         runner: AsyncRunner,
         config: LiveNodeConfig,
         exec_manager: ExecutionManager,
         exec_clients: Vec<LiveExecutionClient>,
+        socket_registry: SocketReconnectRegistry,
         cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
         external_msgbus: Option<ExternalMessageBusIngress>,
     ) -> Self {
@@ -198,6 +206,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients,
+            socket_registry,
             cache_database_factory,
             external_msgbus,
             shutdown_deadline: None,
@@ -262,7 +271,7 @@ impl LiveNode {
             kernel.clock.clone(),
             kernel.cache.clone(),
             exec_manager_config,
-        );
+        )?;
 
         let node = Self {
             kernel,
@@ -271,6 +280,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients: Vec::new(),
+            socket_registry: SocketReconnectRegistry::default(),
             cache_database_factory: None,
             external_msgbus: None,
             shutdown_deadline: None,
@@ -583,7 +593,56 @@ impl LiveNode {
     fn process_system_command(&self, command: SystemCommand) {
         match command {
             SystemCommand::ReconnectSocket(command) => {
-                self.kernel.process_socket_reconnect(command);
+                self.process_socket_reconnect(command);
+            }
+        }
+    }
+
+    fn process_socket_reconnect(&self, command: ReconnectSocket) {
+        let outcome = if command.trader_id == self.config.trader_id {
+            Self::request_socket_reconnect(
+                self.socket_registry
+                    .get(command.client_id, command.endpoint),
+            )
+        } else {
+            SocketReconnectDispatchOutcome::InvalidTrader
+        };
+
+        if outcome == SocketReconnectDispatchOutcome::Accepted {
+            log::info!(
+                "Requested socket reconnect for client {} endpoint {}",
+                command.client_id,
+                command.endpoint
+            );
+        } else {
+            log::warn!(
+                "Rejected socket reconnect request for client {} endpoint {}: {outcome:?}",
+                command.client_id,
+                command.endpoint
+            );
+        }
+    }
+
+    fn request_socket_reconnect(lookup: SocketReconnectLookup) -> SocketReconnectDispatchOutcome {
+        match lookup {
+            SocketReconnectLookup::Handle(handle) => match handle.request_reconnect() {
+                ReconnectRequestOutcome::Accepted => SocketReconnectDispatchOutcome::Accepted,
+                ReconnectRequestOutcome::AlreadyReconnecting => {
+                    SocketReconnectDispatchOutcome::AlreadyReconnecting
+                }
+                ReconnectRequestOutcome::Disconnected => {
+                    SocketReconnectDispatchOutcome::Disconnected
+                }
+                ReconnectRequestOutcome::Closed => SocketReconnectDispatchOutcome::Closed,
+                ReconnectRequestOutcome::Unsupported => SocketReconnectDispatchOutcome::Unsupported,
+            },
+            SocketReconnectLookup::ClientNotFound => SocketReconnectDispatchOutcome::UnknownClient,
+            SocketReconnectLookup::Unsupported => SocketReconnectDispatchOutcome::Unsupported,
+            SocketReconnectLookup::EndpointNotFound => {
+                SocketReconnectDispatchOutcome::UnknownEndpoint
+            }
+            SocketReconnectLookup::AmbiguousEndpoint => {
+                SocketReconnectDispatchOutcome::AmbiguousEndpoint
             }
         }
     }
@@ -2963,6 +3022,19 @@ impl LiveNode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketReconnectDispatchOutcome {
+    Accepted,
+    AlreadyReconnecting,
+    Disconnected,
+    Closed,
+    Unsupported,
+    InvalidTrader,
+    UnknownClient,
+    UnknownEndpoint,
+    AmbiguousEndpoint,
+}
+
 fn record_runner_dispatch(
     metrics: &RunnerMetrics,
     channel: SystemChannel,
@@ -3553,6 +3625,7 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+    use crate::socket::SocketControl;
 
     struct ExternalIngressLogCapture {
         messages: Mutex<Vec<String>>,
@@ -3670,7 +3743,7 @@ mod tests {
     fn test_publish_queue_state_transitions_reaches_typed_subscriber() {
         let config = LiveNodeConfig {
             trader_id: TraderId::from("QUEUE-001"),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -3731,7 +3804,7 @@ mod tests {
     fn test_process_socket_state_change_reaches_typed_subscriber() {
         let config = LiveNodeConfig {
             trader_id: TraderId::from("SOCKET-001"),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -3775,11 +3848,113 @@ mod tests {
     }
 
     #[rstest]
+    #[case::accepted(
+        ReconnectRequestOutcome::Accepted,
+        SocketReconnectDispatchOutcome::Accepted
+    )]
+    #[case::already_reconnecting(
+        ReconnectRequestOutcome::AlreadyReconnecting,
+        SocketReconnectDispatchOutcome::AlreadyReconnecting
+    )]
+    #[case::disconnected(
+        ReconnectRequestOutcome::Disconnected,
+        SocketReconnectDispatchOutcome::Disconnected
+    )]
+    #[case::closed(
+        ReconnectRequestOutcome::Closed,
+        SocketReconnectDispatchOutcome::Closed
+    )]
+    #[case::unsupported(
+        ReconnectRequestOutcome::Unsupported,
+        SocketReconnectDispatchOutcome::Unsupported
+    )]
+    fn test_request_socket_reconnect_maps_transport_outcome(
+        #[case] transport: ReconnectRequestOutcome,
+        #[case] expected: SocketReconnectDispatchOutcome,
+    ) {
+        let registry = SocketReconnectRegistry::default();
+        let client_id = ClientId::from("TEST");
+        let endpoint = Ustr::from("test-streams");
+        let control = SocketControl::with_registry(client_id, None, endpoint, &registry);
+        let _sink = control.sink();
+        control.register(move || transport);
+
+        let outcome = LiveNode::request_socket_reconnect(registry.get(client_id, endpoint));
+
+        assert_eq!(outcome, expected);
+    }
+
+    #[rstest]
+    #[case::client_not_found(
+        SocketReconnectLookup::ClientNotFound,
+        SocketReconnectDispatchOutcome::UnknownClient
+    )]
+    #[case::unsupported(
+        SocketReconnectLookup::Unsupported,
+        SocketReconnectDispatchOutcome::Unsupported
+    )]
+    #[case::endpoint_not_found(
+        SocketReconnectLookup::EndpointNotFound,
+        SocketReconnectDispatchOutcome::UnknownEndpoint
+    )]
+    #[case::ambiguous(
+        SocketReconnectLookup::AmbiguousEndpoint,
+        SocketReconnectDispatchOutcome::AmbiguousEndpoint
+    )]
+    fn test_request_socket_reconnect_maps_lookup_failure(
+        #[case] lookup: SocketReconnectLookup,
+        #[case] expected: SocketReconnectDispatchOutcome,
+    ) {
+        assert_eq!(LiveNode::request_socket_reconnect(lookup), expected);
+    }
+
+    #[rstest]
+    fn test_process_socket_reconnect_routes_only_matching_trader() {
+        let trader_id = TraderId::from("SOCKET-001");
+        let config = LiveNodeConfig {
+            trader_id,
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = LiveNode::build("SocketReconnectNode".to_string(), Some(config)).unwrap();
+        let client_id = ClientId::from("TEST");
+        let endpoint = Ustr::from("test-streams");
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let control =
+            SocketControl::with_registry(client_id, None, endpoint, &node.socket_registry);
+        let _sink = control.sink();
+        control.register(move || {
+            request_count.fetch_add(1, Ordering::SeqCst);
+            ReconnectRequestOutcome::Accepted
+        });
+
+        node.process_system_command(SystemCommand::ReconnectSocket(ReconnectSocket::new(
+            TraderId::from("OTHER-001"),
+            client_id,
+            endpoint,
+            UnixNanos::default(),
+        )));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        node.process_system_command(SystemCommand::ReconnectSocket(ReconnectSocket::new(
+            trader_id,
+            client_id,
+            endpoint,
+            UnixNanos::default(),
+        )));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_start_publishes_socket_change_after_actor_subscribes() {
         let config = LiveNodeConfig {
             trader_id: TraderId::from("SOCKET-STARTUP-001"),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -3836,7 +4011,7 @@ mod tests {
                 mean_dispatch_ns_trigger: 1,
                 mean_dispatch_ns_clear: 0,
             }),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -3905,7 +4080,7 @@ mod tests {
     #[rstest]
     fn test_observe_exec_event_before_dispatch_skips_recent_fill_report() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -3944,7 +4119,7 @@ mod tests {
         #[case] expected_query_count: usize,
     ) {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 open_check_threshold_ms: 5_000,
                 single_order_query_delay_ms: 0,
@@ -4283,7 +4458,7 @@ mod tests {
     #[rstest]
     fn test_observe_exec_event_before_dispatch_accepted_batch_stamps_local_activity() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 open_check_threshold_ms: 5_000,
                 single_order_query_delay_ms: 0,
@@ -4340,7 +4515,7 @@ mod tests {
         use nautilus_model::{events::OrderPendingCancel, identifiers::ClientOrderId};
 
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 inflight_check_threshold_ms: 100,
                 inflight_check_retries: 1,
@@ -4454,7 +4629,7 @@ mod tests {
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_risk_bound_command_does_not_register_inflight() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 inflight_check_threshold_ms: 100,
                 inflight_check_retries: 2,
@@ -4537,7 +4712,7 @@ mod tests {
                 bypass: true,
                 ..Default::default()
             },
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 inflight_check_threshold_ms: 100,
                 inflight_check_retries: 2,
@@ -4701,7 +4876,7 @@ mod tests {
         // and LiveNodeConfig defaults it to false.
         let builder = LiveNodeBuilder::new(TraderId::default(), Environment::Live)
             .unwrap()
-            .with_exec_engine_config(crate::config::LiveExecEngineConfig {
+            .with_exec_engine_config(crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             })
@@ -5299,7 +5474,7 @@ mod tests {
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_run_reconciliation_checks_does_not_publish_open_order_queries() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 open_check_interval_secs: Some(1.0),
                 position_check_interval_secs: Some(1.0),
@@ -5416,7 +5591,7 @@ mod tests {
 
     fn recent_fill_test_fixture(name: &str) -> (LiveNode, OrderEventAny, InstrumentAny) {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: true,
                 ..Default::default()
             },
@@ -5563,7 +5738,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_stop_request_aborts_startup_without_running() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5585,7 +5760,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_stop_processes_residual_exec_event_during_grace_period() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5654,7 +5829,7 @@ mod tests {
         let config = LiveNodeConfig {
             load_state: true,
             save_state: true,
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5716,7 +5891,7 @@ mod tests {
         let (database, control) = TestCacheDatabaseControl::create();
         let config = LiveNodeConfig {
             save_state: true,
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5769,7 +5944,7 @@ mod tests {
     #[tokio::test]
     async fn test_stop_drains_queued_exec_event_after_zero_grace() {
         let config = LiveNodeConfig {
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5907,7 +6082,7 @@ mod tests {
     fn test_build_rejects_event_store_config_without_factory() {
         let config = LiveNodeConfig {
             event_store: Some(EventStoreConfig::default()),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -5929,7 +6104,7 @@ mod tests {
     fn test_direct_build_rejects_event_store_config() {
         let config = LiveNodeConfig {
             event_store: Some(EventStoreConfig::default()),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -6192,7 +6367,7 @@ mod tests {
         let config = LiveNodeConfig {
             environment: Environment::Sandbox,
             msgbus: Some(msgbus_config),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -6292,7 +6467,7 @@ mod tests {
         let config = LiveNodeConfig {
             environment: Environment::Sandbox,
             msgbus: Some(MessageBusConfig::default()),
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -6403,7 +6578,7 @@ mod tests {
         let ingress = CapturingExternalIngress::new(rx, closed.clone());
         let config = LiveNodeConfig {
             environment: Environment::Sandbox,
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -6476,7 +6651,7 @@ mod tests {
         let ingress = CapturingExternalIngress::new(rx, closed.clone());
         let config = LiveNodeConfig {
             environment: Environment::Sandbox,
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
@@ -6533,7 +6708,7 @@ mod tests {
         let ingress = FailingExternalIngress::new(closed.clone());
         let config = LiveNodeConfig {
             environment: Environment::Sandbox,
-            exec_engine: crate::config::LiveExecEngineConfig {
+            exec_engine: crate::config::LiveExecutionEngineConfig {
                 reconciliation: false,
                 ..Default::default()
             },
