@@ -106,6 +106,7 @@ nautilus-blockchain = { path = "crates/adapters/blockchain", version = "0.63.0" 
 nautilus-bybit = { path = "crates/adapters/bybit", version = "0.63.0", default-features = false }
 nautilus-coinbase = { path = "crates/adapters/coinbase", version = "0.63.0", default-features = false }
 nautilus-databento = { path = "crates/adapters/databento", version = "0.63.0", default-features = false }
+nautilus-deepx = { path = "crates/adapters/deepx", version = "0.63.0", default-features = false }
 nautilus-deribit = { path = "crates/adapters/deribit", version = "0.63.0", default-features = false }
 nautilus-derive = { path = "crates/adapters/derive", version = "0.63.0", default-features = false }
 nautilus-dydx = { path = "crates/adapters/dydx", version = "0.63.0", default-features = false }
