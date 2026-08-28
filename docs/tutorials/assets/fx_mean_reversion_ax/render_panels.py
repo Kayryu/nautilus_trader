@@ -115,14 +115,20 @@ def run_backtest() -> object:
         ts_init=0,
     )
 
-    df = pd.read_csv(
-        TRUEFX_CSV,
-        header=None,
-        names=["pair", "timestamp", "bid", "ask"],
-    )
+    df = pd.read_csv(TRUEFX_CSV, header=None)
+    if df.shape[1] == 3 and df.iloc[0].tolist() == ["timestamp", "bid", "ask"]:
+        df.columns = ["timestamp", "bid", "ask"]
+        df = df.iloc[1:]
+        timestamp_format = "ISO8601"
+    elif df.shape[1] == 4:
+        df.columns = ["pair", "timestamp", "bid", "ask"]
+        timestamp_format = "%Y%m%d %H:%M:%S.%f"
+    else:
+        raise ValueError(f"Unexpected TrueFX CSV format with {df.shape[1]} columns")
+
     df["timestamp"] = pd.to_datetime(
         df["timestamp"],
-        format="%Y%m%d %H:%M:%S.%f",
+        format=timestamp_format,
         utc=True,
     )
     df = df.set_index("timestamp")[["bid", "ask"]].sort_index()

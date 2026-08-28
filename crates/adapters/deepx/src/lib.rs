@@ -23,10 +23,19 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod common;
+pub mod config;
+pub mod data;
 pub mod execution;
+pub mod factories;
 pub mod http;
+pub mod providers;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod websocket;
 
 pub use common::consts::{DEEPX, DEEPX_CLIENT_ID, DEEPX_VENUE};
+pub use common::credential::DeepXCredential;
+pub use config::{DeepXDataClientConfig, DeepXExecutionClientConfig};
+pub use data::DeepXDataClient;
+pub use factories::DeepXDataClientFactory;
+pub use providers::DeepXInstrumentProvider;

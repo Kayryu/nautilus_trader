@@ -13,43 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{fmt::Display, str::FromStr};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-
-pub const DEEPX_CLOID_MIN: u64 = 1 << 31;
-pub const DEEPX_CLOID_MAX: u64 = u32::MAX as u64;
-
-/// A DeepX client order ID which becomes the venue order ID when accepted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DeepXCloid(u32);
-
-impl DeepXCloid {
-    /// Creates a CLOID after validating the venue's reserved range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `value` is outside `2^31..=2^32 - 1`.
-    pub fn new(value: u64) -> Result<Self, String> {
-        let value = u32::try_from(value)
-            .map_err(|_| format!("DeepX CLOID {value} exceeds {DEEPX_CLOID_MAX}"))?;
-        if u64::from(value) < DEEPX_CLOID_MIN {
-            return Err(format!("DeepX CLOID {value} is below {DEEPX_CLOID_MIN}"));
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u32 {
-        self.0
-    }
-}
-
-impl Display for DeepXCloid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
 
 /// Business-level lifecycle of a submitted DeepX extrinsic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,20 +52,6 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-
-    #[rstest]
-    #[case(DEEPX_CLOID_MIN)]
-    #[case(DEEPX_CLOID_MAX)]
-    fn accepts_cloid_boundaries(#[case] value: u64) {
-        assert_eq!(DeepXCloid::new(value).unwrap().value(), value as u32);
-    }
-
-    #[rstest]
-    #[case(DEEPX_CLOID_MIN - 1)]
-    #[case(DEEPX_CLOID_MAX + 1)]
-    fn rejects_cloid_outside_reserved_range(#[case] value: u64) {
-        assert!(DeepXCloid::new(value).is_err());
-    }
 
     #[rstest]
     #[case("submitting", DeepXExecutionState::Submitting)]

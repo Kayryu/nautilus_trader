@@ -23,19 +23,35 @@ crate-type = ["rlib"]
 [features]
 default = ["high-precision"]
 extension-module = ["pyo3/extension-module", "python"]
-python = ["nautilus-model/python", "pyo3", "pyo3-stub-gen"]
+python = ["nautilus-model/python", "nautilus-system", "pyo3", "pyo3-stub-gen"]
 high-precision = ["nautilus-model/high-precision"]
 
 [dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
 rust_decimal = { workspace = true }
+scale-decode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subxt = { workspace = true }
+subxt-signer = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 ustr = { workspace = true }
+zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 rstest = { workspace = true }

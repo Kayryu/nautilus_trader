@@ -14,29 +14,57 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Stream DeepX market data with the built-in DataTester actor.
+Request DeepX instruments and an order book snapshot with the built-in DataTester actor.
+
+Running this example connects to DeepX testnet and immediately requests the perpetual market
+catalog and one L2 order book snapshot. No orders are placed.
 
 """
 
 from __future__ import annotations
 
+from nautilus_trader.adapters.deepx import (
+    DEEPX,
+    DeepXDataClientConfig,
+    DeepXDataClientFactory,
+    DeepXEnvironment,
+)
 from nautilus_trader.common import Environment
 from nautilus_trader.live import LiveNode
-from nautilus_trader.model import InstrumentId
-from nautilus_trader.model import TraderId
+from nautilus_trader.model import ClientId, InstrumentId, TraderId
+from nautilus_trader.testkit import DataTesterConfig
 
-
-DEEPX = "DEEPX"
 TRADER_ID = TraderId.from_str("TESTER-001")
 INSTRUMENT_ID = InstrumentId.from_str(f"ETH-USDC-PERP.{DEEPX}")
 
 
 def main() -> None:
-    _ = LiveNode.builder("DEEPX-DATA-TESTER-001", TRADER_ID, Environment.LIVE)
+    """
+    Run the example.
+    """
+    node = (
+        LiveNode.builder("DEEPX-DATA-TESTER-001", TRADER_ID, Environment.LIVE)
+        .add_data_client(
+            DEEPX,
+            DeepXDataClientFactory(),
+            DeepXDataClientConfig(environment=DeepXEnvironment.TESTNET),
+        )
+        .build()
+    )
+    node.add_builtin_actor(
+        "DataTester",
+        DataTesterConfig(
+            client_id=ClientId.from_str(DEEPX),
+            instrument_ids=[INSTRUMENT_ID],
+            request_instruments=True,
+            request_book_snapshot=True,
+            manage_book=True,
+            log_data=True,
+            stats_interval_secs=0,
+        ),
+    )
 
-    print("DeepX data tester placeholder")
-    print("DeepX live data client bindings are not yet available in Python API")
-    print(f"Planned instrument: {INSTRUMENT_ID}")
+    node.run()
 
 
 if __name__ == "__main__":

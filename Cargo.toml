@@ -174,6 +174,7 @@ futures-util = { version = "0.3.34", default-features = false, features = [
   "sink",
 ] }
 http = "1.5.0"
+hex = "0.4.3"
 implied-vol = { version = "2.0.0" }
 indexmap = { version = "2.14.0", features = ["serde"] }
 itchy = "0.3"
@@ -256,6 +257,7 @@ rustls = { version = "0.23.43", default-features = false, features = [
   "std",
   "tls12",
 ] }
+scale-decode = "0.16.2"
 serde = { version = "1.0.229", default-features = false, features = [
   "derive",
   "std",
@@ -264,6 +266,14 @@ serde = { version = "1.0.229", default-features = false, features = [
 serde_json = { version = "1.0.151", default-features = false, features = [
   "raw_value",
   "std",
+] }
+subxt = "0.50.3"
+subxt-signer = { version = "0.50.3", default-features = false, features = [
+  "ecdsa",
+  "native",
+  "std",
+  "subxt",
+  "unstable-eth",
 ] }
 serde_urlencoded = "0.7.1"
 smallvec = { version = "1.15.2", features = ["serde"] }

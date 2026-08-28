@@ -13,6 +13,18 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+pub mod client;
+pub mod nonce;
+pub mod signer;
 pub mod types;
 
+pub use client::{
+    DeepXExecutionCoordinator, DeepXExecutionCoordinatorError, DeepXSubmissionOutcome,
+};
+pub use nonce::{DeepXChainTimeCalibration, DeepXNonceError, DeepXTimestampNonceAllocator};
+pub use signer::{
+    DeepXCancelPerpOrder, DeepXExtrinsicSigner, DeepXOrderType, DeepXOrderValidationError,
+    DeepXPerpMarketConstraints, DeepXPlacePerpOrder, DeepXPostOnly, DeepXSignerError,
+};
 pub use types as models;
+pub use types::DeepXExecutionState;

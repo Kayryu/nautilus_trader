@@ -13,10 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-pub mod book_sync;
-pub mod enums;
-pub mod messages;
-pub mod parse;
-pub mod requests;
+use pyo3::prelude::*;
 
-pub use book_sync::{DeepXBookSync, DeepXBookSyncOutcome};
+use crate::{common::consts::DEEPX, factories::DeepXDataClientFactory};
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DeepXDataClientFactory {
+    /// Factory for creating DeepX data clients.
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
+
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &str {
+        DEEPX
+    }
+}

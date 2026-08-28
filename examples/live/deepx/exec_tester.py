@@ -14,37 +14,23 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 """
-Test DeepX execution with the built-in ExecTester strategy.
+Report the current DeepX execution capability boundary.
 
-WARNING: when this becomes wired to a real account, it can submit live orders.
+DeepX execution is intentionally unavailable until authoritative private account, order, fill,
+and position schemas support bootstrap and reconciliation. This script does not connect or submit
+orders.
 """
 
 from __future__ import annotations
 
-from nautilus_trader.common import Environment
-from nautilus_trader.live import LiveNode
-from nautilus_trader.model import AccountId
-from nautilus_trader.model import InstrumentId
-from nautilus_trader.model import StrategyId
-from nautilus_trader.model import TraderId
-
-
-DEEPX = "DEEPX"
-TRADER_ID = TraderId.from_str("TESTER-001")
-ACCOUNT_ID = AccountId.from_str("DEEPX-001")
-STRATEGY_ID = StrategyId.from_str("EXEC_TESTER-001")
-INSTRUMENT_ID = InstrumentId.from_str(f"ETH-USDC-PERP.{DEEPX}")
-ORDER_QTY = "0.01"
-
 
 def main() -> None:
-    _ = LiveNode.builder("DEEPX-EXEC-TESTER-001", TRADER_ID, Environment.LIVE)
-
-    print("DeepX exec tester placeholder")
-    print("DeepX live execution client bindings are not yet available in Python API")
-    print(
-        "Planned config: "
-        f"account={ACCOUNT_ID}, strategy={STRATEGY_ID}, instrument={INSTRUMENT_ID}, qty={ORDER_QTY}"
+    """
+    Exit before constructing a live trading node.
+    """
+    raise SystemExit(
+        "DeepX execution is unavailable: authoritative account bootstrap and reconciliation "
+        "schemas have not been integrated"
     )
 
 
