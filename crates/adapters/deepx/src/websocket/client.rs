@@ -397,9 +397,103 @@ fn parse_subscription_response(
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        Router,
+        extract::{
+            State,
+            ws::{Message as AxumMessage, WebSocketUpgrade},
+        },
+        response::Response,
+        routing::get,
+    };
     use rstest::rstest;
 
     use super::*;
+
+    async fn capture_request(
+        upgrade: WebSocketUpgrade,
+        State(sender): State<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Response {
+        upgrade.on_upgrade(move |mut socket| async move {
+            if let Some(Ok(AxumMessage::Text(text))) = socket.recv().await {
+                let _ = sender.send(text.to_string());
+            }
+        })
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn replays_desired_subscriptions_after_reconnect() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new()
+            .route("/ws", get(capture_request))
+            .with_state(request_tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let config = WebSocketConfig {
+            url: format!("ws://{address}/ws"),
+            headers: vec![],
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
+            reconnect_delay_initial_ms: None,
+            reconnect_delay_max_ms: None,
+            reconnect_backoff_factor: None,
+            reconnect_jitter_ms: None,
+            reconnect_max_attempts: Some(0),
+            heartbeat_timeout_secs: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::default(),
+            proxy_url: None,
+        };
+        let message_handler: MessageHandler = std::sync::Arc::new(|_| {});
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .connect()
+            .await
+            .unwrap();
+        let params = DeepXWsParams::perpetual_trades("ETH-USDC");
+        let key = SubscriptionKey::from(&params);
+        let desired = HashMap::from([(key.clone(), params)]);
+        let mut pending = HashMap::from([(99, (DeepXWsMethod::Subscribe, key.clone()))]);
+        let mut next_request_id = 1;
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(
+            handle_message(
+                Message::Text(RECONNECTED.to_string().into()),
+                &client,
+                &desired,
+                &mut pending,
+                &mut next_request_id,
+                &output_tx,
+            )
+            .await
+        );
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("DeepX reconnect replay timed out")
+            .expect("DeepX test server closed before receiving replay");
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["id"], 1);
+        assert_eq!(request["method"], "subscribe");
+        assert_eq!(request["params"]["channel"], TRADES_CHANNEL);
+        assert_eq!(request["params"]["symbol"], "ETH-USDC");
+        assert_eq!(next_request_id, 2);
+        assert_eq!(
+            pending,
+            HashMap::from([(1, (DeepXWsMethod::Subscribe, key))])
+        );
+        assert_eq!(
+            output_rx.recv().await,
+            Some(DeepXWebSocketMessage::Reconnected)
+        );
+
+        client.disconnect().await;
+    }
 
     #[rstest]
     fn parses_verified_subscription_response() {

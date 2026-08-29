@@ -883,6 +883,64 @@ mod tests {
         task.abort();
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn recovers_order_book_gap_with_rest_snapshot_and_replays_buffered_delta() {
+        let router = Router::new().route(
+            "/v1/perp/markets/ETH-USDC/orderbook",
+            get(|| async {
+                Json(serde_json::json!({
+                    "asks": [["2457.02", "0.859"]],
+                    "bids": [["2456.81", "0.291"]],
+                    "engineTime": 1787562160783_u64,
+                    "lastUpdateId": 100_u64,
+                    "serverTime": 1787562160833_u64
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let market: DeepXPerpetualMarket = serde_json::from_value(market_json()).unwrap();
+        let instrument = parse_perpetual_instrument(&market, UnixNanos::default()).unwrap();
+        let instruments = std::collections::HashMap::from([(market.symbol.clone(), instrument)]);
+        let http_client =
+            DeepXRawHttpClient::new(Some(format!("http://{address}")), 1, None).unwrap();
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_websocket_task(message_rx, http_client, instruments, data_tx);
+        let delta: DeepXOrderBookUpdate = serde_json::from_str(
+            r#"{"asks":[["2457.02","0"]],"bids":[],"engineTime":1787562162051,"lastUpdateId":101,"prevLastUpdateId":100,"serverTime":1787562162052,"symbol":"ETH-USDC","updateType":"delta"}"#,
+        )
+        .unwrap();
+
+        message_tx
+            .send(DeepXWebSocketMessage::OrderBook(delta))
+            .unwrap();
+
+        let snapshot_event = tokio::time::timeout(Duration::from_secs(1), data_rx.recv())
+            .await
+            .expect("DeepX recovery snapshot publication timed out")
+            .expect("DeepX data stream closed before publishing the recovery snapshot");
+        let DataEvent::Data(Data::Deltas(snapshot_deltas)) = snapshot_event else {
+            panic!("expected recovery snapshot deltas data event")
+        };
+        assert_eq!(snapshot_deltas.deltas.last().unwrap().sequence, 100);
+
+        let replay_event = tokio::time::timeout(Duration::from_secs(1), data_rx.recv())
+            .await
+            .expect("DeepX buffered delta replay timed out")
+            .expect("DeepX data stream closed before replaying the buffered delta");
+        let DataEvent::Data(Data::Deltas(replay_deltas)) = replay_event else {
+            panic!("expected replayed deltas data event")
+        };
+        assert_eq!(replay_deltas.deltas.len(), 1);
+        assert_eq!(replay_deltas.deltas[0].action, BookAction::Delete);
+        assert_eq!(replay_deltas.deltas[0].sequence, 101);
+
+        task.abort();
+    }
+
     async fn client(
         router: Router,
     ) -> (
