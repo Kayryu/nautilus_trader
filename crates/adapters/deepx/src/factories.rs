@@ -94,7 +94,13 @@ impl DataClientFactory for DeepXDataClientFactory {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::factories::DataClientFactory;
+    use nautilus_common::{
+        cache::Cache,
+        clock::TestClock,
+        factories::{ClientConfig, DataClientFactory},
+        live::runner::replace_data_event_sender,
+        messages::DataEvent,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -117,6 +123,51 @@ mod tests {
                 .as_any()
                 .downcast_ref::<DeepXDataClientConfig>()
                 .is_some()
+        );
+    }
+
+    #[rstest]
+    fn data_factory_creates_deepx_client() {
+        let factory = DeepXDataClientFactory::new();
+        let config = DeepXDataClientConfig::default();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        replace_data_event_sender(sender);
+
+        let client = factory
+            .create("DEEPX-TEST", &config, cache.into(), clock)
+            .unwrap();
+
+        assert_eq!(client.client_id(), ClientId::from("DEEPX-TEST"));
+        assert_eq!(client.venue(), Some(*crate::DEEPX_VENUE));
+    }
+
+    #[derive(Debug)]
+    struct WrongConfig;
+
+    impl ClientConfig for WrongConfig {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[rstest]
+    fn data_factory_rejects_wrong_config_type() {
+        let factory = DeepXDataClientFactory::new();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+
+        let result = factory.create("DEEPX-TEST", &WrongConfig, cache.into(), clock);
+        let error = match result {
+            Ok(_) => panic!("expected invalid config type error"),
+            Err(e) => e,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid config type for DeepXDataClientFactory")
         );
     }
 }

@@ -16,7 +16,11 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::common::enums::DeepXEnvironment;
 pub use crate::common::models::DeepXOrderBookLevel;
+
+/// Version of the raw account capture format.
+pub const DEEPX_RAW_ACCOUNT_CAPTURE_VERSION: u8 = 1;
 
 /// Request body used to submit a signed DeepX chain extrinsic.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +69,41 @@ impl DeepXRawAccountSnapshot {
         redact_account_addresses(&mut snapshot.order_history);
         redact_account_addresses(&mut snapshot.trades);
         snapshot
+    }
+}
+
+/// Redacted raw account responses with capture provenance.
+///
+/// The contained requests are concurrent and do not represent an atomic account snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepXRawAccountCapture {
+    pub format_version: u8,
+    pub captured_at_unix_ms: u64,
+    pub environment: DeepXEnvironment,
+    pub rest_base_url: String,
+    pub endpoints: Vec<String>,
+    pub snapshot: DeepXRawAccountSnapshot,
+}
+
+impl DeepXRawAccountCapture {
+    /// Creates a capture envelope and redacts account addresses from all payloads.
+    #[must_use]
+    pub fn new(
+        captured_at_unix_ms: u64,
+        environment: DeepXEnvironment,
+        rest_base_url: String,
+        endpoints: Vec<String>,
+        snapshot: &DeepXRawAccountSnapshot,
+    ) -> Self {
+        Self {
+            format_version: DEEPX_RAW_ACCOUNT_CAPTURE_VERSION,
+            captured_at_unix_ms,
+            environment,
+            rest_base_url,
+            endpoints,
+            snapshot: snapshot.redacted(),
+        }
     }
 }
 
@@ -209,5 +248,35 @@ mod tests {
         );
         assert_eq!(redacted.open_orders["txHash"], transaction_hash);
         assert_eq!(redacted.order_history["orderId"], 42);
+    }
+
+    #[rstest]
+    fn creates_redacted_account_capture_with_provenance() {
+        let address = "0x1111111111111111111111111111111111111111";
+        let snapshot = DeepXRawAccountSnapshot {
+            balances: serde_json::json!({"address": address}),
+            portfolio: serde_json::json!({}),
+            positions: serde_json::json!([]),
+            open_orders: serde_json::json!([]),
+            order_history: serde_json::json!([]),
+            trades: serde_json::json!([]),
+        };
+
+        let capture = DeepXRawAccountCapture::new(
+            1_781_757_000_123,
+            DeepXEnvironment::Testnet,
+            "https://api.testnet.deepx.example".to_string(),
+            vec!["GET /v1/account/subaccounts/{address}/balances".to_string()],
+            &snapshot,
+        );
+        let value = serde_json::to_value(capture).unwrap();
+
+        assert_eq!(value["formatVersion"], DEEPX_RAW_ACCOUNT_CAPTURE_VERSION);
+        assert_eq!(value["capturedAtUnixMs"], 1_781_757_000_123_u64);
+        assert_eq!(value["environment"], "testnet");
+        assert_eq!(
+            value["snapshot"]["balances"]["address"],
+            "<redacted-address>"
+        );
     }
 }

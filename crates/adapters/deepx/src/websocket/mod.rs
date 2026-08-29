@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 pub mod book_sync;
+pub mod client;
 pub mod enums;
 pub mod messages;
 pub mod parse;

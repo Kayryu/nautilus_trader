@@ -507,7 +507,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::credential::DEEPX_TESTNET_SUBACCOUNT_ADDRESS,
+        common::{consts::DEEPX_TESTNET_REST_URL, credential::DEEPX_TESTNET_SUBACCOUNT_ADDRESS},
         http::query::{DeepXOrderSide, DeepXSortDirection},
     };
 
@@ -516,6 +516,90 @@ mod tests {
         let client = DeepXRawHttpClient::new(None, 5, None).unwrap();
 
         assert_eq!(client.base_url(), urls::rest_url(DeepXEnvironment::Testnet));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DeepX testnet REST access"]
+    async fn requests_public_endpoints_from_testnet() {
+        let client =
+            DeepXRawHttpClient::new(Some(DEEPX_TESTNET_REST_URL.to_string()), 10, None).unwrap();
+        let symbol = "ETH-USDC";
+        let trade_history_query = DeepXHistoryQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let market_history_query = DeepXPerpMarketHistoryQuery {
+            interval: "1m".to_string(),
+            limit: Some(2),
+            start_time: None,
+            end_time: None,
+            sort: None,
+        };
+
+        let markets = client.get_perp_markets().await.unwrap();
+        assert!(!markets.is_empty());
+        assert!(markets.iter().all(|market| market.market_id > 0));
+        assert!(markets.iter().all(|market| !market.symbol.is_empty()));
+
+        let market = client.get_perp_market(symbol).await.unwrap();
+        assert_eq!(market.symbol, symbol);
+
+        let candles = client
+            .get_perp_candles(
+                symbol,
+                &DeepXCandleQuery {
+                    interval: "1m".to_string(),
+                    limit: Some(2),
+                    start_time: None,
+                    end_time: None,
+                    price_type: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(candles.is_array());
+
+        let trades = client
+            .get_public_perp_trades(symbol, &trade_history_query)
+            .await
+            .unwrap();
+        assert!(trades["items"].is_array());
+
+        let order_book = client
+            .get_perp_order_book(
+                symbol,
+                &DeepXOrderBookQuery {
+                    limit: Some(10),
+                    merge_level: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(order_book.last_update_id > 0);
+
+        let open_interest = client.get_perp_open_interest(symbol).await.unwrap();
+        assert_eq!(open_interest["symbol"], symbol);
+        let open_interest_history = client
+            .get_perp_open_interest_history(symbol, &market_history_query)
+            .await
+            .unwrap();
+        assert!(open_interest_history.is_array());
+
+        let funding_rate = client.get_perp_funding_rate(symbol).await.unwrap();
+        assert_eq!(funding_rate["symbol"], symbol);
+        let funding_rate_history = client
+            .get_perp_funding_rate_history(symbol, &market_history_query)
+            .await
+            .unwrap();
+        assert!(funding_rate_history.is_array());
+
+        let long_short_ratio = client.get_perp_long_short_ratio(symbol).await.unwrap();
+        assert_eq!(long_short_ratio["symbol"], symbol);
+        let long_short_ratio_history = client
+            .get_perp_long_short_ratio_history(symbol, Some(&market_history_query))
+            .await
+            .unwrap();
+        assert!(long_short_ratio_history.is_array());
     }
 
     #[tokio::test]
@@ -654,7 +738,8 @@ mod tests {
         let subaccount = std::env::var(DEEPX_TESTNET_SUBACCOUNT_ADDRESS).unwrap_or_else(|_| {
             panic!("missing environment variable `{DEEPX_TESTNET_SUBACCOUNT_ADDRESS}`")
         });
-        let client = DeepXRawHttpClient::new(None, 10, None).unwrap();
+        let client =
+            DeepXRawHttpClient::new(Some(DEEPX_TESTNET_REST_URL.to_string()), 10, None).unwrap();
         let history_query = DeepXHistoryQuery {
             limit: Some(500),
             sort: Some(DeepXSortDirection::Desc),
