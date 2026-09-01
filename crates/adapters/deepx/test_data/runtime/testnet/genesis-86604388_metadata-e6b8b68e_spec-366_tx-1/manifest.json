@@ -1,0 +1,37 @@
+{
+  "captured_at": "2026-09-01T03:04:07.715584763+00:00",
+  "deployment": "testnet",
+  "endpoint_role": "runtime_identity",
+  "rpc_url": "https://rpc-testnet.deepx.fi",
+  "block_reference": "best",
+  "identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37",
+    "spec_version": 366,
+    "transaction_version": 1
+  },
+  "metadata_bytes": 101473,
+  "signed_extensions": null,
+  "fixtures": [
+    {
+      "method": "chain_getBlockHash",
+      "params": [
+        0
+      ],
+      "payload_path": "genesis_hash.json",
+      "bytes": 116
+    },
+    {
+      "method": "state_getRuntimeVersion",
+      "params": [],
+      "payload_path": "runtime_version.json",
+      "bytes": 1411
+    },
+    {
+      "method": "state_getMetadata",
+      "params": [],
+      "payload_path": "metadata.json",
+      "bytes": 202998
+    }
+  ]
+}

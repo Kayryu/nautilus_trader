@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-09-01T10:50:56Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_market_data",
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/market/perp/volume",
+    "query": {
+      "marketId": 3,
+      "period": "1h"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "perp_volume_1h.json"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37",
+    "spec_version": 366,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json"
+  },
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves response shape and numeric representation only.",
+    "Volume units, trade-count semantics, window boundaries, and freshness remain unproven."
+  ]
+}

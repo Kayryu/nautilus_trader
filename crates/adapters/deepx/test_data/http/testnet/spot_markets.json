@@ -1,0 +1,26 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": [
+    {
+      "name": "ETH/USDC",
+      "pair": "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+      "quoteAddress": "0x9eb03d8ac62ae18398ced13c033db78b905ad8c9",
+      "quoteDecimal": 6,
+      "quoteSymbol": "usdc",
+      "baseAddress": "0x123ae070eb84068b5fed9f5b99f236507c44c880",
+      "baseDecimal": 18,
+      "baseSymbol": "eth",
+      "takerFeeRate": 0.0004,
+      "makerFeeRate": 0.0001,
+      "price": 2449.68,
+      "tickSize": 0.01,
+      "isPaused": false,
+      "maxDeviationBps": 0.1,
+      "limitOrderGuardLimitLong": 0.2,
+      "limitOrderGuardLimitShort": 5,
+      "last24hPriceChangeRate": 0.51
+    }
+  ],
+  "fail": false
+}
