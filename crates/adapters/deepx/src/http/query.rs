@@ -45,6 +45,30 @@ pub struct DeepXPerpVolumeRequest {
     pub period: DeepXPerpVolumePeriod,
 }
 
+/// Request for the raw perpetual last price.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXPerpLastPriceRequest {
+    /// Deployment-provided perpetual market ID.
+    pub market_id: u64,
+}
+
+impl DeepXPerpLastPriceRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.market_id == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp-last-price market_id must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn as_query(&self) -> DeepXPerpLastPriceQuery {
+        DeepXPerpLastPriceQuery {
+            market_id: self.market_id,
+        }
+    }
+}
+
 impl DeepXPerpVolumeRequest {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.market_id == 0 {
@@ -425,6 +449,12 @@ pub(crate) struct DeepXPerpCandlesQuery {
 pub(crate) struct DeepXPerpVolumeQuery {
     market_id: u64,
     period: DeepXPerpVolumePeriod,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeepXPerpLastPriceQuery {
+    market_id: u64,
 }
 
 impl DeepXPerpCandlesQuery {

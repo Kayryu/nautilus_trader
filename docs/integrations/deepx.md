@@ -19,8 +19,10 @@ implemented and covered by unit tests:
 - Forward-compatible environment and product enums.
 - Product-aware Spot and perpetual symbol parsing and formatting.
 - Exact checked conversion between scaled integers and `Decimal`, without floating point.
-- Read-only runtime capture tooling which pins state queries to one finalized block, plus immutable
-  best-head and finalized fixture sets for the deployment identity below.
+- Read-only runtime capture tooling which pins the header and state queries to one finalized block,
+  records its hash and decoded block number, and supports a `DEEPX_TESTNET_RPC_URL` endpoint
+  override while retaining the hard testnet genesis check. Existing immutable fixtures predate the
+  header capture; a replacement fixture set has not yet been captured.
 - Structured SCALE V14 metadata decoding which validates the metadata prefix and extracts the
   declared signed-extension order; future finalized captures record that order in their manifest.
 - An unauthenticated, read-only JSON HTTP transport built on the shared Nautilus HTTP client, with
@@ -34,9 +36,9 @@ implemented and covered by unit tests:
   instrument provider remains disabled because Spot metadata has no verified order quantity
   increment.
 - Typed single-page perpetual funding-rate, long-short ratio, open-interest, raw trade, raw candle,
-  raw mark-price, and raw oracle-price history reads, plus raw perpetual volume statistics, with
-  synchronous parameter validation and exact financial-value parsing. They preserve venue response
-  order and do not emit Nautilus data events.
+  raw mark-price, and raw oracle-price history reads, plus raw perpetual volume statistics and the
+  raw current last price, with synchronous parameter validation and exact financial-value parsing.
+  They preserve venue response order where applicable and do not emit Nautilus data events.
 - A failure-atomic public market catalog which loads Spot and perpetual metadata concurrently,
   preserves deployment-provided bytes32 pair and numeric market IDs, and indexes entries by
   canonical product-aware Nautilus identities. It is not an `InstrumentProvider`.
@@ -59,11 +61,13 @@ These foundations do not make the adapter operational. Apart from the two public
 single-page perpetual funding-rate, long-short ratio, and open-interest history primitives, one
 descending page of raw perpetual trades, one ascending page of raw one-minute perpetual candles,
 mark-price history, and oracle-price history, and one raw perpetual volume-statistics window, no
-other endpoint-specific HTTP API, live WebSocket transport or channel, instrument provider, market
-data client, account client, signer, execution client, management service, PyO3 binding, or Python
-package is enabled. Authoritative venue rate-limit policy, automatic endpoint pagination, and other
-business response schemas remain unimplemented. Possessing or loading a private key does not enable
-signing or transaction submission.
+other endpoint-specific HTTP API except the raw perpetual last-price read, live WebSocket transport
+or channel, instrument provider, market data client, account client, execution client, management
+service, PyO3 binding, or Python package is enabled. A fixture-gated offline direct-pallet signing
+primitive exists, but no order call is exposed and no transaction submission is implemented.
+Authoritative venue rate-limit policy, automatic endpoint pagination, and other business response
+schemas remain unimplemented. Possessing or loading a private key does not enable trading or
+transaction submission.
 
 ## Plan progress
 
@@ -79,11 +83,17 @@ and add this capability document. The implementation maps to the integration pla
   catalog, strict perpetual `CryptoPerpetual` conversion, typed single-page perpetual funding-rate,
   long-short ratio, and open-interest history reads, a typed single-page raw perpetual trades read,
   a typed single-page raw one-minute perpetual candle, mark-price history, and oracle-price history
-  read, and a typed raw perpetual volume-statistics read exist. No Nautilus instrument provider,
-  framework historical request handling, data client, live public stream, or order-book recovery
-  exists.
-- **Phase D - Not started:** No runtime snapshot service, signer, nonce owner, transaction tracker,
-  or recovery scanner exists.
+  read, a typed raw perpetual volume-statistics read, and a typed raw perpetual last-price read
+  exist. No Nautilus instrument provider, framework historical request handling, data client, live
+  public stream, or order-book recovery exists.
+- **Phase D - Partial:** A fixture-backed immutable runtime snapshot validates the testnet genesis,
+  approved runtime versions, exact metadata SHA-256, ordered signed extensions, and unknown
+  extension encodings. The pinned DeepX Subxt fork provides an AccountId20/Keccak ECDSA offline
+  dynamic-call signer with an explicit caller-supplied nonce. The capture tool can collect the
+  finalized header required to pair a checkpoint hash with its block number, but no committed
+  fixture currently proves that pair, so mortal signing remains disabled. No live snapshot service,
+  runtime refresh or quiescence state machine, order-call model, golden signing vector, nonce owner,
+  transaction submission, tracker, or recovery scanner exists.
 - **Phase E - Not started:** No execution client, account initialization, order commands, reports,
   or reconciliation exists.
 - **Phase F - Not started:** No lending, subaccount, delegate, quota, or bridge service client
@@ -105,9 +115,9 @@ signing, integration-test, benchmark, fuzz, and example directories do not exist
 limited to unauthenticated idempotent JSON reads, including typed Spot and perpetual market lists,
 one page each of perpetual funding-rate, long-short ratio, and open-interest history, one descending
 page of raw perpetual trades, one ascending page of raw one-minute perpetual candles and mark-price
-and oracle-price history, and one raw perpetual volume-statistics window. WebSocket support stops
-before transport connection, venue messages, heartbeat, authentication, subscriptions, and channel
-routing.
+and oracle-price history, one raw perpetual volume-statistics window, and the raw perpetual last
+price. WebSocket support stops before transport connection, venue messages, heartbeat,
+authentication, subscriptions, and channel routing.
 
 Unit and mock tests cover the implemented common, metadata, HTTP, pagination, WebSocket protocol,
 handler, and task-lifecycle code. These tests establish local invariants only; they do not satisfy
@@ -126,7 +136,7 @@ Never use production credentials with this integration.
 | Area                  | Planned boundary                                 | Current status | Notes                                                    |
 | --------------------- | ------------------------------------------------ | -------------- | -------------------------------------------------------- |
 | Environment           | DeepX testnet                                    | Verified       | Deployment identity captured on 2026-09-01.              |
-| Protocol core         | Rust types, fixtures, HTTP/WS protocol state      | Partial        | Typed public reads; no live WebSocket channel.           |
+| Protocol core         | Rust types, fixtures, HTTP/WS and runtime state    | Partial        | Offline signer only; no submission or live WS channel.   |
 | Mainnet               | None                                             | Unsupported    | No validated deployment or protocol evidence is present. |
 | Spot                  | Nautilus data and execution clients              | Planned        | Requires verified asset, market, and trading schemas.    |
 | Perpetual futures     | Nautilus data and execution clients              | Planned        | Requires verified market, account, and trading schemas.  |
@@ -171,9 +181,13 @@ Structured decoding of that finalized SCALE V14 metadata verifies this signed-ex
 9. `CheckPriority`
 
 The order is taken directly from `extrinsic.signed_extensions`; it is not inferred from generic
-Substrate defaults. DeepX's Subxt fork can independently retrieve and decode metadata, but the
-adapter capture path remains block-hash-pinned and uses the smaller `frame-metadata` decoder. This
-evidence resolves extension ordering only and does not enable signing.
+Substrate defaults. The adapter pins DeepX's Subxt fork at commit
+`2904b84ff5d6646481875e06749460dc5ebc6bbc`. The capture path remains block-hash-pinned and uses
+the smaller `frame-metadata` decoder, while the signing path independently decodes the same bytes
+with the pinned fork. This evidence backs an immutable snapshot value which accepts metadata only
+when the observed genesis, runtime versions, metadata SHA-256, extension order, and unknown
+extension encodings match the approved identity. The snapshot is not fetched or refreshed by a
+live service and does not enable transaction submission.
 
 The testnet internal OpenAPI 3.1 document inspected during protocol research identifies itself as
 `internal-v1`. The retrieved JSON was
@@ -301,11 +315,14 @@ market-ID rejection. The volume units, trade-count definition, boundary inclusio
 alignment, update cadence, freshness, and `statisticTime` semantics remain unproven. The adapter
 therefore emits no Nautilus volume or bar event.
 
-The perpetual last-price endpoint is not exposed. A read-only testnet probe on 2026-09-01 confirmed
-a successful scalar JSON-number response. The HTTP financial-value parser now preserves original
-JSON number lexemes when creating a `Decimal`, but the endpoint supplies no observation timestamp.
-Until runtime-tagged evidence establishes observation timing and freshness semantics, the endpoint
-remains unsupported.
+The typed raw perpetual last-price primitive calls `GET /internal/v1/market/perp/last_price` with a
+deployment market ID and returns the successful scalar JSON-number payload as an exact `Decimal`
+without assigning observation-time semantics. A read-only testnet probe on 2026-09-01 confirmed the
+successful response shape. Mock tests prove typed query encoding, exact high-precision response
+decoding, and synchronous market-ID rejection. No sanitized runtime fixture exists, and the
+endpoint supplies no observation timestamp. Until runtime-tagged evidence establishes observation
+timing and freshness semantics, the adapter emits no Nautilus trade, quote, or ticker event from
+this value.
 
 The WebSocket protocol core registers each request before its send is exposed, resolves responses
 strictly by request ID and transport connection epoch, and uses a separate non-wrapping send token
@@ -370,6 +387,7 @@ schemes other than secp256k1 are unsupported.
 | Long-short ratio       | -       | Partial   | Typed single-page history only; no framework events.        |
 | Open interest          | -       | Partial   | Typed single-page history only; units remain unproven.      |
 | Volume statistics      | -       | Partial   | Raw fixed-period window; units and boundaries unproven.     |
+| Last price             | -       | Partial   | Raw exact value only; no timestamp or freshness semantics.  |
 | Bars                   | Planned | Planned   | Interval identity and open/close boundary semantics.       |
 | Market status          | Planned | Planned   | Status values and unknown-value behavior.                  |
 | Lending market status  | Planned | -         | Asset precision and authoritative status evidence.         |
@@ -431,21 +449,25 @@ mutation might have been transmitted.
 
 ### Direct pallet
 
-The current protocol path is expected to encode dynamic calls against a validated immutable
-runtime metadata snapshot and sign them with secp256k1 ECDSA. It remains unsupported until golden
-vectors prove the call bytes, signed-extension order, signature payload, complete extrinsic, and
-transaction hash for every enabled action.
+The adapter can encode a caller-specified dynamic call against the approved immutable runtime
+metadata snapshot and sign it offline with the pinned DeepX Subxt fork's AccountId20/Keccak ECDSA
+signer. The caller must provide the nonce explicitly; the primitive does not read a clock, allocate
+or persist a nonce, access the network, or submit bytes. SDK reference behavior uses a millisecond
+timestamp nonce by default. All trading calls remain unsupported until sanitized golden vectors
+prove the call values, signature payload, complete extrinsic, and transaction hash for every
+enabled action, and a durable nonce owner and runtime-refresh boundary exist.
 
 ### Legacy EVM precompile
 
-The legacy path is expected to encode ABI calldata, sign an EVM transaction, wrap it in
-`Ethereum.transact`, and sign the outer extrinsic. It remains unsupported until fixtures prove the
-precompile address, ABI, chain ID, nonce, gas fields, transaction format, both signatures, wrapper,
-and both transaction hashes.
+The legacy path is expected to encode ABI calldata, sign an EVM transaction, and wrap the decoded
+transaction plus signer AccountId20 in an unsigned `Ethereum.transact` extrinsic. The Python SDK
+reference uses `create_unsigned_extrinsic` for this wrapper; there is no second outer signature. It
+remains unsupported until fixtures prove the precompile address, ABI, chain ID, nonce, gas fields,
+transaction format, EVM signature, wrapper bytes, and both transaction hashes.
 
 ## Transaction evidence
 
-The planned transaction tracker distinguishes these states:
+The adapter now provides a pure, evidence-driven transaction lifecycle with these states:
 
 | State              | Meaning                                                              |
 | ------------------ | -------------------------------------------------------------------- |
@@ -454,7 +476,7 @@ The planned transaction tracker distinguishes these states:
 | `submitting`       | Transmission started and the outcome may become ambiguous.           |
 | `accepted`         | A submission node accepted the transaction into its pool.            |
 | `in-block-success` | The extrinsic and expected business event succeeded in a best block. |
-| `finalized`        | The successful block is canonical and finalized.                     |
+| `finalized`        | The recorded success or failure is canonical and finalized.          |
 | `in-block-failed`  | An authoritative dispatch or expected business event failure exists. |
 | `not-included`     | A complete finalized scan and node-pool check prove absence.         |
 | `action-required`  | Available recovery evidence is incomplete or conflicting.            |
@@ -462,6 +484,95 @@ The planned transaction tracker distinguishes these states:
 Pool acceptance is not order acceptance, block inclusion is not business success, and best-block
 success is not finality. Events must be matched by block extrinsic index. A mutating timeout after
 possible transmission is ambiguous and must not be treated as a venue rejection.
+
+The lifecycle rejects transitions that skip durable signing, preserves the immutable extrinsic
+hash and exact block inclusion evidence, and treats repeated matching observations as idempotent.
+`not-included` requires explicit proof of both a complete canonical scan through a finalized block
+and authoritative absence from the submission node pool. Later canonical inclusion can correct
+that negative observation, while incomplete or conflicting evidence requires `action-required`.
+
+This foundation performs no persistence, networking, submission, nonce allocation or release,
+automatic replay, or Nautilus order-event emission. Those capabilities remain disabled until the
+runtime and recovery evidence gates below are resolved.
+
+Submission failures use the same evidence vocabulary intended for the execution boundary:
+`not-sent` requires local proof that transmission never started, `venue-rejected` requires an
+explicitly decoded authoritative rejection, and `ambiguous` means transmission may have started.
+Once the lifecycle enters `submitting`, transport timeouts, connection loss, missing responses, and
+unknown response forms remain ambiguous unless later authoritative evidence resolves them. Failure
+classification does not itself mutate transaction state, release a nonce, replay bytes, or emit an
+order rejection. No existing generic HTTP or WebSocket error is currently mapped to these classes
+because a DeepX transaction-submission response schema has not yet been proven.
+
+Network configuration assigns explicit JSON-RPC roles for transaction submission, head and
+inclusion watching, and bounded recovery scans. Each role can use an independent endpoint and
+falls back to the common verified testnet RPC URL when no role-specific override is configured.
+Role selection performs the same hard testnet validation as every other endpoint. This separation
+does not enable transaction submission or prove that the default endpoint supports every role;
+clients must still validate endpoint chain identity before using any future operational path.
+
+Direct-pallet transaction reservations have a versioned, strict durable record format. A record
+records the client order ID, signer, instrument, side, nonce domain, and approved runtime identity
+before signing. The offline signed result carries the runtime identity actually used for encoding,
+and the record accepts only a matching signer, timestamp nonce, runtime, and Blake2-256 hash of the
+signed bytes. Sequential account nonce binding remains unsupported. The current generic dynamic
+signer does not prove that pallet call arguments encode the recorded client order ID, instrument,
+or side; that binding remains gated on authoritative SDK golden vectors. Restoration rejects
+unknown fields, unsupported versions, invalid identifiers, incomplete absence evidence, and
+lifecycle state inconsistency. Cache keys are versioned and hex-encode client order ID bytes so
+delimiters cannot change the namespace. Version 2 records retain the complete signed bytes and
+verify their Blake2-256 hash during restoration. These bytes are recovery evidence only: the codec
+does not authorize submission or replay, and no future mutating path may resend them without an
+authoritative reconciliation policy proving that replay is safe.
+
+Restored records expose a pure fail-closed recovery action. `created` requires reconstruction and
+verification of signing inputs, while `signed` requires an external persistence and submission
+decision before transmission can begin. `submitting`, `accepted`, both in-block states, and
+`not-included` require authoritative reconciliation; `finalized` is complete; and
+`action-required` stops automatic recovery for operator review. The classifier performs no I/O or
+mutation and never treats retained bytes as replay authority. In particular,
+`submission-decision-required` does not make submission operational: the committed-write,
+exclusive nonce-owner, call-binding, and protocol-evidence gates still apply.
+
+A separate automatic replay decision gate also returns no bytes or transmission permit. `created`
+requires reconstructed signing inputs, `signed` remains subject to the initial-submission policy,
+and all submitted or included non-final states require fresh reconciliation. A `not-included`
+record with complete canonical-scan and submission-pool absence evidence requires a newly built and
+independently validated replacement; the retained signed extrinsic is never replayed. `finalized`
+requires no transmission, while `action-required` remains an operator stop. Replacement
+construction and transmission are not implemented.
+
+Post-sign submission, pool, inclusion, finality, absence, and operator evidence is applied through
+the durable record boundary. Each observation is first evaluated against a candidate lifecycle and
+the complete record invariants; the candidate is committed in memory only after both checks pass.
+Callers receive no mutable lifecycle reference, so an orphaned extrinsic hash cannot bypass the
+retained signed-payload check. This mutation remains pure and does not imply that the updated record
+was durably committed.
+
+The record codec does not itself provide committed writes, allocation, locking, or nonce ownership.
+The transaction persistence interface now makes the missing capability explicit: an operational
+backend must acquire a cross-process signer lease, acknowledge record creation only after its
+durability boundary commits, and replace records through revision-checked compare-and-set. A lost
+commit acknowledgement is classified as an unknown outcome and retains signer ownership pending
+reconciliation. Acknowledgements are bound to the exact cache key and encoded record, so an older
+write cannot authorize a newer lifecycle state. The generic cache `add` operation does not satisfy
+this interface because its contract does not prove durable commit, CAS, or lease ownership.
+
+No persistence implementation is currently configured for DeepX, so concurrent multi-process
+signing remains disabled. Committed signed bytes also remain evidence rather than replay authority:
+submission and automatic replay require authoritative RPC outcome semantics and a reconciliation
+policy. Sequential account nonce signing and business-call binding remain disabled until captured
+protocol vectors prove their domains and exact encoded call arguments.
+
+The persistence contract is asynchronous so a future PostgreSQL implementation can hold a
+transaction-scoped signer fence and commit record changes without blocking the runtime. Initial
+submission preparation is now an explicit atomic boundary: it revalidates the current signer lease,
+matches the exact previously committed record bytes, requires a golden-vector-backed business-call
+verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use payload permit.
+Stale revisions, forged prior records, unproven call bindings, and unknown commit outcomes release
+no payload. The default verifier rejects every call because the required vectors have not been
+captured. This permit is intentionally unavailable to restored reconciliation states and therefore
+cannot be used for automatic replay.
 
 ## Fixture identity
 
@@ -492,7 +603,8 @@ The following unresolved questions keep their dependent capabilities disabled:
 - Initial snapshot, update ordering, venue reconnect replay, and acknowledgement behavior.
 - Order book snapshot flags, sequence scope, checksum rules, gap recovery, and resnapshot endpoint.
 - REST pagination boundaries, overlap, stable identities, and freshness behavior.
-- Signed-extension payload semantics, mortality, checkpoint selection, and runtime-upgrade behavior.
+- Signed-extension payload semantics, mortality period, checkpoint selection, and runtime-upgrade
+  behavior. Existing fixtures contain a finalized hash but no corresponding block number.
 - Direct pallet call and event definitions for every action.
 - Legacy precompile ABI, transaction envelope, wrapper, and hash semantics.
 - Timestamp order-ID allocation, sequential account-index nonce ownership, and chain-time drift.
@@ -549,8 +661,11 @@ Failed or incomplete conformance leaves that capability disabled and documented 
   block `0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6`.
   Both existing manifests predate structured signed-extension extraction and remain immutable with
   `signed_extensions: null`; the finalized metadata bytes now have an exact decoder-backed order
-  regression test. New captures populate this field. Signing remains disabled pending the other
-  direct-signing evidence gates.
+  regression test. They also predate finalized-header capture and therefore do not prove the block
+  number required for a mortality checkpoint. New captures populate both fields. The default
+  endpoint returned a TLS handshake EOF on 2026-09-02, so no replacement fixture was committed.
+  Mortal signing remains disabled pending a complete capture and the other direct-signing evidence
+  gates.
 - Maintainer approval and confirmation that no competing issue or pull request exists remain
   external contribution process gates; local implementation does not satisfy them.
 - Financial values remain integers or exact decimal values until conversion to Nautilus domain

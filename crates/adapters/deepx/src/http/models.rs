@@ -254,6 +254,15 @@ pub struct DeepXPerpVolume {
     pub statistic_time: u64,
 }
 
+/// One raw perpetual last price without observation-time semantics.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct DeepXPerpLastPrice(
+    /// Venue-reported last price represented without floating point.
+    #[serde(deserialize_with = "exact_decimal::deserialize")]
+    pub Decimal,
+);
+
 /// DeepX Spot market metadata.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

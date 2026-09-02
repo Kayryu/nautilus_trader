@@ -27,13 +27,14 @@ pub use error::{DeepXHttpError, Result};
 pub use models::{
     DeepXApiResponse, DeepXFundingRatePage, DeepXFundingRateRecord, DeepXLongShortRatioPage,
     DeepXLongShortRatioRecord, DeepXOpenInterestPage, DeepXOpenInterestRecord, DeepXPerpCandle,
-    DeepXPerpCandlesPage, DeepXPerpMarket, DeepXPerpTrade, DeepXPerpTradesPage, DeepXPerpVolume,
-    DeepXSpotMarket,
+    DeepXPerpCandlesPage, DeepXPerpLastPrice, DeepXPerpMarket, DeepXPerpTrade, DeepXPerpTradesPage,
+    DeepXPerpVolume, DeepXSpotMarket,
 };
 pub use pagination::{CursorPagination, PaginationDecision};
 pub use query::{
     DeepXFundingRateRequest, DeepXLongShortRatioRequest, DeepXOpenInterestRequest,
-    DeepXPerpCandlesRequest, DeepXPerpMarkPriceRequest, DeepXPerpOraclePriceRequest,
-    DeepXPerpTradesRequest, DeepXPerpVolumePeriod, DeepXPerpVolumeRequest,
+    DeepXPerpCandlesRequest, DeepXPerpLastPriceRequest, DeepXPerpMarkPriceRequest,
+    DeepXPerpOraclePriceRequest, DeepXPerpTradesRequest, DeepXPerpVolumePeriod,
+    DeepXPerpVolumeRequest,
 };
 pub use retry::{deepx_http_retry_config, should_retry_http_error};

@@ -30,13 +30,13 @@ use super::{
     error::{DeepXHttpError, Result},
     models::{
         DeepXApiResponse, DeepXFundingRatePage, DeepXLongShortRatioPage, DeepXOpenInterestPage,
-        DeepXPerpCandlesPage, DeepXPerpMarket, DeepXPerpTradesPage, DeepXPerpVolume,
-        DeepXSpotMarket,
+        DeepXPerpCandlesPage, DeepXPerpLastPrice, DeepXPerpMarket, DeepXPerpTradesPage,
+        DeepXPerpVolume, DeepXSpotMarket,
     },
     query::{
         DeepXFundingRateRequest, DeepXLongShortRatioRequest, DeepXOpenInterestRequest,
-        DeepXPerpCandlesRequest, DeepXPerpMarkPriceRequest, DeepXPerpOraclePriceRequest,
-        DeepXPerpTradesRequest, DeepXPerpVolumeRequest,
+        DeepXPerpCandlesRequest, DeepXPerpLastPriceRequest, DeepXPerpMarkPriceRequest,
+        DeepXPerpOraclePriceRequest, DeepXPerpTradesRequest, DeepXPerpVolumeRequest,
     },
     retry::{deepx_http_retry_config, should_retry_http_error},
 };
@@ -51,6 +51,7 @@ const PERP_CANDLES_PATH: &str = "/internal/v1/market/perp/candles";
 const PERP_MARK_PRICE_PATH: &str = "/internal/v1/market/perp/mark_price";
 const PERP_ORACLE_PRICE_PATH: &str = "/internal/v1/market/perp/oracle_price";
 const PERP_VOLUME_PATH: &str = "/internal/v1/market/perp/volume";
+const PERP_LAST_PRICE_PATH: &str = "/internal/v1/market/perp/last_price";
 
 const MAX_ERROR_BODY_CHARS: usize = 1_024;
 
@@ -314,6 +315,24 @@ impl DeepXHttpClient {
         into_api_data(response)
     }
 
+    /// Returns the raw perpetual last price without assigning observation-time semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid market ID, transport or HTTP failures, malformed responses,
+    /// or a venue-level failure envelope.
+    pub async fn get_perp_last_price(
+        &self,
+        request: &DeepXPerpLastPriceRequest,
+    ) -> Result<DeepXPerpLastPrice> {
+        request.validate()?;
+        let query = request.as_query();
+        let response: DeepXApiResponse<DeepXPerpLastPrice> = self
+            .get_json_with_query(PERP_LAST_PRICE_PATH, &query)
+            .await?;
+        into_api_data(response)
+    }
+
     async fn get_market_data<T>(&self, path: &str) -> Result<Vec<T>>
     where
         T: DeserializeOwned,
@@ -525,6 +544,12 @@ mod tests {
     struct PerpVolumeQuery {
         market_id: u64,
         period: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PerpLastPriceQuery {
+        market_id: u64,
     }
 
     fn immediate_retry_config(max_retries: u32) -> RetryConfig {
@@ -1187,6 +1212,44 @@ mod tests {
         };
 
         let error = client.get_perp_volume(&request).await.unwrap_err();
+
+        assert!(
+            matches!(error, DeepXHttpError::InvalidRequest(message) if message.contains("market_id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn encodes_and_decodes_perp_last_price_exactly() {
+        let router = Router::new().route(
+            PERP_LAST_PRICE_PATH,
+            get(|Query(query): Query<PerpLastPriceQuery>| async move {
+                assert_eq!(query.market_id, 3);
+                r#"{
+                    "code": 200,
+                    "msg": "success",
+                    "data": 2453.980000000000001,
+                    "fail": false
+                }"#
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let request = DeepXPerpLastPriceRequest { market_id: 3 };
+
+        let last_price = client.get_perp_last_price(&request).await.unwrap();
+
+        assert_eq!(
+            last_price.0,
+            "2453.980000000000001".parse::<Decimal>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_perp_last_price_market_before_transport() {
+        let client = DeepXHttpClient::new("http://127.0.0.1:1", Some(1), None).unwrap();
+        let request = DeepXPerpLastPriceRequest { market_id: 0 };
+
+        let error = client.get_perp_last_price(&request).await.unwrap_err();
 
         assert!(
             matches!(error, DeepXHttpError::InvalidRequest(message) if message.contains("market_id"))

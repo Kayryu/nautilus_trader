@@ -27,14 +27,18 @@ nautilus-network = { workspace = true }
 
 alloy = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }
 frame-metadata = { workspace = true }
 jiff = { workspace = true }
 parity-scale-codec = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }
+scale-info = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subxt-core = { workspace = true }
+subxt-signer = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -48,4 +52,3 @@ rstest = { workspace = true }
 name = "deepx-capture-runtime-fixtures"
 path = "bin/capture_runtime_fixtures.rs"
 doc = false
-test = false

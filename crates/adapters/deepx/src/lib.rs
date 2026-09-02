@@ -27,9 +27,27 @@ pub mod config;
 pub mod http;
 pub mod instruments;
 pub mod providers;
+pub mod signing;
+pub mod transaction;
 pub mod websocket;
 
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
-pub use config::DeepXNetworkConfig;
+pub use config::{DeepXNetworkConfig, DeepXRpcRole};
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};
+pub use signing::{
+    ApprovedRuntimeIdentity, DeepXRuntimeConfig, RuntimeSnapshot, SignedPalletExtrinsic,
+    SigningError, SnapshotError, sign_dynamic_pallet_call,
+};
+pub use transaction::{
+    DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION, DeepXAbsenceEvidence,
+    DeepXAutomaticReplayDecision, DeepXBusinessCallBindingError, DeepXBusinessCallVerifier,
+    DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic,
+    DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation, DeepXPreparedSubmission,
+    DeepXSignerLease, DeepXSubmissionFailure, DeepXSubmissionPermit,
+    DeepXSubmissionPreparationError, DeepXTransactionError, DeepXTransactionIdentity,
+    DeepXTransactionLifecycle, DeepXTransactionObservation, DeepXTransactionPersistenceError,
+    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionRecoveryAction,
+    DeepXTransactionRevision, DeepXTransactionState, DeepXTransactionStore,
+    DeepXUnsupportedBusinessCallVerifier, prepare_initial_submission, verify_signer_lease,
+};

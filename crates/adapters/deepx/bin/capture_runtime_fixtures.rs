@@ -18,7 +18,7 @@
 //! Run with:
 //! `cargo run -p nautilus-deepx --bin deepx-capture-runtime-fixtures`
 
-use std::{fs, path::PathBuf};
+use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, ensure};
 use aws_lc_rs::digest;
@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const DEFAULT_RPC_URL: &str = "https://rpc-testnet.deepx.fi";
+const RPC_URL_ENV: &str = "DEEPX_TESTNET_RPC_URL";
 const EXPECTED_GENESIS_HASH: &str =
     "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
 
@@ -50,6 +51,16 @@ struct RuntimeVersion {
     apis: Vec<(String, u32)>,
     transaction_version: u32,
     state_version: u8,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockHeader {
+    parent_hash: String,
+    number: String,
+    state_root: String,
+    extrinsics_root: String,
+    digest: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +87,7 @@ struct FixtureManifest {
     rpc_url: String,
     block_reference: String,
     block_hash: String,
+    block_number: u64,
     identity: FixtureIdentity,
     metadata_bytes: usize,
     signed_extensions: Vec<String>,
@@ -85,18 +97,29 @@ struct FixtureManifest {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let client = Client::new();
-    let genesis = rpc::<String>(&client, "chain_getBlockHash", json!([0])).await?;
+    let rpc_url = env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
+    let genesis = rpc::<String>(&client, &rpc_url, "chain_getBlockHash", json!([0])).await?;
     ensure!(
         genesis.result == EXPECTED_GENESIS_HASH,
         "DeepX genesis hash mismatch: expected {EXPECTED_GENESIS_HASH}, received {}",
         genesis.result,
     );
 
-    let finalized_head = rpc::<String>(&client, "chain_getFinalizedHead", json!([])).await?;
+    let finalized_head =
+        rpc::<String>(&client, &rpc_url, "chain_getFinalizedHead", json!([])).await?;
     let block_params = json!([finalized_head.result]);
-    let runtime =
-        rpc::<RuntimeVersion>(&client, "state_getRuntimeVersion", block_params.clone()).await?;
-    let metadata = rpc::<String>(&client, "state_getMetadata", block_params.clone()).await?;
+    let finalized_header =
+        rpc::<BlockHeader>(&client, &rpc_url, "chain_getHeader", block_params.clone()).await?;
+    let block_number = parse_block_number(&finalized_header.result.number)?;
+    let runtime = rpc::<RuntimeVersion>(
+        &client,
+        &rpc_url,
+        "state_getRuntimeVersion",
+        block_params.clone(),
+    )
+    .await?;
+    let metadata =
+        rpc::<String>(&client, &rpc_url, "state_getMetadata", block_params.clone()).await?;
     let metadata_bytes = nautilus_core::hex::decode(metadata.result.trim_start_matches("0x"))
         .context("DeepX runtime metadata was not valid hex")?;
     let metadata_sha256 =
@@ -134,6 +157,13 @@ async fn main() -> anyhow::Result<()> {
         )?,
         write_fixture(
             &fixture_dir,
+            "finalized_header.json",
+            "chain_getHeader",
+            block_params.clone(),
+            &finalized_header,
+        )?,
+        write_fixture(
+            &fixture_dir,
             "runtime_version.json",
             "state_getRuntimeVersion",
             block_params.clone(),
@@ -153,9 +183,10 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
         deployment: "testnet".to_string(),
         endpoint_role: "runtime_identity".to_string(),
-        rpc_url: DEFAULT_RPC_URL.to_string(),
+        rpc_url,
         block_reference: "finalized".to_string(),
         block_hash: finalized_head.result,
+        block_number,
         identity,
         metadata_bytes: metadata_bytes.len(),
         signed_extensions,
@@ -170,12 +201,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn rpc<T>(client: &Client, method: &str, params: Value) -> anyhow::Result<JsonRpcResponse<T>>
+async fn rpc<T>(
+    client: &Client,
+    rpc_url: &str,
+    method: &str,
+    params: Value,
+) -> anyhow::Result<JsonRpcResponse<T>>
 where
     T: DeserializeOwned,
 {
     client
-        .post(DEFAULT_RPC_URL)
+        .post(rpc_url)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -188,6 +224,18 @@ where
         .json()
         .await
         .with_context(|| format!("Failed to decode DeepX RPC response for {method}"))
+}
+
+fn parse_block_number(value: &str) -> anyhow::Result<u64> {
+    let encoded = value
+        .strip_prefix("0x")
+        .context("DeepX finalized block number must start with 0x")?;
+    ensure!(
+        !encoded.is_empty(),
+        "DeepX finalized block number must not be empty",
+    );
+    u64::from_str_radix(encoded, 16)
+        .with_context(|| format!("Invalid DeepX finalized block number: {value}"))
 }
 
 fn fixture_dir(identity: &FixtureIdentity, block_hash: &str) -> PathBuf {
@@ -234,7 +282,9 @@ fn write_json(path: PathBuf, value: &impl Serialize) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use axum::{Json, Router, routing::post};
     use rstest::rstest;
+    use tokio::net::TcpListener;
 
     use super::*;
 
@@ -268,5 +318,64 @@ mod tests {
         let second = fixture_dir(&identity, "0x3333333344444444");
 
         assert_ne!(first, second);
+    }
+
+    #[rstest]
+    #[case("0x0", 0)]
+    #[case("0x2a", 42)]
+    #[case("0xffffffffffffffff", u64::MAX)]
+    fn parses_hex_finalized_block_number(#[case] value: &str, #[case] expected: u64) {
+        assert_eq!(parse_block_number(value).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("42")]
+    #[case("0x")]
+    #[case("0xgg")]
+    #[case("0x10000000000000000")]
+    fn rejects_invalid_finalized_block_number(#[case] value: &str) {
+        assert!(parse_block_number(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn finalized_header_request_is_bound_to_captured_hash() {
+        const FINALIZED_HASH: &str =
+            "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+
+        async fn handler(Json(payload): Json<Value>) -> Json<Value> {
+            assert_eq!(payload["method"], "chain_getHeader");
+            assert_eq!(payload["params"], json!([FINALIZED_HASH]));
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "parentHash": "0x01",
+                    "number": "0x2a",
+                    "stateRoot": "0x02",
+                    "extrinsicsRoot": "0x03",
+                    "digest": { "logs": [] }
+                }
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(handler)))
+                .await
+                .unwrap();
+        });
+
+        let response = rpc::<BlockHeader>(
+            &Client::new(),
+            &format!("http://{address}"),
+            "chain_getHeader",
+            json!([FINALIZED_HASH]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parse_block_number(&response.result.number).unwrap(), 42);
     }
 }
