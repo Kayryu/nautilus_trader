@@ -17,10 +17,13 @@
 
 mod snapshot;
 
+pub use snapshot::{
+    ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeSnapshotPermit,
+    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, RuntimeSnapshot, SnapshotError,
+};
 use subxt_core::{
     Config,
-    config::Hasher,
-    config::{DefaultExtrinsicParamsBuilder, substrate::BlakeTwo256},
+    config::{DefaultExtrinsicParamsBuilder, Hasher, substrate::BlakeTwo256},
     dynamic::Value,
     tx,
     utils::AccountId20,
@@ -29,8 +32,6 @@ use subxt_signer::eth::{Keypair, Signature};
 use thiserror::Error;
 
 use crate::common::DeepXPrivateKey;
-
-pub use snapshot::{ApprovedRuntimeIdentity, RuntimeSnapshot, SnapshotError};
 
 /// DeepX runtime types required for AccountId20 Ethereum-compatible signatures.
 #[derive(Clone, Copy, Debug)]
@@ -116,14 +117,34 @@ impl SignedPalletExtrinsic {
 
 /// Signs a metadata-driven DeepX pallet call without submitting it.
 ///
-/// The caller supplies an explicit nonce. This function performs no nonce allocation, persistence,
-/// network access, retry, or submission, so it cannot make a trading capability operational.
+/// The caller supplies an explicit nonce and a runtime snapshot permit. Requiring the permit binds
+/// public signing to the runtime-change quiescence boundary. This function performs no nonce
+/// allocation, persistence, network access, retry, or submission, so it cannot make a trading
+/// capability operational.
 ///
 /// # Errors
 ///
 /// Returns an error when the key is invalid or the call cannot be encoded against the approved
 /// runtime snapshot.
 pub fn sign_dynamic_pallet_call(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    pallet: &str,
+    call: &str,
+    arguments: Vec<Value>,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call_with_snapshot(
+        snapshot_permit.snapshot(),
+        key,
+        pallet,
+        call,
+        arguments,
+        nonce,
+    )
+}
+
+fn sign_dynamic_pallet_call_with_snapshot(
     snapshot: &RuntimeSnapshot,
     key: &DeepXPrivateKey,
     pallet: &str,
@@ -193,9 +214,10 @@ mod tests {
 
     #[rstest]
     fn dynamic_signing_is_deterministic_for_a_fixed_snapshot_and_nonce() {
-        let snapshot = snapshot();
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
         let first = sign_dynamic_pallet_call(
-            &snapshot,
+            &permit,
             &key(),
             "System",
             "remark",
@@ -204,7 +226,7 @@ mod tests {
         )
         .unwrap();
         let second = sign_dynamic_pallet_call(
-            &snapshot,
+            &permit,
             &key(),
             "System",
             "remark",
@@ -220,8 +242,10 @@ mod tests {
 
     #[rstest]
     fn unknown_dynamic_call_is_rejected_without_panic() {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
         let result = sign_dynamic_pallet_call(
-            &snapshot(),
+            &permit,
             &key(),
             "UnknownPallet",
             "unknown_call",

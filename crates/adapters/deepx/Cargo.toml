@@ -37,6 +37,7 @@ rust_decimal = { workspace = true }
 scale-info = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 subxt-core = { workspace = true }
 subxt-signer = { workspace = true }
 thiserror = { workspace = true }

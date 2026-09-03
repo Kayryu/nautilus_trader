@@ -15,6 +15,8 @@
 
 //! Durable identity and reservation records for DeepX direct-pallet transactions.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use nautilus_core::hex;
 use nautilus_model::{
     enums::OrderSide,
@@ -31,10 +33,10 @@ use super::{
 use crate::signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic};
 
 /// Version of the durable DeepX transaction record schema.
-pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 2;
+pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 3;
 
 /// Namespace used for DeepX transaction records in the generic cache.
-pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v2:";
+pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v3:";
 
 /// A reserved nonce in one of DeepX's distinct nonce domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +54,136 @@ pub enum DeepXNonceReservation {
         /// Reserved sequential nonce.
         nonce: u64,
     },
+}
+
+/// Errors raised while allocating timestamp-derived DeepX nonces.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXTimestampNonceError {
+    /// Local and chain clocks differ beyond the configured calibration bound.
+    #[error(
+        "DeepX timestamp nonce clocks differ by {observed_drift_ms} ms, exceeding the {max_drift_ms} ms limit"
+    )]
+    ClockDrift {
+        /// Absolute difference between local and chain time.
+        observed_drift_ms: u64,
+        /// Configured maximum accepted difference.
+        max_drift_ms: u64,
+    },
+    /// Restored nonce state is implausibly far ahead of both clocks.
+    #[error(
+        "DeepX restored timestamp nonce is {observed_drift_ms} ms ahead of calibrated time, exceeding the {max_drift_ms} ms limit"
+    )]
+    RestoredNonceAhead {
+        /// Difference between the restored nonce and calibrated time.
+        observed_drift_ms: u64,
+        /// Configured maximum accepted difference.
+        max_drift_ms: u64,
+    },
+    /// No greater timestamp nonce can be represented.
+    #[error("DeepX timestamp nonce overflow")]
+    Overflow,
+}
+
+/// Monotonic timestamp nonce allocator seeded from durable records after restart.
+///
+/// One allocator belongs to one signer lease. The caller must provide every durable record for
+/// that signer when restoring it and must durably commit each returned reservation before signing.
+/// Allocations are never rolled back: a failed or ambiguous commit burns the in-memory value, and
+/// an unknown commit outcome must retain the external signer lease pending reconciliation.
+#[derive(Debug)]
+pub struct DeepXTimestampNonceAllocator {
+    signer: [u8; 20],
+    restored_last_reserved: u64,
+    last_reserved: AtomicU64,
+    max_clock_drift_ms: u64,
+}
+
+impl DeepXTimestampNonceAllocator {
+    /// Restores one signer allocator from its complete durable transaction record set.
+    #[must_use]
+    pub fn from_records<'a>(
+        signer: [u8; 20],
+        records: impl IntoIterator<Item = &'a DeepXTransactionRecord>,
+        max_clock_drift_ms: u64,
+    ) -> Self {
+        let last_reserved = records
+            .into_iter()
+            .filter(|record| record.identity().signer() == signer)
+            .filter_map(|record| match record.identity().nonce() {
+                DeepXNonceReservation::TimestampOrderId { value } => Some(value),
+                DeepXNonceReservation::SequentialAccount { .. } => None,
+            })
+            .max()
+            .unwrap_or_default();
+        Self {
+            signer,
+            restored_last_reserved: last_reserved,
+            last_reserved: AtomicU64::new(last_reserved),
+            max_clock_drift_ms,
+        }
+    }
+
+    /// Returns the AccountId20 whose timestamp nonce domain this allocator owns.
+    #[must_use]
+    pub const fn signer(&self) -> [u8; 20] {
+        self.signer
+    }
+
+    /// Returns the latest nonce reserved by this allocator, or `None` before the first reservation.
+    #[must_use]
+    pub fn last_reserved(&self) -> Option<u64> {
+        match self.last_reserved.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    /// Reserves a nonce after verifying local time against authoritative chain time.
+    ///
+    /// Concurrent callers receive unique monotonically increasing values. This method performs no
+    /// persistence and grants no signing or submission authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for excessive clock drift, implausible restored state, or integer overflow.
+    pub fn reserve(
+        &self,
+        local_time_ms: u64,
+        chain_time_ms: u64,
+    ) -> Result<DeepXNonceReservation, DeepXTimestampNonceError> {
+        let observed_drift_ms = local_time_ms.abs_diff(chain_time_ms);
+        if observed_drift_ms > self.max_clock_drift_ms {
+            return Err(DeepXTimestampNonceError::ClockDrift {
+                observed_drift_ms,
+                max_drift_ms: self.max_clock_drift_ms,
+            });
+        }
+        let calibrated_time_ms = local_time_ms.max(chain_time_ms);
+        if self.restored_last_reserved > calibrated_time_ms
+            && self.restored_last_reserved - calibrated_time_ms > self.max_clock_drift_ms
+        {
+            return Err(DeepXTimestampNonceError::RestoredNonceAhead {
+                observed_drift_ms: self.restored_last_reserved - calibrated_time_ms,
+                max_drift_ms: self.max_clock_drift_ms,
+            });
+        }
+
+        loop {
+            let last_reserved = self.last_reserved.load(Ordering::Acquire);
+            let next = calibrated_time_ms.max(
+                last_reserved
+                    .checked_add(1)
+                    .ok_or(DeepXTimestampNonceError::Overflow)?,
+            );
+            if self
+                .last_reserved
+                .compare_exchange_weak(last_reserved, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(DeepXNonceReservation::TimestampOrderId { value: next });
+            }
+        }
+    }
 }
 
 /// Immutable runtime identity attached to a direct-pallet reservation.
@@ -255,6 +387,7 @@ struct DeepXTransactionLifecycleWire {
     state: DeepXTransactionState,
     extrinsic_hash: Option<[u8; 32]>,
     inclusion: Option<super::DeepXInclusionEvidence>,
+    reverted_inclusion: Option<super::DeepXInclusionEvidence>,
     absence: Option<DeepXAbsenceEvidenceWire>,
 }
 
@@ -497,11 +630,15 @@ impl DeepXTransactionRecord {
             DeepXTransactionState::Created => {
                 self.lifecycle.extrinsic_hash().is_none()
                     && self.lifecycle.inclusion().is_none()
+                    && self.lifecycle.reverted_inclusion().is_none()
                     && self.lifecycle.absence().is_none()
             }
-            DeepXTransactionState::Signed
-            | DeepXTransactionState::Submitting
-            | DeepXTransactionState::Accepted => {
+            DeepXTransactionState::Signed | DeepXTransactionState::Accepted => {
+                self.lifecycle.extrinsic_hash().is_some()
+                    && self.lifecycle.inclusion().is_none()
+                    && self.lifecycle.absence().is_none()
+            }
+            DeepXTransactionState::Submitting => {
                 self.lifecycle.extrinsic_hash().is_some()
                     && self.lifecycle.inclusion().is_none()
                     && self.lifecycle.absence().is_none()
@@ -512,6 +649,7 @@ impl DeepXTransactionRecord {
                         .lifecycle
                         .inclusion()
                         .is_some_and(|e| e.outcome == super::DeepXInclusionOutcome::Success)
+                    && self.lifecycle.reverted_inclusion().is_none()
                     && self.lifecycle.absence().is_none()
             }
             DeepXTransactionState::InBlockFailed => {
@@ -520,11 +658,13 @@ impl DeepXTransactionRecord {
                         .lifecycle
                         .inclusion()
                         .is_some_and(|e| e.outcome == super::DeepXInclusionOutcome::Failed)
+                    && self.lifecycle.reverted_inclusion().is_none()
                     && self.lifecycle.absence().is_none()
             }
             DeepXTransactionState::Finalized => {
                 self.lifecycle.extrinsic_hash().is_some()
                     && self.lifecycle.inclusion().is_some()
+                    && self.lifecycle.reverted_inclusion().is_none()
                     && self.lifecycle.absence().is_none()
             }
             DeepXTransactionState::NotIncluded => {
@@ -588,6 +728,7 @@ impl DeepXTransactionRecord {
                 state: wire.lifecycle.state,
                 extrinsic_hash: wire.lifecycle.extrinsic_hash,
                 inclusion: wire.lifecycle.inclusion,
+                reverted_inclusion: wire.lifecycle.reverted_inclusion,
                 absence,
             },
         };
@@ -608,6 +749,11 @@ impl<'de> Deserialize<'de> for DeepXTransactionRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Barrier},
+    };
+
     use rstest::rstest;
     use serde_json::Value;
     use subxt_core::config::{Hasher, substrate::BlakeTwo256};
@@ -629,6 +775,117 @@ mod tests {
                 signed_extensions: vec!["CheckNonce".to_string()],
             },
         )
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_restores_maximum_for_its_signer() {
+        let records = [
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 1_000,
+            })),
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 1_002,
+            })),
+        ];
+        let allocator = DeepXTimestampNonceAllocator::from_records([7; 20], &records, 100);
+
+        assert_eq!(allocator.last_reserved(), Some(1_002));
+        assert_eq!(
+            allocator.reserve(1_001, 1_001).unwrap(),
+            DeepXNonceReservation::TimestampOrderId { value: 1_003 },
+        );
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_ignores_other_signers_and_nonce_domains() {
+        let mut other_signer = identity(DeepXNonceReservation::TimestampOrderId { value: 9_000 });
+        other_signer.signer = [8; 20];
+        let records = [
+            DeepXTransactionRecord::created(other_signer),
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::SequentialAccount {
+                account_index: 1,
+                nonce: 9_001,
+            })),
+        ];
+        let allocator = DeepXTimestampNonceAllocator::from_records([7; 20], &records, 100);
+
+        assert_eq!(allocator.last_reserved(), None);
+        assert_eq!(
+            allocator.reserve(1_000, 1_001).unwrap(),
+            DeepXNonceReservation::TimestampOrderId { value: 1_001 },
+        );
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_rejects_uncalibrated_clocks() {
+        let allocator = DeepXTimestampNonceAllocator::from_records([7; 20], [], 10);
+
+        assert_eq!(
+            allocator.reserve(1_000, 1_011),
+            Err(DeepXTimestampNonceError::ClockDrift {
+                observed_drift_ms: 11,
+                max_drift_ms: 10,
+            }),
+        );
+        assert_eq!(allocator.last_reserved(), None);
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_rejects_implausible_restored_nonce() {
+        let records = [DeepXTransactionRecord::created(identity(
+            DeepXNonceReservation::TimestampOrderId { value: 2_000 },
+        ))];
+        let allocator = DeepXTimestampNonceAllocator::from_records([7; 20], &records, 100);
+
+        assert_eq!(
+            allocator.reserve(1_000, 1_000),
+            Err(DeepXTimestampNonceError::RestoredNonceAhead {
+                observed_drift_ms: 1_000,
+                max_drift_ms: 100,
+            }),
+        );
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_rejects_overflow() {
+        let records = [DeepXTransactionRecord::created(identity(
+            DeepXNonceReservation::TimestampOrderId { value: u64::MAX },
+        ))];
+        let allocator = DeepXTimestampNonceAllocator::from_records([7; 20], &records, u64::MAX);
+
+        assert_eq!(
+            allocator.reserve(u64::MAX, u64::MAX),
+            Err(DeepXTimestampNonceError::Overflow),
+        );
+    }
+
+    #[rstest]
+    fn timestamp_nonce_allocator_is_unique_under_contention() {
+        const TASKS: usize = 16;
+        let allocator = Arc::new(DeepXTimestampNonceAllocator::from_records([7; 20], [], 0));
+        let barrier = Arc::new(Barrier::new(TASKS));
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let allocator = Arc::clone(&allocator);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let DeepXNonceReservation::TimestampOrderId { value } =
+                    allocator.reserve(1_000, 1_000).unwrap()
+                else {
+                    unreachable!();
+                };
+                value
+            }));
+        }
+        let values = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(values.len(), TASKS);
+        assert_eq!(values.iter().min(), Some(&1_000));
+        assert_eq!(values.iter().max(), Some(&(1_000 + TASKS as u64 - 1)));
     }
 
     fn signed(nonce: u64) -> SignedPalletExtrinsic {
@@ -1061,8 +1318,31 @@ mod tests {
     fn cache_key_is_stable_ascii_and_client_order_scoped() {
         let key = DeepXTransactionRecord::cache_key(ClientOrderId::new("ORDER:1"));
 
-        assert_eq!(key, "deepx:transaction:v2:4f524445523a31");
+        assert_eq!(key, "deepx:transaction:v3:4f524445523a31");
         assert!(key.is_ascii());
+    }
+
+    #[rstest]
+    fn reorganization_evidence_round_trips_with_the_durable_record() {
+        let mut record = record_in_state(DeepXTransactionState::InBlockSuccess);
+        let inclusion = record.lifecycle().inclusion().unwrap();
+
+        record
+            .apply_observation(DeepXTransactionObservation::Reorged(inclusion))
+            .unwrap();
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+
+        assert_eq!(restored, record);
+        assert_eq!(
+            restored.lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+        assert_eq!(restored.lifecycle().inclusion(), None);
+        assert_eq!(restored.lifecycle().reverted_inclusion(), Some(inclusion));
+        assert_eq!(
+            restored.recovery_action(),
+            DeepXTransactionRecoveryAction::ReconciliationRequired,
+        );
     }
 
     #[rstest]

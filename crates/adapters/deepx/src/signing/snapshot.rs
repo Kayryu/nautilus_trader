@@ -15,7 +15,8 @@
 
 //! Immutable runtime identity and metadata used by offline signing.
 
-use super::DeepXRuntimeConfig;
+use std::sync::{Arc, Mutex};
+
 use aws_lc_rs::digest::{SHA256, digest};
 use nautilus_core::hex;
 use scale_info::TypeDef;
@@ -26,6 +27,8 @@ use subxt_core::{
     utils::H256,
 };
 use thiserror::Error;
+
+use super::DeepXRuntimeConfig;
 
 const TESTNET_GENESIS_HASH: &str =
     "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
@@ -83,11 +86,178 @@ pub enum SnapshotError {
     UnsupportedTransactionExtension(String),
 }
 
+/// Decision produced after comparing an observed runtime identity with the active snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXRuntimeChangeDecision {
+    /// The observed identity matches the active immutable snapshot.
+    Unchanged,
+    /// New signing is blocked until the observed identity is validated and installed.
+    RefreshRequired,
+}
+
+/// Errors produced by the runtime snapshot quiescence boundary.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXRuntimeSnapshotServiceError {
+    /// New signing is blocked while a changed runtime is being validated.
+    #[error("DeepX runtime snapshot refresh is in progress")]
+    RefreshInProgress,
+    /// A different runtime change was observed while refresh was already in progress.
+    #[error("DeepX runtime snapshot refresh already targets a different identity")]
+    ConflictingRuntimeChange,
+    /// Installation was attempted before a changed runtime was observed.
+    #[error("DeepX runtime snapshot refresh has not started")]
+    RefreshNotStarted,
+    /// The validated snapshot does not match the identity that triggered refresh.
+    #[error("validated DeepX runtime snapshot does not match the observed identity")]
+    SnapshotIdentityMismatch,
+    /// Existing signing permits still hold the previous immutable snapshot.
+    #[error("DeepX runtime snapshot has {0} in-flight signing permits")]
+    InFlightSigningPermits(usize),
+    /// Shared runtime snapshot state cannot be trusted after synchronization failure.
+    #[error("DeepX runtime snapshot service state is unavailable")]
+    StateUnavailable,
+}
+
 /// An immutable metadata and runtime-version snapshot for deterministic signing.
 #[derive(Clone, Debug)]
 pub struct RuntimeSnapshot {
     identity: ApprovedRuntimeIdentity,
     client_state: ClientState<DeepXRuntimeConfig>,
+}
+
+#[derive(Debug)]
+struct RuntimeSnapshotServiceState {
+    active: Arc<RuntimeSnapshot>,
+    pending_identity: Option<ApprovedRuntimeIdentity>,
+    in_flight: usize,
+}
+
+/// Coordinates immutable runtime snapshots across signing and runtime upgrades.
+#[derive(Clone, Debug)]
+pub struct DeepXRuntimeSnapshotService {
+    state: Arc<Mutex<RuntimeSnapshotServiceState>>,
+}
+
+impl DeepXRuntimeSnapshotService {
+    /// Creates an active service from a fixture-validated runtime snapshot.
+    #[must_use]
+    pub fn new(snapshot: RuntimeSnapshot) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RuntimeSnapshotServiceState {
+                active: Arc::new(snapshot),
+                pending_identity: None,
+                in_flight: 0,
+            })),
+        }
+    }
+
+    /// Acquires the immutable snapshot used for one in-flight signing operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while runtime refresh is in progress or shared state is unavailable.
+    pub fn acquire(&self) -> Result<DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.pending_identity.is_some() {
+            return Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress);
+        }
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .ok_or(DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+
+        Ok(DeepXRuntimeSnapshotPermit {
+            service_state: Arc::clone(&self.state),
+            snapshot: Arc::clone(&state.active),
+        })
+    }
+
+    /// Compares an observed runtime identity and blocks new signing when it changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when refresh already targets another identity or shared state is
+    /// unavailable.
+    pub fn observe_runtime_identity(
+        &self,
+        observed: ApprovedRuntimeIdentity,
+    ) -> Result<DeepXRuntimeChangeDecision, DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if let Some(pending) = &state.pending_identity {
+            return if pending == &observed {
+                Ok(DeepXRuntimeChangeDecision::RefreshRequired)
+            } else {
+                Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
+            };
+        }
+        if state.active.identity() == &observed {
+            return Ok(DeepXRuntimeChangeDecision::Unchanged);
+        }
+
+        state.pending_identity = Some(observed);
+        Ok(DeepXRuntimeChangeDecision::RefreshRequired)
+    }
+
+    /// Installs a fixture-validated replacement after all old signing permits are released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless refresh is active, the snapshot matches the observed identity, no
+    /// old signing permits remain, and shared state is available.
+    pub fn install(
+        &self,
+        snapshot: RuntimeSnapshot,
+    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        let pending = state
+            .pending_identity
+            .as_ref()
+            .ok_or(DeepXRuntimeSnapshotServiceError::RefreshNotStarted)?;
+        if pending != snapshot.identity() {
+            return Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch);
+        }
+        if state.in_flight != 0 {
+            return Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(
+                state.in_flight,
+            ));
+        }
+
+        state.active = Arc::new(snapshot);
+        state.pending_identity = None;
+        Ok(())
+    }
+}
+
+/// In-flight ownership of one immutable runtime snapshot.
+#[derive(Debug)]
+pub struct DeepXRuntimeSnapshotPermit {
+    service_state: Arc<Mutex<RuntimeSnapshotServiceState>>,
+    snapshot: Arc<RuntimeSnapshot>,
+}
+
+impl DeepXRuntimeSnapshotPermit {
+    /// Returns the immutable snapshot retained for this signing operation.
+    #[must_use]
+    pub fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
+    }
+}
+
+impl Drop for DeepXRuntimeSnapshotPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.service_state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
 }
 
 impl RuntimeSnapshot {
@@ -286,6 +456,80 @@ mod tests {
                 &metadata_bytes(),
             ),
             Err(SnapshotError::RuntimeIdentityMismatch),
+        ));
+    }
+
+    #[rstest]
+    fn runtime_change_blocks_new_signing_until_old_permits_finish() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+        let mut changed_identity = snapshot.identity().clone();
+        changed_identity.spec_version += 1;
+
+        assert_eq!(
+            service
+                .observe_runtime_identity(changed_identity.clone())
+                .unwrap(),
+            DeepXRuntimeChangeDecision::RefreshRequired,
+        );
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
+
+        let mut replacement = snapshot;
+        replacement.identity = changed_identity;
+        assert_eq!(
+            service.install(replacement.clone()),
+            Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1)),
+        );
+
+        drop(permit);
+        service.install(replacement).unwrap();
+        assert_eq!(
+            service
+                .acquire()
+                .unwrap()
+                .snapshot()
+                .identity()
+                .spec_version,
+            367
+        );
+    }
+
+    #[rstest]
+    fn runtime_refresh_rejects_unobserved_and_mismatched_snapshots() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+
+        assert_eq!(
+            service.install(snapshot.clone()),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshNotStarted),
+        );
+
+        let mut changed_identity = snapshot.identity().clone();
+        changed_identity.transaction_version += 1;
+        service.observe_runtime_identity(changed_identity).unwrap();
+        assert_eq!(
+            service.install(snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch),
+        );
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
     }
 }

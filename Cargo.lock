@@ -6196,6 +6196,7 @@ dependencies = [
  "scale-info",
  "serde",
  "serde_json",
+ "sqlx",
  "subxt-core",
  "subxt-signer",
  "thiserror 2.0.20",

@@ -56,6 +56,35 @@ implemented and covered by unit tests:
   correlation, and connection-epoch resets through a fixed-capacity command queue.
 - A zeroizing, redacted secp256k1 private-key boundary with typed validation and testnet environment
   resolution.
+- A signer-scoped timestamp nonce allocation policy which restores the maximum reservation from a
+  caller-supplied complete durable record set, requires bounded local-to-chain clock drift, rejects
+  implausible restored state and overflow, and allocates monotonically under thread contention.
+- A fail-closed reservation preparation boundary which revalidates signer ownership, allocates a
+  timestamp nonce, durably creates the exact `created` record, and releases it only after verifying
+  the store's commit acknowledgement.
+- A fail-closed signing preparation boundary which verifies the durable `created` reservation,
+  invokes an offline direct-pallet signer, and releases the `signed` record only after a
+  revision-checked durable commit.
+- A fail-closed reconciliation commit boundary which applies pool, inclusion, finality, complete
+  absence, and operator evidence only through an exact acknowledged record and revision-checked
+  durable commit.
+- A fail-closed RPC role identity boundary which requires submission, watch, and recovery endpoint
+  observations to match their configured URLs and the approved testnet genesis hash before
+  releasing a complete validated endpoint set.
+- A transport-neutral runtime snapshot service which grants immutable snapshots through counted
+  signing permits, blocks new permits as soon as a changed runtime identity is observed, and
+  installs a matching fixture-validated replacement only after all old permits are released. The
+  public offline signer requires one of these permits rather than accepting a bare snapshot.
+- A protocol-neutral missed-block recovery boundary which plans bounded contiguous ranges, accepts
+  each range exactly once in order, rejects incomplete or non-contiguous block evidence, and
+  releases a recovery scan only after every planned finalized block has been collected.
+- Fail-closed recovery and reorganization classifiers which require complete canonical evidence,
+  exact block and inclusion identity, and authoritative submission-pool absence before producing a
+  negative outcome. Missing or conflicting evidence requires operator action.
+- A PostgreSQL durable transaction store over the existing Nautilus `general` table, with versioned
+  exact record envelopes, revision-checked compare-and-set, and detached session advisory locks for
+  cross-process signer ownership. Recovery and reorganization decisions use this acknowledged CAS
+  boundary.
 
 These foundations do not make the adapter operational. Apart from the two public market-list reads,
 single-page perpetual funding-rate, long-short ratio, and open-interest history primitives, one
@@ -89,15 +118,33 @@ and add this capability document. The implementation maps to the integration pla
 - **Phase D - Partial:** A fixture-backed immutable runtime snapshot validates the testnet genesis,
   approved runtime versions, exact metadata SHA-256, ordered signed extensions, and unknown
   extension encodings. The pinned DeepX Subxt fork provides an AccountId20/Keccak ECDSA offline
-  dynamic-call signer with an explicit caller-supplied nonce. The capture tool can collect the
-  finalized header required to pair a checkpoint hash with its block number, but no committed
-  fixture currently proves that pair, so mortal signing remains disabled. No live snapshot service,
-  runtime refresh or quiescence state machine, order-call model, golden signing vector, nonce owner,
-  transaction submission, tracker, or recovery scanner exists.
-- **Phase E - Not started:** No execution client, account initialization, order commands, reports,
+  dynamic-call signer with an explicit caller-supplied nonce. A signer-scoped timestamp nonce policy
+  restores its high-water mark from durable records, calibrates against caller-supplied chain time,
+  and allocates monotonically without rollback. Reservation preparation revalidates the signer
+  lease and durably creates the exact `created` record before exposing it for later signing. Signing
+  preparation verifies that committed reservation and persists matching signed bytes with CAS
+  before exposing the `signed` record. Authoritative pool, inclusion, finality, complete absence,
+  exact best-block reorganization, and operator evidence can be applied through an exact
+  acknowledged record and committed with CAS; signing and submission-start observations cannot
+  bypass their dedicated preparation boundaries. Reorganization evidence must identify the exact
+  non-finalized inclusion, is retained durably, and returns the transaction to reconciliation
+  without authorizing replay. Missed finalized blocks can be planned as bounded contiguous ranges
+  and collected in order through a single-owner fail-closed boundary before recovery evidence is
+  classified. The PostgreSQL store implements exact versioned envelopes, revision-checked CAS, and
+  cross-process signer advisory locks over Nautilus's existing general storage table.
+  A transport-neutral snapshot service blocks new signing permits after a changed runtime identity
+  is observed and prevents replacement until every permit for the old immutable snapshot is
+  released. It accepts only an already validated snapshot matching the observed identity, and the
+  public offline signing entry point cannot bypass this permit boundary.
+  The capture tool can collect the finalized header required to pair a checkpoint hash with its
+  block number, but no committed fixture currently proves that pair, so mortal signing remains
+  disabled. No live runtime watcher, metadata refresh transport or refresh orchestration,
+  order-call model, golden signing vector, configured nonce store or chain time source, transaction
+  submission, tracker, RPC identity collector, role-method capability probe, RPC evidence
+  collector, or live recovery scanner exists.
+- **Phase E - Not started:** No execution client, account initialization, order commands, reports
   or reconciliation exists.
-- **Phase F - Not started:** No lending, subaccount, delegate, quota, or bridge service client
-  exists.
+- **Phase F - Not started:** No subaccount, delegate, quota
 - **Phase G - Partial:** This document exists; configs, factories, PyO3/Python wiring, discovery
   pages, and examples are absent.
 - **Phase H - Not started:** No controlled conformance, benchmarks, fuzz campaigns, or full
@@ -136,7 +183,7 @@ Never use production credentials with this integration.
 | Area                  | Planned boundary                                 | Current status | Notes                                                    |
 | --------------------- | ------------------------------------------------ | -------------- | -------------------------------------------------------- |
 | Environment           | DeepX testnet                                    | Verified       | Deployment identity captured on 2026-09-01.              |
-| Protocol core         | Rust types, fixtures, HTTP/WS and runtime state    | Partial        | Offline signer only; no submission or live WS channel.   |
+| Protocol core         | Rust types, fixtures, HTTP/WS and runtime state  | Partial        | Offline signer only; no submission or live WS channel.   |
 | Mainnet               | None                                             | Unsupported    | No validated deployment or protocol evidence is present. |
 | Spot                  | Nautilus data and execution clients              | Planned        | Requires verified asset, market, and trading schemas.    |
 | Perpetual futures     | Nautilus data and execution clients              | Planned        | Requires verified market, account, and trading schemas.  |
@@ -186,8 +233,11 @@ Substrate defaults. The adapter pins DeepX's Subxt fork at commit
 the smaller `frame-metadata` decoder, while the signing path independently decodes the same bytes
 with the pinned fork. This evidence backs an immutable snapshot value which accepts metadata only
 when the observed genesis, runtime versions, metadata SHA-256, extension order, and unknown
-extension encodings match the approved identity. The snapshot is not fetched or refreshed by a
-live service and does not enable transaction submission.
+extension encodings match the approved identity. A transport-neutral service can quiesce new
+signing permits after an identity change and install an already validated replacement once old
+permits finish. Public offline signing requires a permit retained for the complete encode. The
+service does not watch the chain, fetch metadata, orchestrate refresh, or enable transaction
+submission.
 
 The testnet internal OpenAPI 3.1 document inspected during protocol research identifies itself as
 `internal-v1`. The retrieved JSON was
@@ -383,11 +433,11 @@ schemes other than secp256k1 are unsupported.
 | Live trades            | Planned | Planned   | Public subscription acknowledgement and event fixtures.    |
 | Quotes and ticker      | Planned | Planned   | Field meaning and empty-book behavior.                     |
 | Mark and index prices  | -       | Partial   | Raw 1m mark history only; no events or freshness claim.    |
-| Funding                | -       | Partial   | Typed single-page history only; no framework events.        |
-| Long-short ratio       | -       | Partial   | Typed single-page history only; no framework events.        |
-| Open interest          | -       | Partial   | Typed single-page history only; units remain unproven.      |
-| Volume statistics      | -       | Partial   | Raw fixed-period window; units and boundaries unproven.     |
-| Last price             | -       | Partial   | Raw exact value only; no timestamp or freshness semantics.  |
+| Funding                | -       | Partial   | Typed single-page history only; no framework events.       |
+| Long-short ratio       | -       | Partial   | Typed single-page history only; no framework events.       |
+| Open interest          | -       | Partial   | Typed single-page history only; units remain unproven.     |
+| Volume statistics      | -       | Partial   | Raw fixed-period window; units and boundaries unproven.    |
+| Last price             | -       | Partial   | Raw exact value only; no timestamp or freshness semantics. |
 | Bars                   | Planned | Planned   | Interval identity and open/close boundary semantics.       |
 | Market status          | Planned | Planned   | Status values and unknown-value behavior.                  |
 | Lending market status  | Planned | -         | Asset precision and authoritative status evidence.         |
@@ -489,11 +539,17 @@ The lifecycle rejects transitions that skip durable signing, preserves the immut
 hash and exact block inclusion evidence, and treats repeated matching observations as idempotent.
 `not-included` requires explicit proof of both a complete canonical scan through a finalized block
 and authoritative absence from the submission node pool. Later canonical inclusion can correct
-that negative observation, while incomplete or conflicting evidence requires `action-required`.
+that negative observation. An exact reorganization observation can remove a recorded non-finalized
+inclusion, retain the reverted block and extrinsic-index evidence, and return the lifecycle to
+`submitting` for fresh reconciliation. A later canonical inclusion replaces the reverted evidence;
+mismatched or finalized reorganization observations are rejected. Incomplete or conflicting
+evidence requires `action-required`.
 
-This foundation performs no persistence, networking, submission, nonce allocation or release,
-automatic replay, or Nautilus order-event emission. Those capabilities remain disabled until the
-runtime and recovery evidence gates below are resolved.
+The lifecycle foundation performs no persistence, networking, submission, automatic replay, or
+Nautilus order-event emission. A separate in-memory timestamp nonce policy now performs allocation,
+but it grants no signing or submission authority and depends on external durable records, exclusive
+signer ownership, and authoritative chain time. Those operational capabilities remain disabled
+until the runtime and recovery evidence gates below are resolved.
 
 Submission failures use the same evidence vocabulary intended for the execution boundary:
 `not-sent` requires local proof that transmission never started, `venue-rejected` requires an
@@ -508,20 +564,27 @@ Network configuration assigns explicit JSON-RPC roles for transaction submission
 inclusion watching, and bounded recovery scans. Each role can use an independent endpoint and
 falls back to the common verified testnet RPC URL when no role-specific override is configured.
 Role selection performs the same hard testnet validation as every other endpoint. This separation
-does not enable transaction submission or prove that the default endpoint supports every role;
-clients must still validate endpoint chain identity before using any future operational path.
+does not enable transaction submission or prove that the default endpoint supports every role.
+A pure validation boundary now requires caller-supplied observations for all three roles, rejects
+missing or duplicate roles, requires each observed URL to match the configured selection, and
+requires every endpoint to report the approved DeepX testnet genesis hash before releasing the
+complete endpoint set. URLs remain redacted from `Debug`. The boundary performs no network I/O and
+does not prove role-specific RPC method support; an operational client must still collect genesis
+identity directly from each endpoint and probe required methods before using it.
 
-Direct-pallet transaction reservations have a versioned, strict durable record format. A record
-records the client order ID, signer, instrument, side, nonce domain, and approved runtime identity
-before signing. The offline signed result carries the runtime identity actually used for encoding,
+Direct-pallet transaction reservations have a versioned, strict durable record format. Version 3
+adds retained reorganization evidence and uses a distinct cache-key namespace so older record
+shapes cannot be silently interpreted as current. A record records the client order ID, signer,
+instrument, side, nonce domain, and approved runtime identity before signing. The offline signed
+result carries the runtime identity actually used for encoding,
 and the record accepts only a matching signer, timestamp nonce, runtime, and Blake2-256 hash of the
 signed bytes. Sequential account nonce binding remains unsupported. The current generic dynamic
 signer does not prove that pallet call arguments encode the recorded client order ID, instrument,
 or side; that binding remains gated on authoritative SDK golden vectors. Restoration rejects
 unknown fields, unsupported versions, invalid identifiers, incomplete absence evidence, and
 lifecycle state inconsistency. Cache keys are versioned and hex-encode client order ID bytes so
-delimiters cannot change the namespace. Version 2 records retain the complete signed bytes and
-verify their Blake2-256 hash during restoration. These bytes are recovery evidence only: the codec
+delimiters cannot change the namespace. Records retain the complete signed bytes and verify their
+Blake2-256 hash during restoration. These bytes are recovery evidence only: the codec
 does not authorize submission or replay, and no future mutating path may resend them without an
 authoritative reconciliation policy proving that replay is safe.
 
@@ -558,21 +621,64 @@ reconciliation. Acknowledgements are bound to the exact cache key and encoded re
 write cannot authorize a newer lifecycle state. The generic cache `add` operation does not satisfy
 this interface because its contract does not prove durable commit, CAS, or lease ownership.
 
-No persistence implementation is currently configured for DeepX, so concurrent multi-process
-signing remains disabled. Committed signed bytes also remain evidence rather than replay authority:
-submission and automatic replay require authoritative RPC outcome semantics and a reconciliation
-policy. Sequential account nonce signing and business-call binding remain disabled until captured
-protocol vectors prove their domains and exact encoded call arguments.
+The PostgreSQL transaction store persists versioned record envelopes in Nautilus's existing
+`general` table and compares the complete expected envelope during revision-checked replacement.
+It holds a detached PostgreSQL session advisory lock for the lifetime of each signer lease, so a
+pooled connection cannot retain signer ownership after the lease ends. Lost write acknowledgement
+remains an unknown commit outcome. This store is a persistence primitive, not a configured signing
+or submission service: committed signed bytes remain evidence rather than replay authority, and
+sequential account nonce signing and business-call binding remain disabled until captured protocol
+vectors prove their domains and exact encoded call arguments.
 
-The persistence contract is asynchronous so a future PostgreSQL implementation can hold a
-transaction-scoped signer fence and commit record changes without blocking the runtime. Initial
-submission preparation is now an explicit atomic boundary: it revalidates the current signer lease,
-matches the exact previously committed record bytes, requires a golden-vector-backed business-call
-verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use payload permit.
-Stale revisions, forged prior records, unproven call bindings, and unknown commit outcomes release
-no payload. The default verifier rejects every call because the required vectors have not been
-captured. This permit is intentionally unavailable to restored reconciliation states and therefore
-cannot be used for automatic replay.
+The timestamp nonce allocator is scoped to one externally leased signer and restores the maximum
+timestamp reservation from the complete durable record set supplied by that store. It uses the
+greater of caller-supplied local and chain Unix millisecond time, rejects excessive clock drift and
+restored values implausibly ahead of calibrated time, and atomically advances by at least one under
+same-millisecond contention. Values are never rolled back or released in memory. The caller must
+durably commit each reservation before signing; a failed or unknown commit burns the local value and
+retains signer ownership pending reconciliation. The reservation preparation boundary enforces this
+ordering: it verifies that the current store lease covers the allocator signer, allocates the nonce,
+creates the immutable identity, and returns the record only after `create_committed` acknowledges
+that record's exact encoding. It performs no signing or submission. No configured store or
+authoritative chain-time reader currently connects this boundary to an operational path.
+
+The persistence contract is asynchronous so the PostgreSQL implementation can hold a
+transaction-scoped signer fence and commit record changes without blocking the runtime. Signing
+preparation verifies the current signer lease and exact committed `created` record before invoking
+an offline signer, validates the resulting signer, timestamp nonce, runtime identity, and extrinsic
+hash, and compare-and-sets the complete `signed` record before returning it. A stale revision may be
+detected only by that CAS after offline signing, but no signed result is released on a conflict or
+unknown commit outcome. This boundary does not prove business-call arguments and grants no
+submission authority.
+
+Initial submission preparation is a separate atomic boundary: it revalidates the current signer
+lease, matches the exact previously committed record bytes, requires a golden-vector-backed
+business-call verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use
+payload permit. Stale revisions, forged prior records, unproven call bindings, and unknown commit
+outcomes release no payload. The default verifier rejects every call because the required vectors
+have not been captured. This permit is intentionally unavailable to restored reconciliation states
+and therefore cannot be used for automatic replay.
+
+Authoritative reconciliation observations have a separate durable commit boundary. It revalidates
+the current signer lease and exact prior acknowledgement, applies the observation to a candidate
+record, and compare-and-sets a changed record before exposing it. Repeated identical evidence is
+idempotent and preserves the existing revision. Stale revisions and unknown commit outcomes expose
+no candidate record. `signed` and `submission-started` observations are rejected here so they cannot
+bypass signing validation or the initial-submission business-call gate. This boundary consumes
+already-decoded evidence only: it performs no RPC collection, canonical scanning, pool query,
+submission, replay, or Nautilus order-event emission.
+
+Reorganization observations use this same revision-checked commit boundary. The boundary accepts
+only the exact recorded non-finalized block hash, block number, extrinsic index, and business
+outcome, commits the reverted evidence once, and treats an identical repeated observation as
+idempotent without advancing the durable revision. Pure recovery planning splits blocks after the
+last complete checkpoint into bounded, contiguous inclusive ranges without wrapping at `u64::MAX`.
+A single-owner collector accepts only the next planned range with the exact ordered block count and
+cannot release a recovery scan until all ranges reach the finalized boundary. The resulting scan
+still requires exact finalized-block identity and authoritative submission-pool evidence before it
+can produce `not-included`. These boundaries perform no head watching, canonicality query, pool
+query, or RPC collection; those operational sources remain required before live reorganization or
+absence recovery can be enabled.
 
 ## Fixture identity
 
@@ -607,7 +713,8 @@ The following unresolved questions keep their dependent capabilities disabled:
   behavior. Existing fixtures contain a finalized hash but no corresponding block number.
 - Direct pallet call and event definitions for every action.
 - Legacy precompile ABI, transaction envelope, wrapper, and hash semantics.
-- Timestamp order-ID allocation, sequential account-index nonce ownership, and chain-time drift.
+- Authoritative chain-time source and allowed drift, configured cross-process timestamp reservation
+  storage, and sequential account-index nonce ownership.
 - Relay acknowledgement meaning and correlation with stream, REST, and chain evidence.
 - Canonical inclusion, reorganization, finality, pool eviction, and missed-block recovery.
 - Quota idempotency and the exact EIP-191 claim message.

@@ -32,22 +32,37 @@ pub mod transaction;
 pub mod websocket;
 
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
-pub use config::{DeepXNetworkConfig, DeepXRpcRole};
+pub use config::{
+    DeepXNetworkConfig, DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
+    DeepXValidatedRpcEndpoints, validate_rpc_endpoint_identities,
+};
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};
 pub use signing::{
-    ApprovedRuntimeIdentity, DeepXRuntimeConfig, RuntimeSnapshot, SignedPalletExtrinsic,
-    SigningError, SnapshotError, sign_dynamic_pallet_call,
+    ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeConfig,
+    DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
+    RuntimeSnapshot, SignedPalletExtrinsic, SigningError, SnapshotError, sign_dynamic_pallet_call,
 };
 pub use transaction::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION, DeepXAbsenceEvidence,
     DeepXAutomaticReplayDecision, DeepXBusinessCallBindingError, DeepXBusinessCallVerifier,
-    DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic,
-    DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation, DeepXPreparedSubmission,
-    DeepXSignerLease, DeepXSubmissionFailure, DeepXSubmissionPermit,
-    DeepXSubmissionPreparationError, DeepXTransactionError, DeepXTransactionIdentity,
-    DeepXTransactionLifecycle, DeepXTransactionObservation, DeepXTransactionPersistenceError,
-    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionRecoveryAction,
-    DeepXTransactionRevision, DeepXTransactionState, DeepXTransactionStore,
-    DeepXUnsupportedBusinessCallVerifier, prepare_initial_submission, verify_signer_lease,
+    DeepXCanonicalBlockEvidence, DeepXCommittedObservation, DeepXCommittedTransactionRecord,
+    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXInclusionEvidence,
+    DeepXInclusionOutcome, DeepXMissedBlockScanPlan, DeepXNonceReservation,
+    DeepXObservationCommitError, DeepXPostgresSignerLease, DeepXPostgresTransactionStore,
+    DeepXPreparedReservation, DeepXPreparedSignedTransaction, DeepXPreparedSubmission,
+    DeepXRecoveryDecision, DeepXRecoveryScan, DeepXRecoveryScanCollectionError,
+    DeepXRecoveryScanCollector, DeepXRecoveryScanPlanError, DeepXRecoveryScanRange,
+    DeepXRecoveryScanRanges, DeepXReorganizationDecision, DeepXReservationPreparationError,
+    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+    DeepXSubmissionFailure, DeepXSubmissionPermit, DeepXSubmissionPoolEvidence,
+    DeepXSubmissionPreparationError, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
+    DeepXTransactionError, DeepXTransactionIdentity, DeepXTransactionLifecycle,
+    DeepXTransactionObservation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
+    DeepXTransactionRecordError, DeepXTransactionRecoveryAction, DeepXTransactionRevision,
+    DeepXTransactionState, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
+    classify_reorganization, commit_reconciliation_observation, commit_recovery_decision,
+    commit_reorganization_decision, plan_missed_block_scan, prepare_initial_submission,
+    prepare_signed_transaction, prepare_timestamp_reservation, restore_timestamp_nonce_allocator,
+    verify_signer_lease,
 };

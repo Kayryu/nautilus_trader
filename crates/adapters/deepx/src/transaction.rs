@@ -16,23 +16,36 @@
 //! Evidence-driven lifecycle primitives for DeepX transactions.
 
 mod persistence;
+mod recovery;
 mod reservation;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
 pub use persistence::{
-    DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedTransactionRecord,
-    DeepXPreparedSubmission, DeepXSignerLease, DeepXSubmissionPermit,
+    DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
+    DeepXCommittedTransactionRecord, DeepXObservationCommitError, DeepXPostgresSignerLease,
+    DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
+    DeepXPreparedSubmission, DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
+    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionPermit,
     DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
-    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, prepare_initial_submission,
+    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, commit_reconciliation_observation,
+    commit_recovery_decision, commit_reorganization_decision, prepare_initial_submission,
+    prepare_signed_transaction, prepare_timestamp_reservation, restore_timestamp_nonce_allocator,
     verify_signer_lease,
+};
+pub use recovery::{
+    DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
+    DeepXRecoveryScan, DeepXRecoveryScanCollectionError, DeepXRecoveryScanCollector,
+    DeepXRecoveryScanPlanError, DeepXRecoveryScanRange, DeepXRecoveryScanRanges,
+    DeepXReorganizationDecision, DeepXSubmissionPoolEvidence, classify_reorganization,
+    plan_missed_block_scan,
 };
 pub use reservation::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION,
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXNonceReservation,
-    DeepXTransactionIdentity, DeepXTransactionRecord, DeepXTransactionRecordError,
+    DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionIdentity,
+    DeepXTransactionRecord, DeepXTransactionRecordError,
 };
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// The fail-closed action required after restoring a durable transaction record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +288,8 @@ pub enum DeepXTransactionObservation {
     PoolAccepted,
     /// The transaction was observed at a block extrinsic index.
     Included(DeepXInclusionEvidence),
+    /// A previously recorded best-block inclusion was removed by a reorganization.
+    Reorged(DeepXInclusionEvidence),
     /// The recorded inclusion was proved canonical at the finalized boundary.
     Finalized(DeepXInclusionEvidence),
     /// Complete canonical scanning and a submission-pool check proved absence.
@@ -300,6 +315,12 @@ pub enum DeepXTransactionError {
     /// An included observation conflicts with previously recorded block evidence.
     #[error("conflicting DeepX transaction inclusion evidence")]
     ConflictingInclusionEvidence,
+    /// Reorganization evidence does not identify the previously recorded inclusion.
+    #[error("DeepX reorganization evidence does not match the recorded inclusion")]
+    ReorganizationMismatch,
+    /// Reorganization evidence conflicts with a previously recorded reorganization.
+    #[error("conflicting DeepX transaction reorganization evidence")]
+    ConflictingReorganizationEvidence,
     /// A not-included observation conflicts with previously recorded absence evidence.
     #[error("conflicting DeepX transaction absence evidence")]
     ConflictingAbsenceEvidence,
@@ -326,6 +347,7 @@ pub struct DeepXTransactionLifecycle {
     state: DeepXTransactionState,
     extrinsic_hash: Option<[u8; 32]>,
     inclusion: Option<DeepXInclusionEvidence>,
+    reverted_inclusion: Option<DeepXInclusionEvidence>,
     absence: Option<DeepXAbsenceEvidence>,
 }
 
@@ -343,6 +365,7 @@ impl DeepXTransactionLifecycle {
             state: DeepXTransactionState::Created,
             extrinsic_hash: None,
             inclusion: None,
+            reverted_inclusion: None,
             absence: None,
         }
     }
@@ -363,6 +386,12 @@ impl DeepXTransactionLifecycle {
     #[must_use]
     pub const fn inclusion(&self) -> Option<DeepXInclusionEvidence> {
         self.inclusion
+    }
+
+    /// Returns the latest best-block inclusion removed by a reorganization.
+    #[must_use]
+    pub const fn reverted_inclusion(&self) -> Option<DeepXInclusionEvidence> {
+        self.reverted_inclusion
     }
 
     /// Returns complete absence evidence when a scan classified the transaction as not included.
@@ -407,6 +436,7 @@ impl DeepXTransactionLifecycle {
                 Observation::Included(e),
             ) => {
                 self.inclusion = Some(e);
+                self.reverted_inclusion = None;
                 self.absence = None;
                 self.state = match e.outcome {
                     DeepXInclusionOutcome::Success => State::InBlockSuccess,
@@ -418,6 +448,21 @@ impl DeepXTransactionLifecycle {
                     Ok(false)
                 } else {
                     Err(DeepXTransactionError::ConflictingInclusionEvidence)
+                };
+            }
+            (State::InBlockSuccess | State::InBlockFailed, Observation::Reorged(e)) => {
+                if self.inclusion != Some(e) {
+                    return Err(DeepXTransactionError::ReorganizationMismatch);
+                }
+                self.inclusion = None;
+                self.reverted_inclusion = Some(e);
+                self.state = State::Submitting;
+            }
+            (State::Submitting, Observation::Reorged(e)) => {
+                return if self.reverted_inclusion == Some(e) {
+                    Ok(false)
+                } else {
+                    Err(DeepXTransactionError::ConflictingReorganizationEvidence)
                 };
             }
             (State::InBlockSuccess | State::InBlockFailed, Observation::Finalized(e)) => {
@@ -603,6 +648,73 @@ mod tests {
     }
 
     #[rstest]
+    #[case(DeepXInclusionOutcome::Success)]
+    #[case(DeepXInclusionOutcome::Failed)]
+    fn exact_reorganization_returns_to_reconciliation_and_allows_canonical_reinclusion(
+        #[case] outcome: DeepXInclusionOutcome,
+    ) {
+        let reverted = inclusion(outcome);
+        let mut lifecycle = submitting();
+        lifecycle
+            .apply(DeepXTransactionObservation::Included(reverted))
+            .unwrap();
+
+        assert!(
+            lifecycle
+                .apply(DeepXTransactionObservation::Reorged(reverted))
+                .unwrap()
+        );
+        assert_eq!(lifecycle.state(), DeepXTransactionState::Submitting);
+        assert_eq!(lifecycle.inclusion(), None);
+        assert_eq!(lifecycle.reverted_inclusion(), Some(reverted));
+        assert!(lifecycle.state().requires_reconciliation());
+        assert!(
+            !lifecycle
+                .apply(DeepXTransactionObservation::Reorged(reverted))
+                .unwrap()
+        );
+
+        let canonical = DeepXInclusionEvidence {
+            block_hash: [8; 32],
+            block_number: reverted.block_number + 1,
+            ..reverted
+        };
+        lifecycle
+            .apply(DeepXTransactionObservation::Included(canonical))
+            .unwrap();
+        assert_eq!(lifecycle.inclusion(), Some(canonical));
+        assert_eq!(lifecycle.reverted_inclusion(), None);
+    }
+
+    #[rstest]
+    fn reorganization_requires_exact_non_finalized_inclusion_identity() {
+        let evidence = inclusion(DeepXInclusionOutcome::Success);
+        let conflicting = DeepXInclusionEvidence {
+            extrinsic_index: evidence.extrinsic_index + 1,
+            ..evidence
+        };
+        let mut lifecycle = submitting();
+        lifecycle
+            .apply(DeepXTransactionObservation::Included(evidence))
+            .unwrap();
+
+        assert_eq!(
+            lifecycle.apply(DeepXTransactionObservation::Reorged(conflicting)),
+            Err(DeepXTransactionError::ReorganizationMismatch),
+        );
+        assert_eq!(lifecycle.inclusion(), Some(evidence));
+
+        lifecycle
+            .apply(DeepXTransactionObservation::Finalized(evidence))
+            .unwrap();
+        assert!(matches!(
+            lifecycle.apply(DeepXTransactionObservation::Reorged(evidence)),
+            Err(DeepXTransactionError::InvalidTransition { .. }),
+        ));
+        assert_eq!(lifecycle.state(), DeepXTransactionState::Finalized);
+    }
+
+    #[rstest]
     fn terminal_states_reject_automatic_transitions() {
         let mut lifecycle = submitting();
         lifecycle
@@ -621,6 +733,7 @@ mod tests {
     #[case(DeepXTransactionObservation::SubmissionStarted)]
     #[case(DeepXTransactionObservation::PoolAccepted)]
     #[case(DeepXTransactionObservation::Included(inclusion(DeepXInclusionOutcome::Success)))]
+    #[case(DeepXTransactionObservation::Reorged(inclusion(DeepXInclusionOutcome::Success)))]
     #[case(DeepXTransactionObservation::Finalized(inclusion(DeepXInclusionOutcome::Success)))]
     #[case(DeepXTransactionObservation::NotIncluded(absence()))]
     fn created_state_rejects_observations_that_skip_durable_signing(
