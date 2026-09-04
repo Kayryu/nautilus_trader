@@ -210,7 +210,7 @@ async fn rpc<T>(
 where
     T: DeserializeOwned,
 {
-    client
+    let response: JsonRpcResponse<T> = client
         .post(rpc_url)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -223,7 +223,18 @@ where
         .error_for_status()?
         .json()
         .await
-        .with_context(|| format!("Failed to decode DeepX RPC response for {method}"))
+        .with_context(|| format!("Failed to decode DeepX RPC response for {method}"))?;
+    ensure!(
+        response.jsonrpc == "2.0",
+        "DeepX RPC response for {method} has unexpected JSON-RPC version: {}",
+        response.jsonrpc,
+    );
+    ensure!(
+        response.id == 1,
+        "DeepX RPC response for {method} has unexpected request ID: {}",
+        response.id,
+    );
+    Ok(response)
 }
 
 fn parse_block_number(value: &str) -> anyhow::Result<u64> {
@@ -377,5 +388,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(parse_block_number(&response.result.number).unwrap(), 42);
+    }
+
+    #[rstest]
+    #[case("1.0", 1, "unexpected JSON-RPC version: 1.0")]
+    #[case("2.0", 2, "unexpected request ID: 2")]
+    #[tokio::test]
+    async fn rejects_invalid_json_rpc_envelope(
+        #[case] jsonrpc: &'static str,
+        #[case] id: u64,
+        #[case] expected_error: &str,
+    ) {
+        let router = Router::new().route(
+            "/",
+            post(move || async move {
+                Json(json!({
+                    "jsonrpc": jsonrpc,
+                    "id": id,
+                    "result": "valid-result"
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let error = rpc::<String>(
+            &Client::new(),
+            &format!("http://{address}"),
+            "test_method",
+            json!([]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains(expected_error));
     }
 }

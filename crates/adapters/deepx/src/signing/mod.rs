@@ -18,8 +18,10 @@
 mod snapshot;
 
 pub use snapshot::{
-    ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeSnapshotPermit,
-    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, RuntimeSnapshot, SnapshotError,
+    ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeInterfaceCatalog,
+    DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface, DeepXRuntimeSnapshotPermit,
+    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate,
+    DeepXRuntimeVariantIdentity, RuntimeSnapshot, SnapshotError,
 };
 use subxt_core::{
     Config,
@@ -195,6 +197,7 @@ mod tests {
         let bytes = hex::decode(metadata.result.trim_start_matches("0x")).unwrap();
 
         RuntimeSnapshot::approved_testnet(
+            &crate::common::DeepXEnvironment::Testnet,
             hex::decode_array("86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b")
                 .unwrap(),
             366,

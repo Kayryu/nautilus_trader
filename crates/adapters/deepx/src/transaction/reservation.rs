@@ -138,7 +138,7 @@ impl DeepXTimestampNonceAllocator {
         }
     }
 
-    /// Reserves a nonce after verifying local time against authoritative chain time.
+    /// Reserves a nonce from the current Unix epoch time in milliseconds.
     ///
     /// Concurrent callers receive unique monotonically increasing values. This method performs no
     /// persistence and grants no signing or submission authority.
@@ -386,9 +386,29 @@ struct DeepXTransactionRecordWire {
 struct DeepXTransactionLifecycleWire {
     state: DeepXTransactionState,
     extrinsic_hash: Option<[u8; 32]>,
-    inclusion: Option<super::DeepXInclusionEvidence>,
-    reverted_inclusion: Option<super::DeepXInclusionEvidence>,
+    inclusion: Option<DeepXInclusionEvidenceWire>,
+    reverted_inclusion: Option<DeepXInclusionEvidenceWire>,
     absence: Option<DeepXAbsenceEvidenceWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeepXInclusionEvidenceWire {
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    outcome: super::DeepXInclusionOutcome,
+}
+
+impl DeepXInclusionEvidenceWire {
+    const fn into_evidence(self) -> super::DeepXInclusionEvidence {
+        super::DeepXInclusionEvidence::from_durable_parts(
+            self.block_hash,
+            self.block_number,
+            self.extrinsic_index,
+            self.outcome,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -727,8 +747,14 @@ impl DeepXTransactionRecord {
             lifecycle: DeepXTransactionLifecycle {
                 state: wire.lifecycle.state,
                 extrinsic_hash: wire.lifecycle.extrinsic_hash,
-                inclusion: wire.lifecycle.inclusion,
-                reverted_inclusion: wire.lifecycle.reverted_inclusion,
+                inclusion: wire
+                    .lifecycle
+                    .inclusion
+                    .map(DeepXInclusionEvidenceWire::into_evidence),
+                reverted_inclusion: wire
+                    .lifecycle
+                    .reverted_inclusion
+                    .map(DeepXInclusionEvidenceWire::into_evidence),
                 absence,
             },
         };
@@ -759,6 +785,7 @@ mod tests {
     use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 
     use super::*;
+    use crate::common::DeepXEnvironment;
 
     fn identity(nonce: DeepXNonceReservation) -> DeepXTransactionIdentity {
         DeepXTransactionIdentity::new(
@@ -897,6 +924,7 @@ mod tests {
             signer: [7; 20],
             nonce,
             runtime: ApprovedRuntimeIdentity {
+                environment: DeepXEnvironment::Testnet,
                 genesis_hash: runtime.genesis_hash,
                 metadata_sha256: runtime.metadata_sha256,
                 spec_version: runtime.spec_version,

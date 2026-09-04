@@ -189,18 +189,153 @@ pub enum DeepXInclusionOutcome {
     Failed,
 }
 
+/// The authoritative dispatch result emitted for one block extrinsic index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXDispatchOutcome {
+    /// The runtime reported successful extrinsic dispatch.
+    Success,
+    /// The runtime reported failed extrinsic dispatch.
+    Failed,
+}
+
+/// The authoritative expected business-event result for one block extrinsic index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXBusinessEventOutcome {
+    /// The expected business event proves successful application.
+    Success,
+    /// An expected business failure event was observed.
+    Failed,
+    /// No authoritative expected business event was observed.
+    NotObserved,
+}
+
+/// One indexed runtime observation used to derive authoritative inclusion evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXIndexedOutcome<T> {
+    /// Block extrinsic index associated with the observation.
+    pub extrinsic_index: u32,
+    /// Outcome observed at that extrinsic index.
+    pub outcome: T,
+}
+
+/// Errors raised when indexed runtime observations cannot prove an inclusion outcome.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum DeepXInclusionEvidenceError {
+    /// Dispatch and business-event observations belong to different extrinsics.
+    #[error(
+        "DeepX dispatch index {dispatch_index} does not match business event index {business_event_index}"
+    )]
+    ExtrinsicIndexMismatch {
+        /// Extrinsic index attached to the dispatch observation.
+        dispatch_index: u32,
+        /// Extrinsic index attached to the business-event observation.
+        business_event_index: u32,
+    },
+    /// Successful dispatch did not emit an authoritative expected business event.
+    #[error("DeepX successful dispatch has no authoritative expected business event")]
+    MissingBusinessEvent,
+    /// A failed dispatch cannot also produce an applied business event.
+    #[error("DeepX failed dispatch conflicts with an observed business event")]
+    ConflictingBusinessEvent,
+}
+
 /// Canonical identity and outcome for one included extrinsic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeepXInclusionEvidence {
     /// Hash of the block containing the extrinsic.
-    pub block_hash: [u8; 32],
+    block_hash: [u8; 32],
     /// Number of the block containing the extrinsic.
-    pub block_number: u64,
+    block_number: u64,
     /// Extrinsic index used to match pallet events.
-    pub extrinsic_index: u32,
+    extrinsic_index: u32,
     /// Authoritative extrinsic and business-event outcome.
-    pub outcome: DeepXInclusionOutcome,
+    outcome: DeepXInclusionOutcome,
+}
+
+impl DeepXInclusionEvidence {
+    /// Derives inclusion evidence from dispatch and expected business-event observations.
+    ///
+    /// A failed dispatch is authoritative only when no business event was observed. A successful
+    /// dispatch requires an explicit expected business success or failure event at the same block
+    /// extrinsic index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the observations identify different extrinsics, successful dispatch
+    /// lacks an expected business event, or failed dispatch conflicts with a business event.
+    pub fn from_indexed_observations(
+        block_hash: [u8; 32],
+        block_number: u64,
+        dispatch: DeepXIndexedOutcome<DeepXDispatchOutcome>,
+        business_event: DeepXIndexedOutcome<DeepXBusinessEventOutcome>,
+    ) -> Result<Self, DeepXInclusionEvidenceError> {
+        if dispatch.extrinsic_index != business_event.extrinsic_index {
+            return Err(DeepXInclusionEvidenceError::ExtrinsicIndexMismatch {
+                dispatch_index: dispatch.extrinsic_index,
+                business_event_index: business_event.extrinsic_index,
+            });
+        }
+        let outcome = match (dispatch.outcome, business_event.outcome) {
+            (DeepXDispatchOutcome::Success, DeepXBusinessEventOutcome::Success) => {
+                DeepXInclusionOutcome::Success
+            }
+            (DeepXDispatchOutcome::Success, DeepXBusinessEventOutcome::Failed)
+            | (DeepXDispatchOutcome::Failed, DeepXBusinessEventOutcome::NotObserved) => {
+                DeepXInclusionOutcome::Failed
+            }
+            (DeepXDispatchOutcome::Success, DeepXBusinessEventOutcome::NotObserved) => {
+                return Err(DeepXInclusionEvidenceError::MissingBusinessEvent);
+            }
+            (DeepXDispatchOutcome::Failed, _) => {
+                return Err(DeepXInclusionEvidenceError::ConflictingBusinessEvent);
+            }
+        };
+        Ok(Self {
+            block_hash,
+            block_number,
+            extrinsic_index: dispatch.extrinsic_index,
+            outcome,
+        })
+    }
+
+    /// Returns the hash of the block containing the extrinsic.
+    #[must_use]
+    pub const fn block_hash(&self) -> [u8; 32] {
+        self.block_hash
+    }
+
+    /// Returns the number of the block containing the extrinsic.
+    #[must_use]
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    /// Returns the block extrinsic index shared by the verified observations.
+    #[must_use]
+    pub const fn extrinsic_index(&self) -> u32 {
+        self.extrinsic_index
+    }
+
+    /// Returns the outcome derived from dispatch and expected business-event evidence.
+    #[must_use]
+    pub const fn outcome(&self) -> DeepXInclusionOutcome {
+        self.outcome
+    }
+
+    pub(super) const fn from_durable_parts(
+        block_hash: [u8; 32],
+        block_number: u64,
+        extrinsic_index: u32,
+        outcome: DeepXInclusionOutcome,
+    ) -> Self {
+        Self {
+            block_hash,
+            block_number,
+            extrinsic_index,
+            outcome,
+        }
+    }
 }
 
 /// Proof boundary required before a transaction can be classified as not included.
@@ -516,6 +651,108 @@ mod tests {
             extrinsic_index: 3,
             outcome,
         }
+    }
+
+    #[rstest]
+    #[case(
+        DeepXDispatchOutcome::Success,
+        DeepXBusinessEventOutcome::Success,
+        DeepXInclusionOutcome::Success
+    )]
+    #[case(
+        DeepXDispatchOutcome::Success,
+        DeepXBusinessEventOutcome::Failed,
+        DeepXInclusionOutcome::Failed
+    )]
+    #[case(
+        DeepXDispatchOutcome::Failed,
+        DeepXBusinessEventOutcome::NotObserved,
+        DeepXInclusionOutcome::Failed
+    )]
+    fn derives_inclusion_from_index_matched_runtime_evidence(
+        #[case] dispatch_outcome: DeepXDispatchOutcome,
+        #[case] business_event_outcome: DeepXBusinessEventOutcome,
+        #[case] expected: DeepXInclusionOutcome,
+    ) {
+        let evidence = DeepXInclusionEvidence::from_indexed_observations(
+            [2; 32],
+            42,
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: dispatch_outcome,
+            },
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: business_event_outcome,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(evidence.block_hash(), [2; 32]);
+        assert_eq!(evidence.block_number(), 42);
+        assert_eq!(evidence.extrinsic_index(), 3);
+        assert_eq!(evidence.outcome(), expected);
+    }
+
+    #[rstest]
+    fn rejects_runtime_evidence_from_different_extrinsic_indexes() {
+        let result = DeepXInclusionEvidence::from_indexed_observations(
+            [2; 32],
+            42,
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: DeepXDispatchOutcome::Success,
+            },
+            DeepXIndexedOutcome {
+                extrinsic_index: 4,
+                outcome: DeepXBusinessEventOutcome::Success,
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(DeepXInclusionEvidenceError::ExtrinsicIndexMismatch {
+                dispatch_index: 3,
+                business_event_index: 4,
+            }),
+        );
+    }
+
+    #[rstest]
+    #[case(
+        DeepXDispatchOutcome::Success,
+        DeepXBusinessEventOutcome::NotObserved,
+        DeepXInclusionEvidenceError::MissingBusinessEvent
+    )]
+    #[case(
+        DeepXDispatchOutcome::Failed,
+        DeepXBusinessEventOutcome::Success,
+        DeepXInclusionEvidenceError::ConflictingBusinessEvent
+    )]
+    #[case(
+        DeepXDispatchOutcome::Failed,
+        DeepXBusinessEventOutcome::Failed,
+        DeepXInclusionEvidenceError::ConflictingBusinessEvent
+    )]
+    fn rejects_incomplete_or_conflicting_runtime_evidence(
+        #[case] dispatch_outcome: DeepXDispatchOutcome,
+        #[case] business_event_outcome: DeepXBusinessEventOutcome,
+        #[case] expected: DeepXInclusionEvidenceError,
+    ) {
+        let result = DeepXInclusionEvidence::from_indexed_observations(
+            [2; 32],
+            42,
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: dispatch_outcome,
+            },
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: business_event_outcome,
+            },
+        );
+
+        assert_eq!(result, Err(expected));
     }
 
     fn absence() -> DeepXAbsenceEvidence {

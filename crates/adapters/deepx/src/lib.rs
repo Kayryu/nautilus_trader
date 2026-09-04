@@ -27,7 +27,9 @@ pub mod config;
 pub mod http;
 pub mod instruments;
 pub mod providers;
+pub mod rpc;
 pub mod signing;
+pub mod spot;
 pub mod transaction;
 pub mod websocket;
 
@@ -38,17 +40,29 @@ pub use config::{
 };
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};
+pub use rpc::{
+    DeepXAppliedRuntimeSnapshot, DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot,
+    DeepXRpcEndpointIdentityError, DeepXRpcIdentityError, DeepXRpcMethodCapabilities,
+    DeepXRpcMethodCapabilityError, DeepXRuntimeSnapshotObservationError,
+    DeepXRuntimeSnapshotRefreshError, observe_and_apply_approved_finalized_runtime_snapshot,
+    observe_and_validate_rpc_endpoint_identities, observe_approved_finalized_runtime_snapshot,
+    observe_rpc_endpoint_identity, observe_rpc_method_capabilities,
+};
 pub use signing::{
     ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeConfig,
+    DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
     DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
-    RuntimeSnapshot, SignedPalletExtrinsic, SigningError, SnapshotError, sign_dynamic_pallet_call,
+    DeepXRuntimeSnapshotUpdate, DeepXRuntimeVariantIdentity, RuntimeSnapshot,
+    SignedPalletExtrinsic, SigningError, SnapshotError, sign_dynamic_pallet_call,
 };
+pub use spot::{DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError};
 pub use transaction::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION, DeepXAbsenceEvidence,
     DeepXAutomaticReplayDecision, DeepXBusinessCallBindingError, DeepXBusinessCallVerifier,
-    DeepXCanonicalBlockEvidence, DeepXCommittedObservation, DeepXCommittedTransactionRecord,
-    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXInclusionEvidence,
-    DeepXInclusionOutcome, DeepXMissedBlockScanPlan, DeepXNonceReservation,
+    DeepXBusinessEventOutcome, DeepXCanonicalBlockEvidence, DeepXCommittedObservation,
+    DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXDispatchOutcome,
+    DeepXDurableSignedExtrinsic, DeepXInclusionEvidence, DeepXInclusionEvidenceError,
+    DeepXInclusionOutcome, DeepXIndexedOutcome, DeepXMissedBlockScanPlan, DeepXNonceReservation,
     DeepXObservationCommitError, DeepXPostgresSignerLease, DeepXPostgresTransactionStore,
     DeepXPreparedReservation, DeepXPreparedSignedTransaction, DeepXPreparedSubmission,
     DeepXRecoveryDecision, DeepXRecoveryScan, DeepXRecoveryScanCollectionError,

@@ -22,6 +22,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 nautilus-core = { workspace = true }
+nautilus-blockchain = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 

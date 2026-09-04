@@ -790,6 +790,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        common::DeepXEnvironment,
         signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic},
         transaction::{
             DeepXDirectRuntimeIdentity, DeepXInclusionEvidence, DeepXInclusionOutcome,
@@ -1050,6 +1051,7 @@ mod tests {
             signer: identity.signer(),
             nonce,
             runtime: ApprovedRuntimeIdentity {
+                environment: DeepXEnvironment::Testnet,
                 genesis_hash: runtime.genesis_hash,
                 metadata_sha256: runtime.metadata_sha256,
                 spec_version: runtime.spec_version,
@@ -1082,6 +1084,7 @@ mod tests {
             signer: identity.signer(),
             nonce,
             runtime: ApprovedRuntimeIdentity {
+                environment: DeepXEnvironment::Testnet,
                 genesis_hash: runtime.genesis_hash,
                 metadata_sha256: runtime.metadata_sha256,
                 spec_version: runtime.spec_version,

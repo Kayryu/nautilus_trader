@@ -15,11 +15,14 @@
 
 //! Immutable runtime identity and metadata used by offline signing.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 
 use aws_lc_rs::digest::{SHA256, digest};
 use nautilus_core::hex;
-use scale_info::TypeDef;
+use scale_info::{TypeDef, Variant, form::PortableForm};
 use subxt_core::{
     client::{ClientState, RuntimeVersion},
     metadata,
@@ -29,6 +32,7 @@ use subxt_core::{
 use thiserror::Error;
 
 use super::DeepXRuntimeConfig;
+use crate::common::DeepXEnvironment;
 
 const TESTNET_GENESIS_HASH: &str =
     "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
@@ -51,6 +55,8 @@ const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
 /// Runtime identity approved by the captured DeepX testnet fixture set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovedRuntimeIdentity {
+    /// DeepX deployment associated with the fixture set.
+    pub environment: DeepXEnvironment,
     /// Testnet genesis hash.
     pub genesis_hash: [u8; 32],
     /// SHA-256 of the complete SCALE metadata bytes.
@@ -69,6 +75,9 @@ pub enum SnapshotError {
     /// The pinned identity constant could not be decoded.
     #[error("invalid built-in DeepX runtime identity")]
     InvalidApprovedIdentity,
+    /// Runtime snapshots are currently approved only for DeepX testnet.
+    #[error("unsupported DeepX runtime deployment: {0}")]
+    UnsupportedDeployment(String),
     /// The SCALE metadata cannot be decoded by the pinned DeepX Subxt fork.
     #[error("invalid DeepX runtime metadata: {0}")]
     InvalidMetadata(#[from] parity_scale_codec::Error),
@@ -84,6 +93,193 @@ pub enum SnapshotError {
     /// An unknown non-empty transaction extension would make signing ambiguous.
     #[error("unsupported non-empty DeepX transaction extension: {0}")]
     UnsupportedTransactionExtension(String),
+    /// The approved metadata contains an inconsistent pallet, call, or event identity.
+    #[error(transparent)]
+    InvalidRuntimeInterface(#[from] DeepXRuntimeInterfaceError),
+}
+
+/// Errors produced while constructing or querying a runtime interface catalog.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXRuntimeInterfaceError {
+    /// A pallet name or index is duplicated in the runtime metadata.
+    #[error("duplicate DeepX runtime pallet identity: {0}")]
+    DuplicatePallet(String),
+    /// A call name or index is duplicated within a pallet.
+    #[error("duplicate DeepX runtime call identity: {0}.{1}")]
+    DuplicateCall(String, String),
+    /// An event name or index is duplicated within a pallet.
+    #[error("duplicate DeepX runtime event identity: {0}.{1}")]
+    DuplicateEvent(String, String),
+    /// The requested pallet is absent from the approved runtime metadata.
+    #[error("DeepX runtime pallet is unavailable: {0}")]
+    PalletUnavailable(String),
+    /// The requested call is absent from the approved runtime metadata.
+    #[error("DeepX runtime call is unavailable: {0}.{1}")]
+    CallUnavailable(String, String),
+    /// The requested event is absent from the approved runtime metadata.
+    #[error("DeepX runtime event is unavailable: {0}.{1}")]
+    EventUnavailable(String, String),
+}
+
+/// Immutable metadata identity for one runtime call or event variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXRuntimeVariantIdentity {
+    /// Variant name declared by the runtime metadata.
+    name: String,
+    /// SCALE variant index declared by the runtime metadata.
+    index: u8,
+}
+
+impl DeepXRuntimeVariantIdentity {
+    /// Returns the variant name declared by the runtime metadata.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the SCALE variant index declared by the runtime metadata.
+    #[must_use]
+    pub const fn index(&self) -> u8 {
+        self.index
+    }
+}
+
+/// Immutable metadata identity and variants for one runtime pallet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXRuntimePalletInterface {
+    /// Pallet name declared by the runtime metadata.
+    name: String,
+    /// SCALE pallet index declared by the runtime metadata.
+    index: u8,
+    /// Call variants declared by the runtime metadata.
+    calls: Vec<DeepXRuntimeVariantIdentity>,
+    /// Event variants declared by the runtime metadata.
+    events: Vec<DeepXRuntimeVariantIdentity>,
+}
+
+impl DeepXRuntimePalletInterface {
+    /// Returns the pallet name declared by the runtime metadata.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the SCALE pallet index declared by the runtime metadata.
+    #[must_use]
+    pub const fn index(&self) -> u8 {
+        self.index
+    }
+
+    /// Returns the call variants declared by the runtime metadata.
+    #[must_use]
+    pub fn calls(&self) -> &[DeepXRuntimeVariantIdentity] {
+        &self.calls
+    }
+
+    /// Returns the event variants declared by the runtime metadata.
+    #[must_use]
+    pub fn events(&self) -> &[DeepXRuntimeVariantIdentity] {
+        &self.events
+    }
+}
+
+/// Immutable pallet, call, and event identities from approved runtime metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXRuntimeInterfaceCatalog {
+    pallets: Vec<DeepXRuntimePalletInterface>,
+}
+
+impl DeepXRuntimeInterfaceCatalog {
+    fn from_metadata(metadata: &Metadata) -> Result<Self, DeepXRuntimeInterfaceError> {
+        let mut pallet_names = BTreeSet::new();
+        let mut pallet_indices = BTreeSet::new();
+        let mut pallets = Vec::with_capacity(metadata.pallets().len());
+
+        for pallet in metadata.pallets() {
+            if !pallet_names.insert(pallet.name()) || !pallet_indices.insert(pallet.index()) {
+                return Err(DeepXRuntimeInterfaceError::DuplicatePallet(
+                    pallet.name().to_string(),
+                ));
+            }
+            let calls = collect_variants(
+                pallet.name(),
+                pallet.call_variants().unwrap_or_default(),
+                DeepXRuntimeInterfaceError::DuplicateCall,
+            )?;
+            let events = collect_variants(
+                pallet.name(),
+                pallet.event_variants().unwrap_or_default(),
+                DeepXRuntimeInterfaceError::DuplicateEvent,
+            )?;
+            pallets.push(DeepXRuntimePalletInterface {
+                name: pallet.name().to_string(),
+                index: pallet.index(),
+                calls,
+                events,
+            });
+        }
+
+        Ok(Self { pallets })
+    }
+
+    /// Returns all pallet interfaces in metadata order.
+    #[must_use]
+    pub fn pallets(&self) -> &[DeepXRuntimePalletInterface] {
+        &self.pallets
+    }
+
+    /// Returns a pallet identity from the approved runtime metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pallet is absent.
+    pub fn pallet(
+        &self,
+        pallet: &str,
+    ) -> Result<&DeepXRuntimePalletInterface, DeepXRuntimeInterfaceError> {
+        self.pallets
+            .iter()
+            .find(|candidate| candidate.name == pallet)
+            .ok_or_else(|| DeepXRuntimeInterfaceError::PalletUnavailable(pallet.to_string()))
+    }
+
+    /// Returns a call identity from the approved runtime metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pallet or call is absent.
+    pub fn call(
+        &self,
+        pallet: &str,
+        call: &str,
+    ) -> Result<&DeepXRuntimeVariantIdentity, DeepXRuntimeInterfaceError> {
+        self.pallet(pallet)?
+            .calls
+            .iter()
+            .find(|candidate| candidate.name == call)
+            .ok_or_else(|| {
+                DeepXRuntimeInterfaceError::CallUnavailable(pallet.to_string(), call.to_string())
+            })
+    }
+
+    /// Returns an event identity from the approved runtime metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pallet or event is absent.
+    pub fn event(
+        &self,
+        pallet: &str,
+        event: &str,
+    ) -> Result<&DeepXRuntimeVariantIdentity, DeepXRuntimeInterfaceError> {
+        self.pallet(pallet)?
+            .events
+            .iter()
+            .find(|candidate| candidate.name == event)
+            .ok_or_else(|| {
+                DeepXRuntimeInterfaceError::EventUnavailable(pallet.to_string(), event.to_string())
+            })
+    }
 }
 
 /// Decision produced after comparing an observed runtime identity with the active snapshot.
@@ -93,6 +289,15 @@ pub enum DeepXRuntimeChangeDecision {
     Unchanged,
     /// New signing is blocked until the observed identity is validated and installed.
     RefreshRequired,
+}
+
+/// Result of atomically applying a fixture-validated runtime snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXRuntimeSnapshotUpdate {
+    /// The candidate identity matches the active immutable snapshot.
+    Unchanged,
+    /// The candidate replaced the active immutable snapshot.
+    Installed,
 }
 
 /// Errors produced by the runtime snapshot quiescence boundary.
@@ -122,6 +327,7 @@ pub enum DeepXRuntimeSnapshotServiceError {
 #[derive(Clone, Debug)]
 pub struct RuntimeSnapshot {
     identity: ApprovedRuntimeIdentity,
+    interfaces: DeepXRuntimeInterfaceCatalog,
     client_state: ClientState<DeepXRuntimeConfig>,
 }
 
@@ -235,6 +441,46 @@ impl DeepXRuntimeSnapshotService {
         state.pending_identity = None;
         Ok(())
     }
+
+    /// Atomically compares and applies a fixture-validated runtime snapshot.
+    ///
+    /// A changed candidate immediately blocks new signing permits. When old permits remain, the
+    /// candidate identity stays pending so the same snapshot can be retried after they are
+    /// released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another runtime identity is pending, old signing permits remain, or
+    /// shared state is unavailable.
+    pub fn apply_validated(
+        &self,
+        snapshot: &RuntimeSnapshot,
+    ) -> Result<DeepXRuntimeSnapshotUpdate, DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+
+        if let Some(pending) = &state.pending_identity {
+            if pending != snapshot.identity() {
+                return Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange);
+            }
+        } else if state.active.identity() == snapshot.identity() {
+            return Ok(DeepXRuntimeSnapshotUpdate::Unchanged);
+        } else {
+            state.pending_identity = Some(snapshot.identity().clone());
+        }
+
+        if state.in_flight != 0 {
+            return Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(
+                state.in_flight,
+            ));
+        }
+
+        state.active = Arc::new(snapshot.clone());
+        state.pending_identity = None;
+        Ok(DeepXRuntimeSnapshotUpdate::Installed)
+    }
 }
 
 /// In-flight ownership of one immutable runtime snapshot.
@@ -268,11 +514,17 @@ impl RuntimeSnapshot {
     /// Returns an error unless the observed genesis, runtime versions, metadata hash, extension
     /// order, and extension encodings match the captured finalized fixture.
     pub fn approved_testnet(
+        environment: &DeepXEnvironment,
         observed_genesis_hash: [u8; 32],
         observed_spec_version: u32,
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
+        if !environment.is_testnet() {
+            return Err(SnapshotError::UnsupportedDeployment(
+                environment.to_string(),
+            ));
+        }
         let genesis_hash = decode_32(TESTNET_GENESIS_HASH)?;
         if observed_genesis_hash != genesis_hash
             || observed_spec_version != TESTNET_SPEC_VERSION
@@ -302,8 +554,10 @@ impl RuntimeSnapshot {
             return Err(SnapshotError::SignedExtensionsMismatch);
         }
         validate_unknown_extensions(&metadata)?;
+        let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata)?;
 
         let identity = ApprovedRuntimeIdentity {
+            environment: environment.clone(),
             genesis_hash,
             metadata_sha256: actual_metadata_hash,
             spec_version: TESTNET_SPEC_VERSION,
@@ -321,6 +575,7 @@ impl RuntimeSnapshot {
 
         Ok(Self {
             identity,
+            interfaces,
             client_state,
         })
     }
@@ -331,9 +586,35 @@ impl RuntimeSnapshot {
         &self.identity
     }
 
+    /// Returns the immutable pallet, call, and event identities for this snapshot.
+    #[must_use]
+    pub const fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
+        &self.interfaces
+    }
+
     pub(super) const fn client_state(&self) -> &ClientState<DeepXRuntimeConfig> {
         &self.client_state
     }
+}
+
+fn collect_variants(
+    pallet: &str,
+    variants: &[Variant<PortableForm>],
+    duplicate_error: fn(String, String) -> DeepXRuntimeInterfaceError,
+) -> Result<Vec<DeepXRuntimeVariantIdentity>, DeepXRuntimeInterfaceError> {
+    let mut names = BTreeSet::new();
+    let mut indices = BTreeSet::new();
+    let mut identities = Vec::with_capacity(variants.len());
+    for variant in variants {
+        if !names.insert(variant.name.clone()) || !indices.insert(variant.index) {
+            return Err(duplicate_error(pallet.to_string(), variant.name.clone()));
+        }
+        identities.push(DeepXRuntimeVariantIdentity {
+            name: variant.name.clone(),
+            index: variant.index,
+        });
+    }
+    Ok(identities)
 }
 
 fn validate_unknown_extensions(metadata: &Metadata) -> Result<(), SnapshotError> {
@@ -393,6 +674,7 @@ fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use scale_info::form::PortableForm;
     use serde::Deserialize;
 
     use super::*;
@@ -415,6 +697,7 @@ mod tests {
     #[rstest]
     fn accepts_the_approved_finalized_testnet_metadata() {
         let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
             decode_32(TESTNET_GENESIS_HASH).unwrap(),
             TESTNET_SPEC_VERSION,
             TESTNET_TRANSACTION_VERSION,
@@ -428,6 +711,94 @@ mod tests {
             snapshot.identity().signed_extensions,
             TESTNET_SIGNED_EXTENSIONS
         );
+        assert_eq!(
+            snapshot.interfaces().call("System", "remark").unwrap(),
+            &DeepXRuntimeVariantIdentity {
+                name: "remark".to_string(),
+                index: 0,
+            },
+        );
+        assert_eq!(
+            snapshot
+                .interfaces()
+                .event("System", "ExtrinsicSuccess")
+                .unwrap(),
+            &DeepXRuntimeVariantIdentity {
+                name: "ExtrinsicSuccess".to_string(),
+                index: 0,
+            },
+        );
+    }
+
+    #[rstest]
+    fn runtime_interface_lookups_fail_closed() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.interfaces().pallet("UnknownPallet"),
+            Err(DeepXRuntimeInterfaceError::PalletUnavailable(
+                "UnknownPallet".to_string(),
+            )),
+        );
+        assert_eq!(
+            snapshot.interfaces().call("System", "unknown_call"),
+            Err(DeepXRuntimeInterfaceError::CallUnavailable(
+                "System".to_string(),
+                "unknown_call".to_string(),
+            )),
+        );
+        assert_eq!(
+            snapshot.interfaces().event("System", "UnknownEvent"),
+            Err(DeepXRuntimeInterfaceError::EventUnavailable(
+                "System".to_string(),
+                "UnknownEvent".to_string(),
+            )),
+        );
+    }
+
+    #[rstest]
+    #[case("duplicate name", "first", 1, "first", 2)]
+    #[case("duplicate index", "first", 1, "second", 1)]
+    fn runtime_interface_rejects_duplicate_variant_identity(
+        #[case] _description: &str,
+        #[case] first_name: &str,
+        #[case] first_index: u8,
+        #[case] second_name: &str,
+        #[case] second_index: u8,
+    ) {
+        let variants = [
+            Variant::<PortableForm> {
+                name: first_name.to_string(),
+                fields: Vec::new(),
+                index: first_index,
+                docs: Vec::new(),
+            },
+            Variant::<PortableForm> {
+                name: second_name.to_string(),
+                fields: Vec::new(),
+                index: second_index,
+                docs: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            collect_variants(
+                "System",
+                &variants,
+                DeepXRuntimeInterfaceError::DuplicateCall,
+            ),
+            Err(DeepXRuntimeInterfaceError::DuplicateCall(
+                "System".to_string(),
+                second_name.to_string(),
+            )),
+        );
     }
 
     #[rstest]
@@ -437,6 +808,7 @@ mod tests {
 
         assert!(matches!(
             RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
                 decode_32(TESTNET_GENESIS_HASH).unwrap(),
                 TESTNET_SPEC_VERSION,
                 TESTNET_TRANSACTION_VERSION,
@@ -450,6 +822,7 @@ mod tests {
     fn rejects_runtime_versions_outside_the_approved_fixture_identity() {
         assert!(matches!(
             RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
                 decode_32(TESTNET_GENESIS_HASH).unwrap(),
                 TESTNET_SPEC_VERSION + 1,
                 TESTNET_TRANSACTION_VERSION,
@@ -460,8 +833,25 @@ mod tests {
     }
 
     #[rstest]
+    #[case(DeepXEnvironment::Mainnet)]
+    #[case(DeepXEnvironment::Unknown("staging".to_string()))]
+    fn rejects_unapproved_deployments(#[case] environment: DeepXEnvironment) {
+        assert!(matches!(
+            RuntimeSnapshot::approved_testnet(
+                &environment,
+                decode_32(TESTNET_GENESIS_HASH).unwrap(),
+                TESTNET_SPEC_VERSION,
+                TESTNET_TRANSACTION_VERSION,
+                &metadata_bytes(),
+            ),
+            Err(SnapshotError::UnsupportedDeployment(_)),
+        ));
+    }
+
+    #[rstest]
     fn runtime_change_blocks_new_signing_until_old_permits_finish() {
         let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
             decode_32(TESTNET_GENESIS_HASH).unwrap(),
             TESTNET_SPEC_VERSION,
             TESTNET_TRANSACTION_VERSION,
@@ -507,6 +897,7 @@ mod tests {
     #[rstest]
     fn runtime_refresh_rejects_unobserved_and_mismatched_snapshots() {
         let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
             decode_32(TESTNET_GENESIS_HASH).unwrap(),
             TESTNET_SPEC_VERSION,
             TESTNET_TRANSACTION_VERSION,
@@ -531,5 +922,91 @@ mod tests {
             service.acquire(),
             Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
+    }
+
+    #[rstest]
+    fn validated_snapshot_application_is_idempotent() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+
+        assert_eq!(
+            service.apply_validated(&snapshot).unwrap(),
+            DeepXRuntimeSnapshotUpdate::Unchanged,
+        );
+    }
+
+    #[rstest]
+    fn validated_snapshot_application_waits_for_old_permits() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+        let mut replacement = snapshot;
+        replacement.identity.spec_version += 1;
+
+        assert_eq!(
+            service.apply_validated(&replacement),
+            Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1)),
+        );
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
+
+        drop(permit);
+        assert_eq!(
+            service.apply_validated(&replacement).unwrap(),
+            DeepXRuntimeSnapshotUpdate::Installed,
+        );
+        assert_eq!(
+            service.acquire().unwrap().snapshot().identity(),
+            replacement.identity(),
+        );
+    }
+
+    #[rstest]
+    fn validated_snapshot_application_rejects_conflicting_pending_identity() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+        let mut first_replacement = snapshot.clone();
+        first_replacement.identity.spec_version += 1;
+        let mut conflicting_replacement = snapshot;
+        conflicting_replacement.identity.transaction_version += 1;
+
+        assert_eq!(
+            service.apply_validated(&first_replacement),
+            Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1)),
+        );
+        assert_eq!(
+            service.apply_validated(&conflicting_replacement),
+            Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange),
+        );
+
+        drop(permit);
+        assert_eq!(
+            service.apply_validated(&first_replacement).unwrap(),
+            DeepXRuntimeSnapshotUpdate::Installed,
+        );
     }
 }

@@ -6186,6 +6186,7 @@ dependencies = [
  "axum",
  "frame-metadata",
  "jiff",
+ "nautilus-blockchain",
  "nautilus-core",
  "nautilus-model",
  "nautilus-network",
