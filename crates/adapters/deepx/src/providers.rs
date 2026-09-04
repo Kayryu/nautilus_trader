@@ -89,6 +89,18 @@ impl DeepXMarketProvider {
         self.initialized
     }
 
+    /// Returns whether the market catalog contains no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.markets.is_empty()
+    }
+
+    /// Returns the primary REST endpoint used to load the market catalog.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.client.base_url()
+    }
+
     /// Returns all markets in canonical identity order.
     #[must_use]
     pub fn markets(&self) -> Vec<&DeepXMarketMetadata> {

@@ -21,7 +21,11 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{DeepXWsError, DeepXWsFrame, DeepXWsProtocolCore, DeepXWsRequest};
+use super::{
+    DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt, DeepXWsError, DeepXWsFrame,
+    DeepXWsProtocolCore, DeepXWsRequest,
+};
+use nautilus_network::websocket::auth::AuthResultReceiver;
 
 const DEEPX_WS_COMMAND_CAPACITY: usize = 1024;
 
@@ -31,8 +35,61 @@ pub type DeepXWsRegisteredRequest = (
     oneshot::Receiver<Result<Value, DeepXWsError>>,
 );
 
+/// Authentication attempt registration and its completion waiter.
+pub type DeepXWsRegisteredAuthentication = (DeepXWsAuthenticationAttempt, AuthResultReceiver);
+
 #[derive(Debug)]
 enum DeepXWsHandlerCommand {
+    BeginAuthentication {
+        response_tx: oneshot::Sender<Result<DeepXWsRegisteredAuthentication, DeepXWsError>>,
+    },
+    CompleteAuthentication {
+        attempt: DeepXWsAuthenticationAttempt,
+        response_tx: oneshot::Sender<bool>,
+    },
+    FailAuthentication {
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    CancelAuthentication {
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    IsAuthenticated {
+        response_tx: oneshot::Sender<bool>,
+    },
+    AuthenticatedSession {
+        response_tx: oneshot::Sender<Option<DeepXWsAuthenticatedSession>>,
+    },
+    IsAuthenticatedSession {
+        session: DeepXWsAuthenticatedSession,
+        response_tx: oneshot::Sender<bool>,
+    },
+    Subscribe {
+        topic: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    ConfirmSubscription {
+        connection_epoch: u64,
+        topic: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    FailSubscription {
+        connection_epoch: u64,
+        topic: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    Unsubscribe {
+        topic: String,
+        response_tx: oneshot::Sender<bool>,
+    },
+    ConfirmUnsubscription {
+        connection_epoch: u64,
+        topic: String,
+        response_tx: oneshot::Sender<bool>,
+    },
     Register {
         response_tx: oneshot::Sender<Result<DeepXWsRegisteredRequest, DeepXWsError>>,
     },
@@ -54,7 +111,7 @@ enum DeepXWsHandlerCommand {
     ResetAfterReconnect {
         connection_epoch: u64,
         reason: String,
-        response_tx: oneshot::Sender<Vec<String>>,
+        response_tx: oneshot::Sender<Result<Vec<String>, DeepXWsError>>,
     },
 }
 
@@ -65,6 +122,285 @@ pub struct DeepXWsProtocolHandle {
 }
 
 impl DeepXWsProtocolHandle {
+    /// Begins an authentication attempt owned by the current connection epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when token allocation fails or the handler is no longer running.
+    pub async fn begin_authentication(
+        &self,
+    ) -> Result<DeepXWsRegisteredAuthentication, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::BeginAuthentication { response_tx })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())?
+    }
+
+    /// Completes an authentication attempt only while its connection and generation remain current.
+    ///
+    /// Returns `false` for a stale, superseded, or unknown attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn complete_authentication(
+        &self,
+        attempt: DeepXWsAuthenticationAttempt,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::CompleteAuthentication {
+                attempt,
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Fails an authentication attempt only while its connection and generation remain current.
+    ///
+    /// Returns `false` for a stale, superseded, or unknown attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn fail_authentication(
+        &self,
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: impl Into<String>,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::FailAuthentication {
+                attempt,
+                reason: reason.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Cancels an authentication attempt only while its connection and generation remain current.
+    ///
+    /// Returns `false` for a stale, superseded, or completed attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn cancel_authentication(
+        &self,
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: impl Into<String>,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::CancelAuthentication {
+                attempt,
+                reason: reason.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Waits for authentication and cancels the matching attempt on timeout.
+    ///
+    /// A result completed at the timeout boundary wins the race.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed authentication failure, timeout, or handler-stopped error.
+    pub async fn wait_for_authentication(
+        &self,
+        attempt: DeepXWsAuthenticationAttempt,
+        mut authentication_rx: AuthResultReceiver,
+        timeout: Duration,
+    ) -> Result<(), DeepXWsError> {
+        match tokio::time::timeout(timeout, &mut authentication_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(reason))) => Err(DeepXWsError::AuthenticationFailed(reason)),
+            Ok(Err(_)) => Err(handler_stopped()),
+            Err(_) => {
+                if self
+                    .cancel_authentication(attempt, "authentication timed out")
+                    .await?
+                {
+                    return Err(DeepXWsError::AuthenticationTimeout);
+                }
+
+                authentication_rx
+                    .await
+                    .map_err(|_| handler_stopped())?
+                    .map_err(DeepXWsError::AuthenticationFailed)
+            }
+        }
+    }
+
+    /// Returns whether the current connection epoch has authenticated successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn is_authenticated(&self) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::IsAuthenticated { response_tx })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Returns proof of authentication for the current connection, when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn authenticated_session(
+        &self,
+    ) -> Result<Option<DeepXWsAuthenticatedSession>, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::AuthenticatedSession { response_tx })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Returns whether the supplied authenticated session is still current.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn is_authenticated_session(
+        &self,
+        session: DeepXWsAuthenticatedSession,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::IsAuthenticatedSession {
+                session,
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Records desired subscription intent for the current connection.
+    ///
+    /// Returns `true` when the caller should send a transport subscribe request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn subscribe(&self, topic: impl Into<String>) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::Subscribe {
+                topic: topic.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Confirms subscription acknowledgment only for the current connection epoch.
+    ///
+    /// Returns `false` for an acknowledgment from a stale connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn confirm_subscription(
+        &self,
+        connection_epoch: u64,
+        topic: impl Into<String>,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::ConfirmSubscription {
+                connection_epoch,
+                topic: topic.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Returns a failed subscription to pending state for the current connection epoch.
+    ///
+    /// Returns `false` for a failure from a stale connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn fail_subscription(
+        &self,
+        connection_epoch: u64,
+        topic: impl Into<String>,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::FailSubscription {
+                connection_epoch,
+                topic: topic.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Records desired unsubscription intent for the current connection.
+    ///
+    /// Returns `true` when the caller should send a transport unsubscribe request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn unsubscribe(&self, topic: impl Into<String>) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::Unsubscribe {
+                topic: topic.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
+    /// Confirms unsubscription acknowledgment only for the current connection epoch.
+    ///
+    /// Returns `false` for an acknowledgment from a stale connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the handler is no longer running.
+    pub async fn confirm_unsubscription(
+        &self,
+        connection_epoch: u64,
+        topic: impl Into<String>,
+    ) -> Result<bool, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::ConfirmUnsubscription {
+                connection_epoch,
+                topic: topic.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())
+    }
+
     /// Registers a request before a future transport send is exposed.
     ///
     /// # Errors
@@ -199,7 +535,7 @@ impl DeepXWsProtocolHandle {
             })
             .await
             .map_err(|_| handler_stopped())?;
-        response_rx.await.map_err(|_| handler_stopped())
+        response_rx.await.map_err(|_| handler_stopped())?
     }
 }
 
@@ -217,12 +553,12 @@ impl DeepXWsProtocolHandler {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    self.core.drain_pending("protocol handler canceled");
+                    self.core.drain_connection_owned("protocol handler canceled");
                     return;
                 }
                 command = self.command_rx.recv() => {
                     let Some(command) = command else {
-                        self.core.drain_pending("protocol command channel closed");
+                        self.core.drain_connection_owned("protocol command channel closed");
                         return;
                     };
                     handle_command(&mut self.core, command);
@@ -255,6 +591,68 @@ fn deepx_ws_protocol_handler_with_capacity(
 
 fn handle_command(core: &mut DeepXWsProtocolCore, command: DeepXWsHandlerCommand) {
     match command {
+        DeepXWsHandlerCommand::BeginAuthentication { response_tx } => {
+            let _ = response_tx.send(core.begin_authentication());
+        }
+        DeepXWsHandlerCommand::CompleteAuthentication {
+            attempt,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.complete_authentication(attempt));
+        }
+        DeepXWsHandlerCommand::FailAuthentication {
+            attempt,
+            reason,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.fail_authentication(attempt, reason));
+        }
+        DeepXWsHandlerCommand::CancelAuthentication {
+            attempt,
+            reason,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.cancel_authentication(attempt, reason));
+        }
+        DeepXWsHandlerCommand::IsAuthenticated { response_tx } => {
+            let _ = response_tx.send(core.is_authenticated());
+        }
+        DeepXWsHandlerCommand::AuthenticatedSession { response_tx } => {
+            let _ = response_tx.send(core.authenticated_session());
+        }
+        DeepXWsHandlerCommand::IsAuthenticatedSession {
+            session,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.is_authenticated_session(session));
+        }
+        DeepXWsHandlerCommand::Subscribe { topic, response_tx } => {
+            let _ = response_tx.send(core.subscribe(&topic));
+        }
+        DeepXWsHandlerCommand::ConfirmSubscription {
+            connection_epoch,
+            topic,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.confirm_subscription(connection_epoch, &topic));
+        }
+        DeepXWsHandlerCommand::FailSubscription {
+            connection_epoch,
+            topic,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.fail_subscription(connection_epoch, &topic));
+        }
+        DeepXWsHandlerCommand::Unsubscribe { topic, response_tx } => {
+            let _ = response_tx.send(core.unsubscribe(&topic));
+        }
+        DeepXWsHandlerCommand::ConfirmUnsubscription {
+            connection_epoch,
+            topic,
+            response_tx,
+        } => {
+            let _ = response_tx.send(core.confirm_unsubscription(connection_epoch, &topic));
+        }
         DeepXWsHandlerCommand::Register { response_tx } => {
             let _ = response_tx.send(core.register_request());
         }
@@ -397,15 +795,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_reconnect_command_preserves_current_request() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        handle
+            .reset_after_reconnect(4, "initial connection")
+            .await
+            .unwrap();
+        let (request, response_rx) = handle.register_request().await.unwrap();
+
+        assert_eq!(
+            handle.reset_after_reconnect(3, "stale connection").await,
+            Err(DeepXWsError::NonIncreasingConnectionEpoch {
+                current: 4,
+                received: 3,
+            }),
+        );
+
+        let frame = format!(r#"{{"id":{},"ok":true}}"#, request.id().as_u64());
+        assert!(handle.ingest_text(4, frame).await.unwrap());
+        assert_eq!(response_rx.await.unwrap().unwrap()["ok"], true);
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_lifecycle_is_serialized_and_epoch_fenced() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let topic = "trades:ETH-USDC";
+
+        assert!(handle.subscribe(topic).await.unwrap());
+        assert!(!handle.subscribe(topic).await.unwrap());
+        assert!(
+            !handle
+                .confirm_subscription(0, "unknown:topic")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            handle
+                .reset_after_reconnect(1, "connection replaced")
+                .await
+                .unwrap(),
+            vec![topic.to_string()],
+        );
+        assert!(!handle.confirm_subscription(0, topic).await.unwrap());
+        assert!(!handle.fail_subscription(0, topic).await.unwrap());
+        assert_eq!(
+            handle
+                .reset_after_reconnect(2, "connection replaced again")
+                .await
+                .unwrap(),
+            vec![topic.to_string()],
+        );
+        assert!(handle.confirm_subscription(2, topic).await.unwrap());
+        assert!(!handle.confirm_subscription(2, topic).await.unwrap());
+        assert!(handle.unsubscribe(topic).await.unwrap());
+        assert!(!handle.unsubscribe(topic).await.unwrap());
+        assert!(!handle.confirm_unsubscription(1, topic).await.unwrap());
+        assert!(handle.confirm_unsubscription(2, topic).await.unwrap());
+        assert!(!handle.confirm_unsubscription(2, topic).await.unwrap());
+        assert!(
+            handle
+                .reset_after_reconnect(3, "connection replaced after unsubscribe")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_attempts_are_fenced_by_generation_and_connection_epoch() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let (first, first_rx) = handle.begin_authentication().await.unwrap();
+        let (second, _) = handle.begin_authentication().await.unwrap();
+
+        assert!(first_rx.await.unwrap().is_err());
+        assert!(!handle.complete_authentication(first).await.unwrap());
+        assert!(handle.complete_authentication(second).await.unwrap());
+        assert!(handle.is_authenticated().await.unwrap());
+        let authenticated = handle.authenticated_session().await.unwrap().unwrap();
+        assert!(
+            handle
+                .is_authenticated_session(authenticated)
+                .await
+                .unwrap()
+        );
+
+        let (stale, stale_rx) = handle.begin_authentication().await.unwrap();
+        assert!(handle.authenticated_session().await.unwrap().is_none());
+        assert!(
+            !handle
+                .is_authenticated_session(authenticated)
+                .await
+                .unwrap()
+        );
+        assert!(handle.complete_authentication(stale).await.unwrap());
+        let reauthenticated = handle.authenticated_session().await.unwrap().unwrap();
+        handle
+            .reset_after_reconnect(7, "connection replaced")
+            .await
+            .unwrap();
+
+        assert_eq!(stale_rx.await.unwrap(), Ok(()));
+        assert!(!handle.complete_authentication(stale).await.unwrap());
+        assert!(!handle.is_authenticated().await.unwrap());
+        assert!(
+            !handle
+                .is_authenticated_session(reauthenticated)
+                .await
+                .unwrap()
+        );
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_is_fenced_by_generation() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let (stale, stale_rx) = handle.begin_authentication().await.unwrap();
+        let (active, active_rx) = handle.begin_authentication().await.unwrap();
+
+        assert!(stale_rx.await.unwrap().is_err());
+        assert!(
+            !handle
+                .fail_authentication(stale, "stale rejection")
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle
+                .fail_authentication(active, "invalid credentials")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            active_rx.await.unwrap(),
+            Err("invalid credentials".to_string()),
+        );
+        assert!(!handle.is_authenticated().await.unwrap());
+        assert!(handle.authenticated_session().await.unwrap().is_none());
+
+        let (retry, retry_rx) = handle.begin_authentication().await.unwrap();
+        assert!(handle.complete_authentication(retry).await.unwrap());
+        assert_eq!(retry_rx.await.unwrap(), Ok(()));
+        let session = handle.authenticated_session().await.unwrap().unwrap();
+        assert!(
+            !handle
+                .fail_authentication(active, "late rejection")
+                .await
+                .unwrap()
+        );
+        assert!(handle.is_authenticated_session(session).await.unwrap());
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_authentication_wait_cancels_only_its_attempt() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let (attempt, authentication_rx) = handle.begin_authentication().await.unwrap();
+
+        assert_eq!(
+            handle
+                .wait_for_authentication(attempt, authentication_rx, Duration::from_millis(1),)
+                .await,
+            Err(DeepXWsError::AuthenticationTimeout),
+        );
+        assert!(!handle.complete_authentication(attempt).await.unwrap());
+        assert!(!handle.is_authenticated().await.unwrap());
+
+        let (retry, retry_rx) = handle.begin_authentication().await.unwrap();
+        assert!(handle.complete_authentication(retry).await.unwrap());
+        assert_eq!(
+            handle
+                .wait_for_authentication(retry, retry_rx, Duration::from_secs(1))
+                .await,
+            Ok(()),
+        );
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancellation_drains_pending_and_stops_handle() {
         let cancellation = CancellationToken::new();
         let (handle, handler) = deepx_ws_protocol_handler(':');
         let handler_task = tokio::spawn(handler.run(cancellation.clone()));
         let (_, response_rx) = handle.register_request().await.unwrap();
+        let (_, authentication_rx) = handle.begin_authentication().await.unwrap();
 
         cancellation.cancel();
         handler_task.await.unwrap();
 
+        assert_eq!(
+            authentication_rx.await.unwrap(),
+            Err("protocol handler canceled".to_string())
+        );
         assert!(matches!(
             response_rx.await.unwrap(),
             Err(DeepXWsError::RequestCanceled(reason)) if reason == "protocol handler canceled"
@@ -414,6 +1011,21 @@ mod tests {
             handle.register_request().await,
             Err(DeepXWsError::RequestCanceled(reason)) if reason == "protocol handler stopped"
         ));
+    }
+
+    #[tokio::test]
+    async fn command_channel_closure_cancels_pending_authentication() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let (_, authentication_rx) = handle.begin_authentication().await.unwrap();
+
+        drop(handle);
+        handler_task.await.unwrap();
+
+        assert_eq!(
+            authentication_rx.await.unwrap(),
+            Err("protocol command channel closed".to_string())
+        );
     }
 
     #[tokio::test]
@@ -517,6 +1129,25 @@ mod tests {
                 .unwrap()["ok"],
             true,
         );
+
+        drop(handle);
+        handler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_authentication_wins_at_timeout_boundary() {
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        let handler_task = tokio::spawn(handler.run(CancellationToken::new()));
+        let (attempt, authentication_rx) = handle.begin_authentication().await.unwrap();
+
+        assert!(handle.complete_authentication(attempt).await.unwrap());
+        assert_eq!(
+            handle
+                .wait_for_authentication(attempt, authentication_rx, Duration::ZERO)
+                .await,
+            Ok(()),
+        );
+        assert!(handle.is_authenticated().await.unwrap());
 
         drop(handle);
         handler_task.await.unwrap();

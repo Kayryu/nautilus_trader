@@ -44,12 +44,14 @@ implemented and covered by unit tests:
 - Defensive cursor-pagination state which enforces a local page budget and rejects empty-page
   continuation and repeated cursors without assuming endpoint-specific cursor semantics.
 - Transport-neutral WebSocket protocol state with monotonic request correlation, connection-epoch
-  ownership, stale send/response isolation, shared authentication tracking, and desired-versus-
-  confirmed subscription intent across reconnect resets.
+  ownership, protocol-owner-bound request and authentication capabilities, stale send/response
+  isolation, generation-fenced authentication attempts, and desired-versus-confirmed subscription
+  intent across reconnect resets.
 - Single-decode WebSocket text-frame ingress which correlates only unsigned numeric top-level
   request IDs, preserves valid unknown JSON, and returns typed errors for malformed JSON.
 - Owned WebSocket task lifecycle with generation-specific cancellation, bounded graceful shutdown,
-  forced abort followed by join, and rejection of overlapping handler generations.
+  forced abort followed by join, rejection of overlapping handler generations, and explicit
+  shutdown invalidation of the current generation token even when no task is owned.
 - A schema-neutral single-owner WebSocket command loop which serializes request registration,
   matching send-failure or caller-timeout cleanup, bounded response waits, one-decode inbound
   correlation, and connection-epoch resets through a fixed-capacity command queue.
@@ -110,7 +112,28 @@ implemented and covered by unit tests:
   epoch. The final step verifies that event is present in the matching account ID and account type
   in the shared execution cache. Raw startup evidence advancement is crate-private, and account
   state, order-context restoration, and account registration additionally require their dedicated
-  verification boundaries. Cache borrow contention fails with a typed error. Disconnect resets the
+  verification boundaries. Instrument preload only advances through a `DeepXMarketProvider` which
+  completed its failure-atomic Spot and perpetual catalog load and contains at least one market. An
+  uninitialized provider and a successful but empty catalog return distinct typed startup errors
+  without advancing. The provider primary REST endpoint must also match the execution client's
+  configured REST endpoint; mismatched evidence fails without exposing either URL. This binds
+  startup evidence to configuration but does not independently authenticate the HTTP endpoint.
+  Runtime validation advances only with a snapshot token produced after fixture-approved metadata
+  was observed at one finalized Watch checkpoint and atomically applied to the shared snapshot
+  service. The token's deployment and genesis identity must match the execution configuration and
+  chain-identity-validated Submission, Watch, and Recovery endpoint selection. This proves endpoint
+  URL selection and chain identity, not support for each role's required RPC methods. The approved
+  snapshot authorizes only the direct-pallet backend; legacy-EVM configuration fails without
+  advancing until separate fixture evidence establishes its runtime interface.
+  This public metadata catalog is not a Nautilus `InstrumentProvider` and does not prove trading
+  precision or limits. Startup mass reconciliation advances only while holding the transaction
+  store's current lease for the configured signing identity, after loading its complete durable
+  record set and verifying that every acknowledged record is finalized with no remaining recovery,
+  submission decision, reconciliation, or operator action. An empty complete record set is valid;
+  signer mismatch, stale lease, acknowledgement mismatch, and any unresolved record fail without
+  advancing. This proves only durable transaction recovery readiness for that signer, not protocol-
+  level account or order reconciliation. Cache borrow contention fails with a typed error.
+  Disconnect resets the
   complete gate and current event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
   permits idempotent restoration, fails closed on conflicting client-order identities, and
@@ -127,7 +150,9 @@ implemented and covered by unit tests:
 - Protocol-neutral bounded replay state for already validated venue trade IDs. A reservation blocks
   concurrent handling of the same ID, commits only after future routing succeeds, and is released
   when handling fails so a replay can recover the fill. Committed IDs survive reconnect startup
-  resets and use FIFO eviction. No private trade decoder, fill report, or event emission is enabled.
+  resets and use FIFO eviction. Replay-state lock failure returns a typed error instead of
+  panicking, while reservation cleanup remains best-effort during unwinding. No private trade
+  decoder, fill report, or event emission is enabled.
 
 These foundations do not make the adapter operational. Apart from the two public market-list reads,
 single-page perpetual funding-rate, long-short ratio, and open-interest history primitives, one
@@ -208,8 +233,10 @@ and add this capability document. The implementation maps to the integration pla
   account registration before connected state. It also owns a conflict-safe shared order-context
   registry for tracked/terminal/external update routing, including conflict-safe framework-provided
   external client and venue order identity bindings. External bindings remain report-routed and
-  cannot be promoted to tracked ownership without complete shared `OrderContext`. Its restoration boundary
-  validates and atomically installs a complete caller-supplied replacement snapshot before
+  cannot be promoted to tracked ownership without complete shared `OrderContext`. Instrument
+  preload now requires the failure-atomic public market provider to be initialized, non-empty, and
+  bound to the configured primary REST endpoint before that startup step advances. Its restoration
+  boundary validates and atomically installs a complete caller-supplied replacement snapshot before
   advancing startup, but it does not verify snapshot provenance or completeness and no
   cache/database restoration coordinator exists. Its final startup boundary verifies that the
   exact account-state event recorded for the current startup epoch is present in the matching
@@ -462,7 +489,9 @@ The WebSocket protocol core registers each request before its send is exposed, r
 strictly by request ID and transport connection epoch, and uses a separate non-wrapping send token
 so stale send failures cannot remove a newer registration. Connection replacement drains pending
 waiters, invalidates shared authentication state, and returns desired subscriptions for replay via
-the shared Nautilus subscription tracker. Each inbound text frame is decoded from JSON once. A
+the shared Nautilus subscription tracker. Replacement epochs must increase strictly; an equal or
+stale reset returns a typed error before changing current request, authentication, or subscription
+state. Each inbound text frame is decoded from JSON once. A
 top-level unsigned numeric `id` can be offered to the request registry, while every other valid JSON
 shape remains an explicit unknown frame instead of being silently dropped. Malformed JSON returns a
 typed error without panicking. A transport-neutral command handler now owns all mutations to this
@@ -472,9 +501,30 @@ connection-owned state. A bounded response wait removes only its matching send-t
 when it times out; a response completed at the timeout boundary wins the race, and any later frame
 remains an explicit unknown response instead of reviving the canceled waiter. Owner cancellation or
 closure of every command handle drains all remaining waiters with typed cancellation errors. The
-single-owner command queue has a fixed capacity and applies asynchronous backpressure when full, so
-local callers cannot create an unbounded command backlog. This is local lifecycle control only; it
-does not define venue flow control or a DeepX request rate limit.
+single-owner command queue also serializes desired subscription and unsubscription intent plus
+acknowledgment and failure transitions. Subscription acknowledgments and failures are accepted only
+for the current connection epoch, so a delayed prior-connection result cannot confirm or alter
+replayed intent. Unknown and duplicate acknowledgments are rejected, and subscription or
+unsubscription intent returns whether the transport should send a corresponding request. The queue
+has a fixed capacity and applies asynchronous backpressure when full, so local callers cannot create
+an unbounded command backlog. This is local lifecycle control only; it does not define venue flow
+control or a DeepX request rate limit.
+
+The same single-owner boundary can begin and complete authentication attempts using opaque,
+monotonic attempt tokens bound to the current connection epoch. Starting a newer attempt resolves
+the superseded waiter, duplicate or stale completion is rejected, and connection replacement
+immediately resolves the old waiter while clearing authenticated state. Successful completion
+issues an opaque authenticated-session receipt bound to both the attempt generation and connection
+epoch and an unforgeable protocol-owner identity; attempts, cancellations, and receipts from another
+handler cannot mutate or authenticate this owner even when their counters coincide. The protocol
+owner can verify that a receipt is still current, and supersession or reconnect invalidates it.
+Explicit authentication failure is accepted only for the active attempt; a stale rejection cannot
+fail a newer attempt or invalidate a newer authenticated session. Bounded waits cancel only their
+matching attempt on timeout, preventing a later completion from authenticating an abandoned attempt;
+an already completed result wins at the timeout boundary. This proves only local ownership and
+lifecycle behavior: no DeepX authentication payload or acknowledgement decoder is implemented, the
+receipt does not advance execution startup, and generic correlated responses cannot mark a connection
+authenticated.
 
 The internal OpenAPI currently proves only that `GET /internal/v1/ws` is described as the real-time
 WebSocket connection endpoint. It does not define the upgrade headers, venue message envelope,

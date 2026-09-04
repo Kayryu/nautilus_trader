@@ -32,8 +32,17 @@ use nautilus_model::{
 use thiserror::Error;
 
 use crate::{
-    common::{DeepXPrivateKey, consts::DEEPX_VENUE},
-    config::DeepXExecutionClientConfig,
+    common::{DeepXEnvironment, DeepXPrivateKey, consts::DEEPX_VENUE},
+    config::{
+        DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXRpcRole, DeepXValidatedRpcEndpoints,
+    },
+    providers::DeepXMarketProvider,
+    rpc::DeepXAppliedRuntimeSnapshot,
+    signing::{SigningError, derive_signer_account_id},
+    transaction::{
+        DeepXSignerLease, DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction,
+        DeepXTransactionStore, load_verified_committed_for_signer,
+    },
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
@@ -72,6 +81,32 @@ pub enum DeepXExecutionStartupError {
     /// Startup evidence was supplied after readiness had already been reached.
     #[error("DeepX execution startup is already complete")]
     AlreadyComplete,
+    /// The public market catalog has not completed a failure-atomic load.
+    #[error("DeepX market catalog is not initialized")]
+    MarketCatalogNotInitialized,
+    /// The initialized public market catalog contains no markets.
+    #[error("DeepX market catalog is empty")]
+    MarketCatalogEmpty,
+    /// The public market catalog was loaded from an endpoint outside this execution configuration.
+    #[error("DeepX market catalog endpoint does not match execution configuration")]
+    MarketCatalogEndpointMismatch,
+    /// The applied runtime snapshot belongs to another deployment environment.
+    #[error("DeepX runtime deployment mismatch: expected {expected}, received {received}")]
+    RuntimeEnvironmentMismatch {
+        /// Configured execution deployment.
+        expected: DeepXEnvironment,
+        /// Deployment associated with the applied runtime fixture.
+        received: DeepXEnvironment,
+    },
+    /// The applied runtime and validated RPC roles do not identify the same chain.
+    #[error("DeepX applied runtime genesis hash does not match validated RPC endpoints")]
+    RuntimeGenesisMismatch,
+    /// The configured transaction backend has no fixture-approved runtime interface.
+    #[error("DeepX runtime validation does not support execution backend {0:?}")]
+    UnsupportedRuntimeBackend(DeepXExecutionBackend),
+    /// The validated RPC role selection belongs to another network configuration.
+    #[error("DeepX validated RPC endpoint does not match execution configuration for role {0:?}")]
+    RuntimeRpcEndpointMismatch(DeepXRpcRole),
     /// Account-state initialization was not recorded through the event identity boundary.
     #[error("DeepX account-state initialization evidence requires event verification")]
     AccountStateVerificationRequired,
@@ -127,6 +162,14 @@ pub enum DeepXOrderContextError {
     LockPoisoned,
 }
 
+/// Errors raised when DeepX trade replay state cannot be accessed safely.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXTradeDedupError {
+    /// Another thread panicked while holding the trade replay-state lock.
+    #[error("DeepX trade deduplication lock is poisoned")]
+    LockPoisoned,
+}
+
 /// Errors raised while restoring the complete startup order-context set.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXOrderContextRestorationError {
@@ -136,6 +179,31 @@ pub enum DeepXOrderContextRestorationError {
     /// The replacement context snapshot could not be committed without conflict.
     #[error(transparent)]
     Registry(#[from] DeepXOrderContextError),
+}
+
+/// Errors raised while proving startup mass reconciliation is complete.
+#[derive(Debug, Error)]
+pub enum DeepXMassReconciliationError {
+    /// Startup was not waiting for mass reconciliation.
+    #[error(transparent)]
+    Startup(#[from] DeepXExecutionStartupError),
+    /// The configured signing identity could not be derived.
+    #[error(transparent)]
+    Signing(#[from] SigningError),
+    /// The supplied signer lease belongs to another signing identity.
+    #[error("DeepX transaction store lease does not match the configured signing identity")]
+    SignerLeaseMismatch,
+    /// Complete durable transaction evidence could not be verified.
+    #[error(transparent)]
+    Persistence(#[from] DeepXTransactionPersistenceError),
+    /// A durable transaction still requires recovery or operator action.
+    #[error("DeepX transaction {client_order_id} still requires startup action {action:?}")]
+    UnresolvedTransaction {
+        /// Client order ID owning the unresolved transaction.
+        client_order_id: String,
+        /// Fail-closed action required before startup may continue.
+        action: DeepXTransactionRecoveryAction,
+    },
 }
 
 /// Classification of an execution update against registered Nautilus order context.
@@ -211,16 +279,22 @@ struct DeepXTradeDedup<const N: usize> {
 }
 
 impl<const N: usize> DeepXTradeDedup<N> {
-    fn reserve(&self, trade_id: TradeId) -> Option<DeepXTradeReservation<'_, N>> {
-        let mut state = self.state.lock().expect("DeepX trade dedup lock poisoned");
+    fn reserve(
+        &self,
+        trade_id: TradeId,
+    ) -> Result<Option<DeepXTradeReservation<'_, N>>, DeepXTradeDedupError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXTradeDedupError::LockPoisoned)?;
         if state.committed.contains(&trade_id) || !state.reserved.insert(trade_id) {
-            return None;
+            return Ok(None);
         }
-        Some(DeepXTradeReservation {
+        Ok(Some(DeepXTradeReservation {
             dedup: self,
             trade_id,
             committed: false,
-        })
+        }))
     }
 }
 
@@ -236,27 +310,25 @@ impl<const N: usize> DeepXTradeReservation<'_, N> {
         dead_code,
         reason = "reserved for the fixture-gated private fill dispatch path"
     )]
-    fn commit(mut self) {
+    fn commit(mut self) -> Result<(), DeepXTradeDedupError> {
         let mut state = self
             .dedup
             .state
             .lock()
-            .expect("DeepX trade dedup lock poisoned");
+            .map_err(|_| DeepXTradeDedupError::LockPoisoned)?;
         state.reserved.remove(&self.trade_id);
         state.committed.add(self.trade_id);
         self.committed = true;
+        Ok(())
     }
 }
 
 impl<const N: usize> Drop for DeepXTradeReservation<'_, N> {
     fn drop(&mut self) {
-        if !self.committed {
-            self.dedup
-                .state
-                .lock()
-                .expect("DeepX trade dedup lock poisoned")
-                .reserved
-                .remove(&self.trade_id);
+        if !self.committed
+            && let Ok(mut state) = self.dedup.state.lock()
+        {
+            state.reserved.remove(&self.trade_id);
         }
     }
 }
@@ -547,7 +619,7 @@ impl DeepXExecutionClient {
     fn reserve_trade_id(
         &self,
         trade_id: TradeId,
-    ) -> Option<DeepXTradeReservation<'_, TRADE_DEDUP_CAPACITY>> {
+    ) -> Result<Option<DeepXTradeReservation<'_, TRADE_DEDUP_CAPACITY>>, DeepXTradeDedupError> {
         self.trade_dedup.reserve(trade_id)
     }
 
@@ -627,6 +699,37 @@ impl DeepXExecutionClient {
         self.order_contexts.external_by_venue(venue_order_id)
     }
 
+    /// Verifies the complete public market catalog and advances the startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for instrument loading and the provider has
+    /// completed a failure-atomic Spot and perpetual market load.
+    pub fn record_instruments_loaded(
+        &mut self,
+        provider: &DeepXMarketProvider,
+    ) -> Result<(), DeepXExecutionStartupError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::InstrumentsLoaded)?;
+        if !provider.initialized() {
+            return Err(DeepXExecutionStartupError::MarketCatalogNotInitialized);
+        }
+        let configured_url = self
+            .config
+            .network
+            .rest_url()
+            .map_err(|_| DeepXExecutionStartupError::MarketCatalogEndpointMismatch)?;
+        if provider.base_url() != configured_url.trim_end_matches('/') {
+            return Err(DeepXExecutionStartupError::MarketCatalogEndpointMismatch);
+        }
+        if provider.is_empty() {
+            return Err(DeepXExecutionStartupError::MarketCatalogEmpty);
+        }
+        self.startup
+            .record(DeepXExecutionStartupEvidence::InstrumentsLoaded)?;
+        Ok(())
+    }
+
     /// Atomically replaces the complete order-context snapshot and advances the startup gate.
     ///
     /// An explicitly empty set is valid when no active local orders require restoration. The
@@ -645,6 +748,54 @@ impl DeepXExecutionClient {
         self.order_contexts.restore(contexts)?;
         self.startup
             .record(DeepXExecutionStartupEvidence::OrderContextRestored)?;
+        Ok(())
+    }
+
+    /// Verifies applied finalized runtime and RPC-role evidence and advances the startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for runtime validation, the applied snapshot
+    /// matches the configured deployment, and every validated RPC role matches this configuration
+    /// and the snapshot genesis hash.
+    pub fn record_runtime_validated(
+        &mut self,
+        applied: &DeepXAppliedRuntimeSnapshot,
+        endpoints: &DeepXValidatedRpcEndpoints,
+    ) -> Result<(), DeepXExecutionStartupError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)?;
+        let identity = applied.identity();
+        if identity.environment != self.config.network.environment {
+            return Err(DeepXExecutionStartupError::RuntimeEnvironmentMismatch {
+                expected: self.config.network.environment.clone(),
+                received: identity.environment.clone(),
+            });
+        }
+        if identity.genesis_hash != endpoints.genesis_hash() {
+            return Err(DeepXExecutionStartupError::RuntimeGenesisMismatch);
+        }
+        if self.config.execution_backend != DeepXExecutionBackend::DirectPallet {
+            return Err(DeepXExecutionStartupError::UnsupportedRuntimeBackend(
+                self.config.execution_backend,
+            ));
+        }
+        for role in [
+            DeepXRpcRole::Submission,
+            DeepXRpcRole::Watch,
+            DeepXRpcRole::Recovery,
+        ] {
+            let configured_url = self
+                .config
+                .network
+                .rpc_url_for(role)
+                .map_err(|_| DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role))?;
+            if endpoints.url_for(role) != configured_url {
+                return Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role));
+            }
+        }
+        self.startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)?;
         Ok(())
     }
 
@@ -696,6 +847,43 @@ impl DeepXExecutionClient {
         self.startup_account_event_id = Some(state.event_id);
         self.startup
             .record(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
+        Ok(())
+    }
+
+    /// Verifies the complete durable signer record set and advances startup reconciliation.
+    ///
+    /// An empty complete set is valid. Every restored transaction must have an exact durable
+    /// acknowledgement and require no further recovery, submission decision, or operator action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for mass reconciliation, the current store lease
+    /// belongs to the configured signing key, and every durable transaction is complete.
+    pub async fn record_mass_reconciliation_completed<S>(
+        &mut self,
+        store: &S,
+        lease: &S::Lease,
+    ) -> Result<(), DeepXMassReconciliationError>
+    where
+        S: DeepXTransactionStore,
+    {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        if lease.signer() != derive_signer_account_id(&self.credential)? {
+            return Err(DeepXMassReconciliationError::SignerLeaseMismatch);
+        }
+        let restored = load_verified_committed_for_signer(store, lease).await?;
+        for item in restored {
+            let action = item.record().recovery_action();
+            if action != DeepXTransactionRecoveryAction::Complete {
+                return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                    client_order_id: item.record().identity().client_order_id().to_string(),
+                    action,
+                });
+            }
+        }
+        self.startup
+            .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
         Ok(())
     }
 
@@ -770,10 +958,21 @@ impl DeepXExecutionClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
     use nautilus_common::cache::Cache;
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::{UUID4, UnixNanos, hex};
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
         enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
@@ -786,8 +985,109 @@ mod tests {
         types::{Price, Quantity},
     };
     use rstest::rstest;
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::{
+        common::consts::DEEPX_TESTNET_GENESIS_HASH,
+        config::{DeepXObservedRpcEndpoint, validate_rpc_endpoint_identities},
+        rpc::observe_and_apply_approved_finalized_runtime_snapshot,
+        signing::{DeepXRuntimeSnapshotService, RuntimeSnapshot},
+        transaction::{
+            DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXNonceReservation,
+            DeepXRestoredTransactionRecord, DeepXTransactionIdentity, DeepXTransactionRecord,
+            DeepXTransactionRevision,
+        },
+    };
+
+    const GENESIS_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         genesis_hash.json"
+    );
+    const FINALIZED_HEAD_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         finalized_head.json"
+    );
+    const RUNTIME_VERSION_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         runtime_version.json"
+    );
+    const METADATA_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+            genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         metadata.json"
+    );
+
+    #[derive(Debug)]
+    struct TestSignerLease {
+        signer: [u8; 20],
+    }
+
+    impl DeepXSignerLease for TestSignerLease {
+        fn signer(&self) -> [u8; 20] {
+            self.signer
+        }
+
+        fn generation(&self) -> u64 {
+            1
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestTransactionStore {
+        restored: Vec<DeepXRestoredTransactionRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeepXTransactionStore for TestTransactionStore {
+        type Lease = TestSignerLease;
+
+        async fn acquire_signer_lease(
+            &self,
+            signer: [u8; 20],
+        ) -> Result<Self::Lease, DeepXTransactionPersistenceError> {
+            Ok(TestSignerLease { signer })
+        }
+
+        async fn verify_signer_lease(
+            &self,
+            _lease: &Self::Lease,
+        ) -> Result<(), DeepXTransactionPersistenceError> {
+            Ok(())
+        }
+
+        async fn load_committed_for_signer(
+            &self,
+            _lease: &Self::Lease,
+        ) -> Result<Vec<DeepXRestoredTransactionRecord>, DeepXTransactionPersistenceError> {
+            Ok(self.restored.clone())
+        }
+
+        async fn create_committed(
+            &self,
+            _lease: &Self::Lease,
+            _record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            Err(DeepXTransactionPersistenceError::Unsupported(
+                "read-only test store".to_string(),
+            ))
+        }
+
+        async fn compare_and_set_committed(
+            &self,
+            _lease: &Self::Lease,
+            _expected: &DeepXCommittedTransactionRecord,
+            _record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            Err(DeepXTransactionPersistenceError::Unsupported(
+                "read-only test store".to_string(),
+            ))
+        }
+    }
 
     #[rstest]
     fn startup_requires_authoritative_evidence_in_order() {
@@ -914,6 +1214,296 @@ mod tests {
             .unwrap();
     }
 
+    async fn applied_runtime_evidence() -> (
+        String,
+        DeepXValidatedRpcEndpoints,
+        DeepXAppliedRuntimeSnapshot,
+    ) {
+        let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
+        let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
+        let finalized_header = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "number": "0x2a" },
+        });
+        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post(move |Json(_request): Json<Value>| {
+                let index = calls.fetch_add(1, Ordering::Relaxed);
+                let responses = [
+                    genesis.clone(),
+                    finalized_head.clone(),
+                    finalized_header.clone(),
+                    runtime_version.clone(),
+                    metadata.clone(),
+                ];
+                async move { Json(responses[index].clone()) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let rpc_url = format!("http://{address}");
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_rpc_submission: Some(rpc_url.clone()),
+            base_url_rpc_watch: Some(rpc_url.clone()),
+            base_url_rpc_recovery: Some(rpc_url.clone()),
+            ..Default::default()
+        };
+        let endpoints = validate_rpc_endpoint_identities(
+            &network,
+            [
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Submission,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Recovery,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+            ],
+        )
+        .unwrap();
+        let encoded_metadata = metadata_fixture_bytes();
+        let service = DeepXRuntimeSnapshotService::new(
+            RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis_hash,
+                366,
+                1,
+                &encoded_metadata,
+            )
+            .unwrap(),
+        );
+        let applied = observe_and_apply_approved_finalized_runtime_snapshot(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &service,
+        )
+        .await
+        .unwrap();
+        (rpc_url, endpoints, applied)
+    }
+
+    fn metadata_fixture_bytes() -> Vec<u8> {
+        let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        hex::decode(
+            metadata["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_accepts_applied_snapshot_for_configured_rpc_roles() {
+        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+
+        client
+            .record_runtime_validated(&applied, &endpoints)
+            .unwrap();
+
+        assert!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_rejects_mismatched_rpc_role_without_advancing() {
+        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some("http://127.0.0.1:1".to_string());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url.clone());
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+
+        assert_eq!(
+            client.record_runtime_validated(&applied, &endpoints),
+            Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(
+                DeepXRpcRole::Watch,
+            )),
+        );
+
+        client.config.network.base_url_rpc_watch = Some(rpc_url);
+        assert!(
+            client
+                .record_runtime_validated(&applied, &endpoints)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_startup_rejects_unsupported_backend_without_advancing() {
+        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+
+        assert_eq!(
+            client.record_runtime_validated(&applied, &endpoints),
+            Err(DeepXExecutionStartupError::UnsupportedRuntimeBackend(
+                DeepXExecutionBackend::LegacyEvm,
+            )),
+        );
+
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        assert!(
+            client
+                .record_runtime_validated(&applied, &endpoints)
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn instrument_startup_rejects_uninitialized_market_catalog_without_advancing() {
+        let mut client = test_client();
+        let http_client =
+            crate::http::DeepXHttpClient::new("https://api.testnet.deepx.trade", Some(5), None)
+                .unwrap();
+        let provider = DeepXMarketProvider::new(http_client);
+
+        assert_eq!(
+            client.record_instruments_loaded(&provider),
+            Err(DeepXExecutionStartupError::MarketCatalogNotInitialized),
+        );
+        assert_eq!(
+            client.restore_order_contexts([]),
+            Err(DeepXOrderContextRestorationError::Startup(
+                DeepXExecutionStartupError::OutOfOrder {
+                    expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
+                    received: DeepXExecutionStartupEvidence::OrderContextRestored,
+                },
+            )),
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_startup_accepts_complete_market_catalog() {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http_client =
+            crate::http::DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut provider = DeepXMarketProvider::new(http_client);
+        provider.load_all().await.unwrap();
+        let mut client = test_client();
+        client.config.network.base_url_rest = Some(format!("http://{address}/"));
+
+        client.record_instruments_loaded(&provider).unwrap();
+
+        assert!(client.restore_order_contexts([]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn instrument_startup_rejects_empty_market_catalog_without_advancing() {
+        const EMPTY_RESPONSE: &str = r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { EMPTY_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { EMPTY_RESPONSE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http_client =
+            crate::http::DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut provider = DeepXMarketProvider::new(http_client);
+        provider.load_all().await.unwrap();
+        let mut client = test_client();
+        client.config.network.base_url_rest = Some(format!("http://{address}"));
+
+        assert!(provider.initialized());
+        assert!(provider.instrument_ids().is_empty());
+        assert_eq!(
+            client.record_instruments_loaded(&provider),
+            Err(DeepXExecutionStartupError::MarketCatalogEmpty),
+        );
+        assert_eq!(
+            client.restore_order_contexts([]),
+            Err(DeepXOrderContextRestorationError::Startup(
+                DeepXExecutionStartupError::OutOfOrder {
+                    expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
+                    received: DeepXExecutionStartupEvidence::OrderContextRestored,
+                },
+            )),
+        );
+    }
+
+    #[tokio::test]
+    async fn instrument_startup_rejects_unconfigured_rest_endpoint_without_advancing() {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http_client =
+            crate::http::DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut provider = DeepXMarketProvider::new(http_client);
+        provider.load_all().await.unwrap();
+        let mut client = test_client();
+
+        assert_eq!(
+            client.record_instruments_loaded(&provider),
+            Err(DeepXExecutionStartupError::MarketCatalogEndpointMismatch),
+        );
+        assert_eq!(
+            client.restore_order_contexts([]),
+            Err(DeepXOrderContextRestorationError::Startup(
+                DeepXExecutionStartupError::OutOfOrder {
+                    expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
+                    received: DeepXExecutionStartupEvidence::OrderContextRestored,
+                },
+            )),
+        );
+    }
+
     fn advance_through_mass_reconciliation(client: &mut DeepXExecutionClient) -> AccountState {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
@@ -930,6 +1520,115 @@ mod tests {
             .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)
             .unwrap();
         state
+    }
+
+    fn advance_to_mass_reconciliation(client: &mut DeepXExecutionClient) {
+        record_instruments_loaded(client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+            .unwrap();
+        client
+            .record_account_state_initialized(&test_account_state())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_accepts_empty_complete_store_snapshot() {
+        let mut client = test_client();
+        advance_to_mass_reconciliation(&mut client);
+        let store = TestTransactionStore {
+            restored: Vec::new(),
+        };
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+
+        client
+            .record_mass_reconciliation_completed(&store, &lease)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::AccountStateNotRegistered { .. }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_rejects_another_signer_without_advancing() {
+        let mut client = test_client();
+        advance_to_mass_reconciliation(&mut client);
+        let store = TestTransactionStore {
+            restored: Vec::new(),
+        };
+        let lease = TestSignerLease { signer: [42; 20] };
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::SignerLeaseMismatch),
+        ));
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_rejects_unresolved_durable_transaction_without_advancing() {
+        let mut client = test_client();
+        advance_to_mass_reconciliation(&mut client);
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+            ClientOrderId::from("O-DEEPX-UNRESOLVED"),
+            signer,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity {
+                genesis_hash: [1; 32],
+                metadata_sha256: [2; 32],
+                spec_version: 366,
+                transaction_version: 1,
+                signed_extensions: vec!["CheckNonce".to_string()],
+            },
+        ));
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let store = TestTransactionStore {
+            restored: vec![restored],
+        };
+        let lease = TestSignerLease { signer };
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::RecreateSigningInputs,
+                ..
+            }),
+        ));
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
     }
 
     fn test_account_state() -> AccountState {
@@ -958,9 +1657,9 @@ mod tests {
         let dedup = DeepXTradeDedup::<4>::default();
         let trade_id = TradeId::from("T-DEEPX-001");
 
-        dedup.reserve(trade_id).unwrap().commit();
+        dedup.reserve(trade_id).unwrap().unwrap().commit().unwrap();
 
-        assert!(dedup.reserve(trade_id).is_none());
+        assert!(dedup.reserve(trade_id).unwrap().is_none());
     }
 
     #[rstest]
@@ -968,21 +1667,21 @@ mod tests {
         let dedup = DeepXTradeDedup::<4>::default();
         let trade_id = TradeId::from("T-DEEPX-001");
 
-        drop(dedup.reserve(trade_id).unwrap());
+        drop(dedup.reserve(trade_id).unwrap().unwrap());
 
-        assert!(dedup.reserve(trade_id).is_some());
+        assert!(dedup.reserve(trade_id).unwrap().is_some());
     }
 
     #[rstest]
     fn active_trade_id_reservation_suppresses_duplicate() {
         let dedup = DeepXTradeDedup::<4>::default();
         let trade_id = TradeId::from("T-DEEPX-001");
-        let reservation = dedup.reserve(trade_id).unwrap();
+        let reservation = dedup.reserve(trade_id).unwrap().unwrap();
 
-        assert!(dedup.reserve(trade_id).is_none());
+        assert!(dedup.reserve(trade_id).unwrap().is_none());
 
         drop(reservation);
-        assert!(dedup.reserve(trade_id).is_some());
+        assert!(dedup.reserve(trade_id).unwrap().is_some());
     }
 
     #[rstest]
@@ -991,20 +1690,25 @@ mod tests {
         let first = TradeId::from("T-DEEPX-001");
         let second = TradeId::from("T-DEEPX-002");
 
-        dedup.reserve(first).unwrap().commit();
+        dedup.reserve(first).unwrap().unwrap().commit().unwrap();
 
-        assert!(dedup.reserve(second).is_some());
+        assert!(dedup.reserve(second).unwrap().is_some());
     }
 
     #[rstest]
     fn trade_id_dedup_is_retained_across_startup_reset() {
         let mut client = test_client();
         let trade_id = TradeId::from("T-DEEPX-001");
-        client.reserve_trade_id(trade_id).unwrap().commit();
+        client
+            .reserve_trade_id(trade_id)
+            .unwrap()
+            .unwrap()
+            .commit()
+            .unwrap();
 
         client.reset_startup();
 
-        assert!(client.reserve_trade_id(trade_id).is_none());
+        assert!(client.reserve_trade_id(trade_id).unwrap().is_none());
     }
 
     #[rstest]
@@ -1013,14 +1717,28 @@ mod tests {
         let first = TradeId::from("T-DEEPX-001");
         let second = TradeId::from("T-DEEPX-002");
         let third = TradeId::from("T-DEEPX-003");
-        dedup.reserve(first).unwrap().commit();
-        dedup.reserve(second).unwrap().commit();
+        dedup.reserve(first).unwrap().unwrap().commit().unwrap();
+        dedup.reserve(second).unwrap().unwrap().commit().unwrap();
 
-        dedup.reserve(third).unwrap().commit();
+        dedup.reserve(third).unwrap().unwrap().commit().unwrap();
 
-        assert!(dedup.reserve(first).is_some());
-        assert!(dedup.reserve(second).is_none());
-        assert!(dedup.reserve(third).is_none());
+        assert!(dedup.reserve(first).unwrap().is_some());
+        assert!(dedup.reserve(second).unwrap().is_none());
+        assert!(dedup.reserve(third).unwrap().is_none());
+    }
+
+    #[rstest]
+    fn poisoned_trade_dedup_lock_returns_typed_error() {
+        let dedup = DeepXTradeDedup::<4>::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _state = dedup.state.lock().unwrap();
+            panic!("poison trade dedup lock");
+        });
+
+        assert_eq!(
+            dedup.reserve(TradeId::from("T-DEEPX-001")).unwrap_err(),
+            DeepXTradeDedupError::LockPoisoned,
+        );
     }
 
     #[rstest]

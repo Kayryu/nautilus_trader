@@ -27,9 +27,9 @@ pub use persistence::{
     DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionPermit,
     DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
     DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, commit_reconciliation_observation,
-    commit_recovery_decision, commit_reorganization_decision, prepare_initial_submission,
-    prepare_signed_transaction, prepare_timestamp_reservation, restore_timestamp_nonce_allocator,
-    verify_signer_lease,
+    commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
+    prepare_initial_submission, prepare_signed_transaction, prepare_timestamp_reservation,
+    restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,

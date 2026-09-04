@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 
-use nautilus_network::websocket::{AuthTracker, SubscriptionState};
+use nautilus_core::UUID4;
+use nautilus_network::websocket::{AuthTracker, SubscriptionState, auth::AuthResultReceiver};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -44,9 +45,42 @@ impl DeepXWsRequestId {
 /// Connection-owned request registration created before a send is exposed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeepXWsRequest {
+    owner_id: UUID4,
     id: DeepXWsRequestId,
     send_token: u64,
     connection_epoch: u64,
+}
+
+/// Connection-owned authentication attempt registered before credentials are sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeepXWsAuthenticationAttempt {
+    owner_id: UUID4,
+    token: u64,
+    connection_epoch: u64,
+}
+
+/// Proof that one authentication attempt completed for a specific transport connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeepXWsAuthenticatedSession {
+    owner_id: UUID4,
+    token: u64,
+    connection_epoch: u64,
+}
+
+impl DeepXWsAuthenticatedSession {
+    /// Returns the transport connection epoch which owns this authenticated session.
+    #[must_use]
+    pub const fn connection_epoch(self) -> u64 {
+        self.connection_epoch
+    }
+}
+
+impl DeepXWsAuthenticationAttempt {
+    /// Returns the transport connection epoch which owns this attempt.
+    #[must_use]
+    pub const fn connection_epoch(self) -> u64 {
+        self.connection_epoch
+    }
 }
 
 impl DeepXWsRequest {
@@ -73,9 +107,13 @@ struct PendingRequest {
 /// Single-owner protocol state shared by a future DeepX WebSocket handler.
 #[derive(Debug)]
 pub struct DeepXWsProtocolCore {
+    owner_id: UUID4,
     next_request_id: u64,
     next_send_token: u64,
+    next_authentication_token: u64,
     connection_epoch: u64,
+    pending_authentication: Option<DeepXWsAuthenticationAttempt>,
+    authenticated_session: Option<DeepXWsAuthenticatedSession>,
     pending: HashMap<DeepXWsRequestId, PendingRequest>,
     auth_tracker: AuthTracker,
     subscriptions: SubscriptionState,
@@ -86,9 +124,13 @@ impl DeepXWsProtocolCore {
     #[must_use]
     pub fn new(topic_delimiter: char) -> Self {
         Self {
+            owner_id: UUID4::new(),
             next_request_id: 1,
             next_send_token: 1,
+            next_authentication_token: 1,
             connection_epoch: 0,
+            pending_authentication: None,
+            authenticated_session: None,
             pending: HashMap::new(),
             auth_tracker: AuthTracker::new(),
             subscriptions: SubscriptionState::new(topic_delimiter),
@@ -133,6 +175,7 @@ impl DeepXWsProtocolCore {
 
         Ok((
             DeepXWsRequest {
+                owner_id: self.owner_id,
                 id: request_id,
                 send_token,
                 connection_epoch: self.connection_epoch,
@@ -181,6 +224,9 @@ impl DeepXWsProtocolCore {
 
     /// Removes a request only when cancellation belongs to the same registration.
     pub fn cancel_request(&mut self, request: DeepXWsRequest, reason: impl Into<String>) -> bool {
+        if request.owner_id != self.owner_id {
+            return false;
+        }
         if self
             .pending
             .get(&request.id)
@@ -205,22 +251,196 @@ impl DeepXWsProtocolCore {
         }
     }
 
+    /// Cancels all request and authentication waiters owned by the current connection.
+    pub fn drain_connection_owned(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.drain_pending(reason.clone());
+        self.pending_authentication = None;
+        self.authenticated_session = None;
+        self.auth_tracker.cancel_pending(reason);
+        self.auth_tracker.invalidate();
+    }
+
     /// Returns the current number of pending request waiters.
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
-    /// Returns the shared authentication tracker.
+    /// Returns the current transport connection epoch.
     #[must_use]
-    pub const fn auth_tracker(&self) -> &AuthTracker {
-        &self.auth_tracker
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
     }
 
-    /// Returns the shared desired-versus-confirmed subscription state.
+    /// Begins an authentication attempt owned by the current connection epoch.
+    ///
+    /// The returned receiver resolves when the matching attempt succeeds or a later attempt
+    /// supersedes it.
+    pub fn begin_authentication(
+        &mut self,
+    ) -> Result<(DeepXWsAuthenticationAttempt, AuthResultReceiver), DeepXWsError> {
+        let next_authentication_token = self
+            .next_authentication_token
+            .checked_add(1)
+            .ok_or(DeepXWsError::AuthenticationAttemptTokenExhausted)?;
+        let attempt = DeepXWsAuthenticationAttempt {
+            owner_id: self.owner_id,
+            token: self.next_authentication_token,
+            connection_epoch: self.connection_epoch,
+        };
+        self.next_authentication_token = next_authentication_token;
+        self.pending_authentication = Some(attempt);
+        self.authenticated_session = None;
+        Ok((attempt, self.auth_tracker.begin()))
+    }
+
+    /// Marks the active authentication attempt successful for its connection epoch.
+    ///
+    /// Returns `false` without changing authentication state when no matching attempt is active.
+    pub fn complete_authentication(&mut self, attempt: DeepXWsAuthenticationAttempt) -> bool {
+        if attempt.connection_epoch != self.connection_epoch
+            || self.pending_authentication != Some(attempt)
+        {
+            return false;
+        }
+        self.pending_authentication = None;
+        self.authenticated_session = Some(DeepXWsAuthenticatedSession {
+            owner_id: self.owner_id,
+            token: attempt.token,
+            connection_epoch: attempt.connection_epoch,
+        });
+        self.auth_tracker.succeed();
+        true
+    }
+
+    /// Marks the active authentication attempt failed for its connection epoch.
+    ///
+    /// Returns `false` without changing authentication state when no matching attempt is active.
+    pub fn fail_authentication(
+        &mut self,
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: impl Into<String>,
+    ) -> bool {
+        if attempt.connection_epoch != self.connection_epoch
+            || self.pending_authentication != Some(attempt)
+        {
+            return false;
+        }
+        self.pending_authentication = None;
+        self.authenticated_session = None;
+        self.auth_tracker.fail(reason);
+        true
+    }
+
+    /// Cancels the active authentication attempt without making retry terminal.
+    ///
+    /// Returns `false` without changing authentication state when no matching attempt is active.
+    pub fn cancel_authentication(
+        &mut self,
+        attempt: DeepXWsAuthenticationAttempt,
+        reason: impl Into<String>,
+    ) -> bool {
+        if attempt.connection_epoch != self.connection_epoch
+            || self.pending_authentication != Some(attempt)
+        {
+            return false;
+        }
+        self.pending_authentication = None;
+        self.authenticated_session = None;
+        self.auth_tracker.cancel_pending(reason);
+        self.auth_tracker.invalidate();
+        true
+    }
+
+    /// Returns proof of authentication for the current connection, when available.
     #[must_use]
-    pub const fn subscriptions(&self) -> &SubscriptionState {
-        &self.subscriptions
+    pub fn authenticated_session(&self) -> Option<DeepXWsAuthenticatedSession> {
+        self.auth_tracker
+            .is_authenticated()
+            .then_some(self.authenticated_session)
+            .flatten()
+    }
+
+    /// Returns whether the supplied authenticated session is still current.
+    #[must_use]
+    pub fn is_authenticated_session(&self, session: DeepXWsAuthenticatedSession) -> bool {
+        self.authenticated_session() == Some(session)
+    }
+
+    /// Returns whether the current connection epoch has authenticated successfully.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated_session()
+            .is_some_and(|session| session.connection_epoch == self.connection_epoch)
+    }
+
+    /// Records desired subscription intent for the current connection.
+    ///
+    /// Returns `true` when a transport subscribe request should be sent.
+    pub(crate) fn subscribe(&self, topic: &str) -> bool {
+        self.subscriptions.try_mark_subscribe(topic)
+    }
+
+    /// Confirms a subscription only for the current connection epoch.
+    pub(crate) fn confirm_subscription(&self, connection_epoch: u64, topic: &str) -> bool {
+        if connection_epoch != self.connection_epoch
+            || !self
+                .subscriptions
+                .pending_subscribe_topics()
+                .iter()
+                .any(|pending| pending == topic)
+        {
+            return false;
+        }
+        self.subscriptions.confirm_subscribe(topic);
+        true
+    }
+
+    /// Returns a failed subscription to pending state only for the current connection epoch.
+    pub(crate) fn fail_subscription(&self, connection_epoch: u64, topic: &str) -> bool {
+        if connection_epoch != self.connection_epoch
+            || !self
+                .subscriptions
+                .all_topics()
+                .iter()
+                .any(|active| active == topic)
+        {
+            return false;
+        }
+        self.subscriptions.mark_failure(topic);
+        true
+    }
+
+    /// Records desired unsubscription intent for the current connection.
+    ///
+    /// Returns `true` when a transport unsubscribe request should be sent.
+    pub(crate) fn unsubscribe(&self, topic: &str) -> bool {
+        if !self
+            .subscriptions
+            .all_topics()
+            .iter()
+            .any(|active| active == topic)
+        {
+            return false;
+        }
+        self.subscriptions.mark_unsubscribe(topic);
+        true
+    }
+
+    /// Confirms an unsubscription only for the current connection epoch.
+    pub(crate) fn confirm_unsubscription(&self, connection_epoch: u64, topic: &str) -> bool {
+        if connection_epoch != self.connection_epoch
+            || !self
+                .subscriptions
+                .pending_unsubscribe_topics()
+                .iter()
+                .any(|pending| pending == topic)
+        {
+            return false;
+        }
+        self.subscriptions.confirm_unsubscribe(topic);
+        true
     }
 
     /// Resets connection-owned state while preserving desired subscription intent.
@@ -228,17 +448,21 @@ impl DeepXWsProtocolCore {
         &mut self,
         connection_epoch: u64,
         reason: impl Into<String>,
-    ) -> Vec<String> {
-        self.drain_pending(reason);
+    ) -> Result<Vec<String>, DeepXWsError> {
+        if connection_epoch <= self.connection_epoch {
+            return Err(DeepXWsError::NonIncreasingConnectionEpoch {
+                current: self.connection_epoch,
+                received: connection_epoch,
+            });
+        }
+        self.drain_connection_owned(reason);
         self.connection_epoch = connection_epoch;
-        self.auth_tracker.invalidate();
-        self.subscriptions.reset_after_reconnect()
+        Ok(self.subscriptions.reset_after_reconnect())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nautilus_network::websocket::auth::AuthState;
     use rstest::rstest;
     use serde_json::json;
 
@@ -269,6 +493,7 @@ mod tests {
         let mut core = DeepXWsProtocolCore::new(':');
         let (request, response_rx) = core.register_request().unwrap();
         let stale = DeepXWsRequest {
+            owner_id: request.owner_id,
             id: request.id,
             send_token: request.send_token.wrapping_add(1),
             connection_epoch: request.connection_epoch,
@@ -301,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_response_from_stale_connection_epoch() {
         let mut core = DeepXWsProtocolCore::new(':');
-        core.reset_after_reconnect(4, "initial connection");
+        core.reset_after_reconnect(4, "initial connection").unwrap();
         let (request, response_rx) = core.register_request().unwrap();
 
         assert!(!core.complete_request(request.id(), 3, json!({ "stale": true })));
@@ -313,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn completes_request_from_single_decoded_frame() {
         let mut core = DeepXWsProtocolCore::new(':');
-        core.reset_after_reconnect(9, "connected");
+        core.reset_after_reconnect(9, "connected").unwrap();
         let (request, response_rx) = core.register_request().unwrap();
         let frame = DeepXWsFrame::parse(&format!(
             r#"{{"id":{},"result":{{"ok":true}}}}"#,
@@ -381,18 +606,211 @@ mod tests {
     #[rstest]
     fn reconnect_invalidates_auth_and_preserves_subscription_intent() {
         let mut core = DeepXWsProtocolCore::new(':');
-        core.auth_tracker().succeed();
-        assert!(core.subscriptions().try_mark_subscribe("trades:ETH-USDC"));
-        core.subscriptions().confirm_subscribe("trades:ETH-USDC");
+        let (attempt, _) = core.begin_authentication().unwrap();
+        assert!(core.complete_authentication(attempt));
+        let session = core.authenticated_session().unwrap();
+        assert!(core.is_authenticated());
+        assert!(core.is_authenticated_session(session));
+        assert!(core.subscribe("trades:ETH-USDC"));
+        assert!(core.confirm_subscription(0, "trades:ETH-USDC"));
 
-        let replay = core.reset_after_reconnect(1, "connection replaced");
+        let replay = core
+            .reset_after_reconnect(1, "connection replaced")
+            .unwrap();
 
-        assert_eq!(core.auth_tracker().auth_state(), AuthState::Unauthenticated);
+        assert!(!core.is_authenticated());
+        assert!(!core.is_authenticated_session(session));
         assert_eq!(replay, vec!["trades:ETH-USDC".to_string()]);
-        assert_eq!(core.subscriptions().delimiter(), ':');
+        assert_eq!(core.subscriptions.delimiter(), ':');
         assert_eq!(
-            core.subscriptions().pending_subscribe_topics(),
+            core.subscriptions.pending_subscribe_topics(),
             vec!["trades:ETH-USDC".to_string()],
         );
+    }
+
+    #[rstest]
+    fn stale_connection_cannot_complete_current_authentication() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        core.reset_after_reconnect(4, "initial connection").unwrap();
+        let (attempt, _) = core.begin_authentication().unwrap();
+        core.reset_after_reconnect(5, "connection replaced")
+            .unwrap();
+
+        assert!(!core.complete_authentication(attempt));
+        assert!(!core.is_authenticated());
+        assert_eq!(core.connection_epoch(), 5);
+    }
+
+    #[tokio::test]
+    async fn stale_reconnect_epoch_preserves_current_connection_state() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        core.reset_after_reconnect(4, "initial connection").unwrap();
+        let (request, response_rx) = core.register_request().unwrap();
+        let (attempt, authentication_rx) = core.begin_authentication().unwrap();
+        assert!(core.subscribe("trades:ETH-USDC"));
+
+        assert_eq!(
+            core.reset_after_reconnect(4, "stale reconnect"),
+            Err(DeepXWsError::NonIncreasingConnectionEpoch {
+                current: 4,
+                received: 4,
+            }),
+        );
+        assert_eq!(core.connection_epoch(), 4);
+        assert_eq!(core.pending_len(), 1);
+        assert_eq!(
+            core.subscriptions.pending_subscribe_topics(),
+            vec!["trades:ETH-USDC".to_string()],
+        );
+        assert!(core.complete_request(request.id(), 4, json!({ "ok": true })));
+        assert_eq!(response_rx.await.unwrap().unwrap(), json!({ "ok": true }));
+        assert!(core.complete_authentication(attempt));
+        assert_eq!(authentication_rx.await.unwrap(), Ok(()));
+    }
+
+    #[rstest]
+    fn stale_connection_cannot_acknowledge_replayed_subscription() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        assert!(core.subscribe("trades:ETH-USDC"));
+        core.reset_after_reconnect(1, "connection replaced")
+            .unwrap();
+
+        assert!(!core.confirm_subscription(0, "trades:ETH-USDC"));
+        assert_eq!(
+            core.subscriptions.pending_subscribe_topics(),
+            vec!["trades:ETH-USDC".to_string()],
+        );
+        assert!(core.confirm_subscription(1, "trades:ETH-USDC"));
+        assert!(core.subscriptions.pending_subscribe_topics().is_empty());
+        assert_eq!(core.subscriptions.len(), 1);
+    }
+
+    #[rstest]
+    fn unknown_and_duplicate_subscription_results_are_rejected() {
+        let core = DeepXWsProtocolCore::new(':');
+
+        assert!(!core.confirm_subscription(0, "trades:ETH-USDC"));
+        assert!(!core.fail_subscription(0, "trades:ETH-USDC"));
+        assert!(!core.unsubscribe("trades:ETH-USDC"));
+        assert!(!core.confirm_unsubscription(0, "trades:ETH-USDC"));
+
+        assert!(core.subscribe("trades:ETH-USDC"));
+        assert!(core.confirm_subscription(0, "trades:ETH-USDC"));
+        assert!(!core.confirm_subscription(0, "trades:ETH-USDC"));
+        assert!(core.unsubscribe("trades:ETH-USDC"));
+        assert!(!core.unsubscribe("trades:ETH-USDC"));
+        assert!(core.confirm_unsubscription(0, "trades:ETH-USDC"));
+        assert!(!core.confirm_unsubscription(0, "trades:ETH-USDC"));
+    }
+
+    #[rstest]
+    fn authentication_success_requires_an_active_attempt() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        let attempt = DeepXWsAuthenticationAttempt {
+            owner_id: core.owner_id,
+            token: 1,
+            connection_epoch: 0,
+        };
+
+        assert!(!core.complete_authentication(attempt));
+        assert!(!core.is_authenticated());
+    }
+
+    #[rstest]
+    fn request_capability_cannot_cancel_another_protocol_owner() {
+        let mut first = DeepXWsProtocolCore::new(':');
+        let mut second = DeepXWsProtocolCore::new(':');
+        let (first_request, _) = first.register_request().unwrap();
+        let (_, second_rx) = second.register_request().unwrap();
+
+        assert!(!second.cancel_request(first_request, "foreign timeout"));
+        assert!(second.complete_request(
+            DeepXWsRequestId::new(1),
+            second.connection_epoch(),
+            serde_json::json!({"ok": true}),
+        ));
+        assert_eq!(second_rx.blocking_recv().unwrap().unwrap()["ok"], true);
+    }
+
+    #[rstest]
+    fn authentication_capabilities_are_bound_to_protocol_owner() {
+        let mut first = DeepXWsProtocolCore::new(':');
+        let mut second = DeepXWsProtocolCore::new(':');
+        let (first_attempt, _) = first.begin_authentication().unwrap();
+        let (second_attempt, _) = second.begin_authentication().unwrap();
+
+        assert!(!second.complete_authentication(first_attempt));
+        assert!(second.complete_authentication(second_attempt));
+        let second_session = second.authenticated_session().unwrap();
+        assert!(!first.is_authenticated_session(second_session));
+
+        assert!(first.complete_authentication(first_attempt));
+        let first_session = first.authenticated_session().unwrap();
+        assert!(!second.is_authenticated_session(first_session));
+        assert!(second.is_authenticated_session(second_session));
+    }
+
+    #[tokio::test]
+    async fn superseded_attempt_cannot_complete_new_authentication() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        let (first, first_rx) = core.begin_authentication().unwrap();
+        let (second, _) = core.begin_authentication().unwrap();
+
+        assert!(first_rx.await.unwrap().is_err());
+        assert!(!core.complete_authentication(first));
+        assert!(!core.is_authenticated());
+        assert!(core.complete_authentication(second));
+        assert!(core.is_authenticated());
+        assert_eq!(
+            core.authenticated_session().unwrap().connection_epoch(),
+            second.connection_epoch(),
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_only_applies_to_the_active_attempt() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        let (stale, stale_rx) = core.begin_authentication().unwrap();
+        let (active, active_rx) = core.begin_authentication().unwrap();
+
+        assert!(stale_rx.await.unwrap().is_err());
+        assert!(!core.fail_authentication(stale, "stale rejection"));
+        assert!(core.fail_authentication(active, "invalid credentials"));
+        assert_eq!(
+            active_rx.await.unwrap(),
+            Err("invalid credentials".to_string()),
+        );
+        assert!(!core.is_authenticated());
+        assert!(core.authenticated_session().is_none());
+
+        let (retry, retry_rx) = core.begin_authentication().unwrap();
+        assert!(core.complete_authentication(retry));
+        assert_eq!(retry_rx.await.unwrap(), Ok(()));
+        let session = core.authenticated_session().unwrap();
+        assert!(!core.fail_authentication(active, "late rejection"));
+        assert!(core.is_authenticated());
+        assert!(core.is_authenticated_session(session));
+    }
+
+    #[tokio::test]
+    async fn authentication_cancellation_only_applies_to_the_active_attempt() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        let (stale, stale_rx) = core.begin_authentication().unwrap();
+        let (active, active_rx) = core.begin_authentication().unwrap();
+
+        assert!(stale_rx.await.unwrap().is_err());
+        assert!(!core.cancel_authentication(stale, "stale timeout"));
+        assert!(core.cancel_authentication(active, "authentication timed out"));
+        assert_eq!(
+            active_rx.await.unwrap(),
+            Err("authentication timed out".to_string()),
+        );
+        assert!(!core.complete_authentication(active));
+        assert!(!core.is_authenticated());
+
+        let (retry, retry_rx) = core.begin_authentication().unwrap();
+        assert!(core.complete_authentication(retry));
+        assert_eq!(retry_rx.await.unwrap(), Ok(()));
+        assert!(core.is_authenticated());
     }
 }

@@ -30,8 +30,8 @@ use crate::{
         DeepXRpcRole, DeepXValidatedRpcEndpoints, validate_rpc_endpoint_identities,
     },
     signing::{
-        DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate,
-        RuntimeSnapshot, SnapshotError,
+        ApprovedRuntimeIdentity, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
+        DeepXRuntimeSnapshotUpdate, RuntimeSnapshot, SnapshotError,
     },
 };
 
@@ -122,10 +122,11 @@ impl DeepXObservedRuntimeSnapshot {
 }
 
 /// Result of one approved finalized runtime observation and snapshot application.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXAppliedRuntimeSnapshot {
     checkpoint: DeepXFinalizedCheckpoint,
     update: DeepXRuntimeSnapshotUpdate,
+    identity: ApprovedRuntimeIdentity,
 }
 
 impl DeepXAppliedRuntimeSnapshot {
@@ -139,6 +140,12 @@ impl DeepXAppliedRuntimeSnapshot {
     #[must_use]
     pub const fn update(&self) -> DeepXRuntimeSnapshotUpdate {
         self.update
+    }
+
+    /// Returns the approved runtime identity observed and applied at the finalized checkpoint.
+    #[must_use]
+    pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.identity
     }
 }
 
@@ -395,6 +402,7 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     Ok(DeepXAppliedRuntimeSnapshot {
         checkpoint: observation.checkpoint(),
         update,
+        identity: observation.snapshot().identity().clone(),
     })
 }
 

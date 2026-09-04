@@ -271,6 +271,28 @@ pub trait DeepXTransactionStore: Debug + Send + Sync {
     ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError>;
 }
 
+/// Loads and verifies the complete durable transaction set for a signer lease.
+///
+/// # Errors
+///
+/// Returns an error if the lease is not current, an acknowledgement does not cover the exact
+/// record, or any record belongs to another signer.
+pub async fn load_verified_committed_for_signer<S>(
+    store: &S,
+    lease: &S::Lease,
+) -> Result<Vec<DeepXRestoredTransactionRecord>, DeepXTransactionPersistenceError>
+where
+    S: DeepXTransactionStore,
+{
+    store.verify_signer_lease(lease).await?;
+    let restored = store.load_committed_for_signer(lease).await?;
+    for item in &restored {
+        item.committed().verify(item.record())?;
+        verify_signer_lease(lease, item.record())?;
+    }
+    Ok(restored)
+}
+
 /// Restores a timestamp nonce allocator from the complete durable signer record set.
 ///
 /// # Errors
@@ -291,12 +313,7 @@ pub async fn restore_timestamp_nonce_allocator<S>(
 where
     S: DeepXTransactionStore,
 {
-    store.verify_signer_lease(lease).await?;
-    let restored = store.load_committed_for_signer(lease).await?;
-    for item in &restored {
-        item.committed().verify(item.record())?;
-        verify_signer_lease(lease, item.record())?;
-    }
+    let restored = load_verified_committed_for_signer(store, lease).await?;
     let allocator = DeepXTimestampNonceAllocator::from_records(
         lease.signer(),
         restored.iter().map(DeepXRestoredTransactionRecord::record),

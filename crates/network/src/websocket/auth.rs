@@ -149,6 +149,18 @@ impl AuthTracker {
         }
     }
 
+    /// Cancels the pending authentication attempt without changing session state.
+    ///
+    /// Call this when the connection owning an in-flight attempt is replaced but
+    /// authentication may be retried on the new connection.
+    pub fn cancel_pending(&self, reason: impl Into<String>) {
+        if let Ok(mut guard) = self.tx.lock()
+            && let Some(sender) = guard.take()
+        {
+            let _ = sender.send(Err(reason.into()));
+        }
+    }
+
     /// Begins a new authentication attempt.
     ///
     /// Returns a receiver that will be notified when authentication completes.
@@ -933,6 +945,18 @@ mod tests {
 
         tracker.invalidate();
         assert!(!tracker.is_authenticated());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cancel_pending_resolves_waiter_without_changing_state() {
+        let tracker = AuthTracker::new();
+        let receiver = tracker.begin();
+
+        tracker.cancel_pending("connection replaced");
+
+        assert_eq!(tracker.auth_state(), AuthState::Unauthenticated);
+        assert_eq!(receiver.await.unwrap(), Err("connection replaced".to_string()));
     }
 
     #[rstest]

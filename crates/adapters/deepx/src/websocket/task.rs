@@ -99,11 +99,11 @@ impl DeepXWsTaskHandles {
         &mut self,
         grace_period: Duration,
     ) -> Result<DeepXWsTaskOutcome, DeepXWsError> {
+        self.cancellation.cancel();
         let Some(mut handler) = self.handler.take() else {
             return Ok(DeepXWsTaskOutcome::Completed);
         };
 
-        self.cancellation.cancel();
         match tokio::time::timeout(grace_period, &mut handler).await {
             Ok(result) => result
                 .map(|()| DeepXWsTaskOutcome::Completed)
@@ -170,6 +170,17 @@ mod tests {
 
         assert_eq!(outcome, DeepXWsTaskOutcome::Aborted);
         assert!(!tasks.is_running());
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_task_cancels_generation_token() {
+        let mut tasks = DeepXWsTaskHandles::new();
+        let token = tasks.cancellation_token();
+
+        let outcome = tasks.shutdown(Duration::ZERO).await.unwrap();
+
+        assert_eq!(outcome, DeepXWsTaskOutcome::Completed);
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]

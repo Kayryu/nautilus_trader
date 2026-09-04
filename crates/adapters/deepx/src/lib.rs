@@ -42,8 +42,8 @@ pub use config::{
 };
 pub use execution::{
     DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
-    DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXOrderContextError,
-    DeepXOrderContextRestorationError,
+    DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXMassReconciliationError,
+    DeepXOrderContextError, DeepXOrderContextRestorationError, DeepXTradeDedupError,
 };
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};

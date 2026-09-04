@@ -35,6 +35,25 @@ pub enum DeepXWsError {
     /// No more send ownership tokens can be allocated safely.
     #[error("DeepX WebSocket send token space exhausted")]
     SendTokenExhausted,
+    /// No more authentication attempt tokens can be allocated safely.
+    #[error("DeepX WebSocket authentication attempt token space exhausted")]
+    AuthenticationAttemptTokenExhausted,
+    /// A reconnect attempted to reuse or move backward from the current connection epoch.
+    #[error(
+        "DeepX WebSocket connection epoch must increase: current {current}, received {received}"
+    )]
+    NonIncreasingConnectionEpoch {
+        /// Current protocol-owner connection epoch.
+        current: u64,
+        /// Reconnect epoch supplied by the caller.
+        received: u64,
+    },
+    /// An authentication attempt completed with an explicit failure.
+    #[error("DeepX WebSocket authentication failed: {0}")]
+    AuthenticationFailed(String),
+    /// No authentication result arrived within the caller's bounded wait.
+    #[error("DeepX WebSocket authentication timed out")]
+    AuthenticationTimeout,
     /// A connection-owned request ended before a correlated response arrived.
     #[error("DeepX WebSocket request canceled: {0}")]
     RequestCanceled(String),

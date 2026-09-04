@@ -24,8 +24,11 @@ pub mod task;
 pub use error::DeepXWsError;
 pub use frame::DeepXWsFrame;
 pub use handler::{
-    DeepXWsProtocolHandle, DeepXWsProtocolHandler, DeepXWsRegisteredRequest,
-    deepx_ws_protocol_handler,
+    DeepXWsProtocolHandle, DeepXWsProtocolHandler, DeepXWsRegisteredAuthentication,
+    DeepXWsRegisteredRequest, deepx_ws_protocol_handler,
 };
-pub use protocol::{DeepXWsProtocolCore, DeepXWsRequest, DeepXWsRequestId};
+pub use protocol::{
+    DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt, DeepXWsProtocolCore, DeepXWsRequest,
+    DeepXWsRequestId,
+};
 pub use task::{DeepXWsTaskHandles, DeepXWsTaskOutcome};

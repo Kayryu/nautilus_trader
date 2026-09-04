@@ -66,6 +66,16 @@ impl From<subxt_core::Error> for SigningError {
     }
 }
 
+/// Derives the Ethereum-compatible DeepX account identity for a signing key.
+///
+/// # Errors
+///
+/// Returns an error if the pinned signer implementation rejects the private scalar.
+pub fn derive_signer_account_id(key: &DeepXPrivateKey) -> Result<[u8; 20], SigningError> {
+    let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
+    Ok(signer.public_key().to_account_id().0)
+}
+
 /// A signed SCALE extrinsic and its deterministic identities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedPalletExtrinsic {
@@ -155,7 +165,7 @@ fn sign_dynamic_pallet_call_with_snapshot(
     nonce: u64,
 ) -> Result<SignedPalletExtrinsic, SigningError> {
     let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
-    let account_id = signer.public_key().to_account_id();
+    let account_id = derive_signer_account_id(key)?;
     let payload = subxt_core::dynamic::tx(pallet, call, arguments);
     let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
         .nonce(nonce)
@@ -167,7 +177,7 @@ fn sign_dynamic_pallet_call_with_snapshot(
     Ok(SignedPalletExtrinsic {
         bytes: transaction.into_encoded(),
         extrinsic_hash: hash.0,
-        signer: account_id.0,
+        signer: account_id,
         nonce,
         runtime: snapshot.identity().clone(),
     })
@@ -240,7 +250,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(!first.bytes().is_empty());
-        assert_eq!(first.signer().len(), 20);
+        assert_eq!(first.signer(), derive_signer_account_id(&key()).unwrap());
     }
 
     #[rstest]
