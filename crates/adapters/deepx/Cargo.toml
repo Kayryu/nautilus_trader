@@ -21,8 +21,10 @@ name = "nautilus_deepx"
 crate-type = ["rlib"]
 
 [dependencies]
-nautilus-core = { workspace = true }
 nautilus-blockchain = { workspace = true }
+nautilus-common = { workspace = true }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 
@@ -30,6 +32,7 @@ alloy = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }
+bon = { workspace = true }
 frame-metadata = { workspace = true }
 jiff = { workspace = true }
 parity-scale-codec = { workspace = true }
@@ -47,6 +50,8 @@ tokio-util = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+
 axum = { workspace = true }
 rstest = { workspace = true }
 

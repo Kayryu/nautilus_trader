@@ -24,6 +24,7 @@
 
 pub mod common;
 pub mod config;
+pub mod execution;
 pub mod http;
 pub mod instruments;
 pub mod providers;
@@ -35,8 +36,14 @@ pub mod websocket;
 
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{
-    DeepXNetworkConfig, DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
+    DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXNetworkConfig,
+    DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
     DeepXValidatedRpcEndpoints, validate_rpc_endpoint_identities,
+};
+pub use execution::{
+    DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
+    DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXOrderContextError,
+    DeepXOrderContextRestorationError,
 };
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};

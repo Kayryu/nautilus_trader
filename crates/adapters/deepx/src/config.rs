@@ -13,17 +13,106 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Configuration for DeepX network access.
+//! Configuration for DeepX network and execution access.
 
 use std::fmt::{Debug, Formatter};
 
 use nautilus_core::hex;
+use nautilus_model::identifiers::AccountId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::common::{DeepXEnvironment, Result, consts::DEEPX_TESTNET_GENESIS_HASH, urls};
+use crate::common::{
+    DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, Result,
+    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_VENUE},
+    urls,
+};
 
 const REDACTED: &str = "<redacted>";
+
+/// Explicit DeepX transaction execution backend.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepXExecutionBackend {
+    /// Metadata-driven direct pallet extrinsics.
+    #[default]
+    DirectPallet,
+    /// Legacy EVM-precompile transactions wrapped in a Substrate extrinsic.
+    LegacyEvm,
+}
+
+/// Configuration for a fail-closed DeepX execution client.
+#[derive(Clone, Deserialize, Serialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepXExecutionClientConfig {
+    /// Account identifier for the execution client.
+    #[builder(default = AccountId::from("DEEPX-001"))]
+    pub account_id: AccountId,
+    /// Explicit DeepX subaccount identity.
+    pub subaccount_id: Option<String>,
+    /// secp256k1 private key, loaded from `DEEPX_TESTNET_PRIVATE_KEY` when unset.
+    pub private_key: Option<String>,
+    /// Transaction encoding and submission backend.
+    #[builder(default)]
+    pub execution_backend: DeepXExecutionBackend,
+    /// Testnet network and RPC-role configuration.
+    #[builder(default)]
+    pub network: DeepXNetworkConfig,
+}
+
+impl Default for DeepXExecutionClientConfig {
+    fn default() -> Self {
+        Self {
+            account_id: AccountId::from("DEEPX-001"),
+            subaccount_id: None,
+            private_key: None,
+            execution_backend: DeepXExecutionBackend::default(),
+            network: DeepXNetworkConfig::default(),
+        }
+    }
+}
+
+impl Debug for DeepXExecutionClientConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(DeepXExecutionClientConfig))
+            .field("account_id", &self.account_id)
+            .field("subaccount_id", &self.subaccount_id)
+            .field("private_key", &self.private_key.as_ref().map(|_| REDACTED))
+            .field("execution_backend", &self.execution_backend)
+            .field("network", &self.network)
+            .finish()
+    }
+}
+
+impl DeepXExecutionClientConfig {
+    /// Validates the execution identity and supported deployment.
+    pub fn validate(&self) -> Result<()> {
+        self.network.validate()?;
+        if self.account_id.get_issuer() != *DEEPX_VENUE {
+            return Err(crate::common::DeepXError::InvalidConfiguration(format!(
+                "DeepX account ID issuer must be {}",
+                *DEEPX_VENUE,
+            )));
+        }
+        match self.subaccount_id.as_deref() {
+            Some(value) if !value.trim().is_empty() => Ok(()),
+            _ => Err(crate::common::DeepXError::InvalidConfiguration(
+                "DeepX subaccount identity must be explicitly configured".to_string(),
+            )),
+        }
+    }
+
+    /// Resolves and validates the configured testnet signing credential.
+    pub fn resolve_private_key(&self) -> Result<DeepXPrivateKey> {
+        self.validate()?;
+        match &self.private_key {
+            Some(value) => DeepXPrivateKey::new(value, &DeepXKeyScheme::Secp256k1),
+            None => {
+                DeepXPrivateKey::from_env(&self.network.environment, &DeepXKeyScheme::Secp256k1)
+            }
+        }
+    }
+}
 
 /// Role assigned to a DeepX Substrate JSON-RPC endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,6 +438,79 @@ mod tests {
             config.rpc_url_for(DeepXRpcRole::Recovery).unwrap(),
             DEEPX_TESTNET_RPC_URL,
         );
+    }
+
+    #[rstest]
+    fn execution_config_requires_explicit_deepx_subaccount() {
+        let config = DeepXExecutionClientConfig::default();
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message))
+                if message.contains("subaccount identity"),
+        ));
+    }
+
+    #[rstest]
+    fn execution_config_rejects_non_deepx_account() {
+        let config = DeepXExecutionClientConfig {
+            account_id: AccountId::from("OTHER-001"),
+            subaccount_id: Some("subaccount-1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message)) if message.contains("issuer"),
+        ));
+    }
+
+    #[rstest]
+    fn execution_config_rejects_mainnet_before_credentials() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("subaccount-1".to_string()),
+            private_key: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            network: DeepXNetworkConfig {
+                environment: DeepXEnvironment::Mainnet,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.resolve_private_key(),
+            Err(DeepXError::UnsupportedEnvironment(environment)) if environment == "mainnet",
+        ));
+    }
+
+    #[rstest]
+    fn execution_config_debug_redacts_private_key() {
+        const PRIVATE_KEY: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("subaccount-1".to_string()),
+            private_key: Some(PRIVATE_KEY.to_string()),
+            ..Default::default()
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("DirectPallet"));
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains(PRIVATE_KEY));
+    }
+
+    #[rstest]
+    fn execution_backend_is_explicitly_serialized() {
+        let config: DeepXExecutionClientConfig = serde_json::from_str(
+            r#"{"subaccount_id":"subaccount-1","execution_backend":"legacy_evm"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.execution_backend, DeepXExecutionBackend::LegacyEvm,);
+        assert!(config.validate().is_ok());
     }
 
     #[rstest]

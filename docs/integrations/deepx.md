@@ -99,6 +99,35 @@ implemented and covered by unit tests:
   exact record envelopes, revision-checked compare-and-set, and detached session advisory locks for
   cross-process signer ownership. Recovery and reorganization decisions use this acknowledged CAS
   boundary.
+- A testnet-only execution configuration boundary with an explicit direct-pallet or legacy-EVM
+  backend, matching DeepX account identity, mandatory subaccount identity, environment credential
+  resolution, and redacted debug output.
+- A non-operational execution client foundation around `ExecutionClientCore` and
+  `ExecutionEventEmitter`. Its ordered startup gate remains disconnected until instrument preload,
+  caller-supplied context restoration, runtime validation, private-stream authentication, account-state
+  initialization, startup mass reconciliation, and account registration all have authoritative
+  evidence. Account-state initialization records the exact event identity for the current startup
+  epoch. The final step verifies that event is present in the matching account ID and account type
+  in the shared execution cache. Raw startup evidence advancement is crate-private, and account
+  state, order-context restoration, and account registration additionally require their dedicated
+  verification boundaries. Cache borrow contention fails with a typed error. Disconnect resets the
+  complete gate and current event identity.
+- A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
+  permits idempotent restoration, fails closed on conflicting client-order identities, and
+  classifies unknown updates as external. A caller-supplied complete context snapshot is validated
+  and atomically replaces the previous snapshot before the restoration startup gate advances; an
+  explicit empty snapshot clears the registry. Individual registry population does not prove
+  restoration or authorize event emission. Framework-provided reconciled external order identity
+  can be registered with conflict-safe client and venue order ID bindings. It remains separate from
+  tracked order context and does not authorize typed event emission or provide report decoding.
+  Finished tracked contexts move atomically into a separate bounded FIFO ownership history so late
+  updates remain terminal-owned rather than being misclassified as external. Terminal ownership
+  survives reconnect startup resets, conflicts with active restoration and external registration,
+  and does not itself choose report, suppression, or event behavior before fixture-backed decoding.
+- Protocol-neutral bounded replay state for already validated venue trade IDs. A reservation blocks
+  concurrent handling of the same ID, commits only after future routing succeeds, and is released
+  when handling fails so a replay can recover the fill. Committed IDs survive reconnect startup
+  resets and use FIFO eviction. No private trade decoder, fill report, or event emission is enabled.
 
 These foundations do not make the adapter operational. Apart from the two public market-list reads,
 single-page perpetual funding-rate, long-short ratio, and open-interest history primitives, one
@@ -109,8 +138,9 @@ or channel, instrument provider, market data client, account client, execution c
 service, PyO3 binding, or Python package is enabled. A fixture-gated offline direct-pallet signing
 primitive exists, but no order call is exposed and no transaction submission is implemented.
 Authoritative venue rate-limit policy, automatic history pagination, and other business response
-schemas remain unimplemented. Possessing or loading a private key does not enable trading or
-transaction submission.
+schemas remain unimplemented. The execution client foundation does not implement the Nautilus
+execution trait or any network connection. Possessing or loading a private key does not enable
+trading or transaction submission.
 
 ## Plan progress
 
@@ -171,8 +201,25 @@ and add this capability document. The implementation maps to the integration pla
   semantics or authorize submission, watching, or recovery. A 2026-09-01 attempt to capture a
   replacement finalized-header fixture failed before any RPC response because the testnet endpoint
   closed the TLS connection.
-- **Phase E - Not started:** No execution client, account initialization, order commands, reports
-  or reconciliation exists.
+- **Phase E - Partial:** A strict execution config and disconnected client foundation exist. The
+  client owns `ExecutionClientCore`, `ExecutionEventEmitter`, a redacted credential, and an ordered
+  startup gate which requires instrument preload, caller-supplied context restoration, runtime validation,
+  private-stream authentication, account-state initialization, startup mass reconciliation, and
+  account registration before connected state. It also owns a conflict-safe shared order-context
+  registry for tracked/terminal/external update routing, including conflict-safe framework-provided
+  external client and venue order identity bindings. External bindings remain report-routed and
+  cannot be promoted to tracked ownership without complete shared `OrderContext`. Its restoration boundary
+  validates and atomically installs a complete caller-supplied replacement snapshot before
+  advancing startup, but it does not verify snapshot provenance or completeness and no
+  cache/database restoration coordinator exists. Its final startup boundary verifies that the
+  exact account-state event recorded for the current startup epoch is present in the matching
+  cached account history. This rejects stale account entries from a previous startup epoch, but it
+  does not prove the protocol-dependent semantic completeness of that account state.
+  Bounded trade-ID replay state supports reserve, commit, and failure release for an already
+  validated venue `TradeId`; committed IDs survive reconnect startup resets until FIFO eviction.
+  The state is not connected to a private payload decoder or execution event route.
+  It does not implement `ExecutionClient`; no live connection, account decoder, order command,
+  report, reconciliation implementation, or event emission exists.
 - **Phase F - Not started:** No subaccount, delegate, quota
 - **Phase G - Partial:** This document exists; configs, factories, PyO3/Python wiring, discovery
   pages, and examples are absent.

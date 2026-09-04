@@ -122,6 +122,15 @@ impl CacheView {
     pub fn borrow(&self) -> Ref<'_, Cache> {
         self.inner.borrow()
     }
+
+    /// Attempts to borrow the cache immutably.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache is already mutably borrowed.
+    pub fn try_borrow(&self) -> Result<Ref<'_, Cache>, std::cell::BorrowError> {
+        self.inner.try_borrow()
+    }
 }
 
 impl From<Rc<RefCell<Cache>>> for CacheView {

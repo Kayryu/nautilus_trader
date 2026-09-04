@@ -104,6 +104,15 @@ impl ExecutionClientCore {
         self.cache.borrow()
     }
 
+    /// Attempts to return a read-only borrow of the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache is already mutably borrowed.
+    pub fn try_cache(&self) -> Result<std::cell::Ref<'_, Cache>, std::cell::BorrowError> {
+        self.cache.try_borrow()
+    }
+
     /// Returns the order for the given `client_order_id` from the cache.
     ///
     /// # Errors
