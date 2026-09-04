@@ -50,10 +50,12 @@ pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};
 pub use rpc::{
     DeepXAppliedRuntimeSnapshot, DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot,
     DeepXRpcEndpointIdentityError, DeepXRpcIdentityError, DeepXRpcMethodCapabilities,
-    DeepXRpcMethodCapabilityError, DeepXRuntimeSnapshotObservationError,
-    DeepXRuntimeSnapshotRefreshError, observe_and_apply_approved_finalized_runtime_snapshot,
-    observe_and_validate_rpc_endpoint_identities, observe_approved_finalized_runtime_snapshot,
-    observe_rpc_endpoint_identity, observe_rpc_method_capabilities,
+    DeepXRpcMethodCapabilitiesError, DeepXRpcMethodCapabilityError,
+    DeepXRuntimeSnapshotObservationError, DeepXRuntimeSnapshotRefreshError,
+    DeepXValidatedRpcMethodCapabilities, observe_and_apply_approved_finalized_runtime_snapshot,
+    observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
+    observe_approved_finalized_runtime_snapshot, observe_rpc_endpoint_identity,
+    observe_rpc_method_capabilities,
 };
 pub use signing::{
     ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeConfig,

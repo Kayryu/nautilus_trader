@@ -73,6 +73,11 @@ implemented and covered by unit tests:
   observations to match their configured URLs and the approved testnet genesis hash before
   releasing a complete validated endpoint set. All three read-only observations complete before
   deterministic role-attributed error handling and validation.
+- A fail-closed RPC method capability boundary which concurrently probes all three
+  identity-validated role endpoints and requires the minimum submission, finalized runtime watch,
+  and canonical recovery method names. Evidence retains its endpoint URL and cannot satisfy
+  execution startup for another validated endpoint set. Advertised names do not prove method
+  semantics or authorize transaction operations.
 - A read-only finalized runtime snapshot collector which uses the ordinary configured RPC endpoint,
   reads that hash's header, pins runtime-version and metadata reads to the same hash, and returns
   only an approved snapshot paired with its strictly decoded finalized hash and block number. It
@@ -110,9 +115,11 @@ implemented and covered by unit tests:
   initialization, startup mass reconciliation, and account registration all have authoritative
   evidence. Account-state initialization records the exact event identity for the current startup
   epoch. The final step verifies that event is present in the matching account ID and account type
-  in the shared execution cache. Raw startup evidence advancement is crate-private, and account
-  state, order-context restoration, and account registration additionally require their dedicated
-  verification boundaries. Instrument preload only advances through a `DeepXMarketProvider` which
+  in the shared execution cache. Raw startup evidence advancement is crate-private. Private-stream
+  authentication advances only with an authenticated-session receipt which is still current for
+  its protocol owner and connection epoch; account state, order-context restoration, and account
+  registration additionally require their dedicated verification boundaries. Instrument preload
+  only advances through a `DeepXMarketProvider` which
   completed its failure-atomic Spot and perpetual catalog load and contains at least one market. An
   uninitialized provider and a successful but empty catalog return distinct typed startup errors
   without advancing. The provider primary REST endpoint must also match the execution client's
@@ -121,10 +128,11 @@ implemented and covered by unit tests:
   Runtime validation advances only with a snapshot token produced after fixture-approved metadata
   was observed at one finalized Watch checkpoint and atomically applied to the shared snapshot
   service. The token's deployment and genesis identity must match the execution configuration and
-  chain-identity-validated Submission, Watch, and Recovery endpoint selection. This proves endpoint
-  URL selection and chain identity, not support for each role's required RPC methods. The approved
-  snapshot authorizes only the direct-pallet backend; legacy-EVM configuration fails without
-  advancing until separate fixture evidence establishes its runtime interface.
+  chain-identity-validated Submission, Watch, and Recovery endpoint selection. Each role must also
+  provide endpoint-bound evidence that `rpc_methods` advertised its minimum required method names.
+  This proves endpoint selection, chain identity, and advertised names, not RPC method semantics.
+  The approved snapshot authorizes only the direct-pallet backend; legacy-EVM configuration fails
+  without advancing until separate fixture evidence establishes its runtime interface.
   This public metadata catalog is not a Nautilus `InstrumentProvider` and does not prove trading
   precision or limits. Startup mass reconciliation advances only while holding the transaction
   store's current lease for the configured signing identity, after loading its complete durable
@@ -218,11 +226,13 @@ and add this capability document. The implementation maps to the integration pla
   the identity-validated Watch endpoint and atomically applies it to the snapshot service. It does
   not detect unknown upgrades, poll, retry automatically, or weaken permit quiescence. No live
   runtime watcher, order-call model, golden signing vector, configured nonce store or chain time
-  source, transaction submission, tracker, operational role-method policy, or live recovery scanner
-  exists. A read-only RPC identity collector concurrently queries every configured role endpoint
+  source, transaction submission, tracker, or live recovery scanner exists. A read-only RPC
+  identity collector concurrently queries every configured role endpoint
   for its genesis hash and releases only a complete validated endpoint set. An independent
   read-only capability probe can then require a caller-supplied non-empty method set for one role
-  and fails closed unless `rpc_methods` advertises every name. This evidence does not prove method
+  and fails closed unless `rpc_methods` advertises every name. A complete collector concurrently
+  applies the adapter's minimum per-role method policy and binds the resulting evidence to each
+  endpoint URL; execution startup requires that complete evidence. This does not prove method
   semantics or authorize submission, watching, or recovery. A 2026-09-01 attempt to capture a
   replacement finalized-header fixture failed before any RPC response because the testnet endpoint
   closed the TLS connection.
@@ -522,9 +532,9 @@ Explicit authentication failure is accepted only for the active attempt; a stale
 fail a newer attempt or invalidate a newer authenticated session. Bounded waits cancel only their
 matching attempt on timeout, preventing a later completion from authenticating an abandoned attempt;
 an already completed result wins at the timeout boundary. This proves only local ownership and
-lifecycle behavior: no DeepX authentication payload or acknowledgement decoder is implemented, the
-receipt does not advance execution startup, and generic correlated responses cannot mark a connection
-authenticated.
+lifecycle behavior: no DeepX authentication payload or acknowledgement decoder is implemented.
+Execution startup can consume only a receipt which remains current for the same protocol owner and
+connection epoch; generic correlated responses cannot mark a connection authenticated.
 
 The internal OpenAPI currently proves only that `GET /internal/v1/ws` is described as the real-time
 WebSocket connection endpoint. It does not define the upgrade headers, venue message envelope,
@@ -719,10 +729,13 @@ does not prove role-specific RPC method support; an operational client must stil
 identity directly from each endpoint before probing it. A separate read-only probe accepts only an
 identity-validated endpoint set and a non-empty caller-supplied list of required methods for one
 role. It calls `rpc_methods`, rejects transport or response failures, and returns evidence only when
-every required name is advertised. The evidence contains the role and required method names only;
-it does not retain unrelated advertised methods, prove their semantics, or enable any operational
-client. The definitive per-role method policy remains blocked on the submission, tracking, and
-recovery protocol contracts.
+every required name is advertised. A complete collector requires `author_submitExtrinsic` for
+submission; finalized-head, header, runtime-version, and metadata reads for watch; and pending-pool,
+canonical block, block-hash, finalized-head, and header reads for recovery. It probes all roles
+concurrently and returns no partial evidence. Evidence retains the role, endpoint URL, and required
+method names, but not unrelated advertised methods. Execution startup rejects evidence collected
+from a different endpoint set. These names are the minimum implied by the current planned flows;
+they do not prove semantics or enable any operational client.
 
 Direct-pallet transaction reservations have a versioned, strict durable record format. Version 3
 adds retained reorganization evidence and uses a distinct cache-key namespace so older record

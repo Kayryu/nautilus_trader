@@ -35,6 +35,26 @@ use crate::{
     },
 };
 
+/// RPC methods required from the transaction submission endpoint.
+pub const DEEPX_SUBMISSION_RPC_METHODS: &[&str] = &["author_submitExtrinsic"];
+
+/// RPC methods required from the finalized runtime watch endpoint.
+pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
+    "chain_getFinalizedHead",
+    "chain_getHeader",
+    "state_getMetadata",
+    "state_getRuntimeVersion",
+];
+
+/// RPC methods required from the transaction recovery endpoint.
+pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
+    "author_pendingExtrinsics",
+    "chain_getBlock",
+    "chain_getBlockHash",
+    "chain_getFinalizedHead",
+    "chain_getHeader",
+];
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ObservedRuntimeVersion {
@@ -56,6 +76,7 @@ struct ObservedRpcMethods {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXRpcMethodCapabilities {
     role: DeepXRpcRole,
+    endpoint_url: String,
     methods: BTreeSet<String>,
 }
 
@@ -66,10 +87,36 @@ impl DeepXRpcMethodCapabilities {
         self.role
     }
 
+    /// Returns the identity-validated endpoint which supplied this evidence.
+    #[must_use]
+    pub fn endpoint_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
     /// Returns the required methods advertised by the endpoint at observation time.
     #[must_use]
     pub const fn methods(&self) -> &BTreeSet<String> {
         &self.methods
+    }
+}
+
+/// Complete role-specific RPC method evidence for one validated endpoint set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXValidatedRpcMethodCapabilities {
+    submission: DeepXRpcMethodCapabilities,
+    watch: DeepXRpcMethodCapabilities,
+    recovery: DeepXRpcMethodCapabilities,
+}
+
+impl DeepXValidatedRpcMethodCapabilities {
+    /// Returns the capabilities observed for `role`.
+    #[must_use]
+    pub const fn for_role(&self, role: DeepXRpcRole) -> &DeepXRpcMethodCapabilities {
+        match role {
+            DeepXRpcRole::Submission => &self.submission,
+            DeepXRpcRole::Watch => &self.watch,
+            DeepXRpcRole::Recovery => &self.recovery,
+        }
     }
 }
 
@@ -186,6 +233,17 @@ pub enum DeepXRpcMethodCapabilityError {
         /// Required method absent from the advertised method set.
         method: String,
     },
+}
+
+/// Errors raised while collecting complete role-specific RPC method capabilities.
+#[derive(Debug, Error)]
+#[error("failed to observe DeepX RPC method capabilities for role {role:?}: {source}")]
+pub struct DeepXRpcMethodCapabilitiesError {
+    /// Role whose identity-validated endpoint was queried.
+    pub role: DeepXRpcRole,
+    /// Underlying capability observation error.
+    #[source]
+    pub source: DeepXRpcMethodCapabilityError,
 }
 
 /// Errors raised while collecting and validating every DeepX RPC role endpoint.
@@ -356,7 +414,57 @@ pub async fn observe_rpc_method_capabilities(
 
     Ok(DeepXRpcMethodCapabilities {
         role,
+        endpoint_url: endpoints.url_for(role).to_string(),
         methods: required_methods,
+    })
+}
+
+/// Collects the minimum RPC method capabilities required for all endpoint roles.
+///
+/// All three probes complete before errors are evaluated in submission, watch, then recovery
+/// order. This proves advertised method names only; protocol semantics remain separately gated.
+///
+/// # Errors
+///
+/// Returns a role-attributed error unless every identity-validated endpoint advertises all methods
+/// required by its role.
+pub async fn observe_and_validate_rpc_method_capabilities(
+    endpoints: &DeepXValidatedRpcEndpoints,
+) -> Result<DeepXValidatedRpcMethodCapabilities, DeepXRpcMethodCapabilitiesError> {
+    let (submission, watch, recovery) = tokio::join!(
+        observe_rpc_method_capabilities(
+            endpoints,
+            DeepXRpcRole::Submission,
+            DEEPX_SUBMISSION_RPC_METHODS.iter().copied(),
+        ),
+        observe_rpc_method_capabilities(
+            endpoints,
+            DeepXRpcRole::Watch,
+            DEEPX_WATCH_RPC_METHODS.iter().copied(),
+        ),
+        observe_rpc_method_capabilities(
+            endpoints,
+            DeepXRpcRole::Recovery,
+            DEEPX_RECOVERY_RPC_METHODS.iter().copied(),
+        ),
+    );
+    let submission = submission.map_err(|source| DeepXRpcMethodCapabilitiesError {
+        role: DeepXRpcRole::Submission,
+        source,
+    })?;
+    let watch = watch.map_err(|source| DeepXRpcMethodCapabilitiesError {
+        role: DeepXRpcRole::Watch,
+        source,
+    })?;
+    let recovery = recovery.map_err(|source| DeepXRpcMethodCapabilitiesError {
+        role: DeepXRpcRole::Recovery,
+        source,
+    })?;
+
+    Ok(DeepXValidatedRpcMethodCapabilities {
+        submission,
+        watch,
+        recovery,
     })
 }
 
@@ -752,6 +860,68 @@ mod tests {
         assert!(matches!(
             error,
             DeepXRpcMethodCapabilityError::EmptyRequirements(DeepXRpcRole::Recovery)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observes_required_rpc_methods_for_all_validated_role_endpoints() {
+        let submission_url = spawn_rpc_methods_server(DEEPX_SUBMISSION_RPC_METHODS).await;
+        let watch_url = spawn_rpc_methods_server(DEEPX_WATCH_RPC_METHODS).await;
+        let recovery_url = spawn_rpc_methods_server(DEEPX_RECOVERY_RPC_METHODS).await;
+        let endpoints = validated_role_endpoints(&submission_url, &watch_url, &recovery_url);
+
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+
+        for (role, expected_url, expected_methods) in [
+            (
+                DeepXRpcRole::Submission,
+                submission_url.as_str(),
+                DEEPX_SUBMISSION_RPC_METHODS,
+            ),
+            (
+                DeepXRpcRole::Watch,
+                watch_url.as_str(),
+                DEEPX_WATCH_RPC_METHODS,
+            ),
+            (
+                DeepXRpcRole::Recovery,
+                recovery_url.as_str(),
+                DEEPX_RECOVERY_RPC_METHODS,
+            ),
+        ] {
+            let observed = capabilities.for_role(role);
+            assert_eq!(observed.role(), role);
+            assert_eq!(observed.endpoint_url(), expected_url);
+            assert_eq!(
+                observed.methods(),
+                &expected_methods
+                    .iter()
+                    .map(|method| (*method).to_string())
+                    .collect(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn attributes_complete_rpc_method_failure_to_role() {
+        let submission_url = spawn_rpc_methods_server(DEEPX_SUBMISSION_RPC_METHODS).await;
+        let watch_url = spawn_rpc_methods_server(&["chain_getFinalizedHead"]).await;
+        let recovery_url = spawn_rpc_methods_server(DEEPX_RECOVERY_RPC_METHODS).await;
+        let endpoints = validated_role_endpoints(&submission_url, &watch_url, &recovery_url);
+
+        let error = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.role, DeepXRpcRole::Watch);
+        assert!(matches!(
+            error.source,
+            DeepXRpcMethodCapabilityError::MissingMethod {
+                role: DeepXRpcRole::Watch,
+                ..
+            }
         ));
     }
 

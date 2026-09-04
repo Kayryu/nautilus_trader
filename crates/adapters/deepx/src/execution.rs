@@ -37,12 +37,13 @@ use crate::{
         DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXRpcRole, DeepXValidatedRpcEndpoints,
     },
     providers::DeepXMarketProvider,
-    rpc::DeepXAppliedRuntimeSnapshot,
+    rpc::{DeepXAppliedRuntimeSnapshot, DeepXValidatedRpcMethodCapabilities},
     signing::{SigningError, derive_signer_account_id},
     transaction::{
         DeepXSignerLease, DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction,
         DeepXTransactionStore, load_verified_committed_for_signer,
     },
+    websocket::{DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
@@ -107,6 +108,12 @@ pub enum DeepXExecutionStartupError {
     /// The validated RPC role selection belongs to another network configuration.
     #[error("DeepX validated RPC endpoint does not match execution configuration for role {0:?}")]
     RuntimeRpcEndpointMismatch(DeepXRpcRole),
+    /// RPC method capability evidence belongs to another validated role endpoint.
+    #[error("DeepX RPC method capabilities do not match validated endpoint for role {0:?}")]
+    RuntimeRpcCapabilitiesMismatch(DeepXRpcRole),
+    /// The private-stream authentication receipt is not current for its protocol owner.
+    #[error("DeepX private-stream authenticated session is not current")]
+    PrivateStreamAuthenticationMismatch,
     /// Account-state initialization was not recorded through the event identity boundary.
     #[error("DeepX account-state initialization evidence requires event verification")]
     AccountStateVerificationRequired,
@@ -762,6 +769,7 @@ impl DeepXExecutionClient {
         &mut self,
         applied: &DeepXAppliedRuntimeSnapshot,
         endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)?;
@@ -793,9 +801,38 @@ impl DeepXExecutionClient {
             if endpoints.url_for(role) != configured_url {
                 return Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role));
             }
+            let role_capabilities = capabilities.for_role(role);
+            if role_capabilities.role() != role
+                || role_capabilities.endpoint_url() != endpoints.url_for(role)
+            {
+                return Err(DeepXExecutionStartupError::RuntimeRpcCapabilitiesMismatch(
+                    role,
+                ));
+            }
         }
         self.startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)?;
+        Ok(())
+    }
+
+    /// Verifies current private-stream authentication and advances the startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for private-stream authentication and the
+    /// supplied receipt is still current for the protocol owner and connection epoch.
+    pub fn record_private_stream_authenticated(
+        &mut self,
+        protocol: &DeepXWsProtocolCore,
+        session: DeepXWsAuthenticatedSession,
+    ) -> Result<(), DeepXExecutionStartupError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)?;
+        if !protocol.is_authenticated_session(session) {
+            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+        }
+        self.startup
+            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)?;
         Ok(())
     }
 
@@ -992,7 +1029,11 @@ mod tests {
     use crate::{
         common::consts::DEEPX_TESTNET_GENESIS_HASH,
         config::{DeepXObservedRpcEndpoint, validate_rpc_endpoint_identities},
-        rpc::observe_and_apply_approved_finalized_runtime_snapshot,
+        rpc::{
+            DeepXValidatedRpcMethodCapabilities,
+            observe_and_apply_approved_finalized_runtime_snapshot,
+            observe_and_validate_rpc_method_capabilities,
+        },
         signing::{DeepXRuntimeSnapshotService, RuntimeSnapshot},
         transaction::{
             DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXNonceReservation,
@@ -1217,6 +1258,7 @@ mod tests {
     async fn applied_runtime_evidence() -> (
         String,
         DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
         DeepXAppliedRuntimeSnapshot,
     ) {
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
@@ -1231,8 +1273,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let router = Router::new().route(
             "/",
-            post(move |Json(_request): Json<Value>| {
-                let index = calls.fetch_add(1, Ordering::Relaxed);
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&calls);
                 let responses = [
                     genesis.clone(),
                     finalized_head.clone(),
@@ -1240,7 +1282,28 @@ mod tests {
                     runtime_version.clone(),
                     metadata.clone(),
                 ];
-                async move { Json(responses[index].clone()) }
+                async move {
+                    if request["method"] == "rpc_methods" {
+                        return Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {
+                                "methods": [
+                                    "author_pendingExtrinsics",
+                                    "author_submitExtrinsic",
+                                    "chain_getBlock",
+                                    "chain_getBlockHash",
+                                    "chain_getFinalizedHead",
+                                    "chain_getHeader",
+                                    "state_getMetadata",
+                                    "state_getRuntimeVersion",
+                                ],
+                            },
+                        }));
+                    }
+                    let index = calls.fetch_add(1, Ordering::Relaxed);
+                    Json(responses[index].clone())
+                }
             }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1290,7 +1353,10 @@ mod tests {
         )
         .await
         .unwrap();
-        (rpc_url, endpoints, applied)
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (rpc_url, endpoints, capabilities, applied)
     }
 
     fn metadata_fixture_bytes() -> Vec<u8> {
@@ -1306,7 +1372,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_startup_accepts_applied_snapshot_for_configured_rpc_roles() {
-        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
         client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
         client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
@@ -1315,7 +1381,7 @@ mod tests {
         client.restore_order_contexts([]).unwrap();
 
         client
-            .record_runtime_validated(&applied, &endpoints)
+            .record_runtime_validated(&applied, &endpoints, &capabilities)
             .unwrap();
 
         assert!(
@@ -1327,8 +1393,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_stream_startup_accepts_current_authenticated_session() {
+        let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .record_runtime_validated(&applied, &endpoints, &capabilities)
+            .unwrap();
+        let mut protocol = DeepXWsProtocolCore::new('/');
+        let (attempt, _) = protocol.begin_authentication().unwrap();
+        assert!(protocol.complete_authentication(attempt));
+        let session = protocol.authenticated_session().unwrap();
+
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
+
+        assert!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn private_stream_startup_rejects_session_from_stale_connection_without_advancing() {
+        let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .record_runtime_validated(&applied, &endpoints, &capabilities)
+            .unwrap();
+        let mut protocol = DeepXWsProtocolCore::new('/');
+        let (stale_attempt, _) = protocol.begin_authentication().unwrap();
+        assert!(protocol.complete_authentication(stale_attempt));
+        let stale_session = protocol.authenticated_session().unwrap();
+        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+
+        assert_eq!(
+            client.record_private_stream_authenticated(&protocol, stale_session),
+            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+        );
+
+        let (current_attempt, _) = protocol.begin_authentication().unwrap();
+        assert!(protocol.complete_authentication(current_attempt));
+        client
+            .record_private_stream_authenticated(
+                &protocol,
+                protocol.authenticated_session().unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn runtime_startup_rejects_mismatched_rpc_role_without_advancing() {
-        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
         client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
         client.config.network.base_url_rpc_watch = Some("http://127.0.0.1:1".to_string());
@@ -1337,7 +1465,7 @@ mod tests {
         client.restore_order_contexts([]).unwrap();
 
         assert_eq!(
-            client.record_runtime_validated(&applied, &endpoints),
+            client.record_runtime_validated(&applied, &endpoints, &capabilities),
             Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(
                 DeepXRpcRole::Watch,
             )),
@@ -1346,14 +1474,39 @@ mod tests {
         client.config.network.base_url_rpc_watch = Some(rpc_url);
         assert!(
             client
-                .record_runtime_validated(&applied, &endpoints)
+                .record_runtime_validated(&applied, &endpoints, &capabilities)
                 .is_ok()
         );
     }
 
     #[tokio::test]
+    async fn runtime_startup_rejects_capabilities_from_another_endpoint_without_advancing() {
+        let (rpc_url, endpoints, _capabilities, applied) = applied_runtime_evidence().await;
+        let (_, _, other_capabilities, _) = applied_runtime_evidence().await;
+        let mut client = test_client();
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+
+        assert_eq!(
+            client.record_runtime_validated(&applied, &endpoints, &other_capabilities),
+            Err(DeepXExecutionStartupError::RuntimeRpcCapabilitiesMismatch(
+                DeepXRpcRole::Submission,
+            )),
+        );
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated),
+            Ok(()),
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_startup_rejects_unsupported_backend_without_advancing() {
-        let (rpc_url, endpoints, applied) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
         client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
@@ -1363,7 +1516,7 @@ mod tests {
         client.restore_order_contexts([]).unwrap();
 
         assert_eq!(
-            client.record_runtime_validated(&applied, &endpoints),
+            client.record_runtime_validated(&applied, &endpoints, &capabilities),
             Err(DeepXExecutionStartupError::UnsupportedRuntimeBackend(
                 DeepXExecutionBackend::LegacyEvm,
             )),
@@ -1372,7 +1525,7 @@ mod tests {
         client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
         assert!(
             client
-                .record_runtime_validated(&applied, &endpoints)
+                .record_runtime_validated(&applied, &endpoints, &capabilities)
                 .is_ok()
         );
     }
