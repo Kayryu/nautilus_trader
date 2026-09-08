@@ -17,22 +17,29 @@
 
 mod postgres;
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use nautilus_model::{
     enums::OrderSide,
     identifiers::{ClientOrderId, InstrumentId},
 };
 pub use postgres::{DeepXPostgresSignerLease, DeepXPostgresTransactionStore};
+use subxt_core::dynamic::Value;
 use thiserror::Error;
 
 use super::{
-    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXRecoveryDecision,
-    DeepXReorganizationDecision, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
-    DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
-    DeepXTransactionRecordError, DeepXTransactionState,
+    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXNonceReservation,
+    DeepXRecoveryDecision, DeepXReorganizationDecision, DeepXTimestampNonceAllocator,
+    DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
+    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
 };
-use crate::signing::{SignedPalletExtrinsic, SigningError};
+use crate::{
+    common::DeepXPrivateKey,
+    signing::{
+        RuntimeSnapshot, SignedPalletExtrinsic, SigningError, derive_signer_account_id,
+        sign_dynamic_pallet_call_with_snapshot,
+    },
+};
 
 /// Durable revision assigned to an acknowledged transaction record write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -506,6 +513,118 @@ impl DeepXBusinessCallVerifier for DeepXUnsupportedBusinessCallVerifier {
         Err(DeepXBusinessCallBindingError::Unsupported(
             "authoritative DeepX business-call vectors are unavailable".to_string(),
         ))
+    }
+}
+
+/// Fixture-gated verifier for the one business call whose encoding is proven today.
+///
+/// This verifier binds a `System.remark` signed payload to its reserved transaction identity by
+/// deterministically re-signing the canonical remark payload derived from that identity against
+/// the verifier's approved runtime snapshot, then requiring byte-for-byte equality with the
+/// durable signed extrinsic. Because the pinned signing path is deterministic for a fixed
+/// snapshot, key, nonce, and call, equality proves that the durable bytes encode exactly the
+/// reserved signer, nonce, runtime, and canonical business payload.
+///
+/// The canonical payload embeds the client order ID, instrument, side, nonce, and runtime spec
+/// version, so a durable extrinsic signed for any other identity cannot compare equal. The
+/// remark call mutates no chain state; every DeepX order call remains unsupported here pending
+/// authoritative golden vectors.
+///
+/// The key is retained only to re-derive the deterministic comparison bytes. The verifier
+/// performs no network I/O and never releases the retained bytes.
+#[derive(Clone)]
+pub struct DeepXRemarkCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+}
+
+impl DeepXRemarkCallVerifier {
+    /// Binds remark verification to an approved snapshot and the reserved signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is rejected by the pinned DeepX signer implementation.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        derive_signer_account_id(&key)?;
+        Ok(Self { snapshot, key })
+    }
+
+    /// Derives the canonical remark payload binding one reserved transaction identity.
+    ///
+    /// The payload embeds the client order ID, instrument, side, timestamp nonce, and runtime
+    /// spec version, so a remark signed for any other identity compares unequal.
+    #[must_use]
+    pub fn canonical_remark_payload(identity: &DeepXTransactionIdentity, nonce: u64) -> Vec<u8> {
+        format!(
+            "nautilus-deepx:remark:v1:{}:{}:{}:{}:{}",
+            identity.client_order_id(),
+            identity.instrument_id(),
+            identity.order_side(),
+            nonce,
+            identity.runtime().spec_version,
+        )
+        .into_bytes()
+    }
+
+    fn canonical_signed_remark(
+        &self,
+        identity: &DeepXTransactionIdentity,
+    ) -> Result<SignedPalletExtrinsic, DeepXBusinessCallBindingError> {
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        sign_dynamic_pallet_call_with_snapshot(
+            &self.snapshot,
+            &self.key,
+            "System",
+            "remark",
+            vec![Value::from_bytes(Self::canonical_remark_payload(
+                identity, nonce,
+            ))],
+            nonce,
+        )
+        .map_err(|error| {
+            DeepXBusinessCallBindingError::Unsupported(format!(
+                "canonical DeepX remark call could not be encoded: {error}"
+            ))
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXRemarkCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        if DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "verifier runtime snapshot does not match the reserved runtime".to_string(),
+            ));
+        }
+        let canonical = self.canonical_signed_remark(identity)?;
+        if canonical.bytes() != signed_extrinsic.bytes() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not the canonical remark for this identity".to_string(),
+            ));
+        }
+        if canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable hash does not match the canonical remark hash".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXRemarkCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXRemarkCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
     }
 }
 
@@ -1397,6 +1516,189 @@ mod tests {
             verifier.verify(record.identity(), record.signed_extrinsic().unwrap()),
             Err(DeepXBusinessCallBindingError::Unsupported(_)),
         ));
+    }
+
+    fn remark_snapshot() -> crate::signing::RuntimeSnapshot {
+        #[derive(serde::Deserialize)]
+        struct RpcResponse {
+            result: String,
+        }
+        let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+        )))
+        .unwrap();
+        let bytes = nautilus_core::hex::decode(metadata.result.trim_start_matches("0x")).unwrap();
+        crate::signing::RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            nautilus_core::hex::decode_array(
+                "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+            )
+            .unwrap(),
+            366,
+            1,
+            &bytes,
+        )
+        .unwrap()
+    }
+
+    fn remark_key() -> crate::common::DeepXPrivateKey {
+        crate::common::DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &crate::common::DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap()
+    }
+
+    fn remark_runtime() -> DeepXDirectRuntimeIdentity {
+        DeepXDirectRuntimeIdentity::from(remark_snapshot().identity())
+    }
+
+    fn remark_identity() -> DeepXTransactionIdentity {
+        DeepXTransactionIdentity::new(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            crate::signing::derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_123,
+            },
+            remark_runtime(),
+        )
+    }
+
+    fn remark_record(identity: &DeepXTransactionIdentity) -> DeepXTransactionRecord {
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            unreachable!("remark records reserve a timestamp nonce");
+        };
+        let mut record = DeepXTransactionRecord::created(identity.clone());
+        let signed = sign_dynamic_pallet_call_with_snapshot(
+            &remark_snapshot(),
+            &remark_key(),
+            "System",
+            "remark",
+            vec![Value::from_bytes(
+                DeepXRemarkCallVerifier::canonical_remark_payload(identity, nonce),
+            )],
+            nonce,
+        )
+        .unwrap();
+        record.record_signed(&signed).unwrap();
+        record
+    }
+
+    #[rstest]
+    fn remark_verifier_accepts_exactly_the_canonical_identity_binding() {
+        let identity = remark_identity();
+        let record = remark_record(&identity);
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert_eq!(
+            verifier.verify(&identity, record.signed_extrinsic().unwrap()),
+            Ok(()),
+        );
+    }
+
+    #[rstest]
+    fn remark_verifier_rejects_bytes_signed_for_another_payload() {
+        let identity = remark_identity();
+        let mut record = DeepXTransactionRecord::created(identity.clone());
+        let signed = sign_dynamic_pallet_call_with_snapshot(
+            &remark_snapshot(),
+            &remark_key(),
+            "System",
+            "remark",
+            vec![Value::from_bytes(b"deepx-unrelated-payload")],
+            1_725_000_000_123,
+        )
+        .unwrap();
+        record.record_signed(&signed).unwrap();
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
+    }
+
+    #[rstest]
+    fn remark_verifier_rejects_a_runtime_the_snapshot_does_not_cover() {
+        let record = remark_record(&remark_identity());
+        let unproven_runtime_identity = DeepXTransactionIdentity::new(
+            ClientOrderId::new(remark_identity().client_order_id()),
+            remark_identity().signer(),
+            remark_identity().instrument_id(),
+            remark_identity().order_side(),
+            remark_identity().nonce(),
+            DeepXDirectRuntimeIdentity {
+                spec_version: 999,
+                ..remark_runtime()
+            },
+        );
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(
+                &unproven_runtime_identity,
+                record.signed_extrinsic().unwrap(),
+            ),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
+    }
+
+    #[rstest]
+    fn remark_verifier_rejects_bytes_signed_with_a_different_nonce() {
+        let identity = remark_identity();
+        let other_nonce_identity = DeepXTransactionIdentity::new(
+            ClientOrderId::new(identity.client_order_id()),
+            identity.signer(),
+            identity.instrument_id(),
+            identity.order_side(),
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_124,
+            },
+            remark_runtime(),
+        );
+        let record = remark_record(&other_nonce_identity);
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
+    }
+
+    #[rstest]
+    fn remark_verifier_rejects_the_unproven_sequential_nonce_domain() {
+        let identity = remark_identity();
+        let sequential_identity = DeepXTransactionIdentity::new(
+            ClientOrderId::new(identity.client_order_id()),
+            identity.signer(),
+            identity.instrument_id(),
+            identity.order_side(),
+            DeepXNonceReservation::SequentialAccount {
+                account_index: 0,
+                nonce: 7,
+            },
+            remark_runtime(),
+        );
+        let record = remark_record(&identity);
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&sequential_identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Unsupported(_)),
+        ));
+    }
+
+    #[rstest]
+    fn remark_verifier_debug_output_redacts_the_private_key() {
+        let verifier = DeepXRemarkCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        let debug = format!("{verifier:?}");
+        assert!(debug.contains("DeepXRemarkCallVerifier"));
+        assert!(!debug.contains("0123456789abcdef"));
     }
 
     #[tokio::test]

@@ -156,7 +156,7 @@ pub fn sign_dynamic_pallet_call(
     )
 }
 
-fn sign_dynamic_pallet_call_with_snapshot(
+pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     snapshot: &RuntimeSnapshot,
     key: &DeepXPrivateKey,
     pallet: &str,

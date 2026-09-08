@@ -15,6 +15,10 @@
 
 //! Failure-atomic public market metadata catalog.
 
+mod instrument;
+
+pub use instrument::{DeepXInstrumentProvider, DeepXSpotInstrumentUnsupported};
+
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
@@ -179,6 +183,12 @@ impl DeepXMarketProvider {
     pub async fn load(&mut self, instrument_id: &InstrumentId) -> Result<()> {
         self.load_ids(&[*instrument_id]).await
     }
+
+    /// Replaces the underlying HTTP client, for example to point the catalog at another
+    /// endpoint family after construction.
+    pub fn replace_client(&mut self, client: DeepXHttpClient) -> DeepXHttpClient {
+        std::mem::replace(&mut self.client, client)
+    }
 }
 
 fn insert_unique(
@@ -206,8 +216,8 @@ mod tests {
     use super::*;
     use crate::common::consts::DEEPX_VENUE;
 
-    const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-    const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+    const SPOT_RESPONSE: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
+    const PERP_RESPONSE: &str = include_str!("../../test_data/http/testnet/perp_markets.json");
 
     async fn provider(fail_perp: Arc<AtomicBool>) -> DeepXMarketProvider {
         let router = Router::new()

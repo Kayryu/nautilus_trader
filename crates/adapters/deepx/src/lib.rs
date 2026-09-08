@@ -46,7 +46,10 @@ pub use execution::{
     DeepXOrderContextError, DeepXOrderContextRestorationError, DeepXTradeDedupError,
 };
 pub use instruments::parse_perpetual_instrument;
-pub use providers::{DeepXMarketMetadata, DeepXMarketProvider};
+pub use providers::{
+    DeepXInstrumentProvider, DeepXMarketMetadata, DeepXMarketProvider,
+    DeepXSpotInstrumentUnsupported,
+};
 pub use rpc::{
     DeepXAppliedRuntimeSnapshot, DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot,
     DeepXRpcEndpointIdentityError, DeepXRpcIdentityError, DeepXRpcMethodCapabilities,
@@ -76,16 +79,16 @@ pub use transaction::{
     DeepXPreparedReservation, DeepXPreparedSignedTransaction, DeepXPreparedSubmission,
     DeepXRecoveryDecision, DeepXRecoveryScan, DeepXRecoveryScanCollectionError,
     DeepXRecoveryScanCollector, DeepXRecoveryScanPlanError, DeepXRecoveryScanRange,
-    DeepXRecoveryScanRanges, DeepXReorganizationDecision, DeepXReservationPreparationError,
-    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
-    DeepXSubmissionFailure, DeepXSubmissionPermit, DeepXSubmissionPoolEvidence,
-    DeepXSubmissionPreparationError, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
-    DeepXTransactionError, DeepXTransactionIdentity, DeepXTransactionLifecycle,
-    DeepXTransactionObservation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
-    DeepXTransactionRecordError, DeepXTransactionRecoveryAction, DeepXTransactionRevision,
-    DeepXTransactionState, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
-    classify_reorganization, commit_reconciliation_observation, commit_recovery_decision,
-    commit_reorganization_decision, plan_missed_block_scan, prepare_initial_submission,
-    prepare_signed_transaction, prepare_timestamp_reservation, restore_timestamp_nonce_allocator,
-    verify_signer_lease,
+    DeepXRecoveryScanRanges, DeepXRemarkCallVerifier, DeepXReorganizationDecision,
+    DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
+    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionFailure,
+    DeepXSubmissionPermit, DeepXSubmissionPoolEvidence, DeepXSubmissionPreparationError,
+    DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionError,
+    DeepXTransactionIdentity, DeepXTransactionLifecycle, DeepXTransactionObservation,
+    DeepXTransactionPersistenceError, DeepXTransactionRecord, DeepXTransactionRecordError,
+    DeepXTransactionRecoveryAction, DeepXTransactionRevision, DeepXTransactionState,
+    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, classify_reorganization,
+    commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
+    plan_missed_block_scan, prepare_initial_submission, prepare_signed_transaction,
+    prepare_timestamp_reservation, restore_timestamp_nonce_allocator, verify_signer_lease,
 };

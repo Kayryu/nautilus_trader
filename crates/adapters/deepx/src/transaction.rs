@@ -18,18 +18,19 @@
 mod persistence;
 mod recovery;
 mod reservation;
+mod submission;
 
 pub use persistence::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
     DeepXCommittedTransactionRecord, DeepXObservationCommitError, DeepXPostgresSignerLease,
     DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
-    DeepXPreparedSubmission, DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionPermit,
-    DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
-    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, commit_reconciliation_observation,
-    commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
-    prepare_initial_submission, prepare_signed_transaction, prepare_timestamp_reservation,
-    restore_timestamp_nonce_allocator, verify_signer_lease,
+    DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReservationPreparationError,
+    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+    DeepXSubmissionPermit, DeepXSubmissionPreparationError, DeepXTransactionPersistenceError,
+    DeepXTransactionRevision, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
+    commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
+    load_verified_committed_for_signer, prepare_initial_submission, prepare_signed_transaction,
+    prepare_timestamp_reservation, restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -46,6 +47,10 @@ pub use reservation::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use submission::{
+    DeepXSubmissionError, DeepXSubmittedExtrinsic, submit_extrinsic_once, verify_submission_hash,
+};
 
 /// The fail-closed action required after restoring a durable transaction record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

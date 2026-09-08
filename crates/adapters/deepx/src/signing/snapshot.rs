@@ -93,7 +93,7 @@ pub enum SnapshotError {
     /// An unknown non-empty transaction extension would make signing ambiguous.
     #[error("unsupported non-empty DeepX transaction extension: {0}")]
     UnsupportedTransactionExtension(String),
-    /// The approved metadata contains an inconsistent pallet, call, or event identity.
+    /// The approved metadata contains an inconsistent pallet, call, event, or error identity.
     #[error(transparent)]
     InvalidRuntimeInterface(#[from] DeepXRuntimeInterfaceError),
 }
@@ -110,6 +110,15 @@ pub enum DeepXRuntimeInterfaceError {
     /// An event name or index is duplicated within a pallet.
     #[error("duplicate DeepX runtime event identity: {0}.{1}")]
     DuplicateEvent(String, String),
+    /// An error name or index is duplicated within a pallet.
+    #[error("duplicate DeepX runtime error identity: {0}.{1}")]
+    DuplicateError(String, String),
+    /// The requested SCALE pallet index is absent from the approved runtime metadata.
+    #[error("DeepX runtime pallet index is unavailable: {0}")]
+    PalletIndexUnavailable(u8),
+    /// The requested SCALE error index is absent from the specified pallet.
+    #[error("DeepX runtime error index is unavailable: {0}.{1}")]
+    ErrorIndexUnavailable(u8, u8),
     /// The requested pallet is absent from the approved runtime metadata.
     #[error("DeepX runtime pallet is unavailable: {0}")]
     PalletUnavailable(String),
@@ -121,7 +130,7 @@ pub enum DeepXRuntimeInterfaceError {
     EventUnavailable(String, String),
 }
 
-/// Immutable metadata identity for one runtime call or event variant.
+/// Immutable metadata identity for one runtime call, event, or error variant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXRuntimeVariantIdentity {
     /// Variant name declared by the runtime metadata.
@@ -155,6 +164,8 @@ pub struct DeepXRuntimePalletInterface {
     calls: Vec<DeepXRuntimeVariantIdentity>,
     /// Event variants declared by the runtime metadata.
     events: Vec<DeepXRuntimeVariantIdentity>,
+    /// Error variants declared by the runtime metadata.
+    errors: Vec<DeepXRuntimeVariantIdentity>,
 }
 
 impl DeepXRuntimePalletInterface {
@@ -181,9 +192,15 @@ impl DeepXRuntimePalletInterface {
     pub fn events(&self) -> &[DeepXRuntimeVariantIdentity] {
         &self.events
     }
+
+    /// Returns the error variants declared by the runtime metadata.
+    #[must_use]
+    pub fn errors(&self) -> &[DeepXRuntimeVariantIdentity] {
+        &self.errors
+    }
 }
 
-/// Immutable pallet, call, and event identities from approved runtime metadata.
+/// Immutable pallet, call, event, and error identities from approved runtime metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXRuntimeInterfaceCatalog {
     pallets: Vec<DeepXRuntimePalletInterface>,
@@ -211,11 +228,17 @@ impl DeepXRuntimeInterfaceCatalog {
                 pallet.event_variants().unwrap_or_default(),
                 DeepXRuntimeInterfaceError::DuplicateEvent,
             )?;
+            let errors = collect_variants(
+                pallet.name(),
+                pallet.error_variants().unwrap_or_default(),
+                DeepXRuntimeInterfaceError::DuplicateError,
+            )?;
             pallets.push(DeepXRuntimePalletInterface {
                 name: pallet.name().to_string(),
                 index: pallet.index(),
                 calls,
                 events,
+                errors,
             });
         }
 
@@ -260,6 +283,39 @@ impl DeepXRuntimeInterfaceCatalog {
             .ok_or_else(|| {
                 DeepXRuntimeInterfaceError::CallUnavailable(pallet.to_string(), call.to_string())
             })
+    }
+
+    /// Returns pallet and error identities by their declared SCALE indices.
+    ///
+    /// This lookup does not decode a `DispatchError` or classify a transaction outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns distinct errors when the pallet index or its error index is absent.
+    pub fn error_by_index(
+        &self,
+        pallet_index: u8,
+        error_index: u8,
+    ) -> Result<
+        (&DeepXRuntimePalletInterface, &DeepXRuntimeVariantIdentity),
+        DeepXRuntimeInterfaceError,
+    > {
+        let pallet = self
+            .pallets
+            .iter()
+            .find(|candidate| candidate.index == pallet_index)
+            .ok_or(DeepXRuntimeInterfaceError::PalletIndexUnavailable(
+                pallet_index,
+            ))?;
+        let error = pallet
+            .errors
+            .iter()
+            .find(|candidate| candidate.index == error_index)
+            .ok_or(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(
+                pallet_index,
+                error_index,
+            ))?;
+        Ok((pallet, error))
     }
 
     /// Returns an event identity from the approved runtime metadata.
@@ -334,8 +390,41 @@ pub struct RuntimeSnapshot {
 #[derive(Debug)]
 struct RuntimeSnapshotServiceState {
     active: Arc<RuntimeSnapshot>,
-    pending_identity: Option<ApprovedRuntimeIdentity>,
+    pending_identity: Option<PendingRuntimeIdentity>,
     in_flight: usize,
+}
+
+#[derive(Debug)]
+enum PendingRuntimeIdentity {
+    Approved(ApprovedRuntimeIdentity),
+    Observed {
+        environment: DeepXEnvironment,
+        genesis_hash: [u8; 32],
+        spec_version: u32,
+        transaction_version: u32,
+        metadata_sha256: Option<[u8; 32]>,
+    },
+}
+
+impl PendingRuntimeIdentity {
+    fn matches(&self, identity: &ApprovedRuntimeIdentity) -> bool {
+        match self {
+            Self::Approved(approved) => approved == identity,
+            Self::Observed {
+                environment,
+                genesis_hash,
+                spec_version,
+                transaction_version,
+                metadata_sha256,
+            } => {
+                environment == &identity.environment
+                    && genesis_hash == &identity.genesis_hash
+                    && spec_version == &identity.spec_version
+                    && transaction_version == &identity.transaction_version
+                    && metadata_sha256.is_none_or(|hash| hash == identity.metadata_sha256)
+            }
+        }
+    }
 }
 
 /// Coordinates immutable runtime snapshots across signing and runtime upgrades.
@@ -396,7 +485,8 @@ impl DeepXRuntimeSnapshotService {
             .lock()
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
         if let Some(pending) = &state.pending_identity {
-            return if pending == &observed {
+            return if pending.matches(&observed) {
+                state.pending_identity = Some(PendingRuntimeIdentity::Approved(observed));
                 Ok(DeepXRuntimeChangeDecision::RefreshRequired)
             } else {
                 Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
@@ -406,8 +496,72 @@ impl DeepXRuntimeSnapshotService {
             return Ok(DeepXRuntimeChangeDecision::Unchanged);
         }
 
-        state.pending_identity = Some(observed);
+        state.pending_identity = Some(PendingRuntimeIdentity::Approved(observed));
         Ok(DeepXRuntimeChangeDecision::RefreshRequired)
+    }
+
+    /// Latches runtime change evidence before metadata decoding or fixture approval.
+    pub(crate) fn observe_runtime_fingerprint(
+        &self,
+        environment: &DeepXEnvironment,
+        genesis_hash: [u8; 32],
+        spec_version: u32,
+        transaction_version: u32,
+        metadata_bytes: Option<&[u8]>,
+    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let metadata_sha256 = metadata_bytes.map(|bytes| {
+            let mut hash = [0; 32];
+            hash.copy_from_slice(digest(&SHA256, bytes).as_ref());
+            hash
+        });
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        let matches = |identity: &ApprovedRuntimeIdentity| {
+            environment == &identity.environment
+                && genesis_hash == identity.genesis_hash
+                && spec_version == identity.spec_version
+                && transaction_version == identity.transaction_version
+                && metadata_sha256.is_none_or(|hash| hash == identity.metadata_sha256)
+        };
+
+        if let Some(pending) = &mut state.pending_identity {
+            match pending {
+                PendingRuntimeIdentity::Approved(identity) if matches(identity) => return Ok(()),
+                PendingRuntimeIdentity::Observed {
+                    environment: pending_environment,
+                    genesis_hash: pending_genesis,
+                    spec_version: pending_spec,
+                    transaction_version: pending_transaction,
+                    metadata_sha256: pending_hash,
+                } if environment == pending_environment
+                    && genesis_hash == *pending_genesis
+                    && spec_version == *pending_spec
+                    && transaction_version == *pending_transaction
+                    && (metadata_sha256.is_none()
+                        || pending_hash.is_none()
+                        || metadata_sha256 == *pending_hash) =>
+                {
+                    if metadata_sha256.is_some() {
+                        *pending_hash = metadata_sha256;
+                    }
+                    return Ok(());
+                }
+                _ => return Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange),
+            }
+        }
+
+        if !matches(state.active.identity()) {
+            state.pending_identity = Some(PendingRuntimeIdentity::Observed {
+                environment: environment.clone(),
+                genesis_hash,
+                spec_version,
+                transaction_version,
+                metadata_sha256,
+            });
+        }
+        Ok(())
     }
 
     /// Installs a fixture-validated replacement after all old signing permits are released.
@@ -428,7 +582,7 @@ impl DeepXRuntimeSnapshotService {
             .pending_identity
             .as_ref()
             .ok_or(DeepXRuntimeSnapshotServiceError::RefreshNotStarted)?;
-        if pending != snapshot.identity() {
+        if !pending.matches(snapshot.identity()) {
             return Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch);
         }
         if state.in_flight != 0 {
@@ -462,14 +616,15 @@ impl DeepXRuntimeSnapshotService {
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
 
         if let Some(pending) = &state.pending_identity {
-            if pending != snapshot.identity() {
+            if !pending.matches(snapshot.identity()) {
                 return Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange);
             }
         } else if state.active.identity() == snapshot.identity() {
             return Ok(DeepXRuntimeSnapshotUpdate::Unchanged);
-        } else {
-            state.pending_identity = Some(snapshot.identity().clone());
         }
+        state.pending_identity = Some(PendingRuntimeIdentity::Approved(
+            snapshot.identity().clone(),
+        ));
 
         if state.in_flight != 0 {
             return Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(
@@ -673,6 +828,8 @@ fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
 
 #[cfg(test)]
 mod tests {
+    use frame_metadata::{META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed};
+    use parity_scale_codec::{Decode, Encode};
     use rstest::rstest;
     use scale_info::form::PortableForm;
     use serde::Deserialize;
@@ -727,6 +884,176 @@ mod tests {
                 name: "ExtrinsicSuccess".to_string(),
                 index: 0,
             },
+        );
+    }
+
+    #[rstest]
+    fn runtime_error_identities_match_independently_decoded_fixture() {
+        let bytes = metadata_bytes();
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &bytes,
+        )
+        .unwrap();
+        let mut input = bytes.as_slice();
+        let RuntimeMetadataPrefixed(prefix, RuntimeMetadata::V14(metadata)) =
+            RuntimeMetadataPrefixed::decode(&mut input).unwrap()
+        else {
+            panic!("Expected V14 fixture metadata");
+        };
+        assert_eq!(prefix, META_RESERVED);
+        assert!(input.is_empty());
+        let catalog = snapshot.interfaces();
+        assert_eq!(catalog.pallets().len(), metadata.pallets.len());
+        let mut error_count = 0;
+
+        for pallet in &metadata.pallets {
+            let actual_pallet = catalog.pallet(&pallet.name).unwrap();
+            assert_eq!(actual_pallet.index(), pallet.index);
+            let Some(errors) = &pallet.error else {
+                assert!(actual_pallet.errors().is_empty());
+                assert_eq!(
+                    catalog.error_by_index(pallet.index, 0),
+                    Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(
+                        pallet.index,
+                        0,
+                    )),
+                );
+                continue;
+            };
+            let TypeDef::Variant(variants) =
+                &metadata.types.resolve(errors.ty.id).unwrap().type_def
+            else {
+                panic!("Expected pallet error variants");
+            };
+            assert_eq!(actual_pallet.errors().len(), variants.variants.len());
+
+            for (actual, expected) in actual_pallet.errors().iter().zip(&variants.variants) {
+                assert_eq!(actual.name(), expected.name);
+                assert_eq!(actual.index(), expected.index);
+                let (found_pallet, found_error) = catalog
+                    .error_by_index(pallet.index, expected.index)
+                    .unwrap();
+                assert!(std::ptr::eq(found_pallet, actual_pallet));
+                assert!(std::ptr::eq(found_error, actual));
+                error_count += 1;
+            }
+
+            let unknown_error = (0..=u8::MAX)
+                .find(|index| {
+                    !variants
+                        .variants
+                        .iter()
+                        .any(|variant| variant.index == *index)
+                })
+                .unwrap();
+            assert_eq!(
+                catalog.error_by_index(pallet.index, unknown_error),
+                Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(
+                    pallet.index,
+                    unknown_error,
+                )),
+            );
+        }
+
+        assert!(error_count > 0, "Fixture must contain pallet errors");
+        let unknown_pallet = (0..=u8::MAX)
+            .find(|index| !metadata.pallets.iter().any(|pallet| pallet.index == *index))
+            .unwrap();
+        assert_eq!(
+            catalog.error_by_index(unknown_pallet, 0),
+            Err(DeepXRuntimeInterfaceError::PalletIndexUnavailable(
+                unknown_pallet,
+            )),
+        );
+    }
+
+    fn synthetic_error_metadata(second_name: &str, second_index: u8) -> Metadata {
+        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(mut metadata)) =
+            RuntimeMetadataPrefixed::decode(&mut metadata_bytes().as_slice()).unwrap()
+        else {
+            panic!("Expected V14 fixture metadata");
+        };
+        let mut pallet = metadata
+            .pallets
+            .iter()
+            .find(|pallet| pallet.error.is_some())
+            .unwrap()
+            .clone();
+        let error_type = pallet.error.as_ref().unwrap().ty.id;
+        pallet.name = "SparsePallet".to_string();
+        pallet.index = 71;
+        metadata.pallets = vec![pallet];
+        let ty = metadata
+            .types
+            .types
+            .iter_mut()
+            .find(|ty| ty.id == error_type)
+            .unwrap();
+        let TypeDef::Variant(variants) = &mut ty.ty.type_def else {
+            panic!("Expected pallet error variants");
+        };
+        variants.variants = vec![
+            Variant {
+                name: "FirstError".to_string(),
+                fields: Vec::new(),
+                index: 203,
+                docs: Vec::new(),
+            },
+            Variant {
+                name: second_name.to_string(),
+                fields: Vec::new(),
+                index: second_index,
+                docs: Vec::new(),
+            },
+        ];
+        let bytes = RuntimeMetadataPrefixed(META_RESERVED, RuntimeMetadata::V14(metadata)).encode();
+        metadata::decode_from(&bytes).unwrap()
+    }
+
+    #[rstest]
+    fn runtime_error_lookup_uses_sparse_declared_indices() {
+        let metadata = synthetic_error_metadata("SecondError", 9);
+        let catalog = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata).unwrap();
+
+        for (index, name) in [(203, "FirstError"), (9, "SecondError")] {
+            let (pallet, error) = catalog.error_by_index(71, index).unwrap();
+            assert_eq!(pallet.name(), "SparsePallet");
+            assert_eq!(pallet.index(), 71);
+            assert_eq!(error.name(), name);
+            assert_eq!(error.index(), index);
+        }
+
+        assert_eq!(
+            catalog.error_by_index(0, 203),
+            Err(DeepXRuntimeInterfaceError::PalletIndexUnavailable(0)),
+        );
+
+        for index in [0, 1, 255] {
+            assert_eq!(
+                catalog.error_by_index(71, index),
+                Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(71, index)),
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("FirstError", 9)]
+    #[case("SecondError", 203)]
+    fn runtime_interface_rejects_duplicate_error_identity(
+        #[case] second_name: &str,
+        #[case] second_index: u8,
+    ) {
+        let metadata = synthetic_error_metadata(second_name, second_index);
+        assert_eq!(
+            DeepXRuntimeInterfaceCatalog::from_metadata(&metadata),
+            Err(DeepXRuntimeInterfaceError::DuplicateError(
+                "SparsePallet".to_string(),
+                second_name.to_string(),
+            )),
         );
     }
 
@@ -939,6 +1266,91 @@ mod tests {
         assert_eq!(
             service.apply_validated(&snapshot).unwrap(),
             DeepXRuntimeSnapshotUpdate::Unchanged,
+        );
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn observed_fingerprint_requires_matching_quiescent_install(
+        #[case] include_metadata: bool,
+        #[case] apply: bool,
+    ) {
+        let bytes = metadata_bytes();
+        let replacement = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &bytes,
+        )
+        .unwrap();
+        let mut old = replacement.clone();
+        old.identity.spec_version -= 1;
+        let service = DeepXRuntimeSnapshotService::new(old.clone());
+        let permit = service.acquire().unwrap();
+        let identity = replacement.identity();
+        service
+            .observe_runtime_fingerprint(
+                &identity.environment,
+                identity.genesis_hash,
+                identity.spec_version,
+                identity.transaction_version,
+                None,
+            )
+            .unwrap();
+        if include_metadata {
+            service
+                .observe_runtime_fingerprint(
+                    &identity.environment,
+                    identity.genesis_hash,
+                    identity.spec_version,
+                    identity.transaction_version,
+                    Some(&bytes),
+                )
+                .unwrap();
+            assert_eq!(
+                service.observe_runtime_fingerprint(
+                    &identity.environment,
+                    identity.genesis_hash,
+                    identity.spec_version,
+                    identity.transaction_version,
+                    Some(&[0]),
+                ),
+                Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
+            );
+        }
+        assert_eq!(
+            service.install(old.clone()),
+            Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch)
+        );
+        assert_eq!(
+            service.observe_runtime_identity(old.identity().clone()),
+            Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
+        );
+        let install = || {
+            if apply {
+                service.apply_validated(&replacement).map(|_| ())
+            } else {
+                service.install(replacement.clone())
+            }
+        };
+        assert_eq!(
+            install(),
+            Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1))
+        );
+        assert_eq!(permit.snapshot().identity(), old.identity());
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
+        ));
+        drop(permit);
+        install().unwrap();
+        assert_eq!(
+            service.acquire().unwrap().snapshot().identity(),
+            replacement.identity()
         );
     }
 

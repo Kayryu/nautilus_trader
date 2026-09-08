@@ -26,7 +26,9 @@ use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::conte
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, VenueOrderId},
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
+    },
     orders::OrderAny,
 };
 use thiserror::Error;
@@ -149,6 +151,14 @@ pub enum DeepXExecutionStartupError {
 /// Errors raised when DeepX order context cannot be registered or read safely.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXOrderContextError {
+    /// The order context belongs to another venue.
+    #[error("DeepX order context {client_order_id} has instrument venue {venue}")]
+    InstrumentVenueMismatch {
+        /// Client order ID from the rejected context.
+        client_order_id: ClientOrderId,
+        /// Instrument venue from the rejected context.
+        venue: Venue,
+    },
     /// A client order ID was already bound to different immutable order terms.
     #[error("DeepX client order ID {0} is already registered with different order context")]
     Conflict(ClientOrderId),
@@ -343,6 +353,12 @@ impl<const N: usize> Drop for DeepXTradeReservation<'_, N> {
 impl<const N: usize> DeepXOrderContextRegistryInner<N> {
     fn register(&self, context: OrderContext) -> Result<(), DeepXOrderContextError> {
         let client_order_id = context.identity.client_order_id;
+        if context.identity.instrument_id.venue != *DEEPX_VENUE {
+            return Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                client_order_id,
+                venue: context.identity.instrument_id.venue,
+            });
+        }
         let mut state = self
             .state
             .lock()
@@ -372,6 +388,12 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
 
         for context in contexts {
             let client_order_id = context.identity.client_order_id;
+            if context.identity.instrument_id.venue != *DEEPX_VENUE {
+                return Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                    client_order_id,
+                    venue: context.identity.instrument_id.venue,
+                });
+            }
             if restored
                 .get(&client_order_id)
                 .is_some_and(|existing| existing != &context)
@@ -399,6 +421,12 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
         &self,
         context: DeepXExternalOrderContext,
     ) -> Result<(), DeepXOrderContextError> {
+        if context.instrument_id.venue != *DEEPX_VENUE {
+            return Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                client_order_id: context.client_order_id,
+                venue: context.instrument_id.venue,
+            });
+        }
         let mut state = self
             .state
             .lock()
@@ -1185,10 +1213,18 @@ mod tests {
     }
 
     fn test_order_with_id(client_order_id: &str, quantity: &str) -> OrderAny {
+        test_order_with_instrument(client_order_id, quantity, "ETH-USDC-PERP.DEEPX")
+    }
+
+    fn test_order_with_instrument(
+        client_order_id: &str,
+        quantity: &str,
+        instrument_id: &str,
+    ) -> OrderAny {
         OrderTestBuilder::new(OrderType::Limit)
             .client_order_id(ClientOrderId::from(client_order_id))
             .strategy_id(StrategyId::from("S-DEEPX-001"))
-            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .instrument_id(InstrumentId::from(instrument_id))
             .side(OrderSide::Buy)
             .quantity(Quantity::from(quantity))
             .price(Price::from("2500.00"))
@@ -2336,6 +2372,89 @@ mod tests {
                 .route_execution_update(Some(previous.identity.client_order_id))
                 .unwrap(),
             DeepXExecutionUpdateRoute::Tracked(previous),
+        );
+    }
+
+    #[rstest]
+    fn registering_order_context_rejects_another_venue() {
+        let client = test_client();
+        let order = test_order_with_instrument("O-OTHER-001", "1.0", "ETH-USDC-PERP.OTHER");
+
+        assert_eq!(
+            client.register_order(&order),
+            Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                client_order_id: ClientOrderId::from("O-OTHER-001"),
+                venue: Venue::from("OTHER"),
+            }),
+        );
+        assert_eq!(
+            client
+                .route_execution_update(Some(ClientOrderId::from("O-OTHER-001")))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::External,
+        );
+    }
+
+    #[rstest]
+    fn registering_external_order_rejects_another_venue() {
+        let client = test_client();
+        let mut context = test_external_order_context("O-OTHER-001", "V-OTHER-001");
+        context.instrument_id = InstrumentId::from("ETH-USDC-PERP.OTHER");
+
+        assert_eq!(
+            register_external_order(&client, context),
+            Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                client_order_id: context.client_order_id,
+                venue: Venue::from("OTHER"),
+            }),
+        );
+        assert_eq!(
+            client
+                .external_order_context_by_client(&context.client_order_id)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            client
+                .external_order_context_by_venue(&context.venue_order_id)
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[rstest]
+    fn restoration_rejects_another_venue_without_replacing_snapshot() {
+        let mut client = test_client();
+        let previous = OrderContext::from(&test_order_with_id("O-DEEPX-PREVIOUS", "1.250"));
+        client.register_order_context(previous).unwrap();
+        record_instruments_loaded(&mut client);
+        let replacement = OrderContext::from(&test_order_with_id("O-DEEPX-NEW", "2.500"));
+        let foreign = OrderContext::from(&test_order_with_instrument(
+            "O-OTHER-001",
+            "3.750",
+            "ETH-USDC-PERP.OTHER",
+        ));
+
+        assert_eq!(
+            client.restore_order_contexts([replacement, foreign]),
+            Err(DeepXOrderContextRestorationError::Registry(
+                DeepXOrderContextError::InstrumentVenueMismatch {
+                    client_order_id: ClientOrderId::from("O-OTHER-001"),
+                    venue: Venue::from("OTHER"),
+                },
+            )),
+        );
+        assert_eq!(
+            client
+                .route_execution_update(Some(previous.identity.client_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(previous),
+        );
+        assert_eq!(
+            client
+                .route_execution_update(Some(replacement.identity.client_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::External,
         );
     }
 

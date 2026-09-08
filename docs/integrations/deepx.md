@@ -31,16 +31,22 @@ implemented and covered by unit tests:
   `Decimal` parsing for JSON number and string representations. Response models tolerate unknown
   fields while requiring the observed fields used by the protocol boundary.
 - Strict perpetual market conversion into `CryptoPerpetual`, preserving the deployment market ID,
-  protocol addresses, exact increments, minimum quantity and notional, margins, and fees. The full
-  instrument provider remains disabled because Spot metadata has no verified order quantity
-  increment.
+  protocol addresses, exact increments, minimum quantity and notional, margins, and fees. Spot
+  conversion remains disabled because Spot metadata has no verified order quantity increment.
+- A perpetual-only Nautilus `InstrumentProvider` over the failure-atomic catalog. `load_all`
+  converts every perpetual market into a standard `InstrumentStore` under a single captured
+  conversion timestamp; Spot entries are skipped under the documented quantity-increment gate and
+  explicit Spot construction fails closed with a typed error. Loads are failure-atomic: one
+  unconvertible market fails the whole load, `load_ids`/`load` refresh while preserving cached
+  instruments and report absent identities, and non-empty filters are rejected.
 - Typed single-page perpetual funding-rate, long-short ratio, open-interest, raw trade, raw candle,
   raw mark-price, and raw oracle-price history reads, plus raw perpetual volume statistics and the
   raw current last price, with synchronous parameter validation and exact financial-value parsing.
   They preserve venue response order where applicable and do not emit Nautilus data events.
 - A failure-atomic public market catalog which loads Spot and perpetual metadata concurrently,
   preserves deployment-provided bytes32 pair and numeric market IDs, and indexes entries by
-  canonical product-aware Nautilus identities. It is not an `InstrumentProvider`.
+  canonical product-aware Nautilus identities. A separate perpetual-only `InstrumentProvider`
+  layer builds on it.
 - Defensive cursor-pagination state which enforces a local page budget and rejects empty-page
   continuation and repeated cursors without assuming endpoint-specific cursor semantics.
 - Transport-neutral WebSocket protocol state with monotonic request correlation, connection-epoch
@@ -69,6 +75,12 @@ implemented and covered by unit tests:
 - A fail-closed reconciliation commit boundary which applies pool, inclusion, finality, complete
   absence, and operator evidence only through an exact acknowledged record and revision-checked
   durable commit.
+- A fail-closed one-shot extrinsic submission boundary which submits a signed extrinsic through
+  `author_submitExtrinsic` exactly once, and only returns evidence after the node-returned hash,
+  the recorded extrinsic hash, and a recomputed Blake2-256 hash of the submitted bytes are all
+  equal. Node-reported failures and malformed responses fail the boundary without retry and
+  without any automatic `NotSent`/`Ambiguous` classification; callers own the lifecycle decision.
+  This boundary is not wired into any execution path and enables no submission capability.
 - A fail-closed RPC role identity boundary which requires submission, watch, and recovery endpoint
   observations to match their configured URLs and the approved testnet genesis hash before
   releasing a complete validated endpoint set. All three read-only observations complete before
@@ -83,19 +95,24 @@ implemented and covered by unit tests:
   only an approved snapshot paired with its strictly decoded finalized hash and block number. It
   does not install the snapshot, select a mortality period, or authorize signing.
 - An explicit one-shot runtime snapshot coordinator which observes through the chain-identity-
-  validated Watch endpoint, completes approved fixture validation before changing service state,
-  and atomically applies the snapshot. An unchanged identity is idempotent; a changed approved
-  identity remains pending and blocks new permits until all permits for the old snapshot are
-  released and the operation is retried. It is not a watcher or automatic refresh loop.
+  validated Watch endpoint and blocks new signing permits on a runtime-version change before
+  awaiting metadata, or a raw metadata hash change before SCALE decoding and fixture validation.
+  Failed validation or later RPC errors leave the observed fingerprint pending; old permits stay
+  immutable, and observing the old identity does not clear the block. Pre-evidence RPC errors do
+  not block signing. Installation still requires a matching fixture-approved snapshot and release
+  of all old permits. An unchanged identity is idempotent. This is not a watcher or automatic
+  refresh loop and does not enable execution or submit transactions.
 - A transport-neutral runtime snapshot service which grants immutable snapshots through counted
   signing permits, blocks new permits as soon as a changed runtime identity is observed, and
   installs a matching fixture-validated replacement only after all old permits are released. The
   public offline signer requires one of these permits rather than accepting a bare snapshot.
   Snapshot construction explicitly rejects non-testnet deployment labels, and the immutable
   runtime identity retains its testnet deployment tag.
-- A fixture-derived immutable runtime interface catalog which records pallet, call, and event names
-  with their SCALE indices and fails closed when a requested interface is absent. Catalog presence
-  does not prove business semantics or authorize signing.
+- A fixture-derived immutable runtime interface catalog which records pallet, call, event, and
+  error names with their declared SCALE indices and rejects duplicate identities. Numeric error
+  lookup returns pallet and error identities with distinct unknown-pallet and unknown-error
+  failures. This is metadata identity support only, not a `DispatchError` decoder; it does not
+  classify transaction outcomes, prove business semantics, or authorize signing.
 - A protocol-neutral missed-block recovery boundary which plans bounded contiguous ranges, accepts
   each range exactly once in order, rejects incomplete or non-contiguous block evidence, and
   releases a recovery scan only after every planned finalized block has been collected.
@@ -133,9 +150,11 @@ implemented and covered by unit tests:
   This proves endpoint selection, chain identity, and advertised names, not RPC method semantics.
   The approved snapshot authorizes only the direct-pallet backend; legacy-EVM configuration fails
   without advancing until separate fixture evidence establishes its runtime interface.
-  This public metadata catalog is not a Nautilus `InstrumentProvider` and does not prove trading
-  precision or limits. Startup mass reconciliation advances only while holding the transaction
-  store's current lease for the configured signing identity, after loading its complete durable
+  This public metadata catalog is not itself a trading-precision source: the perpetual-only
+  `InstrumentProvider` built on it constructs `CryptoPerpetual` definitions from catalog metadata,
+  and Spot construction remains fail-closed. Startup mass reconciliation advances only while
+  holding the transaction store's current lease for the configured signing identity, after loading
+  its complete durable
   record set and verifying that every acknowledged record is finalized with no remaining recovery,
   submission decision, reconciliation, or operator action. An empty complete record set is valid;
   signer mismatch, stale lease, acknowledgement mismatch, and any unresolved record fail without
@@ -144,13 +163,14 @@ implemented and covered by unit tests:
   Disconnect resets the
   complete gate and current event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
-  permits idempotent restoration, fails closed on conflicting client-order identities, and
-  classifies unknown updates as external. A caller-supplied complete context snapshot is validated
-  and atomically replaces the previous snapshot before the restoration startup gate advances; an
-  explicit empty snapshot clears the registry. Individual registry population does not prove
-  restoration or authorize event emission. Framework-provided reconciled external order identity
-  can be registered with conflict-safe client and venue order ID bindings. It remains separate from
-  tracked order context and does not authorize typed event emission or provide report decoding.
+  permits idempotent restoration, rejects non-DeepX instrument venues, fails closed on conflicting
+  client-order identities, and classifies unknown updates as external. A caller-supplied complete
+  context snapshot is validated and atomically replaces the previous snapshot before the
+  restoration startup gate advances; an explicit empty snapshot clears the registry. Individual
+  registry population does not prove restoration or authorize event emission. Framework-provided
+  reconciled external order identity is subject to the same venue check and can be registered with
+  conflict-safe client and venue order ID bindings. It remains separate from tracked order context
+  and does not authorize typed event emission or provide report decoding.
   Finished tracked contexts move atomically into a separate bounded FIFO ownership history so late
   updates remain terminal-owned rather than being misclassified as external. Terminal ownership
   survives reconnect startup resets, conflicts with active restoration and external registration,
@@ -167,9 +187,10 @@ single-page perpetual funding-rate, long-short ratio, and open-interest history 
 descending page of raw perpetual trades, one ascending page of raw one-minute perpetual candles,
 mark-price history, and oracle-price history, and one raw perpetual volume-statistics window, no
 other endpoint-specific HTTP API except the raw perpetual last-price read, live WebSocket transport
-or channel, instrument provider, market data client, account client, execution client, management
-service, PyO3 binding, or Python package is enabled. A fixture-gated offline direct-pallet signing
-primitive exists, but no order call is exposed and no transaction submission is implemented.
+or channel, data client, account client, execution client, management
+service, PyO3 binding, or Python package is enabled. A perpetual-only offline instrument provider
+and a fixture-gated offline direct-pallet signing
+primitive exist, but no order call is exposed and no transaction submission is implemented.
 Authoritative venue rate-limit policy, automatic history pagination, and other business response
 schemas remain unimplemented. The execution client foundation does not implement the Nautilus
 execution trait or any network connection. Possessing or loading a private key does not enable
@@ -190,21 +211,31 @@ and add this capability document. The implementation maps to the integration pla
   typed single-page perpetual funding-rate, long-short ratio, and open-interest history reads,
   a typed single-page raw perpetual trades read, a typed single-page raw one-minute perpetual
   candle, mark-price history, and oracle-price history read, a typed raw perpetual
-  volume-statistics read, and a typed raw perpetual last-price read exist. No Nautilus instrument
-  provider, framework historical request handling, data client, live public stream, or order-book
-  recovery exists.
+  volume-statistics read, and a typed raw perpetual last-price read exist. A perpetual-only
+  Nautilus `InstrumentProvider` populates a standard `InstrumentStore` from the catalog with
+  failure-atomic loads, preserved cached instruments on refresh, and fail-closed Spot
+  construction. No framework historical request handling, data client, live public stream, or
+  order-book recovery exists.
 - **Phase D - Partial:** A fixture-backed immutable runtime snapshot explicitly validates and
   retains the testnet deployment tag, then validates the testnet genesis, approved runtime
   versions, exact metadata SHA-256, ordered signed extensions, and unknown extension encodings. It
-  retains fixture-derived pallet, call, and event names with their SCALE indices behind typed
-  fail-closed lookups. The pinned DeepX Subxt fork provides an
+  retains fixture-derived pallet, call, event, and error names with their declared SCALE indices
+  behind typed fail-closed lookups, including numeric pallet/error identity lookup without
+  dispatch-error decoding or transaction-outcome changes. The pinned DeepX Subxt fork provides an
   AccountId20/Keccak ECDSA offline dynamic-call signer with an explicit caller-supplied nonce. A
   signer-scoped timestamp nonce policy restores its high-water mark from durable records,
   calibrates against caller-supplied chain time, and allocates monotonically without rollback.
   Reservation preparation revalidates the signer lease and durably creates the exact `created`
   record before exposing it for later signing. Signing preparation verifies that committed
   timestamp reservation and persists matching signed bytes with CAS before exposing the `signed`
-  record. Authoritative pool,
+  record. Business-call binding for signed extrinsics now has exactly one proven verifier:
+  `DeepXRemarkCallVerifier` binds durable signed bytes to the reserved transaction identity
+  (client order ID, instrument, side, timestamp nonce, and runtime spec version) by
+  deterministic re-signing equality of a canonical identity-derived `System.remark` payload
+  against the approved fixture snapshot. It rejects any runtime the snapshot does not cover and
+  the unproven sequential-nonce domain; every DeepX order call remains unsupported pending
+  authoritative golden vectors, and the fail-closed `DeepXUnsupportedBusinessCallVerifier`
+  remains the default verifier. Authoritative pool,
   inclusion, finality, complete absence,
   exact best-block reorganization, and operator evidence can be applied through an exact
   acknowledged record and committed with CAS; signing and submission-start observations cannot
@@ -222,9 +253,13 @@ and add this capability document. The implementation maps to the integration pla
   finalized-header, pinned runtime-version, and pinned metadata reads against the ordinary
   configured RPC endpoint. It returns the snapshot with the strictly decoded checkpoint hash and
   block number, but the committed fixture still predates header capture, so mortal signing remains
-  disabled. An explicit one-shot coordinator observes an approved finalized snapshot only through
-  the identity-validated Watch endpoint and atomically applies it to the snapshot service. It does
-  not detect unknown upgrades, poll, retry automatically, or weaken permit quiescence. No live
+  disabled. An explicit one-shot coordinator observes finalized runtime versions and metadata only
+  through the identity-validated Watch endpoint. It detects version or raw metadata hash changes,
+  including unknown upgrades, and blocks new signing permits before fixture validation. Later
+  failures leave the change latched. It atomically applies only a matching fixture-approved
+  snapshot after all old permits are released. It does not poll, retry automatically, approve
+  unknown fixtures, automatically resume signing after a failed refresh, or weaken permit
+  quiescence. No live
   runtime watcher, order-call model, golden signing vector, configured nonce store or chain time
   source, transaction submission, tracker, or live recovery scanner exists. A read-only RPC
   identity collector concurrently queries every configured role endpoint
@@ -264,12 +299,13 @@ and add this capability document. The implementation maps to the integration pla
   review-readiness run has been recorded.
 
 Within Phase A, the external maintainer-approval and competing-work checks remain unresolved.
-Fixture collection currently covers deployment/runtime identity only; market metadata parsers and
-the catalog and perpetual instrument conversion are covered by sanitized mock responses rather
-than runtime-tagged protocol evidence. A typed EVM precompile read retrieves raw Spot
-`min_order_size`, `tick_size`, and `step_size` integers for a deployment-provided bytes32 pair, but
-the verified SDK does not specify their human-unit scaling. Spot instrument conversion and the
-complete `InstrumentProvider` therefore remain disabled. No fixtures cover complete REST pages,
+Fixture collection currently covers deployment/runtime identity only; market metadata parsers,
+the catalog, the perpetual-only `InstrumentProvider`, and perpetual instrument conversion are
+covered by sanitized mock responses rather than runtime-tagged protocol evidence. A typed EVM
+precompile read retrieves raw Spot `min_order_size`, `tick_size`, and `step_size` integers for a
+deployment-provided bytes32 pair, but the verified SDK does not specify their human-unit scaling.
+Spot instrument conversion and the complete Spot-inclusive `InstrumentProvider` therefore remain
+disabled. No fixtures cover complete REST pages,
 WebSocket messages, transactions, reconnects, reorganizations, pagination, or management
 operations. Within Phase B, the repository wiring and
 local protocol primitives are implemented, but the planned crate skeleton is incomplete because
@@ -353,10 +389,13 @@ signing permits after an identity change and install an already validated replac
 permits finish. Public offline signing requires a permit retained for the complete encode. The
 service does not watch the chain or fetch metadata itself. An explicit one-shot coordinator can
 fetch and fixture-validate a finalized snapshot through the identity-validated Watch endpoint,
-then atomically apply it to the service. Observation failure leaves service state unchanged; when
-old permits prevent replacement, the approved candidate identity remains pending and the caller
-must retry after those permits drain. No polling loop, unknown-upgrade detection, mortality
-selection, or transaction submission is enabled.
+then atomically apply it to the service. The one-shot gate detects runtime-version or raw metadata
+hash changes, including unknown upgrades, and blocks new signing permits before fixture validation.
+Failures before change evidence leave service state unchanged; validation or RPC failures after
+change evidence leave the observed fingerprint pending. When old permits prevent replacement, the
+candidate remains pending and the caller must retry after those permits drain. Installation still
+requires a matching fixture-approved snapshot. No live watcher, polling loop, unknown-runtime
+approval, mortality selection, or transaction submission is enabled.
 
 The testnet internal OpenAPI 3.1 document inspected during protocol research identifies itself as
 `internal-v1`. The retrieved JSON was
@@ -569,7 +608,7 @@ schemes other than secp256k1 are unsupported.
 
 | Capability             | Spot    | Perpetual | Evidence gate                                              |
 | ---------------------- | ------- | --------- | ---------------------------------------------------------- |
-| Instrument definitions | Planned | Planned   | Complete market metadata, precision, limits, margin, fees. |
+| Instrument definitions | Planned | Implemented | Perpetual: catalog metadata, precision, limits, margin, fees. Spot: no verified quantity increment. |
 | Historical candles     | -       | Partial   | One raw 1m ASC page; no framework events or paging.        |
 | Historical trades      | -       | Partial   | One descending raw page; no framework events or paging.    |
 | Order book snapshots   | Planned | Planned   | Snapshot flags, depth semantics, precision, and freshness. |
@@ -586,10 +625,11 @@ schemes other than secp256k1 are unsupported.
 | Market status          | Planned | Planned   | Status values and unknown-value behavior.                  |
 | Lending market status  | Planned | -         | Asset precision and authoritative status evidence.         |
 
-The metadata catalog does not satisfy the instrument-definition gate. Spot responses do not prove
-the permitted quantity increment or order limits. Perpetual responses do not yet prove settlement
-currency, linear/inverse costing, or contract-multiplier semantics. The adapter therefore does not
-construct `CurrencyPair` or `CryptoPerpetual` instruments from these responses.
+The perpetual-only instrument provider constructs `CryptoPerpetual` definitions from catalog
+metadata with settlement currency, linear costing, and a unit multiplier asserted as documented
+assumptions that remain pending deployment verification. Spot responses do not prove the permitted
+quantity increment or order limits, so the provider skips Spot entries and fails closed on
+explicit Spot construction; it does not construct `CurrencyPair` instruments.
 
 Unsupported parameters and unknown enum values must return typed errors. The adapter must never
 emit an order book assembled from unverified or discontinuous data.
@@ -792,8 +832,9 @@ It holds a detached PostgreSQL session advisory lock for the lifetime of each si
 pooled connection cannot retain signer ownership after the lease ends. Lost write acknowledgement
 remains an unknown commit outcome. This store is a persistence primitive, not a configured signing
 or submission service: committed signed bytes remain evidence rather than replay authority, and
-sequential account nonce signing and business-call binding remain disabled until captured protocol
-vectors prove their domains and exact encoded call arguments.
+sequential account nonce signing and order-call binding remain disabled until captured protocol
+vectors prove their domains and exact encoded call arguments. The single proven business-call
+binding is the identity-bound `System.remark` verifier below, which grants no order capability.
 
 The timestamp nonce allocator is scoped to one externally leased signer and restores the maximum
 timestamp reservation from the complete durable record set supplied by that store. It uses the
@@ -817,11 +858,17 @@ unknown commit outcome. This boundary does not prove business-call arguments and
 submission authority.
 
 Initial submission preparation is a separate atomic boundary: it revalidates the current signer
-lease, matches the exact previously committed record bytes, requires a golden-vector-backed
-business-call verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use
+lease, matches the exact previously committed record bytes, requires a proven business-call
+verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use
 payload permit. Stale revisions, forged prior records, unproven call bindings, and unknown commit
 outcomes release no payload. The default verifier rejects every call because the required vectors
-have not been captured. This permit is intentionally unavailable to restored reconciliation states
+have not been captured; `DeepXRemarkCallVerifier` is the one proven verifier. It deterministically
+re-signs the canonical `System.remark` payload derived from the reserved identity (client order
+ID, instrument, side, timestamp nonce, runtime spec version) against its approved runtime
+snapshot and requires byte-for-byte equality with the durable signed extrinsic, so bytes signed
+for any other identity, nonce, payload, or runtime cannot pass. It rejects the unproven
+sequential-nonce domain and every DeepX order call; it performs no network I/O and mutates no
+chain state. This permit is intentionally unavailable to restored reconciliation states
 and therefore cannot be used for automatic replay.
 
 Authoritative reconciliation observations have a separate durable commit boundary. It revalidates

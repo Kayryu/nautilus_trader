@@ -295,10 +295,10 @@ pub enum DeepXRuntimeSnapshotObservationError {
 /// Errors raised by one approved runtime snapshot observation and application.
 #[derive(Debug, Error)]
 pub enum DeepXRuntimeSnapshotRefreshError {
-    /// The finalized runtime observation failed before service state was changed.
+    /// The finalized runtime observation failed, possibly after a runtime change was latched.
     #[error(transparent)]
     Observation(#[from] DeepXRuntimeSnapshotObservationError),
-    /// The validated snapshot could not be applied to the snapshot service.
+    /// Runtime change evidence or a validated snapshot conflicted with the snapshot service.
     #[error(transparent)]
     Application(#[from] DeepXRuntimeSnapshotServiceError),
 }
@@ -482,13 +482,15 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     config: &DeepXNetworkConfig,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
     let url = config.rpc_url()?;
-    observe_approved_finalized_runtime_snapshot_at(&config.environment, url).await
+    observe_approved_finalized_runtime_snapshot_at(&config.environment, url, |_, _, _| Ok(())).await
 }
 
 /// Observes and atomically applies an approved finalized runtime snapshot.
 ///
-/// The observation uses only the chain-identity-validated Watch endpoint. Observation and fixture
-/// validation complete before the snapshot service is changed. This one-shot operation does not
+/// The observation uses only the chain-identity-validated Watch endpoint. Changed runtime versions
+/// block new signing before the metadata request; changed raw metadata hashes block it before
+/// fixture validation. Failures after this evidence leave the gate blocked and old permits intact.
+/// Errors before change evidence do not block signing. This one-shot operation does not
 /// poll for runtime upgrades, select mortality parameters, or authorize signing or submission.
 ///
 /// # Errors
@@ -503,6 +505,16 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     let observation = observe_approved_finalized_runtime_snapshot_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+        |genesis_hash, version, metadata| {
+            service.observe_runtime_fingerprint(
+                environment,
+                genesis_hash,
+                version.spec_version,
+                version.transaction_version,
+                metadata,
+            )?;
+            Ok::<_, DeepXRuntimeSnapshotRefreshError>(())
+        },
     )
     .await?;
     let update = service.apply_validated(observation.snapshot())?;
@@ -514,10 +526,14 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     })
 }
 
-async fn observe_approved_finalized_runtime_snapshot_at(
+async fn observe_approved_finalized_runtime_snapshot_at<E>(
     environment: &DeepXEnvironment,
     url: String,
-) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
+    mut observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
+) -> Result<DeepXObservedRuntimeSnapshot, E>
+where
+    E: From<DeepXRuntimeSnapshotObservationError>,
+{
     let client = BlockchainHttpRpcClient::new(url, None, None);
     let encoded_genesis: String = client
         .execute_rpc_call(json!({
@@ -571,6 +587,7 @@ async fn observe_approved_finalized_runtime_snapshot_at(
             method: "state_getRuntimeVersion",
             source,
         })?;
+    observe(genesis_hash, &runtime_version, None)?;
     let encoded_metadata: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
@@ -590,13 +607,15 @@ async fn observe_approved_finalized_runtime_snapshot_at(
             hex::decode(value).map_err(|_| DeepXRuntimeSnapshotObservationError::InvalidMetadata)
         })?;
 
+    observe(genesis_hash, &runtime_version, Some(&metadata))?;
     let snapshot = RuntimeSnapshot::approved_testnet(
         environment,
         genesis_hash,
         runtime_version.spec_version,
         runtime_version.transaction_version,
         &metadata,
-    )?;
+    )
+    .map_err(DeepXRuntimeSnapshotObservationError::Snapshot)?;
 
     Ok(DeepXObservedRuntimeSnapshot {
         snapshot,
@@ -972,15 +991,42 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert_eq!(applied.update(), DeepXRuntimeSnapshotUpdate::Unchanged);
         assert_eq!(applied.checkpoint().block_number(), 42);
+        assert!(service.acquire().is_ok());
     }
 
+    #[rstest::rstest]
+    #[case(367, 1, None)]
+    #[case(366, 2, None)]
+    #[case(367, 1, Some("state_getMetadata"))]
     #[tokio::test]
-    async fn failed_snapshot_observation_does_not_block_snapshot_service() {
+    async fn version_change_blocks_before_metadata_request(
+        #[case] spec_version: u32,
+        #[case] transaction_version: u32,
+        #[case] fail_method: Option<&'static str>,
+    ) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let watch_url = spawn_runtime_snapshot_server(367, Arc::clone(&calls)).await;
+        let snapshot = approved_runtime_snapshot();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+        let observed_service = service.clone();
+        let watch_url = spawn_runtime_snapshot_server_with(
+            spec_version,
+            transaction_version,
+            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            fail_method,
+            move |method| {
+                if method == "state_getMetadata" {
+                    assert!(matches!(
+                        observed_service.acquire(),
+                        Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+                    ));
+                }
+            },
+            Arc::clone(&calls),
+        )
+        .await;
         let endpoints =
             validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
 
         let error = observe_and_apply_approved_finalized_runtime_snapshot(
             &DeepXEnvironment::Testnet,
@@ -990,16 +1036,140 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            DeepXRuntimeSnapshotRefreshError::Observation(
-                DeepXRuntimeSnapshotObservationError::Snapshot(
-                    SnapshotError::RuntimeIdentityMismatch
+        if fail_method.is_some() {
+            assert!(matches!(
+                error,
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Rpc {
+                        method: "state_getMetadata",
+                        ..
+                    }
                 )
-            )
-        ));
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ));
+        }
         assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(permit.snapshot().identity(), snapshot.identity());
+        assert_eq!(permit.snapshot().interfaces(), snapshot.interfaces());
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
+        ));
+        drop(permit);
+        assert_old_runtime_cannot_clear_refresh(&service).await;
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn metadata_change_blocks_before_fixture_validation(#[case] malformed: bool) {
+        let mut metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        metadata["result"] = if malformed {
+            json!("0x00")
+        } else {
+            json!(format!("{}00", metadata["result"].as_str().unwrap()))
+        };
+        let snapshot = approved_runtime_snapshot();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+
+        for _ in 0..2 {
+            let url = spawn_runtime_snapshot_server_with(
+                366,
+                1,
+                metadata.clone(),
+                None,
+                |_| {},
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+            assert!(matches!(
+                observe_and_apply_approved_finalized_runtime_snapshot(
+                    &DeepXEnvironment::Testnet,
+                    &validated_endpoints(&url),
+                    &service,
+                )
+                .await,
+                Err(DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::MetadataHashMismatch
+                    )
+                )),
+            ));
+            assert_eq!(permit.snapshot().identity(), snapshot.identity());
+            assert!(matches!(
+                service.acquire(),
+                Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
+            ));
+        }
+        drop(permit);
+        assert_old_runtime_cannot_clear_refresh(&service).await;
+    }
+
+    #[rstest::rstest]
+    #[case("chain_getBlockHash")]
+    #[case("chain_getFinalizedHead")]
+    #[case("chain_getHeader")]
+    #[case("state_getRuntimeVersion")]
+    #[case("state_getMetadata")]
+    #[tokio::test]
+    async fn pre_evidence_rpc_errors_do_not_block_signing(#[case] method: &'static str) {
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+        let url = spawn_runtime_snapshot_server_with(
+            366,
+            1,
+            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            Some(method),
+            |_| {},
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        assert!(matches!(
+            observe_and_apply_approved_finalized_runtime_snapshot(
+                &DeepXEnvironment::Testnet, &validated_endpoints(&url), &service,
+            ).await,
+            Err(DeepXRuntimeSnapshotRefreshError::Observation(
+                DeepXRuntimeSnapshotObservationError::Rpc { method: failed, .. }
+            )) if failed == method,
+        ));
         assert!(service.acquire().is_ok());
+    }
+
+    async fn assert_old_runtime_cannot_clear_refresh(service: &DeepXRuntimeSnapshotService) {
+        let snapshot = approved_runtime_snapshot();
+        assert_eq!(
+            service.apply_validated(&snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
+        );
+        assert_eq!(
+            service.install(snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch)
+        );
+        let url = spawn_runtime_snapshot_server(366, Arc::new(AtomicUsize::new(0))).await;
+        assert!(matches!(
+            observe_and_apply_approved_finalized_runtime_snapshot(
+                &DeepXEnvironment::Testnet,
+                &validated_endpoints(&url),
+                service,
+            )
+            .await,
+            Err(DeepXRuntimeSnapshotRefreshError::Application(
+                DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange
+            )),
+        ));
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
+        ));
     }
 
     #[tokio::test]
@@ -1152,6 +1322,25 @@ mod tests {
     }
 
     async fn spawn_runtime_snapshot_server(spec_version: u32, calls: Arc<AtomicUsize>) -> String {
+        spawn_runtime_snapshot_server_with(
+            spec_version,
+            1,
+            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            None,
+            |_| {},
+            calls,
+        )
+        .await
+    }
+
+    async fn spawn_runtime_snapshot_server_with(
+        spec_version: u32,
+        transaction_version: u32,
+        metadata: Value,
+        fail_method: Option<&'static str>,
+        on_request: impl Fn(&str) + Clone + Send + Sync + 'static,
+        calls: Arc<AtomicUsize>,
+    ) -> String {
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
         let finalized_header = json!({
@@ -1163,7 +1352,7 @@ mod tests {
         });
         let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
         runtime_version["result"]["specVersion"] = json!(spec_version);
-        let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        runtime_version["result"]["transactionVersion"] = json!(transaction_version);
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
@@ -1173,9 +1362,17 @@ mod tests {
                 let finalized_header = finalized_header.clone();
                 let runtime_version = runtime_version.clone();
                 let metadata = metadata.clone();
+                let on_request = on_request.clone();
                 async move {
                     let index = calls.fetch_add(1, Ordering::Relaxed);
                     let method = request["method"].as_str().unwrap();
+                    on_request(method);
+                    if fail_method == Some(method) {
+                        return Json(json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "error": { "code": -32000, "message": "injected observation failure" }
+                        }));
+                    }
                     let response = match index {
                         0 => {
                             assert_eq!(method, "chain_getBlockHash");
