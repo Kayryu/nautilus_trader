@@ -6187,6 +6187,7 @@ dependencies = [
  "bon",
  "frame-metadata",
  "jiff",
+ "log",
  "nautilus-blockchain",
  "nautilus-common",
  "nautilus-core",

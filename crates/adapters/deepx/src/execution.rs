@@ -20,16 +20,30 @@ use std::{
     sync::Mutex,
 };
 
-use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
-use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use async_trait::async_trait;
+use nautilus_common::{
+    cache::fifo::{FifoCache, FifoCacheMap},
+    clients::ExecutionClient,
+    live::runner::get_exec_event_sender,
+    log_error,
+    messages::execution::{
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+    },
+};
+use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
-    enums::AccountType,
+    accounts::AccountAny,
+    enums::{AccountType, OmsType},
     events::AccountState,
     identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
     },
     orders::OrderAny,
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    types::{AccountBalance, MarginBalance},
 };
 use thiserror::Error;
 
@@ -43,11 +57,11 @@ use crate::{
     signing::{SigningError, derive_signer_account_id},
     transaction::{
         DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
-        DeepXReorganizationCommitError, DeepXSignerLease, DeepXTransactionPersistenceError,
-        DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
-        DeepXTransactionWatchError, load_verified_committed_for_signer,
+        DeepXPoolReconciliationCommitError, DeepXReorganizationCommitError, DeepXSignerLease,
+        DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction, DeepXTransactionState,
+        DeepXTransactionStore, DeepXTransactionWatchError, load_verified_committed_for_signer,
         observe_and_commit_finality, observe_and_commit_reorganization,
-        reconcile_not_included_checkpoint,
+        reconcile_not_included_checkpoint, reconcile_submission_pool,
     },
     websocket::{DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
 };
@@ -124,6 +138,9 @@ pub enum DeepXExecutionStartupError {
     /// Account-state initialization was not recorded through the event identity boundary.
     #[error("DeepX account-state initialization evidence requires event verification")]
     AccountStateVerificationRequired,
+    /// The verified account-state event could not be dispatched to the execution engine.
+    #[error("DeepX account-state event dispatch failed: {0}")]
+    AccountStateDispatchFailed(String),
     /// The observed account state does not match the configured execution account.
     #[error(
         "DeepX account state identity mismatch: expected {expected_account_id} ({expected_account_type:?}), received {received_account_id} ({received_account_type:?})"
@@ -221,6 +238,9 @@ pub enum DeepXMassReconciliationError {
     /// An in-block transaction could not be reconciled against finalized chain evidence.
     #[error(transparent)]
     Finality(#[from] DeepXFinalityCommitError),
+    /// A submitting transaction could not be reconciled against the submission-node pool.
+    #[error(transparent)]
+    PoolReconciliation(#[from] DeepXPoolReconciliationCommitError),
     /// An in-block transaction could not be reconciled against canonical chain evidence.
     #[error(transparent)]
     Reorganization(#[from] DeepXReorganizationCommitError),
@@ -911,12 +931,12 @@ impl DeepXExecutionClient {
         self.order_contexts.finish(client_order_id)
     }
 
-    /// Verifies and records the account-state event for the current startup epoch.
+    /// Verifies, emits, and records the account-state event for the current startup epoch.
     ///
     /// # Errors
     ///
     /// Returns an error unless startup is waiting for account-state initialization and the event
-    /// matches the configured execution account identity and type.
+    /// matches the configured execution account identity and type, or event dispatch fails.
     pub fn record_account_state_initialized(
         &mut self,
         state: &AccountState,
@@ -932,6 +952,9 @@ impl DeepXExecutionClient {
                 received_account_type: state.account_type,
             });
         }
+        self.emitter
+            .try_send_account_state(state.clone())
+            .map_err(|e| DeepXExecutionStartupError::AccountStateDispatchFailed(e.to_string()))?;
         self.startup_account_event_id = Some(state.event_id);
         self.startup
             .record(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
@@ -967,6 +990,12 @@ impl DeepXExecutionClient {
         for item in restored {
             let client_order_id = item.record().identity().client_order_id().to_string();
             let action = match item.record().lifecycle().state() {
+                DeepXTransactionState::Submitting | DeepXTransactionState::Accepted => {
+                    reconcile_submission_pool(endpoints, store, lease, &item)
+                        .await?
+                        .record()
+                        .recovery_action()
+                }
                 DeepXTransactionState::InBlockSuccess | DeepXTransactionState::InBlockFailed => {
                     match observe_and_commit_finality(endpoints, capabilities, store, lease, &item)
                         .await
@@ -1081,6 +1110,172 @@ impl DeepXExecutionClient {
     }
 }
 
+#[async_trait(?Send)]
+impl ExecutionClient for DeepXExecutionClient {
+    fn is_connected(&self) -> bool {
+        self.core.is_connected()
+    }
+
+    fn client_id(&self) -> ClientId {
+        self.core.client_id
+    }
+
+    fn account_id(&self) -> AccountId {
+        self.core.account_id
+    }
+
+    fn venue(&self) -> Venue {
+        *DEEPX_VENUE
+    }
+
+    fn oms_type(&self) -> OmsType {
+        self.core.oms_type
+    }
+
+    fn get_account(&self) -> Option<AccountAny> {
+        self.core.cache().account_owned(&self.core.account_id)
+    }
+
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
+    fn generate_account_state(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+        info: Option<Params>,
+    ) -> anyhow::Result<()> {
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event, info);
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+
+        self.emitter.set_sender(get_exec_event_sender());
+        self.core.set_started();
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        self.reset_startup();
+        if self.core.is_stopped() {
+            return Ok(());
+        }
+
+        self.core.set_stopped();
+        Ok(())
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.reset_startup();
+        Ok(())
+    }
+
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.startup.is_ready() && self.core.is_connected(),
+            "DeepX execution startup has not completed",
+        );
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.reset_startup();
+        Ok(())
+    }
+
+    fn submit_order(&self, _cmd: SubmitOrder) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX order submission is not operational")
+    }
+
+    fn submit_order_list(&self, _cmd: SubmitOrderList) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX order-list submission is not operational")
+    }
+
+    fn modify_order(&self, _cmd: ModifyOrder) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX order modification is not operational")
+    }
+
+    fn batch_modify_orders(&self, _cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX batch order modification is not operational")
+    }
+
+    fn cancel_order(&self, _cmd: CancelOrder) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX order cancellation is not operational")
+    }
+
+    fn cancel_all_orders(&self, _cmd: CancelAllOrders) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX cancel-all is not operational")
+    }
+
+    fn batch_cancel_orders(&self, _cmd: BatchCancelOrders) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX batch cancellation is not operational")
+    }
+
+    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX account queries are not operational")
+    }
+
+    fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
+        anyhow::bail!("DeepX order queries are not operational")
+    }
+
+    async fn generate_order_status_report(
+        &self,
+        _cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        anyhow::bail!("DeepX order status reports are not operational")
+    }
+
+    async fn generate_order_status_reports(
+        &self,
+        _cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        anyhow::bail!("DeepX order status reports are not operational")
+    }
+
+    async fn generate_fill_reports(
+        &self,
+        _cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        anyhow::bail!("DeepX fill reports are not operational")
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        _cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        anyhow::bail!("DeepX position status reports are not operational")
+    }
+
+    fn register_external_order(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        strategy_id: StrategyId,
+        ts_init: UnixNanos,
+    ) {
+        if let Err(e) = Self::register_external_order(
+            self,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            strategy_id,
+            ts_init,
+        ) {
+            log_error!("Failed to register external DeepX order: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1096,7 +1291,9 @@ mod tests {
         Json, Router,
         routing::{get, post},
     };
-    use nautilus_common::cache::Cache;
+    use nautilus_common::{
+        cache::Cache, live::runner::replace_exec_event_sender, messages::ExecutionEvent,
+    };
     use nautilus_core::{UUID4, UnixNanos, hex};
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
@@ -1574,6 +1771,28 @@ mod tests {
     }
 
     fn in_block_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
+        let mut record = submitting_record(client);
+        record
+            .apply_observation(DeepXTransactionObservation::Included(
+                DeepXInclusionEvidence::from_indexed_observations(
+                    [8; 32],
+                    72,
+                    DeepXIndexedOutcome {
+                        extrinsic_index: 1,
+                        outcome: DeepXDispatchOutcome::Success,
+                    },
+                    DeepXIndexedOutcome {
+                        extrinsic_index: 1,
+                        outcome: DeepXBusinessEventOutcome::Success,
+                    },
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        record
+    }
+
+    fn submitting_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-IN-BLOCK"),
@@ -1610,23 +1829,6 @@ mod tests {
             .unwrap();
         record
             .apply_observation(DeepXTransactionObservation::SubmissionStarted)
-            .unwrap();
-        record
-            .apply_observation(DeepXTransactionObservation::Included(
-                DeepXInclusionEvidence::from_indexed_observations(
-                    [8; 32],
-                    72,
-                    DeepXIndexedOutcome {
-                        extrinsic_index: 1,
-                        outcome: DeepXDispatchOutcome::Success,
-                    },
-                    DeepXIndexedOutcome {
-                        extrinsic_index: 1,
-                        outcome: DeepXBusinessEventOutcome::Success,
-                    },
-                )
-                .unwrap(),
-            ))
             .unwrap();
         record
     }
@@ -1683,7 +1885,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct RecoveryRpcState {
-        target_extrinsic: String,
+        pool_extrinsics: Vec<String>,
     }
 
     async fn recovery_rpc(
@@ -1719,14 +1921,14 @@ mod tests {
                     "extrinsics": [],
                 },
             }),
-            "author_pendingExtrinsics" => json!([state.target_extrinsic]),
+            "author_pendingExtrinsics" => json!(state.pool_extrinsics),
             method => panic!("unexpected method {method}"),
         };
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
     }
 
     async fn recovery_evidence(
-        target_extrinsic: &[u8],
+        pool_extrinsics: &[&[u8]],
     ) -> (
         String,
         DeepXValidatedRpcEndpoints,
@@ -1735,7 +1937,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = RecoveryRpcState {
-            target_extrinsic: format!("0x{}", hex::encode(target_extrinsic)),
+            pool_extrinsics: pool_extrinsics
+                .iter()
+                .map(|extrinsic| format!("0x{}", hex::encode(extrinsic)))
+                .collect(),
         };
         tokio::spawn(async move {
             axum::serve(
@@ -2190,6 +2395,8 @@ mod tests {
             client.startup.record(evidence).unwrap();
         }
         let state = test_account_state();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
         client.record_account_state_initialized(&state).unwrap();
         client
             .startup
@@ -2209,6 +2416,8 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
             .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
         client
             .record_account_state_initialized(&test_account_state())
             .unwrap();
@@ -2311,6 +2520,67 @@ mod tests {
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
             }),
         ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_commits_pending_pool_acceptance() {
+        let mut client = test_client();
+        let record = submitting_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                ..
+            }),
+        ));
+
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::Accepted,
+        );
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_preserves_submitting_record_when_pool_is_absent() {
+        let mut client = test_client();
+        let record = submitting_record(&client);
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&[8, 99, 98]]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                ..
+            }),
+        ));
+
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::Submitting,
+        );
     }
 
     #[tokio::test]
@@ -2425,7 +2695,44 @@ mod tests {
         let mut client = test_client();
         let record = not_included_record(&client);
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
-        let (rpc_url, endpoints, capabilities) = recovery_evidence(&signed_bytes).await;
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::OperatorActionRequired,
+                ..
+            }),
+        ));
+
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::ActionRequired,
+        );
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_requires_action_after_non_atomic_pool_absence() {
+        let mut client = test_client();
+        let record = not_included_record(&client);
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
         configure_rpc_url(&mut client, rpc_url);
         advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
@@ -3220,6 +3527,63 @@ mod tests {
     }
 
     #[rstest]
+    fn account_state_initialization_dispatches_exact_event() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        for evidence in [
+            DeepXExecutionStartupEvidence::RuntimeValidated,
+            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
+        ] {
+            client.startup.record(evidence).unwrap();
+        }
+        let state = test_account_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+
+        client.record_account_state_initialized(&state).unwrap();
+
+        let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
+            panic!("expected account state event");
+        };
+        assert_eq!(dispatched, state);
+        assert_eq!(client.startup_account_event_id, Some(state.event_id));
+        assert_eq!(client.startup.completed_steps, 5);
+    }
+
+    #[rstest]
+    fn account_state_initialization_dispatch_failure_does_not_advance_startup() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        for evidence in [
+            DeepXExecutionStartupEvidence::RuntimeValidated,
+            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
+        ] {
+            client.startup.record(evidence).unwrap();
+        }
+        let state = test_account_state();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        client.emitter.set_sender(sender);
+
+        let result = client.record_account_state_initialized(&state);
+
+        assert!(matches!(
+            result,
+            Err(DeepXExecutionStartupError::AccountStateDispatchFailed(_)),
+        ));
+        assert_eq!(client.startup_account_event_id, None);
+        assert_eq!(client.startup.completed_steps, 4);
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized),
+            Ok(()),
+        );
+    }
+
+    #[rstest]
     fn account_registration_requires_configured_account_in_cache() {
         let mut client = test_client();
         let state = advance_through_mass_reconciliation(&mut client);
@@ -3312,5 +3676,52 @@ mod tests {
             }),
         );
         assert!(!client.is_connected());
+    }
+
+    #[rstest]
+    fn execution_client_exposes_framework_identity() {
+        let client = test_client();
+
+        assert_eq!(ExecutionClient::client_id(&client), ClientId::from("DEEPX"));
+        assert_eq!(
+            ExecutionClient::account_id(&client),
+            AccountId::from("DEEPX-001"),
+        );
+        assert_eq!(ExecutionClient::venue(&client), *DEEPX_VENUE);
+        assert_eq!(ExecutionClient::oms_type(&client), OmsType::Netting);
+        assert!(ExecutionClient::get_account(&client).is_none());
+        assert!(!ExecutionClient::provides_bulk_position_coverage(
+            &client,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+        ));
+        assert!(!ExecutionClient::is_connected(&client));
+    }
+
+    #[rstest]
+    fn execution_client_start_and_stop_are_idempotent() {
+        let mut client = test_client();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+
+        ExecutionClient::start(&mut client).unwrap();
+        ExecutionClient::start(&mut client).unwrap();
+        assert!(client.core.is_started());
+
+        ExecutionClient::stop(&mut client).unwrap();
+        ExecutionClient::stop(&mut client).unwrap();
+        assert!(client.core.is_stopped());
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_client_connect_rejects_incomplete_startup() {
+        let mut client = test_client();
+
+        let error = ExecutionClient::connect(&mut client).await.unwrap_err();
+
+        assert_eq!(error.to_string(), "DeepX execution startup has not completed");
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 0);
     }
 }

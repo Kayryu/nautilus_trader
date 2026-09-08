@@ -23,8 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt, DeepXWsError, DeepXWsFrame,
-    DeepXWsProtocolCore, DeepXWsRequest,
+    DeepXWsAuthenticatedFrame, DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt,
+    DeepXWsError, DeepXWsFrame, DeepXWsProtocolCore, DeepXWsRequest,
 };
 
 const DEEPX_WS_COMMAND_CAPACITY: usize = 1024;
@@ -107,6 +107,12 @@ enum DeepXWsHandlerCommand {
         connection_epoch: u64,
         text: String,
         response_tx: oneshot::Sender<Result<bool, DeepXWsError>>,
+    },
+    IngestAuthenticatedText {
+        connection_epoch: u64,
+        session: DeepXWsAuthenticatedSession,
+        text: String,
+        response_tx: oneshot::Sender<Result<Option<DeepXWsAuthenticatedFrame>, DeepXWsError>>,
     },
     ResetAfterReconnect {
         connection_epoch: u64,
@@ -516,6 +522,31 @@ impl DeepXWsProtocolHandle {
         response_rx.await.map_err(|_| handler_stopped())?
     }
 
+    /// Parses one text frame once, completing a correlated response or admitting an authenticated
+    /// uncorrelated frame under the current connection session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed JSON or when the handler is no longer running.
+    pub async fn ingest_authenticated_text(
+        &self,
+        connection_epoch: u64,
+        session: DeepXWsAuthenticatedSession,
+        text: impl Into<String>,
+    ) -> Result<Option<DeepXWsAuthenticatedFrame>, DeepXWsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(DeepXWsHandlerCommand::IngestAuthenticatedText {
+                connection_epoch,
+                session,
+                text: text.into(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| handler_stopped())?;
+        response_rx.await.map_err(|_| handler_stopped())?
+    }
+
     /// Replaces connection-owned state and returns desired topics requiring replay.
     ///
     /// # Errors
@@ -679,6 +710,20 @@ fn handle_command(core: &mut DeepXWsProtocolCore, command: DeepXWsHandlerCommand
                 .map(|frame| core.complete_frame(connection_epoch, &frame));
             let _ = response_tx.send(result);
         }
+        DeepXWsHandlerCommand::IngestAuthenticatedText {
+            connection_epoch,
+            session,
+            text,
+            response_tx,
+        } => {
+            let result = DeepXWsFrame::parse(&text).map(|frame| {
+                if core.complete_frame(connection_epoch, &frame) {
+                    return None;
+                }
+                core.admit_authenticated_frame(connection_epoch, session, frame)
+            });
+            let _ = response_tx.send(result);
+        }
         DeepXWsHandlerCommand::ResetAfterReconnect {
             connection_epoch,
             reason,
@@ -727,6 +772,56 @@ mod tests {
         assert_eq!(
             response_rx.await.unwrap().unwrap(),
             json!({"id": 1, "result": {"ok": true}}),
+        );
+        drop(handle);
+        assert_eq!(
+            tasks.shutdown(Duration::from_secs(1)).await.unwrap(),
+            DeepXWsTaskOutcome::Completed,
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_authenticated_unknown_frame_through_single_owner_loop() {
+        let mut tasks = DeepXWsTaskHandles::new();
+        let (handle, handler) = deepx_ws_protocol_handler(':');
+        tasks
+            .spawn(|cancellation| handler.run(cancellation))
+            .unwrap();
+        handle.reset_after_reconnect(4, "connected").await.unwrap();
+        let (attempt, _) = handle.begin_authentication().await.unwrap();
+        assert!(handle.complete_authentication(attempt).await.unwrap());
+        let session = handle.authenticated_session().await.unwrap().unwrap();
+        let (request, response_rx) = handle.register_request().await.unwrap();
+
+        assert!(
+            handle
+                .ingest_authenticated_text(
+                    4,
+                    session,
+                    format!(
+                        r#"{{"id":{},"result":{{"ok":true}}}}"#,
+                        request.id().as_u64()
+                    ),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            response_rx.await.unwrap().unwrap(),
+            json!({"id": 1, "result": {"ok": true}}),
+        );
+
+        let admitted = handle
+            .ingest_authenticated_text(4, session, r#"{"channel":"unproven","data":[]}"#)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(admitted.connection_epoch(), 4);
+        assert_eq!(
+            admitted.value(),
+            &json!({"channel": "unproven", "data": []})
         );
         drop(handle);
         assert_eq!(

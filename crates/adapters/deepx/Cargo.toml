@@ -35,6 +35,7 @@ aws-lc-rs = { workspace = true }
 bon = { workspace = true }
 frame-metadata = { workspace = true }
 jiff = { workspace = true }
+log = { workspace = true }
 parity-scale-codec = { workspace = true }
 reqwest = { workspace = true }
 rust_decimal = { workspace = true }

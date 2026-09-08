@@ -34,6 +34,7 @@ use super::{
     DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
     DeepXTransactionRecordError, DeepXTransactionState, DeepXTransactionWatchError,
     collect_finalized_recovery_scan, observe_finality, observe_reorganization,
+    observe_submission_pool,
 };
 use crate::{
     common::DeepXPrivateKey,
@@ -803,6 +804,23 @@ pub enum DeepXFinalityCommitError {
     Commit(#[from] DeepXObservationCommitError),
 }
 
+/// Failure while reconciling a submitting transaction against the pending pool.
+#[derive(Debug, Error)]
+pub enum DeepXPoolReconciliationCommitError {
+    /// The durable record has no signed extrinsic hash to bind to the pool lookup.
+    #[error("DeepX pending-pool reconciliation requires durable signed bytes")]
+    MissingSignedExtrinsic,
+    /// Only submitting or accepted transactions are eligible for pending-pool reconciliation.
+    #[error("DeepX transaction state {0:?} is not eligible for pending-pool reconciliation")]
+    IneligibleState(DeepXTransactionState),
+    /// Pending-pool observation failed before any lifecycle mutation was attempted.
+    #[error(transparent)]
+    Watch(#[from] DeepXTransactionWatchError),
+    /// The pool observation could not be committed durably.
+    #[error(transparent)]
+    Commit(#[from] DeepXObservationCommitError),
+}
+
 /// Failure while reconciling a durable not-included checkpoint against finalized evidence.
 #[derive(Debug, Error)]
 pub enum DeepXFinalizedRecoveryCommitError {
@@ -1085,6 +1103,53 @@ where
     .await?)
 }
 
+/// Reconciles one acknowledged submitting transaction against the submission-node pool.
+///
+/// Exact presence durably records pool acceptance. Absence preserves the existing record because
+/// a non-atomic pool snapshot cannot prove that the transaction was never included.
+///
+/// # Errors
+///
+/// Returns an error before network access unless the record is submitting or accepted and retains
+/// signed bytes. RPC and commit failures do not mutate the lifecycle.
+pub async fn reconcile_submission_pool<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+) -> Result<DeepXCommittedObservation, DeepXPoolReconciliationCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXPoolReconciliationCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    let target_extrinsic_hash = record
+        .signed_extrinsic()
+        .ok_or(DeepXPoolReconciliationCommitError::MissingSignedExtrinsic)?
+        .extrinsic_hash();
+    match observe_submission_pool(endpoints, target_extrinsic_hash).await? {
+        super::DeepXPoolObservation::Present => Ok(commit_recovery_decision(
+            store,
+            lease,
+            restored.committed(),
+            record,
+            DeepXRecoveryDecision::PoolAccepted,
+        )
+        .await?),
+        super::DeepXPoolObservation::Absent => Ok(DeepXCommittedObservation {
+            record: record.clone(),
+            committed: restored.committed().clone(),
+        }),
+    }
+}
+
 /// Reconciles one acknowledged not-included record from its exact finalized checkpoint.
 ///
 /// All authority-bearing inputs are derived from `restored`. An up-to-date checkpoint preserves
@@ -1254,6 +1319,100 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct FinalizedRecoveryRpcState {
+        finalized_block: u64,
+    }
+
+    async fn finalized_recovery_rpc(
+        State(state): State<FinalizedRecoveryRpcState>,
+        Json(request): Json<JsonValue>,
+    ) -> Json<JsonValue> {
+        let result = match request["method"].as_str().unwrap() {
+            "rpc_methods" => json!({
+                "methods": [
+                    "author_pendingExtrinsics",
+                    "author_submitExtrinsic",
+                    "chain_getBlock",
+                    "chain_getBlockHash",
+                    "chain_getFinalizedHead",
+                    "chain_getHeader",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
+                ],
+            }),
+            "chain_getFinalizedHead" => {
+                json!(format!("0x{:064x}", state.finalized_block))
+            }
+            "chain_getHeader" => json!({
+                "number": format!("0x{:x}", state.finalized_block),
+            }),
+            "chain_getBlockHash" => {
+                let block_number = request["params"][0].as_u64().unwrap();
+                if block_number == 72 {
+                    json!(format!("0x{}", "09".repeat(32)))
+                } else {
+                    json!(format!("0x{block_number:064x}"))
+                }
+            }
+            "chain_getBlock" => {
+                let encoded_hash = request["params"][0].as_str().unwrap();
+                let block_number =
+                    u64::from_str_radix(encoded_hash.trim_start_matches("0x"), 16).unwrap();
+                json!({
+                    "block": {
+                        "header": { "number": format!("0x{block_number:x}") },
+                        "extrinsics": [],
+                    },
+                })
+            }
+            "author_pendingExtrinsics" => json!([]),
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn finalized_recovery_endpoints(
+        finalized_block: u64,
+    ) -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(finalized_recovery_rpc))
+                    .with_state(FinalizedRecoveryRpcState { finalized_block }),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let config = DeepXNetworkConfig {
+            base_url_rpc: Some(url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            nautilus_core::hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x"))
+                .unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &config,
+            [
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Submission, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (endpoints, capabilities)
+    }
+
+    #[derive(Clone, Debug)]
     struct FinalityRpcState {
         finalized_block: u64,
         target_extrinsic: String,
@@ -1344,6 +1503,64 @@ mod tests {
             .await
             .unwrap();
         (endpoints, capabilities, canonical_requests)
+    }
+
+    #[derive(Clone, Debug)]
+    struct PendingPoolRpcState {
+        target_extrinsic: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    async fn pending_pool_rpc(
+        State(state): State<PendingPoolRpcState>,
+        Json(request): Json<JsonValue>,
+    ) -> Json<JsonValue> {
+        state.requests.fetch_add(1, Ordering::Relaxed);
+        let result = match request["method"].as_str().unwrap() {
+            "author_pendingExtrinsics" => json!([state.target_extrinsic]),
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn pending_pool_endpoints(
+        target_extrinsic: &[u8],
+    ) -> (DeepXValidatedRpcEndpoints, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = PendingPoolRpcState {
+            target_extrinsic: format!("0x{}", nautilus_core::hex::encode(target_extrinsic),),
+            requests: Arc::clone(&requests),
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(pending_pool_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let config = DeepXNetworkConfig {
+            base_url_rpc: Some(url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            nautilus_core::hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x"))
+                .unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &config,
+            [
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Submission, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
+            ],
+        )
+        .unwrap();
+        (endpoints, requests)
     }
 
     #[derive(Debug)]
@@ -1613,6 +1830,36 @@ mod tests {
 
     fn submitting_record() -> DeepXTransactionRecord {
         let mut record = signed_record();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+    }
+
+    fn valid_extrinsic_submitting_record() -> DeepXTransactionRecord {
+        let mut record = record();
+        let bytes = vec![8, 1, 2];
+        let identity = record.identity();
+        let runtime = identity.runtime();
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            unreachable!();
+        };
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer: identity.signer(),
+                nonce,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: runtime.genesis_hash,
+                    metadata_sha256: runtime.metadata_sha256,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    signed_extensions: runtime.signed_extensions.clone(),
+                },
+            })
+            .unwrap();
         record
             .apply_observation(DeepXTransactionObservation::SubmissionStarted)
             .unwrap();
@@ -2418,6 +2665,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_not_included_is_durably_committed_once() {
+        let record = submitting_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let absence = DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap();
+        let decision = DeepXRecoveryDecision::NotIncluded(absence);
+
+        let not_included = commit_recovery_decision(&store, &lease, &committed, &record, decision)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            not_included.record().lifecycle().state(),
+            DeepXTransactionState::NotIncluded,
+        );
+        assert_eq!(not_included.record().lifecycle().absence(), Some(absence));
+        assert_eq!(not_included.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+
+        let repeated = commit_recovery_decision(
+            &store,
+            &lease,
+            not_included.committed(),
+            not_included.record(),
+            decision,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repeated.record().lifecycle().absence(), Some(absence));
+        assert_eq!(repeated.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
     async fn repeated_reconciliation_observation_preserves_durable_revision() {
         let mut record = submitting_record();
         record
@@ -2446,6 +2736,75 @@ mod tests {
 
         assert_eq!(result.committed().revision().value(), 4);
         assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn pending_pool_reconciliation_commits_acceptance_once() {
+        let record = valid_extrinsic_submitting_record();
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes();
+        let (endpoints, requests) = pending_pool_endpoints(signed_bytes).await;
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+
+        let accepted = reconcile_submission_pool(&endpoints, &store, &lease, &restored)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            accepted.record().lifecycle().state(),
+            DeepXTransactionState::Accepted,
+        );
+        assert_eq!(accepted.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+
+        let restored = DeepXRestoredTransactionRecord::new(
+            accepted.record().clone(),
+            accepted.committed().clone(),
+        )
+        .unwrap();
+        let repeated = reconcile_submission_pool(&endpoints, &store, &lease, &restored)
+            .await
+            .unwrap();
+
+        assert_eq!(repeated.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pending_pool_reconciliation_rejects_ineligible_state_before_rpc() {
+        let record = signed_record();
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes();
+        let (endpoints, requests) = pending_pool_endpoints(signed_bytes).await;
+        let store = TestStore::new(2, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(2),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+
+        assert!(matches!(
+            reconcile_submission_pool(&endpoints, &store, &lease, &restored).await,
+            Err(DeepXPoolReconciliationCommitError::IneligibleState(
+                DeepXTransactionState::Signed,
+            )),
+        ));
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert_eq!(store.current_revision(), 2);
     }
 
     #[tokio::test]
@@ -2731,6 +3090,45 @@ mod tests {
         );
         assert_eq!(result.committed().revision().value(), 4);
         assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn non_atomic_pool_absence_durably_requires_operator_action() {
+        let record = not_included_record();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities) = finalized_recovery_endpoints(74).await;
+
+        let result = reconcile_not_included_checkpoint(
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+            &restored,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.record().lifecycle().state(),
+            DeepXTransactionState::ActionRequired,
+        );
+        assert_eq!(
+            result.record().lifecycle().absence(),
+            restored.record().lifecycle().absence(),
+        );
+        assert_eq!(result.committed().revision().value(), 5);
+        assert_eq!(store.current_revision(), 5);
     }
 
     #[tokio::test]

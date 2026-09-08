@@ -67,6 +67,27 @@ pub struct DeepXWsAuthenticatedSession {
     connection_epoch: u64,
 }
 
+/// An uncorrelated JSON frame admitted under a current authenticated session.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepXWsAuthenticatedFrame {
+    connection_epoch: u64,
+    value: Value,
+}
+
+impl DeepXWsAuthenticatedFrame {
+    /// Returns the transport connection epoch which admitted this frame.
+    #[must_use]
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+
+    /// Returns the complete decoded JSON frame.
+    #[must_use]
+    pub const fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
 impl DeepXWsAuthenticatedSession {
     /// Returns the transport connection epoch which owns this authenticated session.
     #[must_use]
@@ -215,6 +236,26 @@ impl DeepXWsProtocolCore {
             return false;
         };
         self.complete_request(*id, connection_epoch, value.clone())
+    }
+
+    /// Admits an uncorrelated frame only under the current authenticated connection session.
+    #[must_use]
+    pub fn admit_authenticated_frame(
+        &self,
+        connection_epoch: u64,
+        session: DeepXWsAuthenticatedSession,
+        frame: DeepXWsFrame,
+    ) -> Option<DeepXWsAuthenticatedFrame> {
+        if connection_epoch != self.connection_epoch || !self.is_authenticated_session(session) {
+            return None;
+        }
+        let DeepXWsFrame::Unknown(value) = frame else {
+            return None;
+        };
+        Some(DeepXWsAuthenticatedFrame {
+            connection_epoch,
+            value,
+        })
     }
 
     /// Removes a request only when the send failure belongs to the same registration.
@@ -551,6 +592,51 @@ mod tests {
             response_rx.await.unwrap().unwrap(),
             json!({"id": 1, "result": {"ok": true}}),
         );
+    }
+
+    #[rstest]
+    fn authenticated_frame_admission_enforces_session_epoch_and_frame_kind() {
+        let mut core = DeepXWsProtocolCore::new(':');
+        core.reset_after_reconnect(9, "connected").unwrap();
+        let frame = DeepXWsFrame::parse(r#"{"channel":"unproven","data":[]}"#).unwrap();
+
+        let mut other = DeepXWsProtocolCore::new(':');
+        let (other_attempt, _) = other.begin_authentication().unwrap();
+        assert!(other.complete_authentication(other_attempt));
+        let other_session = other.authenticated_session().unwrap();
+
+        assert!(
+            core.admit_authenticated_frame(9, other_session, frame.clone())
+                .is_none()
+        );
+        let (attempt, _) = core.begin_authentication().unwrap();
+        assert!(core.complete_authentication(attempt));
+        let session = core.authenticated_session().unwrap();
+
+        assert!(
+            core.admit_authenticated_frame(8, session, frame.clone())
+                .is_none()
+        );
+        assert!(
+            core.admit_authenticated_frame(
+                9,
+                session,
+                DeepXWsFrame::parse(r#"{"id":7,"result":{}}"#).unwrap(),
+            )
+            .is_none()
+        );
+        let admitted = core
+            .admit_authenticated_frame(9, session, frame.clone())
+            .unwrap();
+        assert_eq!(admitted.connection_epoch(), 9);
+        assert_eq!(
+            admitted.value(),
+            &json!({"channel": "unproven", "data": []})
+        );
+
+        core.reset_after_reconnect(10, "connection replaced")
+            .unwrap();
+        assert!(core.admit_authenticated_frame(10, session, frame).is_none());
     }
 
     #[rstest]

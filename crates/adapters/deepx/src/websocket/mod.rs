@@ -28,7 +28,7 @@ pub use handler::{
     DeepXWsRegisteredRequest, deepx_ws_protocol_handler,
 };
 pub use protocol::{
-    DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt, DeepXWsProtocolCore, DeepXWsRequest,
-    DeepXWsRequestId,
+    DeepXWsAuthenticatedFrame, DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt,
+    DeepXWsProtocolCore, DeepXWsRequest, DeepXWsRequestId,
 };
 pub use task::{DeepXWsTaskHandles, DeepXWsTaskOutcome};

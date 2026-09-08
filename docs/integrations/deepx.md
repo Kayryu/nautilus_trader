@@ -54,7 +54,9 @@ implemented and covered by unit tests:
   isolation, generation-fenced authentication attempts, and desired-versus-confirmed subscription
   intent across reconnect resets.
 - Single-decode WebSocket text-frame ingress which correlates only unsigned numeric top-level
-  request IDs, preserves valid unknown JSON, and returns typed errors for malformed JSON.
+  request IDs, preserves valid unknown JSON, returns typed errors for malformed JSON, and can admit
+  uncorrelated JSON only under a current protocol-owner-bound authenticated session and connection
+  epoch. The resulting envelope carries transport provenance, not a private business-event type.
 - Owned WebSocket task lifecycle with generation-specific cancellation, bounded graceful shutdown,
   forced abort followed by join, rejection of overlapping handler generations, and explicit
   shutdown invalidation of the current generation token even when no task is owned.
@@ -130,8 +132,12 @@ implemented and covered by unit tests:
 - A testnet-only execution configuration boundary with an explicit direct-pallet or legacy-EVM
   backend, matching DeepX account identity, mandatory subaccount identity, environment credential
   resolution, and redacted debug output.
-- A non-operational execution client foundation around `ExecutionClientCore` and
-  `ExecutionEventEmitter`. Its ordered startup gate remains disconnected until instrument preload,
+- A non-operational Nautilus `ExecutionClient` foundation around `ExecutionClientCore` and
+  `ExecutionEventEmitter`. Framework identity, account lookup, account-state emission, and
+  idempotent lifecycle methods are wired. Unsupported order, query, and report methods return
+  explicit errors rather than the trait's successful no-op defaults, and bulk position reports do
+  not claim complete coverage. `connect` does not perform network startup and succeeds only after
+  the existing ordered startup gate has already completed. The gate remains disconnected until instrument preload,
   caller-supplied context restoration, runtime validation, private-stream authentication, account-state
   initialization, startup mass reconciliation, and account registration all have authoritative
   evidence. Account-state initialization records the exact event identity for the current startup
@@ -175,8 +181,11 @@ implemented and covered by unit tests:
   record is finalized with no remaining recovery, submission decision, reconciliation, or operator
   action. An empty complete record set is valid; endpoint or capability mismatch, signer mismatch,
   stale lease, acknowledgement mismatch, and any unresolved record fail without advancing. This
-  proves only durable transaction recovery readiness for that signer, not protocol-level account
-  or order reconciliation. Cache borrow contention fails with a typed error.
+  includes restored `submitting` and `accepted` records: exact presence in the Submission endpoint's
+  valid pending pool durably records acceptance, while absence preserves the unresolved record
+  because one non-atomic pool snapshot cannot prove non-inclusion. This proves only durable
+  transaction recovery readiness for that signer, not protocol-level account or order
+  reconciliation. Cache borrow contention fails with a typed error.
   Disconnect resets the
   complete gate and current event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
@@ -205,19 +214,57 @@ descending page of raw perpetual trades, one ascending page of raw one-minute pe
 mark-price history, and oracle-price history, and one raw perpetual volume-statistics window, no
 other endpoint-specific HTTP API except the raw perpetual last-price read, live WebSocket transport
 or channel, data client, account client, execution client, management
-service, PyO3 binding, or Python package is enabled. A perpetual-only offline instrument provider
+service, operational execution client, PyO3 binding, or Python package is enabled. A perpetual-only offline instrument provider
 and a fixture-gated offline direct-pallet signing
-primitive exist, but no order call is exposed and no transaction submission is implemented.
+primitive exist, but no order call is exposed and the one-shot submission primitive is not wired
+into an execution path.
 Authoritative venue rate-limit policy, automatic history pagination, and other business response
-schemas remain unimplemented. The execution client foundation does not implement the Nautilus
-execution trait or any network connection. Possessing or loading a private key does not enable
+schemas remain unimplemented. The execution client foundation implements the Nautilus execution
+trait but does not coordinate any network connection. Possessing or loading a private key does not enable
 trading or transaction submission.
 
 ## Plan progress
 
-The current Git changes add the `nautilus-deepx` crate, register it in the Rust workspace and
-adapter test inventory, update the lockfile, add runtime fixture capture and protocol-core code,
-and add this capability document. The implementation maps to the integration plan as follows:
+The repository contains the `nautilus-deepx` crate, Rust workspace and adapter test-inventory
+wiring, runtime fixture capture and protocol-core code, and this capability document. The
+implementation maps to the integration plan as follows:
+
+### Phase advancement decision
+
+As of 2026-09-08, the implementation focus can advance from the pending-pool recovery milestone to
+**Phase E execution and reconciliation**. The durable store, signer lease, exact transaction
+identity, one-shot submission, canonical scan, finality, reorganization, and fail-closed startup
+boundaries are sufficient foundations for developing the execution client. This does not mark
+Phase D complete, enable an order capability, or authorize Phase F management services.
+
+Further attempts to infer authoritative non-inclusion from a non-atomic pending-pool snapshot are
+not a prerequisite for Phase E implementation. A submission retry must reuse the exact durably
+recorded signed extrinsic and therefore the same transaction hash, be bounded, and stop on an
+authoritative rejection or exhausted ambiguity budget. It must not allocate a new timestamp nonce,
+create another order identity, rebuild or re-sign the call, or emit a rejection merely because the
+retry budget was exhausted. Remaining ambiguity is retained for startup reconciliation or operator
+resolution. This retry policy still requires implementation and tests before it can be wired into
+an execution command path.
+
+The next reviewable milestone is the next minimal fixture-backed Phase E execution slice: decode an
+authenticated private message from the transport-proven envelope, initialize account state, and
+deterministic order/report reconciliation for one fixture-proven order capability. Before advancing
+to Phase F management services or Phase G Python/public integration, the repository still requires:
+
+- A complete immutable finalized runtime fixture with decoded signed extensions and the header
+  number needed for mortality/checkpoint construction.
+- Sanitized byte-for-byte direct-pallet order signing vectors and authoritative dispatch plus
+  business-event fixtures matched by block extrinsic index.
+- Fixture-backed canonical inclusion, dispatch and business events, finality, reorganization, and
+  restart reconciliation evidence; current mock tests establish local invariants only.
+- Verified private-stream authentication and initial account-state semantics, followed by network
+  startup coordination and deterministic report reconciliation through the `ExecutionClient`.
+
+Phase F management services and Phase G public/Python wiring remain blocked. This decision does not
+remove the existing partial implementations or unresolved Phase D evidence gates; it changes the
+development priority without mistaking that progress for capability enablement. The external Phase
+A maintainer-approval and competing-work checks also remain unrecorded, so no milestone is ready for
+public submission as an approved integration.
 
 - **Phase A - Partial:** Capability matrix, hard gates, runtime capture tool, and
   runtime-identity fixtures exist.
@@ -277,8 +324,10 @@ and add this capability document. The implementation maps to the integration pla
   snapshot after all old permits are released. It does not poll, retry automatically, approve
   unknown fixtures, automatically resume signing after a failed refresh, or weaken permit
   quiescence. No live
-  runtime watcher, order-call model, golden signing vector, configured nonce store or chain time
-  source, transaction submission, tracker, or live recovery scanner exists. A read-only RPC
+  runtime watcher, order-call model, golden signing vector, configured chain time source, or live
+  recovery event decoder exists. A one-shot submission primitive and durable transaction tracker
+  exist behind fail-closed preparation and signer-lease boundaries, but no execution command path
+  can invoke them. A read-only RPC
   identity collector concurrently queries every configured role endpoint
   for its genesis hash and releases only a complete validated endpoint set. An independent
   read-only capability probe can then require a caller-supplied non-empty method set for one role
@@ -288,8 +337,11 @@ and add this capability document. The implementation maps to the integration pla
   semantics or authorize submission, watching, or recovery. A 2026-09-01 attempt to capture a
   replacement finalized-header fixture failed before any RPC response because the testnet endpoint
   closed the TLS connection.
-- **Phase E - Partial:** A strict execution config and disconnected client foundation exist. The
-  client owns `ExecutionClientCore`, `ExecutionEventEmitter`, a redacted credential, and an ordered
+- **Phase E - Partial:** A strict execution config and disconnected `ExecutionClient` foundation
+  exist. The client exposes framework identity, account lookup, account-state emission, idempotent
+  lifecycle methods, and explicit unsupported errors for order, query, and report commands. It
+  reports incomplete bulk-position coverage and cannot coordinate a network connection. The client
+  owns `ExecutionClientCore`, `ExecutionEventEmitter`, a redacted credential, and an ordered
   startup gate which requires instrument preload, caller-supplied context restoration, runtime validation,
   private-stream authentication, account-state initialization, startup mass reconciliation, and
   account registration before connected state. It also owns a conflict-safe shared order-context
@@ -306,9 +358,18 @@ and add this capability document. The implementation maps to the integration pla
   does not prove the protocol-dependent semantic completeness of that account state.
   Bounded trade-ID replay state supports reserve, commit, and failure release for an already
   validated venue `TradeId`; committed IDs survive reconnect startup resets until FIFO eviction.
-  The state is not connected to a private payload decoder or execution event route.
-  It does not implement `ExecutionClient`; no live connection, account decoder, order command,
-  report, reconciliation implementation, or event emission exists.
+  The WebSocket single-owner path can now preserve an uncorrelated JSON frame in an authenticated
+  envelope only when both its opaque session capability and ingress connection epoch are current.
+  Correlated responses are completed through their request waiter and are not emitted through this
+  path. This proves transport provenance only: the envelope is not connected to a fixture-backed
+  private payload decoder, trade replay state, or execution event route.
+  Startup mass reconciliation can restore acknowledged durable transaction records, reconcile
+  in-block finality and reorganization evidence, resume an exact not-included checkpoint, and
+  observe submitting or accepted records against the Submission endpoint's valid pending pool.
+  Exact pool presence durably records acceptance; pool absence remains unresolved without a write.
+  Pending-pool absence is no longer the active implementation milestone. Phase E work should now
+  implement private account and order decoding, network startup coordination, one fixture-proven order command,
+  report reconciliation, and authoritative event emission. None of those surfaces exists yet.
 - **Phase F - Not started:** No subaccount, delegate, quota
 - **Phase G - Partial:** This document exists; configs, factories, PyO3/Python wiring, discovery
   pages, and examples are absent.
@@ -591,6 +652,10 @@ an already completed result wins at the timeout boundary. This proves only local
 lifecycle behavior: no DeepX authentication payload or acknowledgement decoder is implemented.
 Execution startup can consume only a receipt which remains current for the same protocol owner and
 connection epoch; generic correlated responses cannot mark a connection authenticated.
+The same receipt can admit an uncorrelated JSON frame into a schema-neutral authenticated envelope
+only for its current ingress epoch. Reconnects, foreign protocol owners, stale epochs, and
+correlated response frames cannot produce such an envelope. This establishes provenance for a
+future fixture-backed private decoder without inferring any channel or business schema.
 
 The internal OpenAPI currently proves only that `GET /internal/v1/ws` is described as the real-time
 WebSocket connection endpoint. It does not define the upgrade headers, venue message envelope,
@@ -623,24 +688,24 @@ schemes other than secp256k1 are unsupported.
 
 ## Product capabilities
 
-| Capability             | Spot    | Perpetual | Evidence gate                                              |
-| ---------------------- | ------- | --------- | ---------------------------------------------------------- |
+| Capability             | Spot    | Perpetual   | Evidence gate                                                                                       |
+| ---------------------- | ------- | ----------- | --------------------------------------------------------------------------------------------------- |
 | Instrument definitions | Planned | Implemented | Perpetual: catalog metadata, precision, limits, margin, fees. Spot: no verified quantity increment. |
-| Historical candles     | -       | Partial   | One raw 1m ASC page; no framework events or paging.        |
-| Historical trades      | -       | Partial   | One descending raw page; no framework events or paging.    |
-| Order book snapshots   | Planned | Planned   | Snapshot flags, depth semantics, precision, and freshness. |
-| Order book deltas      | Planned | Planned   | Sequence, gap, checksum, buffering, and recovery rules.    |
-| Live trades            | Planned | Planned   | Public subscription acknowledgement and event fixtures.    |
-| Quotes and ticker      | Planned | Planned   | Field meaning and empty-book behavior.                     |
-| Mark and index prices  | -       | Partial   | Raw 1m mark history only; no events or freshness claim.    |
-| Funding                | -       | Partial   | Typed single-page history only; no framework events.       |
-| Long-short ratio       | -       | Partial   | Typed single-page history only; no framework events.       |
-| Open interest          | -       | Partial   | Typed single-page history only; units remain unproven.     |
-| Volume statistics      | -       | Partial   | Raw fixed-period window; units and boundaries unproven.    |
-| Last price             | -       | Partial   | Raw exact value only; no timestamp or freshness semantics. |
-| Bars                   | Planned | Planned   | Interval identity and open/close boundary semantics.       |
-| Market status          | Planned | Planned   | Status values and unknown-value behavior.                  |
-| Lending market status  | Planned | -         | Asset precision and authoritative status evidence.         |
+| Historical candles     | -       | Partial     | One raw 1m ASC page; no framework events or paging.                                                 |
+| Historical trades      | -       | Partial     | One descending raw page; no framework events or paging.                                             |
+| Order book snapshots   | Planned | Planned     | Snapshot flags, depth semantics, precision, and freshness.                                          |
+| Order book deltas      | Planned | Planned     | Sequence, gap, checksum, buffering, and recovery rules.                                             |
+| Live trades            | Planned | Planned     | Public subscription acknowledgement and event fixtures.                                             |
+| Quotes and ticker      | Planned | Planned     | Field meaning and empty-book behavior.                                                              |
+| Mark and index prices  | -       | Partial     | Raw 1m mark history only; no events or freshness claim.                                             |
+| Funding                | -       | Partial     | Typed single-page history only; no framework events.                                                |
+| Long-short ratio       | -       | Partial     | Typed single-page history only; no framework events.                                                |
+| Open interest          | -       | Partial     | Typed single-page history only; units remain unproven.                                              |
+| Volume statistics      | -       | Partial     | Raw fixed-period window; units and boundaries unproven.                                             |
+| Last price             | -       | Partial     | Raw exact value only; no timestamp or freshness semantics.                                          |
+| Bars                   | Planned | Planned     | Interval identity and open/close boundary semantics.                                                |
+| Market status          | Planned | Planned     | Status values and unknown-value behavior.                                                           |
+| Lending market status  | Planned | -           | Asset precision and authoritative status evidence.                                                  |
 
 The perpetual-only instrument provider constructs `CryptoPerpetual` definitions from catalog
 metadata with settlement currency, linear costing, and a unit multiplier asserted as documented
