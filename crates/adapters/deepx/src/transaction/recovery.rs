@@ -294,7 +294,7 @@ pub struct DeepXCanonicalBlockEvidence {
 impl DeepXCanonicalBlockEvidence {
     /// Creates evidence for one fully inspected canonical block.
     #[must_use]
-    pub const fn new(
+    pub(super) const fn new(
         block_number: u64,
         block_hash: [u8; 32],
         inclusion: Option<DeepXInclusionEvidence>,
@@ -320,7 +320,7 @@ pub struct DeepXRecoveryScan {
 impl DeepXRecoveryScan {
     /// Creates recovery inputs without asserting that the evidence is complete or consistent.
     #[must_use]
-    pub fn new(
+    fn new(
         first_scanned_block: u64,
         finalized_block_number: u64,
         finalized_block_hash: [u8; 32],

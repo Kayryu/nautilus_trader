@@ -36,10 +36,13 @@ use crate::{
 };
 
 /// RPC methods required from the transaction submission endpoint.
-pub const DEEPX_SUBMISSION_RPC_METHODS: &[&str] = &["author_submitExtrinsic"];
+pub const DEEPX_SUBMISSION_RPC_METHODS: &[&str] =
+    &["author_pendingExtrinsics", "author_submitExtrinsic"];
 
 /// RPC methods required from the finalized runtime watch endpoint.
 pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
+    "chain_getBlock",
+    "chain_getBlockHash",
     "chain_getFinalizedHead",
     "chain_getHeader",
     "state_getMetadata",
@@ -48,7 +51,6 @@ pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
 
 /// RPC methods required from the transaction recovery endpoint.
 pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
-    "author_pendingExtrinsics",
     "chain_getBlock",
     "chain_getBlockHash",
     "chain_getFinalizedHead",

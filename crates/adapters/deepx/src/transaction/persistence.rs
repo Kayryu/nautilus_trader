@@ -28,13 +28,17 @@ use subxt_core::dynamic::Value;
 use thiserror::Error;
 
 use super::{
-    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXNonceReservation,
-    DeepXRecoveryDecision, DeepXReorganizationDecision, DeepXTimestampNonceAllocator,
-    DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
-    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
+    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalizedRecoveryCollection,
+    DeepXNonceReservation, DeepXRecoveryDecision, DeepXReorganizationDecision,
+    DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionIdentity,
+    DeepXTransactionObservation, DeepXTransactionRecord, DeepXTransactionRecordError,
+    DeepXTransactionState, DeepXTransactionWatchError, collect_finalized_recovery_scan,
+    observe_reorganization,
 };
 use crate::{
     common::DeepXPrivateKey,
+    config::DeepXValidatedRpcEndpoints,
+    rpc::DeepXValidatedRpcMethodCapabilities,
     signing::{
         RuntimeSnapshot, SignedPalletExtrinsic, SigningError, derive_signer_account_id,
         sign_dynamic_pallet_call_with_snapshot,
@@ -765,6 +769,43 @@ pub enum DeepXObservationCommitError {
     Record(#[from] DeepXTransactionRecordError),
 }
 
+/// Failure while observing and durably committing canonical reorganization evidence.
+#[derive(Debug, Error)]
+pub enum DeepXReorganizationCommitError {
+    /// The durable record has no signed extrinsic hash to bind to the canonical lookup.
+    #[error("DeepX transaction reorganization observation requires durable signed bytes")]
+    MissingSignedExtrinsic,
+    /// The durable lifecycle has no current non-finalized inclusion eligible for reorganization.
+    #[error("DeepX transaction state {0:?} is not eligible for reorganization observation")]
+    IneligibleState(DeepXTransactionState),
+    /// Canonical chain observation failed before any lifecycle mutation was attempted.
+    #[error(transparent)]
+    Watch(#[from] DeepXTransactionWatchError),
+    /// The classified observation could not be committed durably.
+    #[error(transparent)]
+    Commit(#[from] DeepXObservationCommitError),
+}
+
+/// Failure while reconciling a durable not-included checkpoint against finalized evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedRecoveryCommitError {
+    /// The durable record has no signed extrinsic hash to bind to the finalized scan.
+    #[error("DeepX finalized recovery requires durable signed bytes")]
+    MissingSignedExtrinsic,
+    /// Only a prior complete not-included checkpoint can authorize this recovery scan.
+    #[error("DeepX transaction state {0:?} is not eligible for finalized checkpoint recovery")]
+    IneligibleState(DeepXTransactionState),
+    /// The not-included lifecycle state did not retain its required checkpoint evidence.
+    #[error("DeepX not-included transaction is missing durable absence evidence")]
+    MissingAbsenceEvidence,
+    /// Finalized-chain observation failed before any lifecycle mutation was attempted.
+    #[error(transparent)]
+    Watch(#[from] DeepXTransactionWatchError),
+    /// The classified observation could not be committed durably.
+    #[error(transparent)]
+    Commit(#[from] DeepXObservationCommitError),
+}
+
 /// Result of durably applying one authoritative reconciliation observation.
 #[derive(Debug)]
 pub struct DeepXCommittedObservation {
@@ -913,26 +954,225 @@ where
     commit_reconciliation_observation(store, lease, committed_record, record, observation).await
 }
 
+/// Observes and durably commits reorganization evidence for one acknowledged transaction record.
+///
+/// The target extrinsic hash, recorded inclusion, record, and acknowledgement are derived from the
+/// same restored value. This function does not submit, replay, replace, or emit order events.
+///
+/// # Errors
+///
+/// Returns an error before network access when the durable record lacks signed bytes or a current
+/// inclusion. RPC and commit failures remain distinct and do not grant replay authority.
+pub async fn observe_and_commit_reorganization<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+) -> Result<DeepXCommittedObservation, DeepXReorganizationCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::InBlockSuccess | DeepXTransactionState::InBlockFailed
+    ) {
+        return Err(DeepXReorganizationCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    let target_extrinsic_hash = record
+        .signed_extrinsic()
+        .ok_or(DeepXReorganizationCommitError::MissingSignedExtrinsic)?
+        .extrinsic_hash();
+    let recorded_inclusion =
+        record
+            .lifecycle()
+            .inclusion()
+            .ok_or(DeepXReorganizationCommitError::IneligibleState(
+                record.lifecycle().state(),
+            ))?;
+    let decision = observe_reorganization(
+        endpoints,
+        capabilities,
+        target_extrinsic_hash,
+        recorded_inclusion,
+    )
+    .await?;
+    Ok(
+        commit_reorganization_decision(store, lease, restored.committed(), record, decision)
+            .await?,
+    )
+}
+
+/// Reconciles one acknowledged not-included record from its exact finalized checkpoint.
+///
+/// All authority-bearing inputs are derived from `restored`. An up-to-date checkpoint preserves
+/// the existing acknowledgement. A transaction which later appears in the non-atomic submission
+/// pool is treated as conflicting evidence and durably requires operator action. This function
+/// does not submit, replay, replace, or emit order events.
+///
+/// # Errors
+///
+/// Returns an error before network access unless the durable record is not-included and retains
+/// signed bytes plus complete absence evidence. RPC and commit failures do not mutate lifecycle.
+pub async fn reconcile_not_included_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if record.lifecycle().state() != DeepXTransactionState::NotIncluded {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    let target_extrinsic_hash = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?
+        .extrinsic_hash();
+    let absence = record
+        .lifecycle()
+        .absence()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingAbsenceEvidence)?;
+    let collection = collect_finalized_recovery_scan(
+        endpoints,
+        capabilities,
+        absence.finalized_block_number(),
+        absence.finalized_block_hash(),
+        max_blocks_per_range,
+        target_extrinsic_hash,
+    )
+    .await?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            DeepXRecoveryDecision::NotIncluded(absence)
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::PoolAccepted => DeepXRecoveryDecision::ActionRequired,
+            decision => decision,
+        },
+    };
+    Ok(commit_recovery_decision(store, lease, restored.committed(), record, decision).await?)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Mutex};
+    use std::{
+        cell::Cell,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use axum::{Json, Router, extract::State, routing::post};
     use nautilus_model::{
         enums::OrderSide,
         identifiers::{ClientOrderId, InstrumentId},
     };
     use rstest::rstest;
+    use serde_json::{Value as JsonValue, json};
     use subxt_core::config::{Hasher, substrate::BlakeTwo256};
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::{
-        common::DeepXEnvironment,
+        common::{DeepXEnvironment, consts::DEEPX_TESTNET_GENESIS_HASH},
+        config::{
+            DeepXNetworkConfig, DeepXObservedRpcEndpoint, DeepXRpcRole,
+            validate_rpc_endpoint_identities,
+        },
+        rpc::observe_and_validate_rpc_method_capabilities,
         signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic},
         transaction::{
-            DeepXDirectRuntimeIdentity, DeepXInclusionEvidence, DeepXInclusionOutcome,
-            DeepXNonceReservation, DeepXTransactionIdentity, DeepXTransactionObservation,
+            DeepXAbsenceEvidence, DeepXAutomaticReplayDecision, DeepXDirectRuntimeIdentity,
+            DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation,
+            DeepXTransactionIdentity, DeepXTransactionObservation,
         },
     };
+
+    async fn reorganization_rpc(
+        State(request_count): State<Arc<AtomicUsize>>,
+        Json(request): Json<JsonValue>,
+    ) -> Json<JsonValue> {
+        request_count.fetch_add(1, Ordering::Relaxed);
+        let result = match request["method"].as_str().unwrap() {
+            "rpc_methods" => json!({
+                "methods": [
+                    "author_pendingExtrinsics",
+                    "author_submitExtrinsic",
+                    "chain_getBlock",
+                    "chain_getBlockHash",
+                    "chain_getFinalizedHead",
+                    "chain_getHeader",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
+                ],
+            }),
+            "chain_getBlockHash" => json!(format!("0x{}", "09".repeat(32))),
+            "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
+            "chain_getHeader" => json!({ "number": "0x48" }),
+            "author_pendingExtrinsics" => json!([]),
+            "chain_getBlock" => json!({
+                "block": {
+                    "header": { "number": "0x48" },
+                    "extrinsics": [],
+                },
+            }),
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn reorganization_endpoints() -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(reorganization_rpc))
+                    .with_state(server_request_count),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let config = DeepXNetworkConfig {
+            base_url_rpc: Some(url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            nautilus_core::hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x"))
+                .unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &config,
+            [
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Submission, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (endpoints, capabilities, request_count)
+    }
 
     #[derive(Debug)]
     struct TestLease {
@@ -1203,6 +1443,15 @@ mod tests {
         let mut record = signed_record();
         record
             .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+    }
+
+    fn not_included_record() -> DeepXTransactionRecord {
+        let mut record = submitting_record();
+        let absence = DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::NotIncluded(absence))
             .unwrap();
         record
     }
@@ -2123,6 +2372,172 @@ mod tests {
         );
         assert_eq!(result.committed().revision().value(), 5);
         assert_eq!(store.current_revision(), 5);
+    }
+
+    #[tokio::test]
+    async fn record_bound_reorganization_is_observed_and_committed() {
+        let mut record = submitting_record();
+        let inclusion = DeepXInclusionEvidence {
+            block_hash: [8; 32],
+            block_number: 72,
+            extrinsic_index: 4,
+            outcome: DeepXInclusionOutcome::Success,
+        };
+        record
+            .apply_observation(DeepXTransactionObservation::Included(inclusion))
+            .unwrap();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, _) = reorganization_endpoints().await;
+
+        let result =
+            observe_and_commit_reorganization(&endpoints, &capabilities, &store, &lease, &restored)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.record().lifecycle().state(),
+            DeepXTransactionState::Submitting,
+        );
+        assert_eq!(result.record().lifecycle().inclusion(), None);
+        assert_eq!(
+            result.record().lifecycle().reverted_inclusion(),
+            Some(inclusion),
+        );
+        assert_eq!(result.committed().revision().value(), 5);
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(
+            result.record().automatic_replay_decision(),
+            DeepXAutomaticReplayDecision::ReconciliationRequired,
+        );
+    }
+
+    #[tokio::test]
+    async fn up_to_date_not_included_checkpoint_preserves_durable_revision() {
+        let record = not_included_record();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, _) = reorganization_endpoints().await;
+
+        let result = reconcile_not_included_checkpoint(
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+            &restored,
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.record().lifecycle().state(),
+            DeepXTransactionState::NotIncluded,
+        );
+        assert_eq!(result.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn submitting_record_is_rejected_before_finalized_recovery_rpc() {
+        let record = submitting_record();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, request_count) = reorganization_endpoints().await;
+        let requests_before_recovery = request_count.load(Ordering::Relaxed);
+
+        let error = reconcile_not_included_checkpoint(
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+            &restored,
+            10,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXFinalizedRecoveryCommitError::IneligibleState(DeepXTransactionState::Submitting),
+        ));
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            requests_before_recovery,
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_record_is_not_observed_or_committed_as_reorganized() {
+        let mut record = submitting_record();
+        let inclusion = DeepXInclusionEvidence {
+            block_hash: [8; 32],
+            block_number: 72,
+            extrinsic_index: 4,
+            outcome: DeepXInclusionOutcome::Success,
+        };
+        record
+            .apply_observation(DeepXTransactionObservation::Included(inclusion))
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
+            .unwrap();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, request_count) = reorganization_endpoints().await;
+        let requests_before_observation = request_count.load(Ordering::Relaxed);
+
+        let error =
+            observe_and_commit_reorganization(&endpoints, &capabilities, &store, &lease, &restored)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXReorganizationCommitError::IneligibleState(DeepXTransactionState::Finalized),
+        ));
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            requests_before_observation,
+        );
     }
 
     #[tokio::test]

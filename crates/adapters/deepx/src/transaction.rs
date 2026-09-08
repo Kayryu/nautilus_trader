@@ -19,18 +19,21 @@ mod persistence;
 mod recovery;
 mod reservation;
 mod submission;
+mod watch;
 
 pub use persistence::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
-    DeepXCommittedTransactionRecord, DeepXObservationCommitError, DeepXPostgresSignerLease,
-    DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
-    DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReservationPreparationError,
+    DeepXCommittedTransactionRecord, DeepXFinalizedRecoveryCommitError,
+    DeepXObservationCommitError, DeepXPostgresSignerLease, DeepXPostgresTransactionStore,
+    DeepXPreparedReservation, DeepXPreparedSignedTransaction, DeepXPreparedSubmission,
+    DeepXRemarkCallVerifier, DeepXReorganizationCommitError, DeepXReservationPreparationError,
     DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
     DeepXSubmissionPermit, DeepXSubmissionPreparationError, DeepXTransactionPersistenceError,
     DeepXTransactionRevision, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
     commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
-    load_verified_committed_for_signer, prepare_initial_submission, prepare_signed_transaction,
-    prepare_timestamp_reservation, restore_timestamp_nonce_allocator, verify_signer_lease,
+    load_verified_committed_for_signer, observe_and_commit_reorganization,
+    prepare_initial_submission, prepare_signed_transaction, prepare_timestamp_reservation,
+    reconcile_not_included_checkpoint, restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -46,10 +49,15 @@ pub use reservation::{
     DeepXTransactionRecord, DeepXTransactionRecordError,
 };
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
 pub use submission::{
     DeepXSubmissionError, DeepXSubmittedExtrinsic, submit_extrinsic_once, verify_submission_hash,
+};
+use thiserror::Error;
+pub use watch::{
+    DeepXCanonicalBlockObservation, DeepXFinalizedRecoveryCheckpoint,
+    DeepXFinalizedRecoveryCollection, DeepXPoolObservation, DeepXTransactionWatchError,
+    collect_finalized_recovery_scan, observe_canonical_block, observe_reorganization,
+    observe_submission_pool,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.
@@ -367,7 +375,7 @@ impl DeepXAbsenceEvidence {
     /// # Errors
     ///
     /// Returns an error when the scan range ends before it starts.
-    pub fn new(
+    fn new(
         first_scanned_block: u64,
         finalized_block_number: u64,
         finalized_block_hash: [u8; 32],

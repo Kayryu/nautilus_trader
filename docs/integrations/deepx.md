@@ -119,6 +119,10 @@ implemented and covered by unit tests:
 - Fail-closed recovery and reorganization classifiers which require complete canonical evidence,
   exact block and inclusion identity, and authoritative submission-pool absence before producing a
   negative outcome. Missing or conflicting evidence requires operator action.
+- A capability-bound reorganization observer which reads the recorded inclusion height from the
+  validated Watch endpoint and binds the lookup to the durable extrinsic hash. A changed canonical
+  block hash proves reorganization; an unchanged block is canonical only when the transaction
+  remains at its recorded index. Missing or displaced evidence requires operator action.
 - A PostgreSQL durable transaction store over the existing Nautilus `general` table, with versioned
   exact record envelopes, revision-checked compare-and-set, and detached session advisory locks for
   cross-process signer ownership. Recovery and reorganization decisions use this acknowledged CAS
@@ -714,7 +718,7 @@ The adapter now provides a pure, evidence-driven transaction lifecycle with thes
 | `in-block-success` | The extrinsic and expected business event succeeded in a best block. |
 | `finalized`        | The recorded success or failure is canonical and finalized.          |
 | `in-block-failed`  | An authoritative dispatch or expected business event failure exists. |
-| `not-included`     | A complete finalized scan and node-pool check prove absence.         |
+| `not-included`     | Authoritative checkpoint-bound evidence proves absence.              |
 | `action-required`  | Available recovery evidence is incomplete or conflicting.            |
 
 Pool acceptance is not order acceptance, block inclusion is not business success, and best-block
@@ -730,11 +734,43 @@ Version 3 durable records retain their existing collapsed inclusion shape and ar
 through the internal validated record codec. No RPC event decoder or business-event schema is yet
 connected to this boundary, so live inclusion classification remains disabled.
 
+A read-only network observation boundary now queries only chain-identity-validated endpoints. It
+fetches a canonical block hash and body from the Watch endpoint, verifies the returned header
+height, decodes every prefixed SCALE extrinsic, and recomputes each Blake2-256 hash before exposing
+the unique matching extrinsic index. It separately inspects `author_pendingExtrinsics` through the
+Submission endpoint and reports observed pool absence only after every returned entry decodes successfully.
+Malformed entries, duplicate target extrinsics, missing blocks, and inconsistent heights fail
+closed. These observations prove location or pool membership only: without fixture-backed dispatch
+and expected business-event decoding they cannot produce `in-block-success`, `in-block-failed`,
+`finalized`, or `not-included` lifecycle evidence.
+
+The network recovery boundary now binds complete role-capability evidence to the validated Recovery
+and Submission endpoints. Before resuming, it revalidates both the height and canonical hash of the
+durable scan checkpoint; a changed or unavailable checkpoint stops recovery before scanning later
+blocks or querying the submission pool. It then pins a bounded scan to the Recovery endpoint's
+finalized head and feeds contiguous canonical observations into the pure recovery collector. Pool
+presence on the node that accepted submission can produce `accepted`. Pool absence is not atomic
+with the finalized scan and therefore remains `unknown`/`action-required`; it cannot produce
+`not-included` or authorize a replacement. If the exact extrinsic appears in any scanned block,
+collection stops with an explicit event-evidence error because location alone cannot prove dispatch
+or business outcome. The boundary performs no durable mutation, automatic replay, lifecycle commit,
+or Nautilus event emission.
+
+The reorganization observation boundary binds Watch capability evidence to the configured endpoint,
+queries the exact recorded inclusion height using the durable extrinsic hash, and applies the pure
+reorganization classifier. It proves `reorganized` only when the canonical block hash changed and
+proves `canonical` only when the original block and extrinsic index still match. It returns
+`action-required` for missing or displaced transaction evidence. A record-bound coordinator derives
+the signed hash, inclusion, record, and acknowledgement from one restored durable value, then
+commits the decision through the signer lease and revision-checked compare-and-set boundary.
+Ineligible or finalized records are rejected before network access. The coordinator performs no
+automatic replay, replacement, submission, or event emission.
+
 The lifecycle rejects transitions that skip durable signing, preserves the immutable extrinsic
 hash and exact block inclusion evidence, and treats repeated matching observations as idempotent.
-`not-included` requires explicit proof of both a complete canonical scan through a finalized block
-and authoritative absence from the submission node pool. Later canonical inclusion can correct
-that negative observation. An exact reorganization observation can remove a recorded non-finalized
+`not-included` requires checkpoint-bound authoritative absence evidence that the current network
+collector does not produce. Later canonical inclusion can correct an existing negative observation.
+An exact reorganization observation can remove a recorded non-finalized
 inclusion, retain the reverted block and extrinsic-index evidence, and return the lifecycle to
 `submitting` for fresh reconciliation. A later canonical inclusion replaces the reverted evidence;
 mismatched or finalized reorganization observations are rejected. Incomplete or conflicting
@@ -769,13 +805,13 @@ does not prove role-specific RPC method support; an operational client must stil
 identity directly from each endpoint before probing it. A separate read-only probe accepts only an
 identity-validated endpoint set and a non-empty caller-supplied list of required methods for one
 role. It calls `rpc_methods`, rejects transport or response failures, and returns evidence only when
-every required name is advertised. A complete collector requires `author_submitExtrinsic` for
-submission; finalized-head, header, runtime-version, and metadata reads for watch; and pending-pool,
-canonical block, block-hash, finalized-head, and header reads for recovery. It probes all roles
-concurrently and returns no partial evidence. Evidence retains the role, endpoint URL, and required
-method names, but not unrelated advertised methods. Execution startup rejects evidence collected
-from a different endpoint set. These names are the minimum implied by the current planned flows;
-they do not prove semantics or enable any operational client.
+every required name is advertised. A complete collector requires submission and pending-pool
+methods for Submission; canonical block, block-hash, finalized-head, header, runtime-version, and
+metadata reads for Watch; and canonical block, block-hash, finalized-head, and header reads for
+Recovery. It probes all roles concurrently and returns no partial evidence. Evidence retains the
+role, endpoint URL, and required method names, but not unrelated advertised methods. Execution
+startup rejects evidence collected from a different endpoint set. These names are the minimum
+implied by the current planned flows; they do not prove semantics or enable any operational client.
 
 Direct-pallet transaction reservations have a versioned, strict durable record format. Version 3
 adds retained reorganization evidence and uses a distinct cache-key namespace so older record
@@ -886,11 +922,22 @@ outcome, commits the reverted evidence once, and treats an identical repeated ob
 idempotent without advancing the durable revision. Pure recovery planning splits blocks after the
 last complete checkpoint into bounded, contiguous inclusive ranges without wrapping at `u64::MAX`.
 A single-owner collector accepts only the next planned range with the exact ordered block count and
-cannot release a recovery scan until all ranges reach the finalized boundary. The resulting scan
-still requires exact finalized-block identity and authoritative submission-pool evidence before it
-can produce `not-included`. These boundaries perform no head watching, canonicality query, pool
-query, or RPC collection; those operational sources remain required before live reorganization or
-absence recovery can be enabled.
+cannot release a recovery scan until all ranges reach the finalized boundary. The network recovery
+boundary requires the prior checkpoint number and hash to remain canonical before it supplies exact
+finalized-block identity, canonical absence, and node-local pending-pool observations for this
+collector. It conservatively retains observed pool absence as unknown. Exact reorganization
+observation for an acknowledged non-finalized inclusion can be explicitly committed through the
+existing signer lease and CAS boundary. No tracker or polling loop invokes it automatically, and
+returning a reorganized transaction to `submitting` grants reconciliation, not replay, authority.
+An acknowledged `not-included` record can also explicitly resume a bounded scan only from the
+exact finalized number and hash retained in its durable absence evidence. Other lifecycle states
+are rejected before RPC because they do not retain that checkpoint. An unchanged finalized head is
+verified idempotently through the signer lease and prior acknowledgement. Later node-local pool
+presence conflicts with the durable absence state and therefore commits `action-required`; pool
+absence remains unknown and cannot create fresh `not-included` evidence.
+Live absence and inclusion classification remain disabled until evidence can be bound to an
+authoritative chain checkpoint and an event decoder can bind dispatch and expected business
+outcomes to the matching block extrinsic index.
 
 ## Fixture identity
 
