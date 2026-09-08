@@ -23,7 +23,7 @@ mod watch;
 
 pub use persistence::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
-    DeepXCommittedTransactionRecord, DeepXFinalizedRecoveryCommitError,
+    DeepXCommittedTransactionRecord, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
     DeepXObservationCommitError, DeepXPostgresSignerLease, DeepXPostgresTransactionStore,
     DeepXPreparedReservation, DeepXPreparedSignedTransaction, DeepXPreparedSubmission,
     DeepXRemarkCallVerifier, DeepXReorganizationCommitError, DeepXReservationPreparationError,
@@ -31,9 +31,10 @@ pub use persistence::{
     DeepXSubmissionPermit, DeepXSubmissionPreparationError, DeepXTransactionPersistenceError,
     DeepXTransactionRevision, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
     commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
-    load_verified_committed_for_signer, observe_and_commit_reorganization,
-    prepare_initial_submission, prepare_signed_transaction, prepare_timestamp_reservation,
-    reconcile_not_included_checkpoint, restore_timestamp_nonce_allocator, verify_signer_lease,
+    load_verified_committed_for_signer, observe_and_commit_finality,
+    observe_and_commit_reorganization, prepare_initial_submission, prepare_signed_transaction,
+    prepare_timestamp_reservation, reconcile_not_included_checkpoint,
+    restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -54,10 +55,10 @@ pub use submission::{
 };
 use thiserror::Error;
 pub use watch::{
-    DeepXCanonicalBlockObservation, DeepXFinalizedRecoveryCheckpoint,
+    DeepXCanonicalBlockObservation, DeepXFinalityObservation, DeepXFinalizedRecoveryCheckpoint,
     DeepXFinalizedRecoveryCollection, DeepXPoolObservation, DeepXTransactionWatchError,
-    collect_finalized_recovery_scan, observe_canonical_block, observe_reorganization,
-    observe_submission_pool,
+    collect_finalized_recovery_scan, observe_canonical_block, observe_finality,
+    observe_reorganization, observe_submission_pool,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.

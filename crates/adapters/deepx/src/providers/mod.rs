@@ -17,11 +17,10 @@
 
 mod instrument;
 
-pub use instrument::{DeepXInstrumentProvider, DeepXSpotInstrumentUnsupported};
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
+pub use instrument::{DeepXInstrumentProvider, DeepXSpotInstrumentUnsupported};
 use nautilus_model::identifiers::InstrumentId;
 
 use crate::{

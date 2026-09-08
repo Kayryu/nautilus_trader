@@ -42,14 +42,19 @@ use crate::{
     rpc::{DeepXAppliedRuntimeSnapshot, DeepXValidatedRpcMethodCapabilities},
     signing::{SigningError, derive_signer_account_id},
     transaction::{
-        DeepXSignerLease, DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction,
-        DeepXTransactionStore, load_verified_committed_for_signer,
+        DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
+        DeepXReorganizationCommitError, DeepXSignerLease, DeepXTransactionPersistenceError,
+        DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
+        DeepXTransactionWatchError, load_verified_committed_for_signer,
+        observe_and_commit_finality, observe_and_commit_reorganization,
+        reconcile_not_included_checkpoint,
     },
     websocket::{DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
 const TERMINAL_CONTEXT_CAPACITY: usize = 10_000;
+const RECOVERY_BLOCKS_PER_RANGE: u64 = 100;
 
 /// Ordered evidence required before a DeepX execution client can become connected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +218,15 @@ pub enum DeepXMassReconciliationError {
     /// Complete durable transaction evidence could not be verified.
     #[error(transparent)]
     Persistence(#[from] DeepXTransactionPersistenceError),
+    /// An in-block transaction could not be reconciled against finalized chain evidence.
+    #[error(transparent)]
+    Finality(#[from] DeepXFinalityCommitError),
+    /// An in-block transaction could not be reconciled against canonical chain evidence.
+    #[error(transparent)]
+    Reorganization(#[from] DeepXReorganizationCommitError),
+    /// A not-included transaction could not be reconciled from its finalized checkpoint.
+    #[error(transparent)]
+    FinalizedRecovery(#[from] DeepXFinalizedRecoveryCommitError),
     /// A durable transaction still requires recovery or operator action.
     #[error("DeepX transaction {client_order_id} still requires startup action {action:?}")]
     UnresolvedTransaction {
@@ -606,6 +620,36 @@ pub struct DeepXExecutionClient {
 }
 
 impl DeepXExecutionClient {
+    fn validate_rpc_evidence(
+        &self,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
+    ) -> Result<(), DeepXExecutionStartupError> {
+        for role in [
+            DeepXRpcRole::Submission,
+            DeepXRpcRole::Watch,
+            DeepXRpcRole::Recovery,
+        ] {
+            let configured_url = self
+                .config
+                .network
+                .rpc_url_for(role)
+                .map_err(|_| DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role))?;
+            if endpoints.url_for(role) != configured_url {
+                return Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role));
+            }
+            let role_capabilities = capabilities.for_role(role);
+            if role_capabilities.role() != role
+                || role_capabilities.endpoint_url() != endpoints.url_for(role)
+            {
+                return Err(DeepXExecutionStartupError::RuntimeRpcCapabilitiesMismatch(
+                    role,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a disconnected DeepX execution client foundation.
     ///
     /// # Errors
@@ -816,28 +860,7 @@ impl DeepXExecutionClient {
                 self.config.execution_backend,
             ));
         }
-        for role in [
-            DeepXRpcRole::Submission,
-            DeepXRpcRole::Watch,
-            DeepXRpcRole::Recovery,
-        ] {
-            let configured_url = self
-                .config
-                .network
-                .rpc_url_for(role)
-                .map_err(|_| DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role))?;
-            if endpoints.url_for(role) != configured_url {
-                return Err(DeepXExecutionStartupError::RuntimeRpcEndpointMismatch(role));
-            }
-            let role_capabilities = capabilities.for_role(role);
-            if role_capabilities.role() != role
-                || role_capabilities.endpoint_url() != endpoints.url_for(role)
-            {
-                return Err(DeepXExecutionStartupError::RuntimeRpcCapabilitiesMismatch(
-                    role,
-                ));
-            }
-        }
+        self.validate_rpc_evidence(endpoints, capabilities)?;
         self.startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)?;
         Ok(())
@@ -926,6 +949,8 @@ impl DeepXExecutionClient {
     /// belongs to the configured signing key, and every durable transaction is complete.
     pub async fn record_mass_reconciliation_completed<S>(
         &mut self,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
         store: &S,
         lease: &S::Lease,
     ) -> Result<(), DeepXMassReconciliationError>
@@ -937,12 +962,47 @@ impl DeepXExecutionClient {
         if lease.signer() != derive_signer_account_id(&self.credential)? {
             return Err(DeepXMassReconciliationError::SignerLeaseMismatch);
         }
+        self.validate_rpc_evidence(endpoints, capabilities)?;
         let restored = load_verified_committed_for_signer(store, lease).await?;
         for item in restored {
-            let action = item.record().recovery_action();
+            let client_order_id = item.record().identity().client_order_id().to_string();
+            let action = match item.record().lifecycle().state() {
+                DeepXTransactionState::InBlockSuccess | DeepXTransactionState::InBlockFailed => {
+                    match observe_and_commit_finality(endpoints, capabilities, store, lease, &item)
+                        .await
+                    {
+                        Ok(committed) => committed.record().recovery_action(),
+                        Err(DeepXFinalityCommitError::Watch(
+                            DeepXTransactionWatchError::FinalityEvidenceConflict(_),
+                        )) => observe_and_commit_reorganization(
+                            endpoints,
+                            capabilities,
+                            store,
+                            lease,
+                            &item,
+                        )
+                        .await?
+                        .record()
+                        .recovery_action(),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                DeepXTransactionState::NotIncluded => reconcile_not_included_checkpoint(
+                    endpoints,
+                    capabilities,
+                    store,
+                    lease,
+                    &item,
+                    RECOVERY_BLOCKS_PER_RANGE,
+                )
+                .await?
+                .record()
+                .recovery_action(),
+                _ => item.record().recovery_action(),
+            };
             if action != DeepXTransactionRecoveryAction::Complete {
                 return Err(DeepXMassReconciliationError::UnresolvedTransaction {
-                    client_order_id: item.record().identity().client_order_id().to_string(),
+                    client_order_id,
                     action,
                 });
             }
@@ -1027,7 +1087,7 @@ mod tests {
         cell::RefCell,
         rc::Rc,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -1051,6 +1111,7 @@ mod tests {
     };
     use rstest::rstest;
     use serde_json::{Value, json};
+    use subxt_core::config::{Hasher, substrate::BlakeTwo256};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -1062,11 +1123,15 @@ mod tests {
             observe_and_apply_approved_finalized_runtime_snapshot,
             observe_and_validate_rpc_method_capabilities,
         },
-        signing::{DeepXRuntimeSnapshotService, RuntimeSnapshot},
+        signing::{
+            ApprovedRuntimeIdentity, DeepXRuntimeSnapshotService, RuntimeSnapshot,
+            SignedPalletExtrinsic,
+        },
         transaction::{
-            DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXNonceReservation,
-            DeepXRestoredTransactionRecord, DeepXTransactionIdentity, DeepXTransactionRecord,
-            DeepXTransactionRevision,
+            DeepXBusinessEventOutcome, DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity,
+            DeepXDispatchOutcome, DeepXInclusionEvidence, DeepXIndexedOutcome,
+            DeepXNonceReservation, DeepXRestoredTransactionRecord, DeepXTransactionIdentity,
+            DeepXTransactionObservation, DeepXTransactionRecord, DeepXTransactionRevision,
         },
     };
 
@@ -1155,6 +1220,102 @@ mod tests {
             Err(DeepXTransactionPersistenceError::Unsupported(
                 "read-only test store".to_string(),
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FinalityTestStore {
+        revision: Mutex<u64>,
+        encoded_record: Mutex<Vec<u8>>,
+    }
+
+    impl FinalityTestStore {
+        fn new(revision: u64, record: &DeepXTransactionRecord) -> Self {
+            Self {
+                revision: Mutex::new(revision),
+                encoded_record: Mutex::new(record.encode().unwrap()),
+            }
+        }
+
+        fn current_revision(&self) -> u64 {
+            *self.revision.lock().unwrap()
+        }
+
+        fn persisted_record(&self) -> DeepXTransactionRecord {
+            DeepXTransactionRecord::decode(&self.encoded_record.lock().unwrap()).unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeepXTransactionStore for FinalityTestStore {
+        type Lease = TestSignerLease;
+
+        async fn acquire_signer_lease(
+            &self,
+            signer: [u8; 20],
+        ) -> Result<Self::Lease, DeepXTransactionPersistenceError> {
+            Ok(TestSignerLease { signer })
+        }
+
+        async fn verify_signer_lease(
+            &self,
+            _lease: &Self::Lease,
+        ) -> Result<(), DeepXTransactionPersistenceError> {
+            Ok(())
+        }
+
+        async fn load_committed_for_signer(
+            &self,
+            lease: &Self::Lease,
+        ) -> Result<Vec<DeepXRestoredTransactionRecord>, DeepXTransactionPersistenceError> {
+            let record = DeepXTransactionRecord::decode(&self.encoded_record.lock().unwrap())
+                .map_err(|e| DeepXTransactionPersistenceError::BeforeCommit(e.to_string()))?;
+            if record.identity().signer() != lease.signer() {
+                return Ok(Vec::new());
+            }
+            let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+                &record,
+                DeepXTransactionRevision::new(*self.revision.lock().unwrap()),
+            )?;
+            Ok(vec![DeepXRestoredTransactionRecord::new(
+                record, committed,
+            )?])
+        }
+
+        async fn create_committed(
+            &self,
+            _lease: &Self::Lease,
+            _record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            Err(DeepXTransactionPersistenceError::Unsupported(
+                "finality test store does not create records".to_string(),
+            ))
+        }
+
+        async fn compare_and_set_committed(
+            &self,
+            _lease: &Self::Lease,
+            expected: &DeepXCommittedTransactionRecord,
+            record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            let mut revision = self.revision.lock().unwrap();
+            let mut encoded_record = self.encoded_record.lock().unwrap();
+            let current_record = DeepXTransactionRecord::decode(&encoded_record)
+                .map_err(|e| DeepXTransactionPersistenceError::BeforeCommit(e.to_string()))?;
+            if *revision != expected.revision().value()
+                || expected.verify(&current_record).is_err()
+                || current_record.identity() != record.identity()
+            {
+                return Err(DeepXTransactionPersistenceError::RevisionConflict);
+            }
+            *revision += 1;
+            *encoded_record = record
+                .encode()
+                .map_err(|e| DeepXTransactionPersistenceError::BeforeCommit(e.to_string()))?;
+            DeepXCommittedTransactionRecord::acknowledge_committed(
+                record,
+                DeepXTransactionRevision::new(*revision),
+            )
         }
     }
 
@@ -1404,6 +1565,332 @@ mod tests {
                 .trim_start_matches("0x"),
         )
         .unwrap()
+    }
+
+    fn configure_rpc_url(client: &mut DeepXExecutionClient, rpc_url: String) {
+        client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_watch = Some(rpc_url.clone());
+        client.config.network.base_url_rpc_recovery = Some(rpc_url);
+    }
+
+    fn in_block_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+            ClientOrderId::from("O-DEEPX-IN-BLOCK"),
+            signer,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity {
+                genesis_hash: [1; 32],
+                metadata_sha256: [2; 32],
+                spec_version: 366,
+                transaction_version: 1,
+                signed_extensions: vec!["CheckNonce".to_string()],
+            },
+        ));
+        let bytes = vec![12, 1, 2, 3];
+        let identity = record.identity();
+        let runtime = identity.runtime();
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer,
+                nonce: 42,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: runtime.genesis_hash,
+                    metadata_sha256: runtime.metadata_sha256,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    signed_extensions: runtime.signed_extensions.clone(),
+                },
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Included(
+                DeepXInclusionEvidence::from_indexed_observations(
+                    [8; 32],
+                    72,
+                    DeepXIndexedOutcome {
+                        extrinsic_index: 1,
+                        outcome: DeepXDispatchOutcome::Success,
+                    },
+                    DeepXIndexedOutcome {
+                        extrinsic_index: 1,
+                        outcome: DeepXBusinessEventOutcome::Success,
+                    },
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        record
+    }
+
+    fn not_included_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+            ClientOrderId::from("O-DEEPX-NOT-INCLUDED"),
+            signer,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity {
+                genesis_hash: [1; 32],
+                metadata_sha256: [2; 32],
+                spec_version: 366,
+                transaction_version: 1,
+                signed_extensions: vec!["CheckNonce".to_string()],
+            },
+        ));
+        let bytes = vec![12, 1, 2, 3];
+        let identity = record.identity();
+        let runtime = identity.runtime();
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer,
+                nonce: 42,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: runtime.genesis_hash,
+                    metadata_sha256: runtime.metadata_sha256,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    signed_extensions: runtime.signed_extensions.clone(),
+                },
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        let mut encoded: Value = serde_json::from_slice(&record.encode().unwrap()).unwrap();
+        encoded["lifecycle"]["state"] = json!(DeepXTransactionState::NotIncluded);
+        encoded["lifecycle"]["absence"] = json!({
+            "first_scanned_block": 70,
+            "finalized_block_number": 72,
+            "finalized_block_hash": vec![9; 32],
+            "canonical_scan_complete": true,
+            "submission_pool_absence": true,
+        });
+        DeepXTransactionRecord::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap()
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecoveryRpcState {
+        target_extrinsic: String,
+    }
+
+    async fn recovery_rpc(
+        axum::extract::State(state): axum::extract::State<RecoveryRpcState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let result = match request["method"].as_str().unwrap() {
+            "rpc_methods" => json!({
+                "methods": [
+                    "author_pendingExtrinsics",
+                    "author_submitExtrinsic",
+                    "chain_getBlock",
+                    "chain_getBlockHash",
+                    "chain_getFinalizedHead",
+                    "chain_getHeader",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
+                ],
+            }),
+            "chain_getFinalizedHead" => json!(format!("0x{:064x}", 73)),
+            "chain_getHeader" => json!({ "number": "0x49" }),
+            "chain_getBlockHash" => {
+                let block_number = request["params"][0].as_u64().unwrap();
+                if block_number == 72 {
+                    json!(format!("0x{}", "09".repeat(32)))
+                } else {
+                    json!(format!("0x{block_number:064x}"))
+                }
+            }
+            "chain_getBlock" => json!({
+                "block": {
+                    "header": { "number": "0x49" },
+                    "extrinsics": [],
+                },
+            }),
+            "author_pendingExtrinsics" => json!([state.target_extrinsic]),
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn recovery_evidence(
+        target_extrinsic: &[u8],
+    ) -> (
+        String,
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = RecoveryRpcState {
+            target_extrinsic: format!("0x{}", hex::encode(target_extrinsic)),
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(recovery_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let rpc_url = format!("http://{address}");
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_rpc: Some(rpc_url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &network,
+            [
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Submission,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Recovery,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (rpc_url, endpoints, capabilities)
+    }
+
+    #[derive(Clone, Debug)]
+    struct FinalityRpcState {
+        finalized_block: u64,
+        canonical_block_hash: [u8; 32],
+        target_extrinsic: String,
+        canonical_requests: Arc<AtomicUsize>,
+    }
+
+    async fn finality_rpc(
+        axum::extract::State(state): axum::extract::State<FinalityRpcState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let result = match request["method"].as_str().unwrap() {
+            "rpc_methods" => json!({
+                "methods": [
+                    "author_pendingExtrinsics",
+                    "author_submitExtrinsic",
+                    "chain_getBlock",
+                    "chain_getBlockHash",
+                    "chain_getFinalizedHead",
+                    "chain_getHeader",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
+                ],
+            }),
+            "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
+            "chain_getHeader" => json!({ "number": format!("0x{:x}", state.finalized_block) }),
+            "chain_getBlockHash" => {
+                state.canonical_requests.fetch_add(1, Ordering::Relaxed);
+                json!(format!("0x{}", hex::encode(state.canonical_block_hash)))
+            }
+            "chain_getBlock" => {
+                state.canonical_requests.fetch_add(1, Ordering::Relaxed);
+                json!({
+                    "block": {
+                        "header": { "number": "0x48" },
+                        "extrinsics": ["0x0400", state.target_extrinsic],
+                    },
+                })
+            }
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn finality_evidence(
+        finalized_block: u64,
+        target_extrinsic: &[u8],
+    ) -> (
+        String,
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
+        finality_evidence_with_hash(finalized_block, [8; 32], target_extrinsic).await
+    }
+
+    async fn finality_evidence_with_hash(
+        finalized_block: u64,
+        canonical_block_hash: [u8; 32],
+        target_extrinsic: &[u8],
+    ) -> (
+        String,
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let canonical_requests = Arc::new(AtomicUsize::new(0));
+        let state = FinalityRpcState {
+            finalized_block,
+            canonical_block_hash,
+            target_extrinsic: format!("0x{}", hex::encode(target_extrinsic)),
+            canonical_requests: Arc::clone(&canonical_requests),
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(finality_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let rpc_url = format!("http://{address}");
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_rpc: Some(rpc_url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &network,
+            [
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Submission,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Recovery,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (rpc_url, endpoints, capabilities, canonical_requests)
     }
 
     #[tokio::test]
@@ -1730,6 +2217,8 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_accepts_empty_complete_store_snapshot() {
         let mut client = test_client();
+        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        configure_rpc_url(&mut client, rpc_url);
         advance_to_mass_reconciliation(&mut client);
         let store = TestTransactionStore {
             restored: Vec::new(),
@@ -1738,7 +2227,7 @@ mod tests {
         let lease = store.acquire_signer_lease(signer).await.unwrap();
 
         client
-            .record_mass_reconciliation_completed(&store, &lease)
+            .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
             .await
             .unwrap();
 
@@ -1751,6 +2240,8 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_rejects_another_signer_without_advancing() {
         let mut client = test_client();
+        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        configure_rpc_url(&mut client, rpc_url);
         advance_to_mass_reconciliation(&mut client);
         let store = TestTransactionStore {
             restored: Vec::new(),
@@ -1759,7 +2250,7 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&store, &lease)
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
                 .await,
             Err(DeepXMassReconciliationError::SignerLeaseMismatch),
         ));
@@ -1775,6 +2266,8 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_rejects_unresolved_durable_transaction_without_advancing() {
         let mut client = test_client();
+        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        configure_rpc_url(&mut client, rpc_url);
         advance_to_mass_reconciliation(&mut client);
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
@@ -1804,13 +2297,158 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&store, &lease)
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::RecreateSigningInputs,
                 ..
             }),
         ));
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_finalizes_restored_in_block_transaction() {
+        let mut client = test_client();
+        let record = in_block_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities, canonical_requests) =
+            finality_evidence(72, &signed_bytes).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        client
+            .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+            .await
+            .unwrap();
+
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(canonical_requests.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::AccountStateNotRegistered { .. }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_keeps_pending_in_block_transaction_unresolved() {
+        let mut client = test_client();
+        let record = in_block_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities, canonical_requests) =
+            finality_evidence(71, &signed_bytes).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                ..
+            }),
+        ));
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(canonical_requests.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_commits_reorganized_in_block_transaction() {
+        let mut client = test_client();
+        let record = in_block_record(&client);
+        let inclusion = record.lifecycle().inclusion().unwrap();
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities, canonical_requests) =
+            finality_evidence_with_hash(72, [9; 32], &signed_bytes).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                ..
+            }),
+        ));
+
+        let persisted = store.persisted_record();
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(
+            persisted.lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+        assert_eq!(persisted.lifecycle().inclusion(), None);
+        assert_eq!(persisted.lifecycle().reverted_inclusion(), Some(inclusion));
+        assert_eq!(canonical_requests.load(Ordering::Relaxed), 4);
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_requires_action_for_not_included_pool_conflict() {
+        let mut client = test_client();
+        let record = not_included_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&signed_bytes).await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                action: DeepXTransactionRecoveryAction::OperatorActionRequired,
+                ..
+            }),
+        ));
+
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::ActionRequired,
+        );
         assert!(matches!(
             client.complete_account_registration(),
             Err(DeepXExecutionStartupError::OutOfOrder {

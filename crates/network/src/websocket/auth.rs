@@ -956,7 +956,10 @@ mod tests {
         tracker.cancel_pending("connection replaced");
 
         assert_eq!(tracker.auth_state(), AuthState::Unauthenticated);
-        assert_eq!(receiver.await.unwrap(), Err("connection replaced".to_string()));
+        assert_eq!(
+            receiver.await.unwrap(),
+            Err("connection replaced".to_string())
+        );
     }
 
     #[rstest]

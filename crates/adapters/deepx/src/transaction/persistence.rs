@@ -28,12 +28,12 @@ use subxt_core::dynamic::Value;
 use thiserror::Error;
 
 use super::{
-    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalizedRecoveryCollection,
-    DeepXNonceReservation, DeepXRecoveryDecision, DeepXReorganizationDecision,
-    DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionIdentity,
-    DeepXTransactionObservation, DeepXTransactionRecord, DeepXTransactionRecordError,
-    DeepXTransactionState, DeepXTransactionWatchError, collect_finalized_recovery_scan,
-    observe_reorganization,
+    DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalityObservation,
+    DeepXFinalizedRecoveryCollection, DeepXNonceReservation, DeepXRecoveryDecision,
+    DeepXReorganizationDecision, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
+    DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
+    DeepXTransactionRecordError, DeepXTransactionState, DeepXTransactionWatchError,
+    collect_finalized_recovery_scan, observe_finality, observe_reorganization,
 };
 use crate::{
     common::DeepXPrivateKey,
@@ -786,6 +786,23 @@ pub enum DeepXReorganizationCommitError {
     Commit(#[from] DeepXObservationCommitError),
 }
 
+/// Failure while observing and durably committing finality for an in-block record.
+#[derive(Debug, Error)]
+pub enum DeepXFinalityCommitError {
+    /// The durable record has no signed extrinsic hash to bind to the canonical lookup.
+    #[error("DeepX transaction finality observation requires durable signed bytes")]
+    MissingSignedExtrinsic,
+    /// The durable lifecycle has no current in-block inclusion eligible for finality observation.
+    #[error("DeepX transaction state {0:?} is not eligible for finality observation")]
+    IneligibleState(DeepXTransactionState),
+    /// Finalized-chain observation failed before any lifecycle mutation was attempted.
+    #[error(transparent)]
+    Watch(#[from] DeepXTransactionWatchError),
+    /// The finalized observation could not be committed durably.
+    #[error(transparent)]
+    Commit(#[from] DeepXObservationCommitError),
+}
+
 /// Failure while reconciling a durable not-included checkpoint against finalized evidence.
 #[derive(Debug, Error)]
 pub enum DeepXFinalizedRecoveryCommitError {
@@ -1006,6 +1023,68 @@ where
     )
 }
 
+/// Observes and durably commits finality for one acknowledged in-block transaction record.
+///
+/// A finalized head behind the recorded inclusion preserves the exact record and acknowledgement.
+/// This function does not submit, replay, replace, or emit order events.
+///
+/// # Errors
+///
+/// Returns an error before network access when the durable record lacks signed bytes or a current
+/// in-block inclusion. RPC conflicts and commit failures do not mutate the lifecycle.
+pub async fn observe_and_commit_finality<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+) -> Result<DeepXCommittedObservation, DeepXFinalityCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::InBlockSuccess | DeepXTransactionState::InBlockFailed
+    ) {
+        return Err(DeepXFinalityCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    let target_extrinsic_hash = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalityCommitError::MissingSignedExtrinsic)?
+        .extrinsic_hash();
+    let recorded_inclusion =
+        record
+            .lifecycle()
+            .inclusion()
+            .ok_or(DeepXFinalityCommitError::IneligibleState(
+                record.lifecycle().state(),
+            ))?;
+    let observation = observe_finality(
+        endpoints,
+        capabilities,
+        target_extrinsic_hash,
+        recorded_inclusion,
+    )
+    .await?;
+    let DeepXFinalityObservation::Finalized(inclusion) = observation else {
+        return Ok(DeepXCommittedObservation {
+            record: record.clone(),
+            committed: restored.committed().clone(),
+        });
+    };
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        restored.committed(),
+        record,
+        DeepXRecoveryDecision::FinalizedInclusion(inclusion),
+    )
+    .await?)
+}
+
 /// Reconciles one acknowledged not-included record from its exact finalized checkpoint.
 ///
 /// All authority-bearing inputs are derived from `restored`. An up-to-date checkpoint preserves
@@ -1172,6 +1251,99 @@ mod tests {
             .await
             .unwrap();
         (endpoints, capabilities, request_count)
+    }
+
+    #[derive(Clone, Debug)]
+    struct FinalityRpcState {
+        finalized_block: u64,
+        target_extrinsic: String,
+        canonical_requests: Arc<AtomicUsize>,
+    }
+
+    async fn finality_rpc(
+        State(state): State<FinalityRpcState>,
+        Json(request): Json<JsonValue>,
+    ) -> Json<JsonValue> {
+        let result = match request["method"].as_str().unwrap() {
+            "rpc_methods" => json!({
+                "methods": [
+                    "author_pendingExtrinsics",
+                    "author_submitExtrinsic",
+                    "chain_getBlock",
+                    "chain_getBlockHash",
+                    "chain_getFinalizedHead",
+                    "chain_getHeader",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
+                ],
+            }),
+            "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
+            "chain_getHeader" => json!({ "number": format!("0x{:x}", state.finalized_block) }),
+            "chain_getBlockHash" => {
+                state.canonical_requests.fetch_add(1, Ordering::Relaxed);
+                json!(format!("0x{}", "08".repeat(32)))
+            }
+            "chain_getBlock" => {
+                state.canonical_requests.fetch_add(1, Ordering::Relaxed);
+                json!({
+                    "block": {
+                        "header": { "number": "0x48" },
+                        "extrinsics": ["0x0400", state.target_extrinsic],
+                    },
+                })
+            }
+            method => panic!("unexpected method {method}"),
+        };
+        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+    }
+
+    async fn finality_endpoints(
+        finalized_block: u64,
+        target_extrinsic: &[u8],
+    ) -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let canonical_requests = Arc::new(AtomicUsize::new(0));
+        let state = FinalityRpcState {
+            finalized_block,
+            target_extrinsic: format!("0x{}", nautilus_core::hex::encode(target_extrinsic)),
+            canonical_requests: Arc::clone(&canonical_requests),
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(finality_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let config = DeepXNetworkConfig {
+            base_url_rpc: Some(url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            nautilus_core::hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x"))
+                .unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &config,
+            [
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Submission, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        (endpoints, capabilities, canonical_requests)
     }
 
     #[derive(Debug)]
@@ -1452,6 +1624,46 @@ mod tests {
         let absence = DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap();
         record
             .apply_observation(DeepXTransactionObservation::NotIncluded(absence))
+            .unwrap();
+        record
+    }
+
+    fn in_block_record() -> DeepXTransactionRecord {
+        let mut record = record();
+        let bytes = vec![12, 1, 2, 3];
+        let identity = record.identity();
+        let runtime = identity.runtime();
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            unreachable!();
+        };
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer: identity.signer(),
+                nonce,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: runtime.genesis_hash,
+                    metadata_sha256: runtime.metadata_sha256,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    signed_extensions: runtime.signed_extensions.clone(),
+                },
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Included(
+                DeepXInclusionEvidence {
+                    block_hash: [8; 32],
+                    block_number: 72,
+                    extrinsic_index: 1,
+                    outcome: DeepXInclusionOutcome::Success,
+                },
+            ))
             .unwrap();
         record
     }
@@ -2419,6 +2631,71 @@ mod tests {
             result.record().automatic_replay_decision(),
             DeepXAutomaticReplayDecision::ReconciliationRequired,
         );
+    }
+
+    #[tokio::test]
+    async fn record_bound_finality_is_observed_and_committed() {
+        let record = in_block_record();
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, canonical_requests) =
+            finality_endpoints(72, &signed_bytes).await;
+
+        let result =
+            observe_and_commit_finality(&endpoints, &capabilities, &store, &lease, &restored)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.record().lifecycle().state(),
+            DeepXTransactionState::Finalized,
+        );
+        assert_eq!(result.committed().revision().value(), 5);
+        assert!(result.committed().verify(result.record()).is_ok());
+        assert_eq!(store.current_revision(), 5);
+        assert_eq!(canonical_requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn record_bound_finality_pending_preserves_durable_revision() {
+        let record = in_block_record();
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, canonical_requests) =
+            finality_endpoints(71, &signed_bytes).await;
+
+        let result =
+            observe_and_commit_finality(&endpoints, &capabilities, &store, &lease, &restored)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.record().lifecycle().state(),
+            DeepXTransactionState::InBlockSuccess,
+        );
+        assert_eq!(result.committed().revision().value(), 4);
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(canonical_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

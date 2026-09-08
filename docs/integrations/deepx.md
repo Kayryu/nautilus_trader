@@ -158,12 +158,25 @@ implemented and covered by unit tests:
   `InstrumentProvider` built on it constructs `CryptoPerpetual` definitions from catalog metadata,
   and Spot construction remains fail-closed. Startup mass reconciliation advances only while
   holding the transaction store's current lease for the configured signing identity, after loading
-  its complete durable
-  record set and verifying that every acknowledged record is finalized with no remaining recovery,
-  submission decision, reconciliation, or operator action. An empty complete record set is valid;
-  signer mismatch, stale lease, acknowledgement mismatch, and any unresolved record fail without
-  advancing. This proves only durable transaction recovery readiness for that signer, not protocol-
-  level account or order reconciliation. Cache borrow contention fails with a typed error.
+  its complete durable record set. Restored in-block records are first reconciled against finalized
+  Watch evidence bound to the execution client's configured endpoint roles and advertised method
+  capabilities. A covered finalized checkpoint advances a record only when the canonical block
+  hash, extrinsic index, and exact signed-extrinsic hash all match, then persists that transition
+  with revision-checked compare-and-set. If that exact finality check instead finds conflicting
+  canonical evidence, startup runs the record-bound reorganization coordinator against the same
+  restored value. A changed canonical block hash durably removes the stale inclusion and returns the
+  record to reconciliation; missing or displaced evidence becomes operator action. Both remain
+  unresolved and block startup. A checkpoint below the recorded inclusion remains pending without
+  a durable write. Restored `not-included` records resume a bounded finalized scan from their exact
+  durable checkpoint. An unchanged checkpoint remains unresolved without a write, while later
+  submission-pool presence conflicts with the prior absence evidence and is durably committed as
+  operator action. Finding the exact extrinsic still fails closed because authoritative dispatch
+  and business-event evidence is not yet available. Startup advances only when every acknowledged
+  record is finalized with no remaining recovery, submission decision, reconciliation, or operator
+  action. An empty complete record set is valid; endpoint or capability mismatch, signer mismatch,
+  stale lease, acknowledgement mismatch, and any unresolved record fail without advancing. This
+  proves only durable transaction recovery readiness for that signer, not protocol-level account
+  or order reconciliation. Cache borrow contention fails with a typed error.
   Disconnect resets the
   complete gate and current event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
@@ -765,6 +778,19 @@ the signed hash, inclusion, record, and acknowledgement from one restored durabl
 commits the decision through the signer lease and revision-checked compare-and-set boundary.
 Ineligible or finalized records are rejected before network access. The coordinator performs no
 automatic replay, replacement, submission, or event emission.
+
+The finality observation boundary binds Watch capability evidence to the configured endpoint and
+reconciles only a restored `in-block-success` or `in-block-failed` record. It first reads the exact
+finalized checkpoint. A checkpoint below the recorded inclusion height preserves the existing
+record and durable revision without querying that canonical block. Once the checkpoint covers the
+height, the boundary requires the recorded block hash, extrinsic index, and durable extrinsic hash
+to match the canonical block exactly before a record-bound coordinator commits `finalized` through
+the signer lease and revision-checked compare-and-set boundary. Missing, displaced, or conflicting
+canonical evidence fails closed without inferring finality. This coordinator does not submit,
+replay, replace, or emit order events. During startup mass reconciliation, this exact conflict is
+passed to the reorganization coordinator. A proven changed canonical hash is committed durably and
+returns the record to `submitting`; missing or displaced evidence is committed as
+`action-required`. Neither outcome authorizes startup to advance.
 
 The lifecycle rejects transitions that skip durable signing, preserves the immutable extrinsic
 hash and exact block inclusion evidence, and treats repeated matching observations as idempotent.

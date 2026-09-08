@@ -57,6 +57,11 @@ pub enum DeepXTransactionWatchError {
     /// The finalized head did not have an available header.
     #[error("DeepX finalized head header was unavailable")]
     FinalizedHeaderUnavailable,
+    /// Finality reached the recorded height without preserving the exact recorded inclusion.
+    #[error(
+        "DeepX finalized chain does not preserve the recorded transaction inclusion at block {0}"
+    )]
+    FinalityEvidenceConflict(u64),
     /// The durable recovery checkpoint is no longer canonical at its recorded height.
     #[error(
         "DeepX recovery checkpoint at block {block_number} no longer matches the canonical hash"
@@ -139,6 +144,15 @@ pub struct DeepXCanonicalBlockObservation {
     block_number: u64,
     block_hash: [u8; 32],
     extrinsic_index: Option<u32>,
+}
+
+/// Finality observation for one exact recorded inclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXFinalityObservation {
+    /// The finalized head has not reached the recorded inclusion height.
+    Pending(DeepXFinalizedRecoveryCheckpoint),
+    /// The exact recorded inclusion remains canonical at a finalized height.
+    Finalized(DeepXInclusionEvidence),
 }
 
 impl DeepXCanonicalBlockObservation {
@@ -224,6 +238,57 @@ pub async fn observe_reorganization(
     ))
 }
 
+/// Observes whether an exact recorded inclusion has become final on the Watch endpoint.
+///
+/// Finality is released only when the finalized head reaches the recorded height and the same
+/// block hash still contains the target extrinsic at its recorded index. Conflicting canonical
+/// evidence is rejected for separate reorganization handling.
+///
+/// # Errors
+///
+/// Returns an error for mismatched Watch capabilities, RPC failure, malformed chain data, or
+/// canonical evidence which no longer preserves the exact recorded inclusion.
+pub async fn observe_finality(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    target_extrinsic_hash: [u8; 32],
+    recorded_inclusion: DeepXInclusionEvidence,
+) -> Result<DeepXFinalityObservation, DeepXTransactionWatchError> {
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != watch_url
+        || DEEPX_WATCH_RPC_METHODS
+            .iter()
+            .any(|method| !watch_capabilities.methods().contains(*method))
+    {
+        return Err(DeepXTransactionWatchError::CapabilitiesMismatch(
+            DeepXRpcRole::Watch,
+        ));
+    }
+
+    let checkpoint = observe_finalized_checkpoint_at(watch_url).await?;
+    if checkpoint.block_number() < recorded_inclusion.block_number() {
+        return Ok(DeepXFinalityObservation::Pending(checkpoint));
+    }
+
+    let observation = observe_canonical_block_at(
+        watch_url,
+        recorded_inclusion.block_number(),
+        target_extrinsic_hash,
+    )
+    .await?;
+    match classify_canonical_block_observation(recorded_inclusion, observation) {
+        DeepXReorganizationDecision::Canonical => {
+            Ok(DeepXFinalityObservation::Finalized(recorded_inclusion))
+        }
+        DeepXReorganizationDecision::Reorganized(_)
+        | DeepXReorganizationDecision::ActionRequired => Err(
+            DeepXTransactionWatchError::FinalityEvidenceConflict(recorded_inclusion.block_number()),
+        ),
+    }
+}
+
 /// Exact transaction-membership observation from the submission node pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeepXPoolObservation {
@@ -252,6 +317,42 @@ impl DeepXFinalizedRecoveryCheckpoint {
     pub const fn block_hash(&self) -> [u8; 32] {
         self.block_hash
     }
+}
+
+async fn observe_finalized_checkpoint_at(
+    endpoint_url: &str,
+) -> Result<DeepXFinalizedRecoveryCheckpoint, DeepXTransactionWatchError> {
+    let client = BlockchainHttpRpcClient::new(endpoint_url.to_string(), None, None);
+    let encoded_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getFinalizedHead",
+            "params": [],
+        }))
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getFinalizedHead",
+            source,
+        })?;
+    let block_hash = decode_hash(&encoded_hash)?;
+    let header: Option<RpcBlockHeader> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getHeader",
+            "params": [encoded_hash],
+        }))
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getHeader",
+            source,
+        })?;
+    let header = header.ok_or(DeepXTransactionWatchError::FinalizedHeaderUnavailable)?;
+    Ok(DeepXFinalizedRecoveryCheckpoint {
+        block_number: decode_block_number(&header.number)?,
+        block_hash,
+    })
 }
 
 /// Complete result of observing a bounded finalized recovery interval.

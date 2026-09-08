@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use nautilus_network::websocket::auth::AuthResultReceiver;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -25,7 +26,6 @@ use super::{
     DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt, DeepXWsError, DeepXWsFrame,
     DeepXWsProtocolCore, DeepXWsRequest,
 };
-use nautilus_network::websocket::auth::AuthResultReceiver;
 
 const DEEPX_WS_COMMAND_CAPACITY: usize = 1024;
 
