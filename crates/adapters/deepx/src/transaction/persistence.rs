@@ -30,9 +30,10 @@ use thiserror::Error;
 use super::{
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalityObservation,
     DeepXFinalizedRecoveryCollection, DeepXNonceReservation, DeepXRecoveryDecision,
-    DeepXReorganizationDecision, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
-    DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
-    DeepXTransactionRecordError, DeepXTransactionState, DeepXTransactionWatchError,
+    DeepXReorganizationDecision, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
+    DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
+    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
+    DeepXTransactionWatchError,
     collect_finalized_recovery_scan, observe_finality, observe_reorganization,
     observe_submission_pool,
 };
@@ -667,8 +668,8 @@ pub enum DeepXSubmissionPreparationError {
 /// Single-use signed bytes released only after the submitting state commits durably.
 #[derive(Debug)]
 pub struct DeepXSubmissionPermit {
-    bytes: Vec<u8>,
-    extrinsic_hash: [u8; 32],
+    pub(super) bytes: Vec<u8>,
+    pub(super) extrinsic_hash: [u8; 32],
 }
 
 impl DeepXSubmissionPermit {
@@ -753,6 +754,75 @@ where
         record: submitting,
         committed,
         permit,
+    })
+}
+
+/// Failure while durably committing verified initial-submission acceptance.
+#[derive(Debug, Error)]
+pub enum DeepXSubmissionAcceptanceCommitError {
+    /// Only a submitting transaction can consume initial-submission acceptance evidence.
+    #[error("DeepX transaction state {0:?} cannot commit initial-submission acceptance")]
+    InvalidState(DeepXTransactionState),
+    /// The durable record has no signed extrinsic hash to bind to the submission evidence.
+    #[error("DeepX initial-submission acceptance requires a durable signed extrinsic")]
+    MissingSignedExtrinsic,
+    /// Verified submission evidence identifies a different signed extrinsic.
+    #[error("DeepX initial-submission acceptance does not match the durable extrinsic hash")]
+    ExtrinsicHashMismatch,
+    /// Persistence or signer ownership could not be proven.
+    #[error(transparent)]
+    Persistence(#[from] DeepXTransactionPersistenceError),
+    /// The acceptance transition conflicted with the durable transaction record.
+    #[error(transparent)]
+    Record(#[from] DeepXTransactionRecordError),
+}
+
+/// Commits hash-verified initial-submission acceptance to the exact submitting record.
+///
+/// This function performs no submission, retry, classification, replay, or order-event emission.
+/// The verified node response and durable record must identify the same signed extrinsic before a
+/// revision-checked compare-and-set advances the lifecycle to `accepted`.
+///
+/// # Errors
+///
+/// Returns an error without an accepted record if the lease, prior acknowledgement, submitting
+/// state, signed hash binding, lifecycle transition, or compare-and-set outcome cannot be proven.
+pub async fn commit_initial_submission_acceptance<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_submitting: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    submitted: DeepXSubmittedExtrinsic,
+) -> Result<DeepXCommittedObservation, DeepXSubmissionAcceptanceCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_submitting.verify(record)?;
+    if record.lifecycle().state() != DeepXTransactionState::Submitting {
+        return Err(DeepXSubmissionAcceptanceCommitError::InvalidState(
+            record.lifecycle().state(),
+        ));
+    }
+    let durable_hash = record
+        .signed_extrinsic()
+        .map(DeepXDurableSignedExtrinsic::extrinsic_hash)
+        .ok_or(DeepXSubmissionAcceptanceCommitError::MissingSignedExtrinsic)?;
+    if submitted.extrinsic_hash() != durable_hash || submitted.node_hash() != durable_hash {
+        return Err(DeepXSubmissionAcceptanceCommitError::ExtrinsicHashMismatch);
+    }
+
+    let mut accepted = record.clone();
+    accepted.apply_observation(DeepXTransactionObservation::PoolAccepted)?;
+    let committed = store
+        .compare_and_set_committed(lease, committed_submitting, &accepted)
+        .await?;
+    committed.verify(&accepted)?;
+
+    Ok(DeepXCommittedObservation {
+        record: accepted,
+        committed,
     })
 }
 
@@ -1211,6 +1281,8 @@ where
 mod tests {
     use std::{
         cell::Cell,
+        future::ready,
+        num::NonZeroU32,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1239,7 +1311,8 @@ mod tests {
         transaction::{
             DeepXAbsenceEvidence, DeepXAutomaticReplayDecision, DeepXDirectRuntimeIdentity,
             DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation,
-            DeepXTransactionIdentity, DeepXTransactionObservation,
+            DeepXSubmissionPermit, DeepXTransactionIdentity, DeepXTransactionObservation,
+            submit_with_bounded_ambiguity_retry,
         },
     };
 
@@ -1938,6 +2011,20 @@ mod tests {
         }
     }
 
+    async fn submitted_for_bytes(bytes: Vec<u8>) -> DeepXSubmittedExtrinsic {
+        let extrinsic_hash = BlakeTwo256.hash(&bytes).0;
+        submit_with_bounded_ambiguity_retry(
+            DeepXSubmissionPermit {
+                bytes,
+                extrinsic_hash,
+            },
+            NonZeroU32::new(1).unwrap(),
+            move |_, _| ready(Ok(extrinsic_hash)),
+        )
+        .await
+        .unwrap()
+    }
+
     fn runtime() -> DeepXDirectRuntimeIdentity {
         DeepXDirectRuntimeIdentity {
             genesis_hash: [1; 32],
@@ -2550,6 +2637,133 @@ mod tests {
             Err(DeepXTransactionPersistenceError::RevisionConflict),
         );
         assert_eq!(store.current_revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn verified_initial_submission_acceptance_commits_exact_record() {
+        let record = submitting_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let submitted =
+            submitted_for_bytes(record.signed_extrinsic().unwrap().bytes().to_vec()).await;
+
+        let accepted = commit_initial_submission_acceptance(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            submitted,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            accepted.record().lifecycle().state(),
+            DeepXTransactionState::Accepted,
+        );
+        assert_eq!(accepted.committed().revision().value(), 4);
+        assert!(accepted.committed().verify(accepted.record()).is_ok());
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn mismatched_submission_acceptance_never_advances_record() {
+        let record = submitting_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let submitted = submitted_for_bytes(vec![9, 8, 7]).await;
+
+        assert!(matches!(
+            commit_initial_submission_acceptance(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                submitted,
+            )
+            .await,
+            Err(DeepXSubmissionAcceptanceCommitError::ExtrinsicHashMismatch),
+        ));
+        assert_eq!(store.current_revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn stale_acknowledgement_cannot_commit_submission_acceptance() {
+        let record = submitting_record();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let stale = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let submitted =
+            submitted_for_bytes(record.signed_extrinsic().unwrap().bytes().to_vec()).await;
+
+        assert!(matches!(
+            commit_initial_submission_acceptance(&store, &lease, &stale, &record, submitted).await,
+            Err(DeepXSubmissionAcceptanceCommitError::Persistence(
+                DeepXTransactionPersistenceError::RevisionConflict
+            )),
+        ));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_submission_acceptance_commit_requires_reconciliation() {
+        let record = submitting_record();
+        let store = TestStore {
+            revision: Mutex::new(3),
+            encoded_record: Mutex::new(record.encode().unwrap()),
+            active_generation: 4,
+            create_outcome_unknown: false,
+            commit_outcome_unknown: true,
+        };
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let submitted =
+            submitted_for_bytes(record.signed_extrinsic().unwrap().bytes().to_vec()).await;
+
+        assert!(matches!(
+            commit_initial_submission_acceptance(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                submitted,
+            )
+            .await,
+            Err(DeepXSubmissionAcceptanceCommitError::Persistence(
+                DeepXTransactionPersistenceError::CommitOutcomeUnknown(_)
+            )),
+        ));
+        assert_eq!(store.current_revision(), 4);
     }
 
     #[tokio::test]

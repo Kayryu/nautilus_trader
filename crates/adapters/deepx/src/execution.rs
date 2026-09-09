@@ -1377,9 +1377,12 @@ impl DeepXExecutionClient {
     /// # Errors
     ///
     /// Returns an error unless startup is waiting for mass reconciliation, the current store lease
-    /// belongs to the configured signing key, and every durable transaction is complete.
+    /// belongs to the configured signing key, the private-stream authentication is still current,
+    /// and every durable transaction is complete.
     pub async fn record_mass_reconciliation_completed<S>(
         &mut self,
+        protocol: &DeepXWsProtocolCore,
+        session: DeepXWsAuthenticatedSession,
         endpoints: &DeepXValidatedRpcEndpoints,
         capabilities: &DeepXValidatedRpcMethodCapabilities,
         store: &S,
@@ -1390,6 +1393,11 @@ impl DeepXExecutionClient {
     {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        if self.startup_authenticated_session != Some(session)
+            || !protocol.is_authenticated_session(session)
+        {
+            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch.into());
+        }
         if lease.signer() != derive_signer_account_id(&self.credential)? {
             return Err(DeepXMassReconciliationError::SignerLeaseMismatch);
         }
@@ -1462,11 +1470,21 @@ impl DeepXExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for account registration and the configured
-    /// account exists in the shared execution cache.
-    pub fn complete_account_registration(&mut self) -> Result<(), DeepXExecutionStartupError> {
+    /// Returns an error unless startup is waiting for account registration, the private-stream
+    /// authentication is still current, and the configured account exists in the shared execution
+    /// cache.
+    pub fn complete_account_registration(
+        &mut self,
+        protocol: &DeepXWsProtocolCore,
+        session: DeepXWsAuthenticatedSession,
+    ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::AccountRegistered)?;
+        if self.startup_authenticated_session != Some(session)
+            || !protocol.is_authenticated_session(session)
+        {
+            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+        }
         let event_id = self
             .startup_account_event_id
             .ok_or(DeepXExecutionStartupError::AccountStateVerificationRequired)?;
@@ -2930,7 +2948,13 @@ mod tests {
         );
     }
 
-    fn advance_through_mass_reconciliation(client: &mut DeepXExecutionClient) -> AccountState {
+    fn advance_through_mass_reconciliation(
+        client: &mut DeepXExecutionClient,
+    ) -> (
+        AccountState,
+        DeepXWsProtocolCore,
+        DeepXWsAuthenticatedSession,
+    ) {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
         client
@@ -2951,10 +2975,12 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)
             .unwrap();
-        state
+        (state, protocol, session)
     }
 
-    fn advance_to_mass_reconciliation(client: &mut DeepXExecutionClient) {
+    fn advance_to_mass_reconciliation(
+        client: &mut DeepXExecutionClient,
+    ) -> (DeepXWsProtocolCore, DeepXWsAuthenticatedSession) {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
         client
@@ -2970,6 +2996,7 @@ mod tests {
         client
             .record_account_state_initialized(&protocol, session, &test_account_state())
             .unwrap();
+        (protocol, session)
     }
 
     #[tokio::test]
@@ -2977,7 +3004,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = TestTransactionStore {
             restored: Vec::new(),
         };
@@ -2985,12 +3012,19 @@ mod tests {
         let lease = store.acquire_signer_lease(signer).await.unwrap();
 
         client
-            .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+            .record_mass_reconciliation_completed(
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
             .await
             .unwrap();
 
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered { .. }),
         ));
     }
@@ -3000,7 +3034,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = TestTransactionStore {
             restored: Vec::new(),
         };
@@ -3008,12 +3042,19 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::SignerLeaseMismatch),
         ));
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3026,7 +3067,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-FOREIGN-GENESIS"),
@@ -3055,7 +3096,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::RuntimeGenesisMismatch {
                 client_order_id,
@@ -3066,7 +3114,7 @@ mod tests {
                 && received_genesis_hash == [1; 32],
         ));
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3079,7 +3127,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let genesis_hash =
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
@@ -3110,7 +3158,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::RecreateSigningInputs,
@@ -3118,7 +3173,7 @@ mod tests {
             }),
         ));
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3133,7 +3188,7 @@ mod tests {
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3142,7 +3197,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
@@ -3163,7 +3225,7 @@ mod tests {
         let record = submitting_record(&client);
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&[8, 99, 98]]).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3172,7 +3234,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
@@ -3195,7 +3264,7 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence(72, &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3203,14 +3272,21 @@ mod tests {
             .unwrap();
 
         client
-            .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+            .record_mass_reconciliation_completed(
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
             .await
             .unwrap();
 
         assert_eq!(store.current_revision(), 5);
         assert_eq!(canonical_requests.load(Ordering::Relaxed), 2);
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered { .. }),
         ));
     }
@@ -3223,7 +3299,7 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence(71, &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3232,7 +3308,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
@@ -3242,7 +3325,7 @@ mod tests {
         assert_eq!(store.current_revision(), 4);
         assert_eq!(canonical_requests.load(Ordering::Relaxed), 0);
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3259,7 +3342,7 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence_with_hash(72, [9; 32], &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3268,7 +3351,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
@@ -3286,7 +3376,7 @@ mod tests {
         assert_eq!(persisted.lifecycle().reverted_inclusion(), Some(inclusion));
         assert_eq!(canonical_requests.load(Ordering::Relaxed), 4);
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3301,7 +3391,7 @@ mod tests {
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3310,7 +3400,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::OperatorActionRequired,
@@ -3324,7 +3421,7 @@ mod tests {
             DeepXTransactionState::ActionRequired,
         );
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -3338,7 +3435,7 @@ mod tests {
         let record = not_included_record(&client);
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
         configure_rpc_url(&mut client, rpc_url);
-        advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3347,7 +3444,14 @@ mod tests {
 
         assert!(matches!(
             client
-                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
                 .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::OperatorActionRequired,
@@ -3361,12 +3465,51 @@ mod tests {
             DeepXTransactionState::ActionRequired,
         );
         assert!(matches!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
             }),
         ));
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_rejects_stale_session_without_mutation() {
+        let mut client = test_client();
+        let record = submitting_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        let (mut protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(
+                    &protocol,
+                    session,
+                    &endpoints,
+                    &capabilities,
+                    &store,
+                    &lease,
+                )
+                .await,
+            Err(DeepXMassReconciliationError::Startup(
+                DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch,
+            )),
+        ));
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::Submitting,
+        );
+        assert_eq!(client.startup.completed_steps, 5);
+        assert!(!client.is_connected());
     }
 
     fn test_account_state() -> AccountState {
@@ -4691,10 +4834,10 @@ mod tests {
     #[rstest]
     fn account_registration_requires_configured_account_in_cache() {
         let mut client = test_client();
-        let state = advance_through_mass_reconciliation(&mut client);
+        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
 
         assert_eq!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered {
                 account_id: AccountId::from("DEEPX-001"),
                 event_id: state.event_id,
@@ -4706,10 +4849,12 @@ mod tests {
     #[rstest]
     fn account_registration_connects_after_cache_verification() {
         let (mut client, cache) = test_client_with_cache();
-        let state = advance_through_mass_reconciliation(&mut client);
+        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
         register_test_account(&cache, state);
 
-        client.complete_account_registration().unwrap();
+        client
+            .complete_account_registration(&protocol, session)
+            .unwrap();
 
         assert!(client.is_connected());
     }
@@ -4717,17 +4862,19 @@ mod tests {
     #[rstest]
     fn account_registration_reports_cache_borrow_conflict() {
         let (mut client, cache) = test_client_with_cache();
-        let state = advance_through_mass_reconciliation(&mut client);
+        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
         register_test_account(&cache, state);
         let borrowed = cache.borrow_mut();
 
         assert_eq!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::CacheBorrowConflict),
         );
         assert!(!client.is_connected());
         drop(borrowed);
-        client.complete_account_registration().unwrap();
+        client
+            .complete_account_registration(&protocol, session)
+            .unwrap();
         assert!(client.is_connected());
     }
 
@@ -4735,9 +4882,10 @@ mod tests {
     fn account_registration_checks_startup_order_before_cache() {
         let (mut client, cache) = test_client_with_cache();
         register_test_account(&cache, test_account_state());
+        let (protocol, session) = authenticated_protocol();
 
         assert_eq!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -4749,13 +4897,15 @@ mod tests {
     #[rstest]
     fn reconnect_requires_startup_replay_before_cached_account_registration() {
         let (mut client, cache) = test_client_with_cache();
-        let state = advance_through_mass_reconciliation(&mut client);
+        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
         register_test_account(&cache, state);
-        client.complete_account_registration().unwrap();
+        client
+            .complete_account_registration(&protocol, session)
+            .unwrap();
         client.reset_startup();
 
         assert_eq!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&protocol, session),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -4767,20 +4917,39 @@ mod tests {
     #[rstest]
     fn reconnect_rejects_account_state_from_previous_startup_epoch() {
         let (mut client, cache) = test_client_with_cache();
-        let initial_state = advance_through_mass_reconciliation(&mut client);
+        let (initial_state, initial_protocol, initial_session) =
+            advance_through_mass_reconciliation(&mut client);
         register_test_account(&cache, initial_state);
-        client.complete_account_registration().unwrap();
+        client
+            .complete_account_registration(&initial_protocol, initial_session)
+            .unwrap();
         client.reset_startup();
-        let current_state = advance_through_mass_reconciliation(&mut client);
+        let (current_state, current_protocol, current_session) =
+            advance_through_mass_reconciliation(&mut client);
 
         assert_eq!(
-            client.complete_account_registration(),
+            client.complete_account_registration(&current_protocol, current_session),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered {
                 account_id: AccountId::from("DEEPX-001"),
                 event_id: current_state.event_id,
             }),
         );
         assert!(!client.is_connected());
+    }
+
+    #[rstest]
+    fn account_registration_rejects_session_invalidated_after_account_state() {
+        let (mut client, cache) = test_client_with_cache();
+        let (state, mut protocol, session) = advance_through_mass_reconciliation(&mut client);
+        register_test_account(&cache, state);
+        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+
+        assert_eq!(
+            client.complete_account_registration(&protocol, session),
+            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+        );
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 6);
     }
 
     #[rstest]

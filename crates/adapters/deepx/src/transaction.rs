@@ -28,13 +28,15 @@ pub use persistence::{
     DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
     DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReorganizationCommitError,
     DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionPermit,
-    DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
-    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier, commit_reconciliation_observation,
-    commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
-    observe_and_commit_finality, observe_and_commit_reorganization, prepare_initial_submission,
-    prepare_signed_transaction, prepare_timestamp_reservation, reconcile_not_included_checkpoint,
-    reconcile_submission_pool, restore_timestamp_nonce_allocator, verify_signer_lease,
+    DeepXSignedTransactionPreparationError, DeepXSignerLease,
+    DeepXSubmissionAcceptanceCommitError, DeepXSubmissionPermit, DeepXSubmissionPreparationError,
+    DeepXTransactionPersistenceError, DeepXTransactionRevision, DeepXTransactionStore,
+    DeepXUnsupportedBusinessCallVerifier, commit_initial_submission_acceptance,
+    commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
+    load_verified_committed_for_signer, observe_and_commit_finality,
+    observe_and_commit_reorganization, prepare_initial_submission, prepare_signed_transaction,
+    prepare_timestamp_reservation, reconcile_not_included_checkpoint, reconcile_submission_pool,
+    restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -51,7 +53,8 @@ pub use reservation::{
 };
 use serde::{Deserialize, Serialize};
 pub use submission::{
-    DeepXSubmissionError, DeepXSubmittedExtrinsic, submit_extrinsic_once, verify_submission_hash,
+    DeepXSubmissionError, DeepXSubmissionRetryError, DeepXSubmittedExtrinsic,
+    submit_extrinsic_once, submit_with_bounded_ambiguity_retry, verify_submission_hash,
 };
 use thiserror::Error;
 pub use watch::{

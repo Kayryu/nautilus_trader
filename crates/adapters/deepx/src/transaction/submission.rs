@@ -14,12 +14,15 @@
 
 //! Hash-verified DeepX transaction submission boundary.
 
+use std::{future::Future, num::NonZeroU32};
+
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
 use serde_json::json;
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 use thiserror::Error;
 
+use super::{DeepXSubmissionFailure, DeepXSubmissionPermit};
 use crate::signing::SignedPalletExtrinsic;
 
 /// JSON-RPC method used to submit a signed DeepX extrinsic exactly once.
@@ -58,6 +61,38 @@ pub enum DeepXSubmissionError {
         /// Blake2-256 hash recomputed from the submitted extrinsic bytes.
         recomputed_hash: [u8; 32],
     },
+}
+
+/// Terminal result of a bounded initial-submission attempt sequence.
+#[derive(Debug, Error)]
+pub enum DeepXSubmissionRetryError {
+    /// Local evidence proved that the terminal attempt never started transmission.
+    #[error("DeepX submission was not sent after {attempts} attempt(s): {reason}")]
+    NotSent {
+        /// Number of attempts made, including the terminal attempt.
+        attempts: u32,
+        /// Local delivery evidence.
+        reason: String,
+    },
+    /// The submission node authoritatively rejected the signed extrinsic.
+    #[error("DeepX submission was rejected after {attempts} attempt(s): {reason}")]
+    VenueRejected {
+        /// Number of attempts made, including the terminal attempt.
+        attempts: u32,
+        /// Authoritative rejection evidence.
+        reason: String,
+    },
+    /// Every permitted attempt ended without authoritative delivery evidence.
+    #[error("DeepX submission remained ambiguous after {attempts} attempt(s): {reason}")]
+    AmbiguousExhausted {
+        /// Number of attempts made.
+        attempts: u32,
+        /// Most recent ambiguity evidence.
+        reason: String,
+    },
+    /// Accepted response evidence did not identify the exact permitted payload.
+    #[error(transparent)]
+    Hash(#[from] DeepXSubmissionError),
 }
 
 /// Renders a 32-byte hash as a fixed-width hex string for error messages.
@@ -116,6 +151,66 @@ impl DeepXSubmittedExtrinsic {
     }
 }
 
+/// Consumes one durable submission permit and retries only explicitly ambiguous outcomes.
+///
+/// Every attempt receives a fresh copy of the exact bytes and hash released by the same permit.
+/// `NotSent` and `VenueRejected` stop immediately; only `Ambiguous` consumes the remaining bounded
+/// attempt budget. A successful attempt is accepted only when its node hash matches the permitted
+/// bytes. This coordinator does not classify transport or JSON-RPC errors and applies no lifecycle
+/// mutation; callers must supply protocol-proven delivery evidence and commit the result.
+///
+/// # Errors
+///
+/// Returns a terminal delivery classification when submission cannot continue, or a hash error
+/// when accepted response evidence does not match the exact permitted payload.
+pub async fn submit_with_bounded_ambiguity_retry<F, Fut>(
+    permit: DeepXSubmissionPermit,
+    max_attempts: NonZeroU32,
+    mut submit: F,
+) -> Result<DeepXSubmittedExtrinsic, DeepXSubmissionRetryError>
+where
+    F: FnMut(Vec<u8>, [u8; 32]) -> Fut,
+    Fut: Future<Output = Result<[u8; 32], DeepXSubmissionFailure>>,
+{
+    let (bytes, extrinsic_hash) = permit.into_payload();
+    verify_submission_hash(&bytes, extrinsic_hash, extrinsic_hash)?;
+
+    for attempt in 1..=max_attempts.get() {
+        match submit(bytes.clone(), extrinsic_hash).await {
+            Ok(node_hash) => {
+                verify_submission_hash(&bytes, extrinsic_hash, node_hash)?;
+                return Ok(DeepXSubmittedExtrinsic {
+                    node_hash,
+                    extrinsic_hash,
+                });
+            }
+            Err(DeepXSubmissionFailure::NotSent(reason)) => {
+                return Err(DeepXSubmissionRetryError::NotSent {
+                    attempts: attempt,
+                    reason,
+                });
+            }
+            Err(DeepXSubmissionFailure::VenueRejected(reason)) => {
+                return Err(DeepXSubmissionRetryError::VenueRejected {
+                    attempts: attempt,
+                    reason,
+                });
+            }
+            Err(DeepXSubmissionFailure::Ambiguous(reason))
+                if attempt == max_attempts.get() =>
+            {
+                return Err(DeepXSubmissionRetryError::AmbiguousExhausted {
+                    attempts: attempt,
+                    reason,
+                });
+            }
+            Err(DeepXSubmissionFailure::Ambiguous(_)) => {}
+        }
+    }
+
+    unreachable!("NonZeroU32 guarantees at least one submission attempt")
+}
+
 /// Submits one signed extrinsic and verifies the node's hash before returning evidence.
 ///
 /// The call is attempted exactly once with no retry. A successful return proves only that the
@@ -170,7 +265,11 @@ fn decode_node_hash(encoded: &str) -> Result<[u8; 32], DeepXSubmissionError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        future::ready,
+        sync::{Arc, Mutex},
+    };
 
     use axum::{Json, Router, routing::post};
     use rstest::rstest;
@@ -258,6 +357,142 @@ mod tests {
             "id": 1,
             "result": format!("0x{}", hex::encode(extrinsic.extrinsic_hash())),
         })
+    }
+
+    fn submission_permit(extrinsic: &SignedPalletExtrinsic) -> DeepXSubmissionPermit {
+        DeepXSubmissionPermit {
+            bytes: extrinsic.bytes().to_vec(),
+            extrinsic_hash: extrinsic.extrinsic_hash(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_reuses_exact_permitted_payload_after_ambiguity() {
+        let extrinsic = signed_remark().unwrap();
+        let expected_bytes = extrinsic.bytes().to_vec();
+        let expected_hash = extrinsic.extrinsic_hash();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&attempts);
+        let mut outcomes = VecDeque::from([
+            Err(DeepXSubmissionFailure::ambiguous("response lost")),
+            Ok(expected_hash),
+        ]);
+
+        let submitted = submit_with_bounded_ambiguity_retry(
+            submission_permit(&extrinsic),
+            NonZeroU32::new(3).unwrap(),
+            move |bytes, hash| {
+                captured.lock().unwrap().push((bytes, hash));
+                ready(outcomes.pop_front().unwrap())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(submitted.extrinsic_hash(), expected_hash);
+        assert_eq!(attempts.lock().unwrap().as_slice(), [
+            (expected_bytes.clone(), expected_hash),
+            (expected_bytes, expected_hash),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_stops_on_authoritative_rejection() {
+        let extrinsic = signed_remark().unwrap();
+        let mut outcomes = VecDeque::from([
+            Err(DeepXSubmissionFailure::ambiguous("response lost")),
+            Err(DeepXSubmissionFailure::venue_rejected("invalid transaction")),
+            Ok(extrinsic.extrinsic_hash()),
+        ]);
+
+        let error = submit_with_bounded_ambiguity_retry(
+            submission_permit(&extrinsic),
+            NonZeroU32::new(3).unwrap(),
+            move |_, _| ready(outcomes.pop_front().unwrap()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXSubmissionRetryError::VenueRejected { attempts: 2, reason }
+                if reason == "invalid transaction"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_stops_when_transmission_provably_did_not_start() {
+        let extrinsic = signed_remark().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let captured = Arc::clone(&attempts);
+
+        let error = submit_with_bounded_ambiguity_retry(
+            submission_permit(&extrinsic),
+            NonZeroU32::new(3).unwrap(),
+            move |_, _| {
+                *captured.lock().unwrap() += 1;
+                ready(Err(DeepXSubmissionFailure::not_sent("send canceled")))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        assert!(matches!(
+            error,
+            DeepXSubmissionRetryError::NotSent { attempts: 1, reason }
+                if reason == "send canceled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_preserves_ambiguity_when_budget_is_exhausted() {
+        let extrinsic = signed_remark().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let captured = Arc::clone(&attempts);
+
+        let error = submit_with_bounded_ambiguity_retry(
+            submission_permit(&extrinsic),
+            NonZeroU32::new(2).unwrap(),
+            move |_, _| {
+                *captured.lock().unwrap() += 1;
+                ready(Err(DeepXSubmissionFailure::ambiguous("still unknown")))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(*attempts.lock().unwrap(), 2);
+        assert!(matches!(
+            error,
+            DeepXSubmissionRetryError::AmbiguousExhausted { attempts: 2, reason }
+                if reason == "still unknown"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_rejects_mismatched_success_hash_without_retry() {
+        let extrinsic = signed_remark().unwrap();
+        let attempts = Arc::new(Mutex::new(0_u32));
+        let captured = Arc::clone(&attempts);
+        let wrong_hash = BlakeTwo256.hash(b"different accepted extrinsic").0;
+
+        let error = submit_with_bounded_ambiguity_retry(
+            submission_permit(&extrinsic),
+            NonZeroU32::new(3).unwrap(),
+            move |_, _| {
+                *captured.lock().unwrap() += 1;
+                ready(Ok(wrong_hash))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(*attempts.lock().unwrap(), 1);
+        assert!(matches!(
+            error,
+            DeepXSubmissionRetryError::Hash(DeepXSubmissionError::HashMismatch { .. })
+        ));
     }
 
     #[tokio::test]

@@ -142,16 +142,18 @@ implemented and covered by unit tests:
   idempotent lifecycle methods are wired. Unsupported order, query, and report methods return
   explicit errors rather than the trait's successful no-op defaults, and bulk position reports do
   not claim complete coverage. `connect` does not perform network startup and succeeds only after
-  the existing ordered startup gate has already completed. The gate remains disconnected until instrument preload,
-  caller-supplied context restoration, runtime validation, private-stream authentication, account-state
-  initialization, startup mass reconciliation, and account registration all have authoritative
-  evidence. Account-state initialization records the exact event identity for the current startup
-  epoch. The final step verifies that event is present in the matching account ID and account type
-  in the shared execution cache. Raw startup evidence advancement is crate-private. Private-stream
-  authentication advances only with an authenticated-session receipt which is still current for
-  its protocol owner and connection epoch; account state, order-context restoration, and account
-  registration additionally require their dedicated verification boundaries. Instrument preload
-  only advances through a `DeepXMarketProvider` which
+  the existing ordered startup gate has already completed. The gate remains disconnected until
+  instrument preload, caller-supplied context restoration, runtime validation, private-stream
+  authentication, account-state initialization, startup mass reconciliation, and account
+  registration all have authoritative evidence. Account-state initialization records the exact
+  event identity for the current startup epoch. The final step verifies that event is present in
+  the matching account ID and account type in the shared execution cache and revalidates the exact
+  authenticated-session receipt before marking the client connected. Raw startup evidence
+  advancement is crate-private. Private-stream authentication advances only with an
+  authenticated-session receipt which is still current for its protocol owner and connection
+  epoch; account state, order-context restoration, and account registration additionally require
+  their dedicated verification boundaries. Instrument preload only advances through a
+  `DeepXMarketProvider` which
   completed its failure-atomic Spot and perpetual catalog load and contains at least one market. An
   uninitialized provider and a successful but empty catalog return distinct typed startup errors
   without advancing. The provider primary REST endpoint must also match the execution client's
@@ -168,10 +170,13 @@ implemented and covered by unit tests:
   This public metadata catalog is not itself a trading-precision source: the perpetual-only
   `InstrumentProvider` built on it constructs `CryptoPerpetual` definitions from catalog metadata,
   and Spot construction remains fail-closed. Startup mass reconciliation advances only while
-  holding the transaction store's current lease for the configured signing identity, after loading
-  its complete durable record set. Before any recovery RPC, every durable record's signing-time
-  genesis hash must match the chain identity observed from all validated endpoint roles; a foreign
-  chain record fails startup without mutation. Restored in-block records are first reconciled
+  holding the transaction store's current lease for the configured signing identity and the exact
+  authenticated-session receipt recorded for this startup epoch. Reconciliation rejects a stale
+  receipt before loading or mutating durable state, and holds the protocol authentication epoch
+  stable for the complete asynchronous operation. After loading the complete durable record set,
+  every durable record's signing-time genesis hash must match the chain identity observed from all
+  validated endpoint roles before any recovery RPC; a foreign chain record fails startup without
+  mutation. Restored in-block records are first reconciled
   against finalized Watch evidence bound to the execution client's configured endpoint roles and
   advertised method capabilities. A covered finalized checkpoint advances a record only when the canonical block
   hash, extrinsic index, and exact signed-extrinsic hash all match, then persists that transition
@@ -194,7 +199,7 @@ implemented and covered by unit tests:
   transaction recovery readiness for that signer, not protocol-level account or order
   reconciliation. Cache borrow contention fails with a typed error.
   Disconnect resets the
-  complete gate and current event identity.
+  complete gate, current authentication receipt, and event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
   permits idempotent restoration, rejects non-DeepX instrument venues, fails closed on conflicting
   client-order identities, and classifies unknown updates as external. A caller-supplied complete
@@ -258,8 +263,13 @@ recorded signed extrinsic and therefore the same transaction hash, be bounded, a
 authoritative rejection or exhausted ambiguity budget. It must not allocate a new timestamp nonce,
 create another order identity, rebuild or re-sign the call, or emit a rejection merely because the
 retry budget was exhausted. Remaining ambiguity is retained for startup reconciliation or operator
-resolution. This retry policy still requires implementation and tests before it can be wired into
-an execution command path.
+resolution. A bounded coordinator now consumes the single durable submission permit and can retry
+only caller-classified ambiguous attempts. Every attempt receives the exact same signed bytes and
+hash; `not-sent`, authoritative rejection, hash mismatch, and budget exhaustion stop immediately.
+A dedicated persistence boundary can bind verified acceptance to the exact `submitting` record and
+commit `accepted` with revision-checked compare-and-set. No protocol-proven transport classifier,
+retry delay policy, or execution-command wiring exists, so these foundations do not make submission
+operational.
 
 The next protocol milestone is the next minimal fixture-backed Phase E execution slice: decode an
 authenticated private message from the transport-proven envelope, initialize account state, and
@@ -371,10 +381,12 @@ integration.
   account and venue, but it does not verify database restoration, cache provenance, or venue-side
   completeness. Account-state initialization revalidates the authenticated session immediately
   before event dispatch, so a reconnect invalidates the prior receipt without advancing startup.
-  Its final startup boundary verifies that the
-  exact account-state event recorded for the current startup epoch is present in the matching
-  cached account history. This rejects stale account entries from a previous startup epoch, but it
-  does not prove the protocol-dependent semantic completeness of that account state.
+  Startup mass reconciliation holds that exact authentication epoch across durable recovery and
+  rejects a stale receipt before loading or mutating transaction state. Its final startup boundary
+  revalidates the receipt and verifies that the exact account-state event recorded for the current
+  startup epoch is present in the matching cached account history. This rejects stale account
+  entries from a previous startup epoch, but it does not prove the protocol-dependent semantic
+  completeness of that account state.
   Bounded trade-ID replay state supports reserve, commit, and failure release for an already
   validated venue `TradeId`; committed IDs survive reconnect startup resets until FIFO eviction.
   The WebSocket single-owner path can now preserve an uncorrelated JSON frame in an authenticated
@@ -934,6 +946,16 @@ unknown response forms remain ambiguous unless later authoritative evidence reso
 classification does not itself mutate transaction state, release a nonce, replay bytes, or emit an
 order rejection. No existing generic HTTP or WebSocket error is currently mapped to these classes
 because a DeepX transaction-submission response schema has not yet been proven.
+A bounded retry coordinator can consume the permit released after the durable `submitting` commit.
+It retries only outcomes already classified as `ambiguous`, passes an identical copy of the
+permitted signed bytes and hash to each attempt, and validates successful node-hash evidence
+against that payload. `not-sent` and `venue-rejected` stop on their first occurrence; exhausted
+ambiguity remains ambiguous. The coordinator itself performs no classification, delay, lifecycle
+commit, nonce allocation, signing, replacement, order-event emission, or execution-client
+submission. A separate acceptance boundary verifies that successful node evidence identifies the
+durable signed hash before atomically advancing the exact acknowledged `submitting` record to
+`accepted`. A lost commit acknowledgement remains `commit-outcome-unknown` and requires durable
+reconciliation; it never grants retry authority.
 
 Network configuration assigns explicit JSON-RPC roles for transaction submission, head and
 inclusion watching, and bounded recovery scans. Each role can use an independent endpoint and
