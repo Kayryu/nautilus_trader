@@ -50,6 +50,7 @@ pub fn should_retry_http_error(error: &DeepXHttpError) -> bool {
         | DeepXHttpError::InvalidPaginationLimit
         | DeepXHttpError::PaginationLimitExceeded { .. }
         | DeepXHttpError::PaginationNoProgress { .. }
+        | DeepXHttpError::MissingPaginationCursor { .. }
         | DeepXHttpError::RepeatedPaginationCursor { .. }
         | DeepXHttpError::RetryControl(_) => false,
     }

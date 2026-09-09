@@ -911,6 +911,7 @@ pub struct DeepXExecutionClient {
     order_contexts: DeepXOrderContextRegistry,
     trade_dedup: DeepXTradeDedup<TRADE_DEDUP_CAPACITY>,
     startup: DeepXExecutionStartup,
+    startup_authenticated_session: Option<DeepXWsAuthenticatedSession>,
     startup_account_event_id: Option<UUID4>,
 }
 
@@ -982,6 +983,7 @@ impl DeepXExecutionClient {
             order_contexts: DeepXOrderContextRegistry::default(),
             trade_dedup: DeepXTradeDedup::default(),
             startup: DeepXExecutionStartup::default(),
+            startup_authenticated_session: None,
             startup_account_event_id: None,
         })
     }
@@ -1240,6 +1242,7 @@ impl DeepXExecutionClient {
         }
         self.startup
             .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)?;
+        self.startup_authenticated_session = Some(session);
         Ok(())
     }
 
@@ -1332,14 +1335,22 @@ impl DeepXExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for account-state initialization and the event
-    /// matches the configured execution account identity and type, or event dispatch fails.
+    /// Returns an error unless startup is waiting for account-state initialization, the private
+    /// stream authentication is still current, and the event matches the configured execution
+    /// account identity and type, or event dispatch fails.
     pub fn record_account_state_initialized(
         &mut self,
+        protocol: &DeepXWsProtocolCore,
+        session: DeepXWsAuthenticatedSession,
         state: &AccountState,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
+        if self.startup_authenticated_session != Some(session)
+            || !protocol.is_authenticated_session(session)
+        {
+            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+        }
         if state.account_id != self.core.account_id || state.account_type != self.core.account_type
         {
             return Err(DeepXExecutionStartupError::AccountStateIdentityMismatch {
@@ -1488,6 +1499,7 @@ impl DeepXExecutionClient {
     pub fn reset_startup(&mut self) {
         self.core.set_disconnected();
         self.startup.reset();
+        self.startup_authenticated_session = None;
         self.startup_account_event_id = None;
     }
 
@@ -2921,16 +2933,20 @@ mod tests {
     fn advance_through_mass_reconciliation(client: &mut DeepXExecutionClient) -> AccountState {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
-        for evidence in [
-            DeepXExecutionStartupEvidence::RuntimeValidated,
-            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
-        ] {
-            client.startup.record(evidence).unwrap();
-        }
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
         let state = test_account_state();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
-        client.record_account_state_initialized(&state).unwrap();
+        client
+            .record_account_state_initialized(&protocol, session, &state)
+            .unwrap();
         client
             .startup
             .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)
@@ -2945,14 +2961,14 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
+        let (protocol, session) = authenticated_protocol();
         client
-            .startup
-            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+            .record_private_stream_authenticated(&protocol, session)
             .unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
         client
-            .record_account_state_initialized(&test_account_state())
+            .record_account_state_initialized(&protocol, session, &test_account_state())
             .unwrap();
     }
 
@@ -3365,6 +3381,14 @@ mod tests {
             UnixNanos::default(),
             None,
         )
+    }
+
+    fn authenticated_protocol() -> (DeepXWsProtocolCore, DeepXWsAuthenticatedSession) {
+        let mut protocol = DeepXWsProtocolCore::new('/');
+        let (attempt, _) = protocol.begin_authentication().unwrap();
+        assert!(protocol.complete_authentication(attempt));
+        let session = protocol.authenticated_session().unwrap();
+        (protocol, session)
     }
 
     fn register_test_account(cache: &Rc<RefCell<Cache>>, state: AccountState) {
@@ -4481,17 +4505,19 @@ mod tests {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
-        for evidence in [
-            DeepXExecutionStartupEvidence::RuntimeValidated,
-            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
-        ] {
-            client.startup.record(evidence).unwrap();
-        }
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
         let mut state = test_account_state();
         state.account_type = AccountType::Cash;
 
         assert_eq!(
-            client.record_account_state_initialized(&state),
+            client.record_account_state_initialized(&protocol, session, &state),
             Err(DeepXExecutionStartupError::AccountStateIdentityMismatch {
                 expected_account_id: AccountId::from("DEEPX-001"),
                 expected_account_type: AccountType::Margin,
@@ -4515,17 +4541,21 @@ mod tests {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
-        for evidence in [
-            DeepXExecutionStartupEvidence::RuntimeValidated,
-            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
-        ] {
-            client.startup.record(evidence).unwrap();
-        }
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
-        client.record_account_state_initialized(&state).unwrap();
+        client
+            .record_account_state_initialized(&protocol, session, &state)
+            .unwrap();
 
         let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
             panic!("expected account state event");
@@ -4540,18 +4570,20 @@ mod tests {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
-        for evidence in [
-            DeepXExecutionStartupEvidence::RuntimeValidated,
-            DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
-        ] {
-            client.startup.record(evidence).unwrap();
-        }
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
         let state = test_account_state();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
         client.emitter.set_sender(sender);
 
-        let result = client.record_account_state_initialized(&state);
+        let result = client.record_account_state_initialized(&protocol, session, &state);
 
         assert!(matches!(
             result,
@@ -4565,6 +4597,95 @@ mod tests {
                 .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized),
             Ok(()),
         );
+    }
+
+    #[rstest]
+    fn account_state_initialization_rejects_stale_authenticated_session_without_dispatch() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (mut protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
+        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+        let state = test_account_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+
+        assert_eq!(
+            client.record_account_state_initialized(&protocol, session, &state),
+            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(client.startup_account_event_id, None);
+        assert_eq!(client.startup.completed_steps, 4);
+    }
+
+    #[rstest]
+    fn account_state_initialization_rejects_session_from_another_protocol_owner() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
+        let (other_protocol, other_session) = authenticated_protocol();
+        let state = test_account_state();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+
+        assert_eq!(
+            client.record_account_state_initialized(&other_protocol, other_session, &state),
+            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(client.startup_account_event_id, None);
+        assert_eq!(client.startup.completed_steps, 4);
+    }
+
+    #[rstest]
+    fn reset_clears_authenticated_session_receipt() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let (protocol, session) = authenticated_protocol();
+        client
+            .record_private_stream_authenticated(&protocol, session)
+            .unwrap();
+
+        client.reset_startup();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+            .unwrap();
+        let state = test_account_state();
+
+        assert_eq!(
+            client.record_account_state_initialized(&protocol, session, &state),
+            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+        );
+        assert_eq!(client.startup_account_event_id, None);
+        assert_eq!(client.startup.completed_steps, 4);
     }
 
     #[rstest]

@@ -33,6 +33,7 @@ use super::{
         DeepXPerpCandlesPage, DeepXPerpLastPrice, DeepXPerpMarket, DeepXPerpTradesPage,
         DeepXPerpVolume, DeepXSpotMarket,
     },
+    pagination::validate_cursor_page,
     query::{
         DeepXFundingRateRequest, DeepXLongShortRatioRequest, DeepXOpenInterestRequest,
         DeepXPerpCandlesRequest, DeepXPerpLastPriceRequest, DeepXPerpMarkPriceRequest,
@@ -209,7 +210,13 @@ impl DeepXHttpClient {
         let response: DeepXApiResponse<DeepXFundingRatePage> = self
             .get_json_with_query(PERP_FUNDING_RATE_PATH, &query)
             .await?;
-        into_api_data(response)
+        let page = into_api_data(response)?;
+        validate_cursor_page(
+            "perp funding-rate",
+            page.has_next,
+            page.next_cursor.as_deref(),
+        )?;
+        Ok(page)
     }
 
     /// Returns one ascending page of perpetual long-short ratio history.
@@ -227,7 +234,13 @@ impl DeepXHttpClient {
         let response: DeepXApiResponse<DeepXLongShortRatioPage> = self
             .get_json_with_query(PERP_LONG_SHORT_RATIO_PATH, &query)
             .await?;
-        into_api_data(response)
+        let page = into_api_data(response)?;
+        validate_cursor_page(
+            "perp long-short-ratio",
+            page.has_next,
+            page.next_cursor.as_deref(),
+        )?;
+        Ok(page)
     }
 
     /// Returns one ascending page of perpetual open-interest history.
@@ -262,7 +275,9 @@ impl DeepXHttpClient {
         let query = request.as_query();
         let response: DeepXApiResponse<DeepXPerpTradesPage> =
             self.get_json_with_query(PERP_TRADES_PATH, &query).await?;
-        into_api_data(response)
+        let page = into_api_data(response)?;
+        validate_cursor_page("perp trades", page.has_next, page.next_cursor.as_deref())?;
+        Ok(page)
     }
 
     /// Returns one ascending page of raw one-minute perpetual candles.
@@ -487,7 +502,12 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+    use axum::{
+        Json, Router,
+        extract::{Query, RawQuery},
+        http::StatusCode,
+        routing::get,
+    };
     use nautilus_network::retry::RetryConfig;
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -497,6 +517,9 @@ mod tests {
 
     use super::*;
     use crate::http::DeepXPerpVolumePeriod;
+
+    const PERP_VOLUME_1H_RESPONSE: &str =
+        include_str!("../../test_data/http/testnet/perp_volume_1h.json");
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct HealthResponse {
@@ -890,6 +913,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_long_short_ratio_continuation_without_cursor() {
+        let router = Router::new().route(
+            PERP_LONG_SHORT_RATIO_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "marketId": 3,
+                        "details": [],
+                        "nextCursor": "",
+                        "hasNext": true
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let request = DeepXLongShortRatioRequest {
+            market_id: 3,
+            start_ms: 1,
+            end_ms: Some(2),
+            limit: Some(3),
+            cursor: None,
+        };
+
+        let error = client
+            .get_perp_long_short_ratios(&request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::MissingPaginationCursor {
+                endpoint: "perp long-short-ratio"
+            }
+        ));
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(""))]
+    fn rejects_next_page_without_usable_cursor(#[case] next_cursor: Option<&str>) {
+        let error = validate_cursor_page("perp trades", true, next_cursor).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::MissingPaginationCursor {
+                endpoint: "perp trades"
+            }
+        ));
+    }
+
+    #[rstest]
+    #[case(false, None)]
+    #[case(false, Some("unused"))]
+    #[case(true, Some("next-page"))]
+    fn accepts_cursor_pages_that_can_terminate_or_continue(
+        #[case] has_next: bool,
+        #[case] next_cursor: Option<&str>,
+    ) {
+        validate_cursor_page("perp trades", has_next, next_cursor).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_funding_rate_continuation_without_cursor() {
+        let router = Router::new().route(
+            PERP_FUNDING_RATE_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "marketId": 3,
+                        "details": [],
+                        "nextCursor": null,
+                        "hasNext": true
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let request = DeepXFundingRateRequest {
+            market_id: 3,
+            start_ms: 1,
+            end_ms: Some(2),
+            limit: Some(3),
+            cursor: None,
+        };
+
+        let error = client.get_perp_funding_rates(&request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::MissingPaginationCursor {
+                endpoint: "perp funding-rate"
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn encodes_and_decodes_perp_trades_page_exactly() {
         let router = Router::new().route(
             PERP_TRADES_PATH,
@@ -969,6 +1096,41 @@ mod tests {
         assert!(
             matches!(error, DeepXHttpError::InvalidRequest(message) if message.contains("page_size"))
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_perp_trades_continuation_without_cursor() {
+        let router = Router::new().route(
+            PERP_TRADES_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "items": [],
+                        "nextCursor": null,
+                        "hasNext": true
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let request = DeepXPerpTradesRequest {
+            market_id: 3,
+            page_size: Some(3),
+            cursor: None,
+        };
+
+        let error = client.get_perp_trades(&request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::MissingPaginationCursor {
+                endpoint: "perp trades"
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1221,6 +1383,31 @@ mod tests {
         assert_eq!(volume.trade_count, 2_421);
         assert_eq!(volume.end_time - volume.start_time, 3_600_000);
         assert_eq!(volume.statistic_time, volume.end_time);
+    }
+
+    #[tokio::test]
+    async fn decodes_perp_volume_fixture_through_client() {
+        let router = Router::new().route(
+            PERP_VOLUME_PATH,
+            get(|RawQuery(raw_query): RawQuery| async move {
+                assert_eq!(raw_query.as_deref(), Some("marketId=3&period=1h"));
+                PERP_VOLUME_1H_RESPONSE
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let request = DeepXPerpVolumeRequest {
+            market_id: 3,
+            period: DeepXPerpVolumePeriod::OneHour,
+        };
+
+        let volume = client.get_perp_volume(&request).await.unwrap();
+
+        assert_eq!(volume.total_volume, Decimal::new(2_117_975, 3));
+        assert_eq!(volume.trade_count, 2_492);
+        assert_eq!(volume.start_time, 1_788_256_255_843);
+        assert_eq!(volume.end_time, 1_788_259_855_843);
+        assert_eq!(volume.statistic_time, 1_788_259_855_843);
     }
 
     #[tokio::test]

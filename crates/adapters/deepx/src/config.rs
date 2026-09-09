@@ -36,6 +36,14 @@ const DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS: u64 = 5_000;
 /// Bounded retry configuration for idempotent DeepX HTTP reads only.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXHttpReadRetryConfig {
     /// Maximum retries after the initial read attempt.
     pub max_retries: u32,
@@ -115,6 +123,14 @@ pub enum DeepXExecutionBackend {
 /// Configuration for a fail-closed DeepX data client.
 #[derive(Clone, Debug, Deserialize, Serialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXDataClientConfig {
     /// Testnet network, REST failover, and read-retry configuration.
     #[builder(default)]
@@ -156,6 +172,14 @@ impl DeepXDataClientConfig {
 /// Configuration for a fail-closed DeepX execution client.
 #[derive(Clone, Deserialize, Serialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXExecutionClientConfig {
     /// Account identifier for the execution client.
     #[builder(default = AccountId::from("DEEPX-001"))]
@@ -360,6 +384,14 @@ impl DeepXValidatedRpcEndpoints {
 /// Read-only DeepX network configuration.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXNetworkConfig {
     /// DeepX deployment environment.
     pub environment: DeepXEnvironment,

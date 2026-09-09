@@ -459,6 +459,90 @@ mod tests {
 
     const PERP_VOLUME_1H_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_volume_1h.json");
+    const PERP_VOLUME_1H_MANIFEST: &str =
+        include_str!("../../test_data/http/testnet/perp_volume_1h.manifest.json");
+    const RUNTIME_MANIFEST: &str = include_str!(
+        "../../test_data/runtime/testnet/genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json"
+    );
+
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+    struct FixtureIdentity {
+        genesis_hash: String,
+        metadata_sha256: String,
+        spec_version: u32,
+        transaction_version: u32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerpVolumeFixtureManifest {
+        deployment: String,
+        endpoint_role: String,
+        request: PerpVolumeFixtureRequest,
+        response: PerpVolumeFixtureResponse,
+        runtime_identity: PerpVolumeRuntimeIdentity,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerpVolumeFixtureRequest {
+        method: String,
+        path: String,
+        query: PerpVolumeFixtureQuery,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PerpVolumeFixtureQuery {
+        market_id: u32,
+        period: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerpVolumeFixtureResponse {
+        status: u16,
+        content_type: String,
+        payload_path: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerpVolumeRuntimeIdentity {
+        #[serde(flatten)]
+        identity: FixtureIdentity,
+        source_manifest: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimeFixtureManifest {
+        deployment: String,
+        endpoint_role: String,
+        identity: FixtureIdentity,
+    }
+
+    fn validate_perp_volume_fixture_manifest(
+        manifest: &PerpVolumeFixtureManifest,
+        runtime_manifest: &RuntimeFixtureManifest,
+    ) -> Result<(), String> {
+        if manifest.deployment != "testnet"
+            || manifest.endpoint_role != "public_rest_market_data"
+            || manifest.request.method != "GET"
+            || manifest.request.path != "/internal/v1/market/perp/volume"
+            || manifest.request.query.market_id != 3
+            || manifest.request.query.period != "1h"
+            || manifest.response.status != 200
+            || manifest.response.content_type != "application/json"
+            || manifest.response.payload_path != "perp_volume_1h.json"
+            || manifest.runtime_identity.source_manifest
+                != "../../runtime/testnet/genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json"
+            || runtime_manifest.deployment != "testnet"
+            || runtime_manifest.endpoint_role != "runtime_identity"
+        {
+            return Err("unexpected DeepX perpetual volume fixture provenance".to_string());
+        }
+        if manifest.runtime_identity.identity != runtime_manifest.identity {
+            return Err("DeepX perpetual volume fixture runtime identity mismatch".to_string());
+        }
+
+        Ok(())
+    }
 
     #[rstest]
     fn preserves_exact_json_number_lexeme() {
@@ -478,14 +562,33 @@ mod tests {
 
     #[rstest]
     fn decodes_sanitized_perp_volume_fixture() {
+        let manifest: PerpVolumeFixtureManifest =
+            serde_json::from_str(PERP_VOLUME_1H_MANIFEST).unwrap();
+        let runtime_manifest: RuntimeFixtureManifest =
+            serde_json::from_str(RUNTIME_MANIFEST).unwrap();
         let response: DeepXApiResponse<DeepXPerpVolume> =
             serde_json::from_str(PERP_VOLUME_1H_RESPONSE).unwrap();
 
+        validate_perp_volume_fixture_manifest(&manifest, &runtime_manifest).unwrap();
         assert_eq!(response.code, 200);
         assert!(!response.fail);
         assert_eq!(response.data.total_volume, Decimal::new(2_117_975, 3));
         assert_eq!(response.data.trade_count, 2_492);
         assert_eq!(response.data.end_time - response.data.start_time, 3_600_000);
         assert_eq!(response.data.statistic_time, response.data.end_time);
+    }
+
+    #[rstest]
+    fn rejects_perp_volume_fixture_runtime_identity_drift() {
+        let manifest: PerpVolumeFixtureManifest =
+            serde_json::from_str(PERP_VOLUME_1H_MANIFEST).unwrap();
+        let mut runtime_manifest: RuntimeFixtureManifest =
+            serde_json::from_str(RUNTIME_MANIFEST).unwrap();
+        runtime_manifest.identity.spec_version += 1;
+
+        assert_eq!(
+            validate_perp_volume_fixture_manifest(&manifest, &runtime_manifest),
+            Err("DeepX perpetual volume fixture runtime identity mismatch".to_string()),
+        );
     }
 }

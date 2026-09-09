@@ -54,6 +54,9 @@ pub enum DeepXHttpError {
     /// A response supplied a cursor without any records and therefore made no progress.
     #[error("DeepX HTTP pagination returned an empty page with cursor '{cursor}'")]
     PaginationNoProgress { cursor: String },
+    /// A response claimed another page without supplying a usable cursor.
+    #[error("DeepX HTTP {endpoint} pagination hasNext is true without a non-empty nextCursor")]
+    MissingPaginationCursor { endpoint: &'static str },
     /// A response repeated a cursor already observed by this paginator.
     #[error("DeepX HTTP pagination repeated cursor '{cursor}'")]
     RepeatedPaginationCursor { cursor: String },

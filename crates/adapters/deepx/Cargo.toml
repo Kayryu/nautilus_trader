@@ -20,6 +20,26 @@ workspace = true
 name = "nautilus_deepx"
 crate-type = ["rlib"]
 
+[features]
+extension-module = [
+	"nautilus-common/extension-module",
+	"nautilus-core/extension-module",
+	"nautilus-model/extension-module",
+	"nautilus-network/extension-module",
+	"pyo3/extension-module",
+	"python",
+]
+python = [
+	"dep:nautilus-system",
+	"nautilus-common/python",
+	"nautilus-core/python",
+	"nautilus-model/python",
+	"nautilus-network/python",
+	"nautilus-system/python",
+	"pyo3",
+	"pyo3-stub-gen",
+]
+
 [dependencies]
 nautilus-blockchain = { workspace = true }
 nautilus-common = { workspace = true }
@@ -27,6 +47,7 @@ nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
+nautilus-system = { workspace = true, optional = true }
 
 alloy = { workspace = true }
 anyhow = { workspace = true }
@@ -49,6 +70,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 zeroize = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-common = { workspace = true, features = ["live"] }

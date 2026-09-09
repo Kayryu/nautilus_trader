@@ -13,19 +13,41 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Verified DeepX testnet deployment constants.
+//! Python bindings for DeepX factory types.
 
-use std::sync::LazyLock;
+use pyo3::prelude::*;
 
-use nautilus_model::identifiers::{ClientId, Venue};
+use crate::{
+    common::consts::DEEPX,
+    factories::{DeepXDataClientFactory, DeepXExecutionClientFactory},
+};
 
-pub const DEEPX: &str = "DEEPX";
-pub static DEEPX_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(DEEPX));
-pub static DEEPX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(DEEPX));
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DeepXDataClientFactory {
+    /// Factory for creating fail-closed DeepX data clients.
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
 
-pub const DEEPX_TESTNET_REST_URL: &str = "https://rest-api-testnet.deepx.fi";
-pub const DEEPX_TESTNET_WS_URL: &str = "wss://ws-api-testnet.deepx.fi";
-pub const DEEPX_TESTNET_RPC_URL: &str = "https://rpc-testnet.deepx.fi";
-pub const DEEPX_TESTNET_CHAIN_ID: u32 = 4_846;
-pub const DEEPX_TESTNET_GENESIS_HASH: &str =
-    "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &str {
+        DEEPX
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DeepXExecutionClientFactory {
+    /// Factory for creating fail-closed DeepX execution clients.
+    #[new]
+    fn py_new() -> Self {
+        Self
+    }
+
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &str {
+        DEEPX
+    }
+}

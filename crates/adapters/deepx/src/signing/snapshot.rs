@@ -833,22 +833,174 @@ mod tests {
     use rstest::rstest;
     use scale_info::form::PortableForm;
     use serde::Deserialize;
+    use serde_json::Value;
 
     use super::*;
+
+    const FIXTURE_MANIFEST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json",
+    ));
+    const GENESIS_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/genesis_hash.json",
+    ));
+    const FINALIZED_HEAD_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/finalized_head.json",
+    ));
+    const RUNTIME_VERSION_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/runtime_version.json",
+    ));
+    const METADATA_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+    ));
 
     #[derive(Deserialize)]
     struct RpcResponse {
         result: String,
     }
 
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+    struct FixtureIdentity {
+        genesis_hash: String,
+        metadata_sha256: String,
+        spec_version: u32,
+        transaction_version: u32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimeFixtureManifest {
+        deployment: String,
+        endpoint_role: String,
+        block_reference: String,
+        block_hash: String,
+        identity: FixtureIdentity,
+        metadata_bytes: usize,
+        signed_extensions: Option<Vec<String>>,
+        fixtures: Vec<FixtureRecord>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureRecord {
+        method: String,
+        params: Value,
+        payload_path: String,
+        bytes: usize,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RuntimeVersion {
+        spec_version: u32,
+        transaction_version: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct RuntimeVersionResponse {
+        result: RuntimeVersion,
+    }
+
     fn metadata_bytes() -> Vec<u8> {
-        let response: RpcResponse = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
-        )))
-        .unwrap();
+        let response: RpcResponse = serde_json::from_str(METADATA_RESPONSE).unwrap();
         hex::decode(response.result.trim_start_matches("0x")).unwrap()
+    }
+
+    fn validate_runtime_fixture_set(manifest: &RuntimeFixtureManifest) -> Result<(), String> {
+        let genesis: RpcResponse = serde_json::from_str(GENESIS_RESPONSE).unwrap();
+        let finalized_head: RpcResponse = serde_json::from_str(FINALIZED_HEAD_RESPONSE).unwrap();
+        let runtime: RuntimeVersionResponse =
+            serde_json::from_str(RUNTIME_VERSION_RESPONSE).unwrap();
+        let metadata = metadata_bytes();
+        let metadata_sha256 = hex::encode(digest(&SHA256, &metadata).as_ref());
+        let expected_records = [
+            (
+                "chain_getBlockHash",
+                serde_json::json!([0]),
+                "genesis_hash.json",
+                GENESIS_RESPONSE.len(),
+            ),
+            (
+                "chain_getFinalizedHead",
+                serde_json::json!([]),
+                "finalized_head.json",
+                FINALIZED_HEAD_RESPONSE.len(),
+            ),
+            (
+                "state_getRuntimeVersion",
+                serde_json::json!([manifest.block_hash]),
+                "runtime_version.json",
+                RUNTIME_VERSION_RESPONSE.len(),
+            ),
+            (
+                "state_getMetadata",
+                serde_json::json!([manifest.block_hash]),
+                "metadata.json",
+                METADATA_RESPONSE.len(),
+            ),
+        ];
+
+        if manifest.deployment != "testnet"
+            || manifest.endpoint_role != "runtime_identity"
+            || manifest.block_reference != "finalized"
+            || manifest.block_hash != finalized_head.result
+            || manifest.identity.genesis_hash != genesis.result
+            || manifest.identity.metadata_sha256 != metadata_sha256
+            || manifest.identity.spec_version != runtime.result.spec_version
+            || manifest.identity.transaction_version != runtime.result.transaction_version
+            || manifest.metadata_bytes != metadata.len()
+            || manifest.signed_extensions.is_some()
+            || manifest.fixtures.len() != expected_records.len()
+        {
+            return Err("DeepX finalized runtime fixture identity mismatch".to_string());
+        }
+        for (actual, expected) in manifest.fixtures.iter().zip(expected_records) {
+            if actual.method != expected.0
+                || actual.params != expected.1
+                || actual.payload_path != expected.2
+                || actual.bytes != expected.3
+            {
+                return Err("DeepX finalized runtime fixture record mismatch".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[rstest]
+    fn finalized_runtime_fixture_set_is_self_consistent() {
+        let manifest: RuntimeFixtureManifest = serde_json::from_str(FIXTURE_MANIFEST).unwrap();
+
+        validate_runtime_fixture_set(&manifest).unwrap();
+    }
+
+    #[rstest]
+    fn rejects_finalized_runtime_fixture_manifest_hash_drift() {
+        let mut manifest: RuntimeFixtureManifest = serde_json::from_str(FIXTURE_MANIFEST).unwrap();
+        manifest.identity.metadata_sha256 = "00".repeat(32);
+
+        assert_eq!(
+            validate_runtime_fixture_set(&manifest),
+            Err("DeepX finalized runtime fixture identity mismatch".to_string()),
+        );
+    }
+
+    #[rstest]
+    fn rejects_finalized_runtime_fixture_manifest_record_drift() {
+        let mut manifest: RuntimeFixtureManifest = serde_json::from_str(FIXTURE_MANIFEST).unwrap();
+        manifest.fixtures[0].bytes += 1;
+
+        assert_eq!(
+            validate_runtime_fixture_set(&manifest),
+            Err("DeepX finalized runtime fixture record mismatch".to_string()),
+        );
     }
 
     #[rstest]

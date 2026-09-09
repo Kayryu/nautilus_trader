@@ -30,6 +30,8 @@ pub mod factories;
 pub mod http;
 pub mod instruments;
 pub mod providers;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod rpc;
 pub mod signing;
 pub mod spot;

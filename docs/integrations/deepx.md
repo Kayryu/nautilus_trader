@@ -48,7 +48,9 @@ implemented and covered by unit tests:
   canonical product-aware Nautilus identities. A separate perpetual-only `InstrumentProvider`
   layer builds on it.
 - Defensive cursor-pagination state which enforces a local page budget and rejects empty-page
-  continuation and repeated cursors without assuming endpoint-specific cursor semantics.
+  continuation and repeated cursors without assuming endpoint-specific cursor semantics. The
+  cursor-based single-page HTTP methods also reject a response which claims another page without
+  supplying a non-empty continuation cursor.
 - Transport-neutral WebSocket protocol state with monotonic request correlation, connection-epoch
   ownership, protocol-owner-bound request and authentication capabilities, stale send/response
   isolation, generation-fenced authentication attempts, and desired-versus-confirmed subscription
@@ -226,11 +228,11 @@ single-page perpetual funding-rate, long-short ratio, and open-interest history 
 descending page of raw perpetual trades, one ascending page of raw one-minute perpetual candles,
 mark-price history, and oracle-price history, and one raw perpetual volume-statistics window, no
 other endpoint-specific HTTP API except the raw perpetual last-price read, live WebSocket transport
-or channel, data client, account client, execution client, management
-service, operational execution client, PyO3 binding, or Python package is enabled. A perpetual-only offline instrument provider
-and a fixture-gated offline direct-pallet signing
-primitive exist, but no order call is exposed and the one-shot submission primitive is not wired
-into an execution path.
+or channel, operational data client, account client, operational execution client, or management
+service is enabled. A thin Python package exposes canonical identity constants, validated configs,
+and factories for the disconnected data and execution client foundations. A perpetual-only offline
+instrument provider and a fixture-gated offline direct-pallet signing primitive exist, but no order
+call is exposed and the one-shot submission primitive is not wired into an execution path.
 Authoritative venue rate-limit policy, automatic history pagination, and other business response
 schemas remain unimplemented. The execution client foundation implements the Nautilus execution
 trait but does not coordinate any network connection. Possessing or loading a private key does not enable
@@ -259,10 +261,11 @@ retry budget was exhausted. Remaining ambiguity is retained for startup reconcil
 resolution. This retry policy still requires implementation and tests before it can be wired into
 an execution command path.
 
-The next reviewable milestone is the next minimal fixture-backed Phase E execution slice: decode an
+The next protocol milestone is the next minimal fixture-backed Phase E execution slice: decode an
 authenticated private message from the transport-proven envelope, initialize account state, and
-deterministic order/report reconciliation for one fixture-proven order capability. Before advancing
-to Phase F management services or Phase G Python/public integration, the repository still requires:
+implement deterministic order/report reconciliation for one fixture-proven order capability.
+Before advancing to Phase F management services or operational Python examples, the repository
+still requires:
 
 - A complete immutable finalized runtime fixture with decoded signed extensions and the header
   number needed for mortality/checkpoint construction.
@@ -273,11 +276,11 @@ to Phase F management services or Phase G Python/public integration, the reposit
 - Verified private-stream authentication and initial account-state semantics, followed by network
   startup coordination and deterministic report reconciliation through the `ExecutionClient`.
 
-Phase F management services and Phase G public/Python wiring remain blocked. This decision does not
-remove the existing partial implementations or unresolved Phase D evidence gates; it changes the
-development priority without mistaking that progress for capability enablement. The external Phase
-A maintainer-approval and competing-work checks also remain unrecorded, so no milestone is ready for
-public submission as an approved integration.
+Phase F management services and operational Python examples remain blocked. The completed Phase G
+config, factory, and package projection does not remove the unresolved Phase D and Phase E evidence
+gates or enable a live capability. The external Phase A maintainer-approval and competing-work
+checks also remain unrecorded, so no milestone is ready for public submission as an approved
+integration.
 
 - **Phase A - Partial:** Capability matrix, hard gates, runtime capture tool, and
   runtime-identity fixtures exist.
@@ -366,7 +369,9 @@ public submission as an approved integration.
   boundary validates and atomically installs a complete caller-supplied replacement snapshot before
   advancing startup. It can derive the active snapshot from the shared execution cache by configured
   account and venue, but it does not verify database restoration, cache provenance, or venue-side
-  completeness. Its final startup boundary verifies that the
+  completeness. Account-state initialization revalidates the authenticated session immediately
+  before event dispatch, so a reconnect invalidates the prior receipt without advancing startup.
+  Its final startup boundary verifies that the
   exact account-state event recorded for the current startup epoch is present in the matching
   cached account history. This rejects stale account entries from a previous startup epoch, but it
   does not prove the protocol-dependent semantic completeness of that account state.
@@ -385,16 +390,20 @@ public submission as an approved integration.
   implement private account and order decoding, network startup coordination, one fixture-proven order command,
   report reconciliation, and authoritative event emission. None of those surfaces exists yet.
 - **Phase F - Not started:** No subaccount, delegate, quota
-- **Phase G - Partial:** This document and the strict Rust execution config exist. The config
+- **Phase G - Partial:** This document and the strict Rust data and execution configs exist. The
+  execution config
   exposes a non-zero canonical recovery scan range size, defaulting to 100 finalized blocks, and a
   non-zero timestamp nonce clock-drift limit, defaulting to five seconds. It also exposes ordered
   REST read-failover endpoints and a strictly validated bounded retry policy for idempotent reads.
   A Rust execution factory validates the typed config and constructs a disconnected framework
   client with the DeepX venue, netting OMS, and margin account identity. A separate Rust data
   factory validates `DeepXDataClientConfig` and constructs a disconnected framework client with
-  the DeepX identity, read-only cache view, and framework clock. Its network startup fails
-  explicitly; no public connection, subscription, request, or market-data emission capability,
-  PyO3/Python wiring, discovery pages, or operational examples exist.
+  the DeepX identity, read-only cache view, and framework clock. PyO3 registers the canonical
+  identity constants, four config classes, two factories, and their config/factory extractors in
+  the global registry. The thin Python facade and generated stubs expose only that boundary, with
+  public-export and credential-redaction tests. Its network startup fails explicitly; no public
+  connection, subscription, request, market-data emission, management service, or operational
+  example exists.
 - **Phase H - Not started:** No controlled conformance, benchmarks, fuzz campaigns, or full
   review-readiness run has been recorded.
 
@@ -418,9 +427,9 @@ price. WebSocket support stops before transport connection, venue messages, hear
 authentication, subscriptions, and channel routing.
 
 Unit and mock tests cover the implemented common, metadata, HTTP, pagination, WebSocket protocol,
-handler, and task-lifecycle code. These tests establish local invariants only; they do not satisfy
-the fixture, live testnet, signing-vector, client-conformance, Python-boundary, benchmark, or fuzz
-requirements from later milestones.
+handler, task-lifecycle, and Python config/factory boundaries. These tests establish local
+invariants only; they do not satisfy the fixture, live testnet, signing-vector, client-conformance,
+management-service, benchmark, or fuzz requirements from later milestones.
 
 :::danger
 DeepX execution can submit transactions that affect account balances and positions. Testnet
@@ -710,6 +719,24 @@ and `Display` output.
 This credential boundary is preparation for independently verified signing implementations. It
 does not currently sign requests, extrinsics, or EVM transactions. Mainnet credentials and key
 schemes other than secp256k1 are unsupported.
+
+## Python configuration boundary
+
+The `nautilus_trader.adapters.deepx` package currently exports only the canonical `DEEPX`,
+`DEEPX_CLIENT_ID`, and `DEEPX_VENUE` identities, the validated data, execution, network, and HTTP
+read-retry configs, and the disconnected data and execution factories. It does not export raw HTTP
+or WebSocket clients, endpoint helpers, signing primitives, or credentials.
+
+`DeepXNetworkConfig` defaults to testnet and rejects mainnet or unknown environments before any
+endpoint override is accepted. `DeepXExecutionClientConfig` requires an explicit subaccount for a
+valid execution configuration and accepts only `direct_pallet` or `legacy_evm` as an explicit
+backend. Selecting a backend validates configuration only; neither backend is wired to an order
+command. Config representations redact private keys, and the public API exposes only
+`has_private_key`, never the credential value.
+
+`DeepXHttpReadRetryConfig` applies only to idempotent reads. It bounds retry count, initial and
+maximum delay, jitter, per-operation timeout, and total elapsed time. Mutating operations do not
+inherit this policy, and no Python factory currently starts network I/O.
 
 ## Product capabilities
 
@@ -1136,8 +1163,8 @@ Failed or incomplete conformance leaves that capability disabled and documented 
 
 ## Known limitations
 
-- The Rust adapter crate contains protocol-core foundations only; the Python package does not yet
-  exist.
+- The Python package exposes only validated configs, disconnected factories, and canonical
+  identities; it does not expose an operational client or management service.
 - No DeepX market data, account, signing, trading, or management capability is currently enabled.
 - Mainnet is explicitly unsupported.
 - The Python SDK is a protocol reference and golden-vector oracle only; it will not be a runtime

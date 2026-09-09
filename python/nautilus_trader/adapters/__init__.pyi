@@ -9,6 +9,7 @@ from . import blockchain
 from . import bybit
 from . import coinbase
 from . import databento
+from . import deepx
 from . import deribit
 from . import derive
 from . import dydx
@@ -30,6 +31,7 @@ __all__ = [
     "bybit",
     "coinbase",
     "databento",
+    "deepx",
     "deribit",
     "derive",
     "dydx",

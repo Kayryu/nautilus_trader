@@ -17,7 +17,9 @@ testnet configuration and constructs a disconnected framework client. Canonical 
 default to ranges of 100 finalized blocks and require a non-zero configured range size. Timestamp
 nonce restoration uses a configurable non-zero clock-drift limit which defaults to five seconds.
 Idempotent public HTTP reads support strictly validated bounded retry timing and ordered testnet
-endpoint failover; execution startup binds the loaded market catalog to that complete endpoint list.
+endpoint failover. Cursor-based reads fail closed when a response claims another page without a
+usable continuation cursor; automatic pagination remains disabled. Execution startup binds the
+loaded market catalog to that complete endpoint list.
 Network startup, order commands, queries, and reports remain non-operational and fail explicitly.
 
 The Rust data factory validates a strict testnet `DeepXDataClientConfig` and constructs a
