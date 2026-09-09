@@ -65,6 +65,26 @@ pub struct DeepXHttpClient {
 }
 
 impl DeepXHttpClient {
+    /// Creates a public read-only client from validated network and retry configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the network configuration or HTTP client construction is invalid.
+    pub fn from_network_config(
+        config: &crate::config::DeepXNetworkConfig,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+    ) -> Result<Self> {
+        let base_urls = config
+            .rest_urls()
+            .map_err(|error| DeepXHttpError::InvalidRequest(error.to_string()))?;
+        let retry_config = config
+            .http_read_retry
+            .to_retry_config()
+            .map_err(|error| DeepXHttpError::InvalidRequest(error.to_string()))?;
+        Self::new_with_endpoints(base_urls, timeout_secs, proxy_url, retry_config)
+    }
+
     /// Creates a public read-only DeepX HTTP client.
     ///
     /// # Errors
@@ -1391,6 +1411,44 @@ mod tests {
         let response = client.get_json::<HealthResponse>("/health").await.unwrap();
 
         assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn network_configured_zero_retries_sends_one_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_clone = Arc::clone(&requests);
+        let base_url = spawn_server(Router::new().route(
+            "/health",
+            get(move || {
+                let requests = Arc::clone(&requests_clone);
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+                }
+            }),
+        ))
+        .await;
+        let config = crate::config::DeepXNetworkConfig {
+            base_url_rest: Some(base_url),
+            http_read_retry: crate::config::DeepXHttpReadRetryConfig {
+                max_retries: 0,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                jitter_ms: 0,
+                operation_timeout_ms: 1_000,
+                max_elapsed_ms: 5_000,
+            },
+            ..Default::default()
+        };
+        let client = DeepXHttpClient::from_network_config(&config, Some(1), None).unwrap();
+
+        let error = client
+            .get_json::<HealthResponse>("/health")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, DeepXHttpError::Http { status: 503, .. }));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

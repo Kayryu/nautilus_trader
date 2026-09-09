@@ -24,7 +24,9 @@
 
 pub mod common;
 pub mod config;
+pub mod data;
 pub mod execution;
+pub mod factories;
 pub mod http;
 pub mod instruments;
 pub mod providers;
@@ -36,15 +38,19 @@ pub mod websocket;
 
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{
-    DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXNetworkConfig,
-    DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
-    DeepXValidatedRpcEndpoints, validate_rpc_endpoint_identities,
+    DeepXDataClientConfig, DeepXExecutionBackend, DeepXExecutionClientConfig,
+    DeepXHttpReadRetryConfig, DeepXNetworkConfig, DeepXObservedRpcEndpoint,
+    DeepXRpcEndpointValidationError, DeepXRpcRole, DeepXValidatedRpcEndpoints,
+    validate_rpc_endpoint_identities,
 };
+pub use data::DeepXDataClient;
 pub use execution::{
     DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
     DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXMassReconciliationError,
-    DeepXOrderContextError, DeepXOrderContextRestorationError, DeepXTradeDedupError,
+    DeepXNonceRestorationError, DeepXOrderContextError, DeepXOrderContextRestorationError,
+    DeepXRestoredOrderContext, DeepXTradeDedupError,
 };
+pub use factories::{DeepXDataClientFactory, DeepXExecutionClientFactory};
 pub use instruments::parse_perpetual_instrument;
 pub use providers::{
     DeepXInstrumentProvider, DeepXMarketMetadata, DeepXMarketProvider,

@@ -68,6 +68,9 @@ implemented and covered by unit tests:
 - A signer-scoped timestamp nonce allocation policy which restores the maximum reservation from a
   caller-supplied complete durable record set, requires bounded local-to-chain clock drift, rejects
   implausible restored state and overflow, and allocates monotonically under thread contention.
+- An execution-client nonce restoration boundary which binds the durable store lease to the
+  configured signing key and applies a non-zero clock-drift limit, defaulting to five seconds,
+  before returning the allocator and its verified durable record snapshot.
 - A fail-closed reservation preparation boundary which revalidates signer ownership, allocates a
   current Unix timestamp nonce with millisecond precision, durably creates the exact `created`
   record, and releases it only after verifying the store's commit acknowledgement.
@@ -164,9 +167,11 @@ implemented and covered by unit tests:
   `InstrumentProvider` built on it constructs `CryptoPerpetual` definitions from catalog metadata,
   and Spot construction remains fail-closed. Startup mass reconciliation advances only while
   holding the transaction store's current lease for the configured signing identity, after loading
-  its complete durable record set. Restored in-block records are first reconciled against finalized
-  Watch evidence bound to the execution client's configured endpoint roles and advertised method
-  capabilities. A covered finalized checkpoint advances a record only when the canonical block
+  its complete durable record set. Before any recovery RPC, every durable record's signing-time
+  genesis hash must match the chain identity observed from all validated endpoint roles; a foreign
+  chain record fails startup without mutation. Restored in-block records are first reconciled
+  against finalized Watch evidence bound to the execution client's configured endpoint roles and
+  advertised method capabilities. A covered finalized checkpoint advances a record only when the canonical block
   hash, extrinsic index, and exact signed-extrinsic hash all match, then persists that transition
   with revision-checked compare-and-set. If that exact finality check instead finds conflicting
   canonical evidence, startup runs the record-bound reorganization coordinator against the same
@@ -191,12 +196,20 @@ implemented and covered by unit tests:
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
   permits idempotent restoration, rejects non-DeepX instrument venues, fails closed on conflicting
   client-order identities, and classifies unknown updates as external. A caller-supplied complete
-  context snapshot is validated and atomically replaces the previous snapshot before the
-  restoration startup gate advances; an explicit empty snapshot clears the registry. Individual
+  context snapshot can include previously verified venue order IDs and is validated before it
+  atomically replaces the previous tracked contexts and their bidirectional venue identity
+  bindings. Duplicate or externally owned venue IDs fail without mutation or startup advancement;
+  an explicit empty snapshot clears active tracked ownership. A cache-backed restoration boundary
+  derives this snapshot from open DeepX orders assigned to the configured execution account and
+  preserves any cached venue order IDs; cache borrow conflicts fail without startup advancement.
+  Individual
   registry population does not prove restoration or authorize event emission. Framework-provided
   reconciled external order identity is subject to the same venue check and can be registered with
-  conflict-safe client and venue order ID bindings. It remains separate from tracked order context
-  and does not authorize typed event emission or provide report decoding.
+  conflict-safe client and venue order ID bindings. Execution updates can be classified atomically
+  from either or both IDs; tracked venue identity survives terminal transition until bounded
+  ownership eviction, registered external identity is returned explicitly, and IDs which resolve to
+  different ownership fail closed. These routing bindings do not authorize typed event emission or
+  provide report decoding.
   Finished tracked contexts move atomically into a separate bounded FIFO ownership history so late
   updates remain terminal-owned rather than being misclassified as external. Terminal ownership
   survives reconnect startup resets, conflicts with active restoration and external registration,
@@ -351,8 +364,9 @@ public submission as an approved integration.
   preload now requires the failure-atomic public market provider to be initialized, non-empty, and
   bound to the configured primary REST endpoint before that startup step advances. Its restoration
   boundary validates and atomically installs a complete caller-supplied replacement snapshot before
-  advancing startup, but it does not verify snapshot provenance or completeness and no
-  cache/database restoration coordinator exists. Its final startup boundary verifies that the
+  advancing startup. It can derive the active snapshot from the shared execution cache by configured
+  account and venue, but it does not verify database restoration, cache provenance, or venue-side
+  completeness. Its final startup boundary verifies that the
   exact account-state event recorded for the current startup epoch is present in the matching
   cached account history. This rejects stale account entries from a previous startup epoch, but it
   does not prove the protocol-dependent semantic completeness of that account state.
@@ -371,8 +385,16 @@ public submission as an approved integration.
   implement private account and order decoding, network startup coordination, one fixture-proven order command,
   report reconciliation, and authoritative event emission. None of those surfaces exists yet.
 - **Phase F - Not started:** No subaccount, delegate, quota
-- **Phase G - Partial:** This document exists; configs, factories, PyO3/Python wiring, discovery
-  pages, and examples are absent.
+- **Phase G - Partial:** This document and the strict Rust execution config exist. The config
+  exposes a non-zero canonical recovery scan range size, defaulting to 100 finalized blocks, and a
+  non-zero timestamp nonce clock-drift limit, defaulting to five seconds. It also exposes ordered
+  REST read-failover endpoints and a strictly validated bounded retry policy for idempotent reads.
+  A Rust execution factory validates the typed config and constructs a disconnected framework
+  client with the DeepX venue, netting OMS, and margin account identity. A separate Rust data
+  factory validates `DeepXDataClientConfig` and constructs a disconnected framework client with
+  the DeepX identity, read-only cache view, and framework clock. Its network startup fails
+  explicitly; no public connection, subscription, request, or market-data emission capability,
+  PyO3/Python wiring, discovery pages, or operational examples exist.
 - **Phase H - Not started:** No controlled conformance, benchmarks, fuzz campaigns, or full
   review-readiness run has been recorded.
 
@@ -497,8 +519,11 @@ HTTP `429`, or HTTP `5xx`. It uses the shared bounded retry manager and rotates 
 list of explicitly configured HTTP or HTTPS base URLs. Decode failures, invalid local paths or
 base URLs, and other HTTP `4xx` responses terminate immediately. Only one official testnet REST
 endpoint is currently verified, so the default configuration does not imply an alternate endpoint
-and cannot fail over unless an operator explicitly supplies another candidate. No DeepX request
-quota is configured until authoritative rate-limit semantics are captured.
+and cannot fail over unless an operator explicitly supplies another candidate. Retry count,
+initial/maximum delay, jitter, per-attempt timeout, and total elapsed budget are integer-valued,
+strictly validated configuration. The exponential factor remains fixed at two and the first retry
+is delayed. This policy is not used by mutating requests. No DeepX request quota is configured
+until authoritative rate-limit semantics are captured.
 
 The pagination state treats a missing or empty cursor as completion, rejects a continuation cursor
 on an empty page, rejects repeated cursors, and stops before a request could exceed its configured
@@ -888,6 +913,9 @@ inclusion watching, and bounded recovery scans. Each role can use an independent
 falls back to the common verified testnet RPC URL when no role-specific override is configured.
 Role selection performs the same hard testnet validation as every other endpoint. This separation
 does not enable transaction submission or prove that the default endpoint supports every role.
+Execution configuration limits each canonical recovery scan range to a non-zero number of finalized
+blocks, defaulting to 100. This setting controls scan partitioning only; it does not authorize
+submission retries, parallel scans, or broader historical inference.
 A pure validation boundary now requires caller-supplied observations for all three roles, rejects
 missing or duplicate roles, requires each observed URL to match the configured selection, and
 requires every endpoint to report the approved DeepX testnet genesis hash before releasing the
@@ -973,7 +1001,11 @@ retains signer ownership pending reconciliation. The reservation preparation bou
 ordering: it verifies that the current store lease covers the allocator signer, allocates the nonce,
 creates the immutable identity, and returns the record only after `create_committed` acknowledges
 that record's exact encoding. It performs no signing or submission. No configured store or
-authoritative chain-time reader currently connects this boundary to an operational path.
+authoritative chain-time reader currently connects this boundary to an operational path. The
+execution client can now restore the allocator and verified durable snapshot for its configured
+signing key using the configured non-zero clock-drift limit, which defaults to five seconds. It does
+not retain that allocator, read chain time, allocate a nonce, enable sequential account nonces, sign,
+or submit a transaction.
 
 The persistence contract is asynchronous so the PostgreSQL implementation can hold a
 transaction-scoped signer fence and commit record changes without blocking the runtime. Signing

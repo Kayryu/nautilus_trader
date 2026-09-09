@@ -104,6 +104,12 @@ impl DeepXMarketProvider {
         self.client.base_url()
     }
 
+    /// Returns all REST endpoints used to load the market catalog in failover order.
+    #[must_use]
+    pub fn base_urls(&self) -> &[String] {
+        self.client.base_urls()
+    }
+
     /// Returns all markets in canonical identity order.
     #[must_use]
     pub fn markets(&self) -> Vec<&DeepXMarketMetadata> {

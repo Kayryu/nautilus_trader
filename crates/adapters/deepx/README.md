@@ -12,8 +12,18 @@ durably recorded signed extrinsic. It must never allocate a new order identity o
 ambiguous outcome.
 
 The Rust client implements the Nautilus `ExecutionClient` framework boundary for identity,
-account-state emission, and lifecycle handling. Network startup, order commands, queries, and
-reports remain non-operational and fail explicitly.
+account-state emission, and lifecycle handling. Its Rust execution factory validates the typed
+testnet configuration and constructs a disconnected framework client. Canonical recovery scans
+default to ranges of 100 finalized blocks and require a non-zero configured range size. Timestamp
+nonce restoration uses a configurable non-zero clock-drift limit which defaults to five seconds.
+Idempotent public HTTP reads support strictly validated bounded retry timing and ordered testnet
+endpoint failover; execution startup binds the loaded market catalog to that complete endpoint list.
+Network startup, order commands, queries, and reports remain non-operational and fail explicitly.
+
+The Rust data factory validates a strict testnet `DeepXDataClientConfig` and constructs a
+disconnected framework client with the DeepX identity, read-only cache view, and framework clock.
+Its `connect` method fails explicitly: no public WebSocket connection, subscription, request, or
+market-data emission capability is enabled without fixture-proven protocol semantics.
 
 The WebSocket protocol can attach current authenticated-session and connection-epoch provenance to
 an uncorrelated JSON frame without interpreting it as an account, order, or trade event. No DeepX

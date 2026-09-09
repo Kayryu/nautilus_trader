@@ -51,6 +51,10 @@ pub enum DeepXError {
     #[error("unsupported DeepX product type: {0}")]
     UnsupportedProduct(String),
 
+    /// A capability is not enabled by the available protocol evidence.
+    #[error("unsupported DeepX capability: {0}")]
+    UnsupportedCapability(&'static str),
+
     /// A discrete financial value cannot be represented exactly.
     #[error("inexact DeepX decimal conversion: {0}")]
     InexactDecimal(String),

@@ -13,12 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Configuration for DeepX network and execution access.
+//! Configuration for DeepX network, data, and execution access.
 
 use std::fmt::{Debug, Formatter};
 
 use nautilus_core::hex;
 use nautilus_model::identifiers::AccountId;
+use nautilus_network::retry::RetryConfig;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -29,6 +30,76 @@ use crate::common::{
 };
 
 const REDACTED: &str = "<redacted>";
+const DEFAULT_RECOVERY_BLOCKS_PER_RANGE: u64 = 100;
+const DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS: u64 = 5_000;
+
+/// Bounded retry configuration for idempotent DeepX HTTP reads only.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepXHttpReadRetryConfig {
+    /// Maximum retries after the initial read attempt.
+    pub max_retries: u32,
+    /// Initial delay between attempts in milliseconds.
+    pub initial_delay_ms: u64,
+    /// Maximum delay between attempts in milliseconds.
+    pub max_delay_ms: u64,
+    /// Maximum random jitter added to each delay in milliseconds.
+    pub jitter_ms: u64,
+    /// Timeout for each read attempt in milliseconds.
+    pub operation_timeout_ms: u64,
+    /// Maximum total elapsed time across all attempts in milliseconds.
+    pub max_elapsed_ms: u64,
+}
+
+impl Default for DeepXHttpReadRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay_ms: 250,
+            max_delay_ms: 2_000,
+            jitter_ms: 100,
+            operation_timeout_ms: 30_000,
+            max_elapsed_ms: 60_000,
+        }
+    }
+}
+
+impl DeepXHttpReadRetryConfig {
+    /// Validates bounded read-retry timing.
+    pub fn validate(&self) -> Result<()> {
+        if self.initial_delay_ms == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "HTTP read retry initial delay must be non-zero".to_string(),
+            ));
+        }
+        if self.max_delay_ms < self.initial_delay_ms {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "HTTP read retry maximum delay must not be less than the initial delay".to_string(),
+            ));
+        }
+        if self.operation_timeout_ms == 0 || self.max_elapsed_ms == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "HTTP read retry timeouts must be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Converts this adapter configuration to the shared retry policy.
+    pub fn to_retry_config(&self) -> Result<RetryConfig> {
+        self.validate()?;
+        Ok(RetryConfig {
+            max_retries: self.max_retries,
+            initial_delay_ms: self.initial_delay_ms,
+            max_delay_ms: self.max_delay_ms,
+            backoff_factor: 2.0,
+            jitter_ms: self.jitter_ms,
+            operation_timeout_ms: Some(self.operation_timeout_ms),
+            immediate_first: false,
+            max_elapsed_ms: Some(self.max_elapsed_ms),
+        })
+    }
+}
 
 /// Explicit DeepX transaction execution backend.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -39,6 +110,47 @@ pub enum DeepXExecutionBackend {
     DirectPallet,
     /// Legacy EVM-precompile transactions wrapped in a Substrate extrinsic.
     LegacyEvm,
+}
+
+/// Configuration for a fail-closed DeepX data client.
+#[derive(Clone, Debug, Deserialize, Serialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepXDataClientConfig {
+    /// Testnet network, REST failover, and read-retry configuration.
+    #[builder(default)]
+    pub network: DeepXNetworkConfig,
+    /// Optional proxy URL for future HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
+    /// HTTP operation timeout in seconds.
+    #[builder(default = 30)]
+    pub http_timeout_secs: u64,
+    /// WebSocket operation timeout in seconds.
+    #[builder(default = 30)]
+    pub websocket_timeout_secs: u64,
+}
+
+impl Default for DeepXDataClientConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl DeepXDataClientConfig {
+    /// Validates the testnet-only data client configuration.
+    pub fn validate(&self) -> Result<()> {
+        self.network.validate()?;
+        if self.http_timeout_secs == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "HTTP timeout must be non-zero".to_string(),
+            ));
+        }
+        if self.websocket_timeout_secs == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "WebSocket timeout must be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for a fail-closed DeepX execution client.
@@ -55,6 +167,12 @@ pub struct DeepXExecutionClientConfig {
     /// Transaction encoding and submission backend.
     #[builder(default)]
     pub execution_backend: DeepXExecutionBackend,
+    /// Maximum finalized blocks requested in one canonical recovery scan range.
+    #[builder(default = DEFAULT_RECOVERY_BLOCKS_PER_RANGE)]
+    pub recovery_blocks_per_range: u64,
+    /// Maximum accepted difference between local and chain time for timestamp nonce allocation.
+    #[builder(default = DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS)]
+    pub timestamp_nonce_max_clock_drift_ms: u64,
     /// Testnet network and RPC-role configuration.
     #[builder(default)]
     pub network: DeepXNetworkConfig,
@@ -67,6 +185,8 @@ impl Default for DeepXExecutionClientConfig {
             subaccount_id: None,
             private_key: None,
             execution_backend: DeepXExecutionBackend::default(),
+            recovery_blocks_per_range: DEFAULT_RECOVERY_BLOCKS_PER_RANGE,
+            timestamp_nonce_max_clock_drift_ms: DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
             network: DeepXNetworkConfig::default(),
         }
     }
@@ -79,6 +199,11 @@ impl Debug for DeepXExecutionClientConfig {
             .field("subaccount_id", &self.subaccount_id)
             .field("private_key", &self.private_key.as_ref().map(|_| REDACTED))
             .field("execution_backend", &self.execution_backend)
+            .field("recovery_blocks_per_range", &self.recovery_blocks_per_range)
+            .field(
+                "timestamp_nonce_max_clock_drift_ms",
+                &self.timestamp_nonce_max_clock_drift_ms,
+            )
             .field("network", &self.network)
             .finish()
     }
@@ -93,6 +218,16 @@ impl DeepXExecutionClientConfig {
                 "DeepX account ID issuer must be {}",
                 *DEEPX_VENUE,
             )));
+        }
+        if self.recovery_blocks_per_range == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "DeepX recovery blocks per range must be greater than zero".to_string(),
+            ));
+        }
+        if self.timestamp_nonce_max_clock_drift_ms == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "DeepX timestamp nonce maximum clock drift must be greater than zero".to_string(),
+            ));
         }
         match self.subaccount_id.as_deref() {
             Some(value) if !value.trim().is_empty() => Ok(()),
@@ -230,6 +365,10 @@ pub struct DeepXNetworkConfig {
     pub environment: DeepXEnvironment,
     /// Optional REST API base URL override.
     pub base_url_rest: Option<String>,
+    /// Optional ordered REST API base URL overrides for read failover.
+    pub base_urls_rest: Option<Vec<String>>,
+    /// Retry policy for idempotent HTTP reads.
+    pub http_read_retry: DeepXHttpReadRetryConfig,
     /// Optional WebSocket API URL override.
     pub base_url_ws: Option<String>,
     /// Optional Substrate JSON-RPC URL override.
@@ -250,6 +389,14 @@ impl Debug for DeepXNetworkConfig {
                 "base_url_rest",
                 &self.base_url_rest.as_ref().map(|_| REDACTED),
             )
+            .field(
+                "base_urls_rest",
+                &self
+                    .base_urls_rest
+                    .as_ref()
+                    .map(|urls| vec![REDACTED; urls.len()]),
+            )
+            .field("http_read_retry", &self.http_read_retry)
             .field("base_url_ws", &self.base_url_ws.as_ref().map(|_| REDACTED))
             .field(
                 "base_url_rpc",
@@ -275,15 +422,29 @@ impl DeepXNetworkConfig {
     /// Validates that this configuration targets the supported deployment.
     pub fn validate(&self) -> Result<()> {
         urls::rest_url(&self.environment)?;
+        if self.base_urls_rest.as_ref().is_some_and(Vec::is_empty) {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "REST failover endpoints cannot be empty".to_string(),
+            ));
+        }
+        self.http_read_retry.validate()?;
         Ok(())
     }
 
     /// Returns the configured REST API URL.
     pub fn rest_url(&self) -> Result<String> {
+        Ok(self.rest_urls()?.remove(0))
+    }
+
+    /// Returns the configured REST API URLs in read-failover order.
+    pub fn rest_urls(&self) -> Result<Vec<String>> {
         self.validate()?;
+        if let Some(urls) = &self.base_urls_rest {
+            return Ok(urls.clone());
+        }
         match &self.base_url_rest {
-            Some(url) => Ok(url.clone()),
-            None => Ok(urls::rest_url(&self.environment)?.to_string()),
+            Some(url) => Ok(vec![url.clone()]),
+            None => Ok(vec![urls::rest_url(&self.environment)?.to_string()]),
         }
     }
 
@@ -505,12 +666,104 @@ mod tests {
     #[rstest]
     fn execution_backend_is_explicitly_serialized() {
         let config: DeepXExecutionClientConfig = serde_json::from_str(
-            r#"{"subaccount_id":"subaccount-1","execution_backend":"legacy_evm"}"#,
+            r#"{"subaccount_id":"subaccount-1","execution_backend":"legacy_evm","recovery_blocks_per_range":25}"#,
         )
         .unwrap();
 
         assert_eq!(config.execution_backend, DeepXExecutionBackend::LegacyEvm,);
+        assert_eq!(config.recovery_blocks_per_range, 25);
         assert!(config.validate().is_ok());
+    }
+
+    #[rstest]
+    fn execution_config_defaults_to_bounded_recovery_ranges() {
+        let config = DeepXExecutionClientConfig::default();
+
+        assert_eq!(
+            config.recovery_blocks_per_range,
+            DEFAULT_RECOVERY_BLOCKS_PER_RANGE
+        );
+        assert_eq!(
+            config.timestamp_nonce_max_clock_drift_ms,
+            DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
+        );
+    }
+
+    #[rstest]
+    fn execution_config_rejects_empty_recovery_ranges() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("subaccount-1".to_string()),
+            recovery_blocks_per_range: 0,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message))
+                if message.contains("recovery blocks per range"),
+        ));
+    }
+
+    #[rstest]
+    fn execution_config_rejects_zero_timestamp_nonce_clock_drift() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("subaccount-1".to_string()),
+            timestamp_nonce_max_clock_drift_ms: 0,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message))
+                if message.contains("timestamp nonce maximum clock drift"),
+        ));
+    }
+
+    #[rstest]
+    fn data_config_defaults_to_strict_testnet_network() {
+        let config = DeepXDataClientConfig::default();
+
+        assert_eq!(config.network.environment, DeepXEnvironment::Testnet);
+        assert_eq!(config.http_timeout_secs, 30);
+        assert_eq!(config.websocket_timeout_secs, 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[rstest]
+    #[case(0, 30)]
+    #[case(30, 0)]
+    fn data_config_rejects_zero_timeouts(
+        #[case] http_timeout_secs: u64,
+        #[case] websocket_timeout_secs: u64,
+    ) {
+        let config = DeepXDataClientConfig {
+            http_timeout_secs,
+            websocket_timeout_secs,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(_)),
+        ));
+    }
+
+    #[rstest]
+    fn data_config_rejects_mainnet_even_with_url_overrides() {
+        let config = DeepXDataClientConfig {
+            network: DeepXNetworkConfig {
+                environment: DeepXEnvironment::Mainnet,
+                base_url_rest: Some("https://example.invalid".to_string()),
+                base_url_ws: Some("wss://example.invalid".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::UnsupportedEnvironment(environment)) if environment == "mainnet",
+        ));
     }
 
     #[rstest]
@@ -525,6 +778,92 @@ mod tests {
             config.rest_url(),
             Err(DeepXError::UnsupportedEnvironment("mainnet".to_string())),
         );
+    }
+
+    #[rstest]
+    fn rest_failover_endpoints_take_precedence_over_single_override() {
+        let config = DeepXNetworkConfig {
+            base_url_rest: Some("https://single.example.invalid".to_string()),
+            base_urls_rest: Some(vec![
+                "https://primary.example.invalid".to_string(),
+                "https://secondary.example.invalid".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.rest_urls().unwrap(),
+            [
+                "https://primary.example.invalid",
+                "https://secondary.example.invalid"
+            ],
+        );
+        assert_eq!(
+            config.rest_url().unwrap(),
+            "https://primary.example.invalid",
+        );
+    }
+
+    #[rstest]
+    fn empty_rest_failover_endpoints_are_rejected() {
+        let config = DeepXNetworkConfig {
+            base_urls_rest: Some(Vec::new()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.rest_urls(),
+            Err(DeepXError::InvalidConfiguration(message))
+                if message.contains("REST failover endpoints"),
+        ));
+    }
+
+    #[rstest]
+    fn http_read_retry_config_converts_to_bounded_shared_policy() {
+        let config = DeepXHttpReadRetryConfig {
+            max_retries: 2,
+            initial_delay_ms: 10,
+            max_delay_ms: 40,
+            jitter_ms: 3,
+            operation_timeout_ms: 100,
+            max_elapsed_ms: 250,
+        };
+
+        let retry = config.to_retry_config().unwrap();
+
+        assert_eq!(retry.max_retries, 2);
+        assert_eq!(retry.initial_delay_ms, 10);
+        assert_eq!(retry.max_delay_ms, 40);
+        assert_eq!(retry.backoff_factor, 2.0);
+        assert_eq!(retry.jitter_ms, 3);
+        assert_eq!(retry.operation_timeout_ms, Some(100));
+        assert!(!retry.immediate_first);
+        assert_eq!(retry.max_elapsed_ms, Some(250));
+    }
+
+    #[rstest]
+    #[case(0, 10, 100, 200)]
+    #[case(20, 10, 100, 200)]
+    #[case(10, 20, 0, 200)]
+    #[case(10, 20, 100, 0)]
+    fn invalid_http_read_retry_timing_is_rejected(
+        #[case] initial_delay_ms: u64,
+        #[case] max_delay_ms: u64,
+        #[case] operation_timeout_ms: u64,
+        #[case] max_elapsed_ms: u64,
+    ) {
+        let config = DeepXHttpReadRetryConfig {
+            initial_delay_ms,
+            max_delay_ms,
+            operation_timeout_ms,
+            max_elapsed_ms,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(_)),
+        ));
     }
 
     #[rstest]
@@ -580,6 +919,7 @@ mod tests {
         let endpoint = format!("https://rpc.example.invalid/{SECRET}?api_key={SECRET}");
         let config = DeepXNetworkConfig {
             base_url_rest: Some(endpoint.clone()),
+            base_urls_rest: Some(vec![endpoint.clone(), endpoint.clone()]),
             base_url_ws: Some(endpoint.clone()),
             base_url_rpc: Some(endpoint.clone()),
             base_url_rpc_submission: Some(endpoint.clone()),
@@ -591,7 +931,7 @@ mod tests {
         let debug = format!("{config:?}");
 
         assert!(debug.contains("environment: Testnet"));
-        assert_eq!(debug.matches(REDACTED).count(), 6);
+        assert_eq!(debug.matches(REDACTED).count(), 8);
         assert!(!debug.contains(SECRET));
         assert!(!debug.contains(&endpoint));
     }

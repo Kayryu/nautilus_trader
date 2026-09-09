@@ -41,7 +41,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
     },
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
@@ -57,18 +57,19 @@ use crate::{
     signing::{SigningError, derive_signer_account_id},
     transaction::{
         DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
-        DeepXPoolReconciliationCommitError, DeepXReorganizationCommitError, DeepXSignerLease,
+        DeepXPoolReconciliationCommitError, DeepXReorganizationCommitError,
+        DeepXRestoredTransactionRecord, DeepXSignerLease, DeepXTimestampNonceAllocator,
         DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction, DeepXTransactionState,
         DeepXTransactionStore, DeepXTransactionWatchError, load_verified_committed_for_signer,
         observe_and_commit_finality, observe_and_commit_reorganization,
         reconcile_not_included_checkpoint, reconcile_submission_pool,
+        restore_timestamp_nonce_allocator,
     },
     websocket::{DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
 const TERMINAL_CONTEXT_CAPACITY: usize = 10_000;
-const RECOVERY_BLOCKS_PER_RANGE: u64 = 100;
 
 /// Ordered evidence required before a DeepX execution client can become connected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +196,27 @@ pub enum DeepXOrderContextError {
     ExternalClientConflict(ClientOrderId),
     /// An external venue order ID was already bound to a different client order ID.
     #[error("DeepX external venue order ID {0} is already registered to another client order ID")]
-    ExternalVenueConflict(VenueOrderId),
+    VenueOrderOwnershipConflict(VenueOrderId),
+    /// A tracked client order ID was already bound to a different venue order ID.
+    #[error(
+        "DeepX client order ID {client_order_id} is already bound to venue order ID {venue_order_id}"
+    )]
+    VenueOrderBindingConflict {
+        /// Client order ID owning the existing binding.
+        client_order_id: ClientOrderId,
+        /// Existing venue order ID bound to the client order.
+        venue_order_id: VenueOrderId,
+    },
+    /// Client and venue order IDs resolve to different registered ownership.
+    #[error(
+        "DeepX execution update identity conflict for client order ID {client_order_id} and venue order ID {venue_order_id}"
+    )]
+    UpdateIdentityConflict {
+        /// Client order ID from the conflicting update.
+        client_order_id: ClientOrderId,
+        /// Venue order ID from the conflicting update.
+        venue_order_id: VenueOrderId,
+    },
     /// Another thread panicked while holding the order-context registry lock.
     #[error("DeepX order-context registry lock is poisoned")]
     LockPoisoned,
@@ -215,6 +236,9 @@ pub enum DeepXOrderContextRestorationError {
     /// Startup was not waiting for order-context restoration.
     #[error(transparent)]
     Startup(#[from] DeepXExecutionStartupError),
+    /// The shared execution cache is temporarily unavailable for restoration.
+    #[error("DeepX execution cache is already mutably borrowed")]
+    CacheBorrowConflict,
     /// The replacement context snapshot could not be committed without conflict.
     #[error(transparent)]
     Registry(#[from] DeepXOrderContextError),
@@ -232,6 +256,18 @@ pub enum DeepXMassReconciliationError {
     /// The supplied signer lease belongs to another signing identity.
     #[error("DeepX transaction store lease does not match the configured signing identity")]
     SignerLeaseMismatch,
+    /// A durable transaction belongs to another chain.
+    #[error(
+        "DeepX transaction {client_order_id} genesis does not match the validated RPC endpoints: expected {expected_genesis_hash:?}, received {received_genesis_hash:?}"
+    )]
+    RuntimeGenesisMismatch {
+        /// Client order ID owning the mismatched durable transaction.
+        client_order_id: String,
+        /// Genesis hash observed from every validated RPC role.
+        expected_genesis_hash: [u8; 32],
+        /// Genesis hash persisted with the transaction before signing.
+        received_genesis_hash: [u8; 32],
+    },
     /// Complete durable transaction evidence could not be verified.
     #[error(transparent)]
     Persistence(#[from] DeepXTransactionPersistenceError),
@@ -257,6 +293,20 @@ pub enum DeepXMassReconciliationError {
     },
 }
 
+/// Errors raised while restoring the configured signer's timestamp nonce domain.
+#[derive(Debug, Error)]
+pub enum DeepXNonceRestorationError {
+    /// The configured signing identity could not be derived.
+    #[error(transparent)]
+    Signing(#[from] SigningError),
+    /// The supplied signer lease belongs to another signing identity.
+    #[error("DeepX transaction store lease does not match the configured signing identity")]
+    SignerLeaseMismatch,
+    /// Complete durable transaction evidence could not be verified.
+    #[error(transparent)]
+    Persistence(#[from] DeepXTransactionPersistenceError),
+}
+
 /// Classification of an execution update against registered Nautilus order context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeepXExecutionUpdateRoute {
@@ -264,6 +314,8 @@ pub enum DeepXExecutionUpdateRoute {
     Tracked(OrderContext),
     /// The update belongs to an order whose tracked lifecycle is terminal.
     Terminal(OrderContext),
+    /// The update belongs to an external order registered during reconciliation.
+    RegisteredExternal(DeepXExternalOrderContext),
     /// The update has no registered Nautilus order context.
     External,
 }
@@ -283,6 +335,26 @@ pub struct DeepXExternalOrderContext {
     pub ts_init: UnixNanos,
 }
 
+/// Complete tracked order identity restored before execution updates are dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXRestoredOrderContext {
+    /// Immutable Nautilus order context.
+    pub context: OrderContext,
+    /// Venue order ID already assigned to the order, when known.
+    pub venue_order_id: Option<VenueOrderId>,
+}
+
+impl DeepXRestoredOrderContext {
+    /// Creates a restored tracked order identity.
+    #[must_use]
+    pub const fn new(context: OrderContext, venue_order_id: Option<VenueOrderId>) -> Self {
+        Self {
+            context,
+            venue_order_id,
+        }
+    }
+}
+
 type DeepXOrderContextRegistry = DeepXOrderContextRegistryInner<TERMINAL_CONTEXT_CAPACITY>;
 
 #[derive(Debug, Default)]
@@ -294,6 +366,8 @@ struct DeepXOrderContextRegistryInner<const N: usize> {
 struct DeepXOrderContextState<const N: usize> {
     tracked: HashMap<ClientOrderId, OrderContext>,
     terminal: FifoCacheMap<ClientOrderId, OrderContext, N>,
+    tracked_venue_by_client: HashMap<ClientOrderId, VenueOrderId>,
+    tracked_client_by_venue: HashMap<VenueOrderId, ClientOrderId>,
     external_by_client: HashMap<ClientOrderId, DeepXExternalOrderContext>,
     external_client_by_venue: HashMap<VenueOrderId, ClientOrderId>,
 }
@@ -303,9 +377,29 @@ impl<const N: usize> Default for DeepXOrderContextState<N> {
         Self {
             tracked: HashMap::new(),
             terminal: FifoCacheMap::new(),
+            tracked_venue_by_client: HashMap::new(),
+            tracked_client_by_venue: HashMap::new(),
             external_by_client: HashMap::new(),
             external_client_by_venue: HashMap::new(),
         }
+    }
+}
+
+impl<const N: usize> DeepXOrderContextState<N> {
+    fn retain_owned_venue_bindings(&mut self) {
+        let Self {
+            tracked,
+            terminal,
+            tracked_venue_by_client,
+            tracked_client_by_venue,
+            ..
+        } = self;
+        tracked_venue_by_client.retain(|client_order_id, _| {
+            tracked.contains_key(client_order_id) || terminal.contains_key(client_order_id)
+        });
+        tracked_client_by_venue.retain(|venue_order_id, client_order_id| {
+            tracked_venue_by_client.get(client_order_id) == Some(venue_order_id)
+        });
     }
 }
 
@@ -448,6 +542,132 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             return Err(DeepXOrderContextError::OwnershipConflict(*client_order_id));
         }
         state.tracked = restored;
+        state.retain_owned_venue_bindings();
+        Ok(())
+    }
+
+    fn restore_with_venue_ids(
+        &self,
+        contexts: impl IntoIterator<Item = DeepXRestoredOrderContext>,
+    ) -> Result<(), DeepXOrderContextError> {
+        let mut restored = HashMap::new();
+        let mut restored_venue_by_client = HashMap::new();
+        let mut restored_client_by_venue = HashMap::new();
+
+        for restored_context in contexts {
+            let context = restored_context.context;
+            let client_order_id = context.identity.client_order_id;
+            if context.identity.instrument_id.venue != *DEEPX_VENUE {
+                return Err(DeepXOrderContextError::InstrumentVenueMismatch {
+                    client_order_id,
+                    venue: context.identity.instrument_id.venue,
+                });
+            }
+            if restored
+                .get(&client_order_id)
+                .is_some_and(|existing| existing != &context)
+            {
+                return Err(DeepXOrderContextError::Conflict(client_order_id));
+            }
+            if let Some(venue_order_id) = restored_context.venue_order_id {
+                if let Some(existing) = restored_venue_by_client.get(&client_order_id)
+                    && existing != &venue_order_id
+                {
+                    return Err(DeepXOrderContextError::VenueOrderBindingConflict {
+                        client_order_id,
+                        venue_order_id: *existing,
+                    });
+                }
+                if restored_client_by_venue
+                    .get(&venue_order_id)
+                    .is_some_and(|existing| existing != &client_order_id)
+                {
+                    return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                        venue_order_id,
+                    ));
+                }
+                restored_venue_by_client.insert(client_order_id, venue_order_id);
+                restored_client_by_venue.insert(venue_order_id, client_order_id);
+            }
+            restored.insert(client_order_id, context);
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXOrderContextError::LockPoisoned)?;
+        if let Some(client_order_id) = restored.keys().find(|client_order_id| {
+            state.external_by_client.contains_key(client_order_id)
+                || state.terminal.contains_key(client_order_id)
+        }) {
+            return Err(DeepXOrderContextError::OwnershipConflict(*client_order_id));
+        }
+        if let Some(venue_order_id) = restored_client_by_venue.keys().find(|venue_order_id| {
+            state.external_client_by_venue.contains_key(venue_order_id)
+                || state
+                    .tracked_client_by_venue
+                    .get(venue_order_id)
+                    .is_some_and(|client_order_id| state.terminal.contains_key(client_order_id))
+        }) {
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                *venue_order_id,
+            ));
+        }
+        state.tracked = restored;
+        let DeepXOrderContextState {
+            terminal,
+            tracked_venue_by_client,
+            tracked_client_by_venue,
+            ..
+        } = &mut *state;
+        tracked_venue_by_client.retain(|client_order_id, _| terminal.contains_key(client_order_id));
+        tracked_client_by_venue.retain(|_, client_order_id| terminal.contains_key(client_order_id));
+        tracked_venue_by_client.extend(restored_venue_by_client);
+        tracked_client_by_venue.extend(restored_client_by_venue);
+        Ok(())
+    }
+
+    fn bind_tracked_venue_order_id(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    ) -> Result<(), DeepXOrderContextError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXOrderContextError::LockPoisoned)?;
+        if !state.tracked.contains_key(&client_order_id)
+            && !state.terminal.contains_key(&client_order_id)
+        {
+            return Err(DeepXOrderContextError::ContextNotFound(client_order_id));
+        }
+        if let Some(existing) = state.tracked_venue_by_client.get(&client_order_id) {
+            return if existing == &venue_order_id {
+                Ok(())
+            } else {
+                Err(DeepXOrderContextError::VenueOrderBindingConflict {
+                    client_order_id,
+                    venue_order_id: *existing,
+                })
+            };
+        }
+        if state
+            .tracked_client_by_venue
+            .get(&venue_order_id)
+            .is_some_and(|existing| existing != &client_order_id)
+            || state.external_client_by_venue.contains_key(&venue_order_id)
+        {
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                venue_order_id,
+            ));
+        }
+
+        state
+            .tracked_venue_by_client
+            .insert(client_order_id, venue_order_id);
+        state
+            .tracked_client_by_venue
+            .insert(venue_order_id, client_order_id);
         Ok(())
     }
 
@@ -485,8 +705,11 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             .external_client_by_venue
             .get(&context.venue_order_id)
             .is_some_and(|client_order_id| client_order_id != &context.client_order_id)
+            || state
+                .tracked_client_by_venue
+                .contains_key(&context.venue_order_id)
         {
-            return Err(DeepXOrderContextError::ExternalVenueConflict(
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
                 context.venue_order_id,
             ));
         }
@@ -531,21 +754,72 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
     fn route(
         &self,
         client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
     ) -> Result<DeepXExecutionUpdateRoute, DeepXOrderContextError> {
-        let Some(client_order_id) = client_order_id else {
-            return Ok(DeepXExecutionUpdateRoute::External);
-        };
         let state = self
             .state
             .lock()
             .map_err(|_| DeepXOrderContextError::LockPoisoned)?;
-        Ok(if let Some(context) = state.tracked.get(&client_order_id) {
-            DeepXExecutionUpdateRoute::Tracked(*context)
-        } else if let Some(context) = state.terminal.get(&client_order_id) {
-            DeepXExecutionUpdateRoute::Terminal(*context)
-        } else {
-            DeepXExecutionUpdateRoute::External
-        })
+        let external_by_client = client_order_id
+            .and_then(|client_order_id| state.external_by_client.get(&client_order_id));
+        let external_by_venue = venue_order_id.and_then(|venue_order_id| {
+            state
+                .external_client_by_venue
+                .get(&venue_order_id)
+                .and_then(|client_order_id| state.external_by_client.get(client_order_id))
+        });
+        let tracked_client_by_venue = venue_order_id
+            .and_then(|venue_order_id| state.tracked_client_by_venue.get(&venue_order_id));
+        if let (Some(client_order_id), Some(venue_order_id)) = (client_order_id, venue_order_id)
+            && (state
+                .tracked_venue_by_client
+                .get(&client_order_id)
+                .is_some_and(|bound| bound != &venue_order_id)
+                || tracked_client_by_venue.is_some_and(|bound| bound != &client_order_id)
+                || external_by_client
+                    .is_some_and(|context| context.venue_order_id != venue_order_id)
+                || external_by_venue
+                    .is_some_and(|context| context.client_order_id != client_order_id))
+        {
+            return Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id,
+                venue_order_id,
+            });
+        }
+        if let Some(client_order_id) = client_order_id {
+            if let Some(context) = state.tracked.get(&client_order_id) {
+                if let (Some(venue_order_id), Some(_)) = (venue_order_id, external_by_venue) {
+                    return Err(DeepXOrderContextError::UpdateIdentityConflict {
+                        client_order_id,
+                        venue_order_id,
+                    });
+                }
+                return Ok(DeepXExecutionUpdateRoute::Tracked(*context));
+            }
+            if let Some(context) = state.terminal.get(&client_order_id) {
+                if let (Some(venue_order_id), Some(_)) = (venue_order_id, external_by_venue) {
+                    return Err(DeepXOrderContextError::UpdateIdentityConflict {
+                        client_order_id,
+                        venue_order_id,
+                    });
+                }
+                return Ok(DeepXExecutionUpdateRoute::Terminal(*context));
+            }
+        }
+        if let Some(client_order_id) = tracked_client_by_venue {
+            if let Some(context) = state.tracked.get(client_order_id) {
+                return Ok(DeepXExecutionUpdateRoute::Tracked(*context));
+            }
+            if let Some(context) = state.terminal.get(client_order_id) {
+                return Ok(DeepXExecutionUpdateRoute::Terminal(*context));
+            }
+        }
+        Ok(external_by_client
+            .or(external_by_venue)
+            .copied()
+            .map_or(DeepXExecutionUpdateRoute::External, |context| {
+                DeepXExecutionUpdateRoute::RegisteredExternal(context)
+            }))
     }
 
     fn finish(&self, client_order_id: &ClientOrderId) -> Result<(), DeepXOrderContextError> {
@@ -561,6 +835,7 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             .remove(client_order_id)
             .ok_or(DeepXOrderContextError::ContextNotFound(*client_order_id))?;
         state.terminal.insert(*client_order_id, context);
+        state.retain_owned_venue_bindings();
         Ok(())
     }
 }
@@ -813,12 +1088,18 @@ impl DeepXExecutionClient {
         if !provider.initialized() {
             return Err(DeepXExecutionStartupError::MarketCatalogNotInitialized);
         }
-        let configured_url = self
+        let configured_urls = self
             .config
             .network
-            .rest_url()
+            .rest_urls()
             .map_err(|_| DeepXExecutionStartupError::MarketCatalogEndpointMismatch)?;
-        if provider.base_url() != configured_url.trim_end_matches('/') {
+        if provider.base_urls().len() != configured_urls.len()
+            || provider
+                .base_urls()
+                .iter()
+                .zip(configured_urls)
+                .any(|(actual, configured)| actual != configured.trim_end_matches('/'))
+        {
             return Err(DeepXExecutionStartupError::MarketCatalogEndpointMismatch);
         }
         if provider.is_empty() {
@@ -848,6 +1129,61 @@ impl DeepXExecutionClient {
         self.startup
             .record(DeepXExecutionStartupEvidence::OrderContextRestored)?;
         Ok(())
+    }
+
+    /// Atomically restores complete order context and venue identity bindings.
+    ///
+    /// An explicitly empty set is valid when no active local orders require restoration. The
+    /// registry and startup gate remain unchanged if validation or registration fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for restoration and the supplied snapshot has
+    /// unique, conflict-free client and venue order identities.
+    pub fn restore_order_context_identities(
+        &mut self,
+        contexts: impl IntoIterator<Item = DeepXRestoredOrderContext>,
+    ) -> Result<(), DeepXOrderContextRestorationError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::OrderContextRestored)?;
+        self.order_contexts.restore_with_venue_ids(contexts)?;
+        self.startup
+            .record(DeepXExecutionStartupEvidence::OrderContextRestored)?;
+        Ok(())
+    }
+
+    /// Restores the complete open-order context snapshot from the shared execution cache.
+    ///
+    /// Only DeepX orders assigned to the configured execution account are restored. Existing venue
+    /// order IDs are preserved in the atomic replacement snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for restoration, the cache can be borrowed, and
+    /// the derived snapshot has unique, conflict-free client and venue order identities.
+    pub fn restore_order_contexts_from_cache(
+        &mut self,
+    ) -> Result<(), DeepXOrderContextRestorationError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::OrderContextRestored)?;
+        let contexts = self
+            .core
+            .try_cache()
+            .map_err(|_| DeepXOrderContextRestorationError::CacheBorrowConflict)?
+            .orders_open(
+                Some(&self.core.venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            )
+            .into_iter()
+            .map(|order| {
+                let order = order.cloned();
+                DeepXRestoredOrderContext::new(OrderContext::from(&order), order.venue_order_id())
+            })
+            .collect::<Vec<_>>();
+        self.restore_order_context_identities(contexts)
     }
 
     /// Verifies applied finalized runtime and RPC-role evidence and advances the startup gate.
@@ -916,7 +1252,36 @@ impl DeepXExecutionClient {
         &self,
         client_order_id: Option<ClientOrderId>,
     ) -> Result<DeepXExecutionUpdateRoute, DeepXOrderContextError> {
-        self.order_contexts.route(client_order_id)
+        self.route_execution_update_identity(client_order_id, None)
+    }
+
+    /// Classifies an execution update using every available venue identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when client and venue order IDs resolve to conflicting ownership or
+    /// registry access fails.
+    pub fn route_execution_update_identity(
+        &self,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> Result<DeepXExecutionUpdateRoute, DeepXOrderContextError> {
+        self.order_contexts.route(client_order_id, venue_order_id)
+    }
+
+    /// Binds a venue order ID to tracked or retained terminal order ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client order has no tracked ownership, either identity is already
+    /// bound inconsistently, or registry access fails.
+    pub fn bind_tracked_venue_order_id(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    ) -> Result<(), DeepXOrderContextError> {
+        self.order_contexts
+            .bind_tracked_venue_order_id(client_order_id, venue_order_id)
     }
 
     /// Moves terminal order context from active routing into bounded ownership history.
@@ -929,6 +1294,38 @@ impl DeepXExecutionClient {
         client_order_id: &ClientOrderId,
     ) -> Result<(), DeepXOrderContextError> {
         self.order_contexts.finish(client_order_id)
+    }
+
+    /// Restores the configured signer's timestamp nonce allocator from durable records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the lease belongs to the configured signing key and the complete
+    /// durable signer record set passes acknowledgement and identity verification.
+    pub async fn restore_timestamp_nonce_allocator<S>(
+        &self,
+        store: &S,
+        lease: &S::Lease,
+    ) -> Result<
+        (
+            DeepXTimestampNonceAllocator,
+            Vec<DeepXRestoredTransactionRecord>,
+        ),
+        DeepXNonceRestorationError,
+    >
+    where
+        S: DeepXTransactionStore,
+    {
+        if lease.signer() != derive_signer_account_id(&self.credential)? {
+            return Err(DeepXNonceRestorationError::SignerLeaseMismatch);
+        }
+        restore_timestamp_nonce_allocator(
+            store,
+            lease,
+            self.config.timestamp_nonce_max_clock_drift_ms,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Verifies, emits, and records the account-state event for the current startup epoch.
@@ -989,6 +1386,15 @@ impl DeepXExecutionClient {
         let restored = load_verified_committed_for_signer(store, lease).await?;
         for item in restored {
             let client_order_id = item.record().identity().client_order_id().to_string();
+            let received_genesis_hash = item.record().identity().runtime().genesis_hash;
+            let expected_genesis_hash = endpoints.genesis_hash();
+            if received_genesis_hash != expected_genesis_hash {
+                return Err(DeepXMassReconciliationError::RuntimeGenesisMismatch {
+                    client_order_id,
+                    expected_genesis_hash,
+                    received_genesis_hash,
+                });
+            }
             let action = match item.record().lifecycle().state() {
                 DeepXTransactionState::Submitting | DeepXTransactionState::Accepted => {
                     reconcile_submission_pool(endpoints, store, lease, &item)
@@ -1022,7 +1428,7 @@ impl DeepXExecutionClient {
                     store,
                     lease,
                     &item,
-                    RECOVERY_BLOCKS_PER_RANGE,
+                    self.config.recovery_blocks_per_range,
                 )
                 .await?
                 .record()
@@ -1298,7 +1704,7 @@ mod tests {
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
         enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
-        events::AccountState,
+        events::{AccountState, OrderAccepted, OrderEventAny, OrderSubmitted},
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId,
             VenueOrderId,
@@ -1327,8 +1733,9 @@ mod tests {
         transaction::{
             DeepXBusinessEventOutcome, DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity,
             DeepXDispatchOutcome, DeepXInclusionEvidence, DeepXIndexedOutcome,
-            DeepXNonceReservation, DeepXRestoredTransactionRecord, DeepXTransactionIdentity,
-            DeepXTransactionObservation, DeepXTransactionRecord, DeepXTransactionRevision,
+            DeepXNonceReservation, DeepXRestoredTransactionRecord, DeepXTimestampNonceError,
+            DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
+            DeepXTransactionRevision,
         },
     };
 
@@ -1590,6 +1997,48 @@ mod tests {
             .build()
     }
 
+    fn accept_order_in_cache(
+        cache: &Rc<RefCell<Cache>>,
+        order: &OrderAny,
+        account_id: AccountId,
+        venue_order_id: VenueOrderId,
+    ) {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("DEEPX")), false)
+            .unwrap();
+        let submitted = OrderSubmitted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account_id,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::Submitted(submitted))
+            .unwrap();
+        let accepted = OrderAccepted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            venue_order_id,
+            account_id,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+        );
+        cache
+            .borrow_mut()
+            .update_order(&OrderEventAny::Accepted(accepted))
+            .unwrap();
+    }
+
     fn test_external_order_context(
         client_order_id: &str,
         venue_order_id: &str,
@@ -1640,6 +2089,48 @@ mod tests {
             ..Default::default()
         };
         (DeepXExecutionClient::new(core, config).unwrap(), cache)
+    }
+
+    #[tokio::test]
+    async fn nonce_restoration_uses_configured_clock_drift() {
+        let mut client = test_client();
+        client.config.timestamp_nonce_max_clock_drift_ms = 10;
+        let store = TestTransactionStore {
+            restored: Vec::new(),
+        };
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+
+        let (allocator, restored) = client
+            .restore_timestamp_nonce_allocator(&store, &lease)
+            .await
+            .unwrap();
+
+        assert!(restored.is_empty());
+        assert_eq!(allocator.signer(), signer);
+        assert_eq!(
+            allocator.reserve(1_000, 1_011),
+            Err(DeepXTimestampNonceError::ClockDrift {
+                observed_drift_ms: 11,
+                max_drift_ms: 10,
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_restoration_rejects_another_signer() {
+        let client = test_client();
+        let store = TestTransactionStore {
+            restored: Vec::new(),
+        };
+        let lease = TestSignerLease { signer: [42; 20] };
+
+        assert!(matches!(
+            client
+                .restore_timestamp_nonce_allocator(&store, &lease)
+                .await,
+            Err(DeepXNonceRestorationError::SignerLeaseMismatch),
+        ));
     }
 
     fn record_instruments_loaded(client: &mut DeepXExecutionClient) {
@@ -1794,6 +2285,8 @@ mod tests {
 
     fn submitting_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
         let signer = derive_signer_account_id(&client.credential).unwrap();
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
         let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-IN-BLOCK"),
             signer,
@@ -1801,7 +2294,7 @@ mod tests {
             OrderSide::Buy,
             DeepXNonceReservation::TimestampOrderId { value: 42 },
             DeepXDirectRuntimeIdentity {
-                genesis_hash: [1; 32],
+                genesis_hash,
                 metadata_sha256: [2; 32],
                 spec_version: 366,
                 transaction_version: 1,
@@ -1835,6 +2328,8 @@ mod tests {
 
     fn not_included_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
         let signer = derive_signer_account_id(&client.credential).unwrap();
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
         let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-NOT-INCLUDED"),
             signer,
@@ -1842,7 +2337,7 @@ mod tests {
             OrderSide::Buy,
             DeepXNonceReservation::TimestampOrderId { value: 42 },
             DeepXDirectRuntimeIdentity {
-                genesis_hash: [1; 32],
+                genesis_hash,
                 metadata_sha256: [2; 32],
                 spec_version: 366,
                 transaction_version: 1,
@@ -2385,6 +2880,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn instrument_startup_rejects_unconfigured_failover_endpoint() {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let primary = format!("http://{address}");
+        let http_client = crate::http::DeepXHttpClient::new_with_endpoints(
+            [primary.clone(), "https://other.example.invalid".to_string()],
+            Some(5),
+            None,
+            crate::http::deepx_http_retry_config(),
+        )
+        .unwrap();
+        let mut provider = DeepXMarketProvider::new(http_client);
+        provider.load_all().await.unwrap();
+        let mut client = test_client();
+        client.config.network.base_urls_rest = Some(vec![
+            primary,
+            "https://configured.example.invalid".to_string(),
+        ]);
+
+        assert_eq!(
+            client.record_instruments_loaded(&provider),
+            Err(DeepXExecutionStartupError::MarketCatalogEndpointMismatch),
+        );
+    }
+
     fn advance_through_mass_reconciliation(client: &mut DeepXExecutionClient) -> AccountState {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
@@ -2473,12 +3006,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mass_reconciliation_rejects_durable_record_from_another_genesis_without_advancing() {
+        let mut client = test_client();
+        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        configure_rpc_url(&mut client, rpc_url);
+        advance_to_mass_reconciliation(&mut client);
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+            ClientOrderId::from("O-DEEPX-FOREIGN-GENESIS"),
+            signer,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity {
+                genesis_hash: [1; 32],
+                metadata_sha256: [2; 32],
+                spec_version: 366,
+                transaction_version: 1,
+                signed_extensions: vec!["CheckNonce".to_string()],
+            },
+        ));
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let store = TestTransactionStore {
+            restored: vec![restored],
+        };
+        let lease = TestSignerLease { signer };
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(&endpoints, &capabilities, &store, &lease)
+                .await,
+            Err(DeepXMassReconciliationError::RuntimeGenesisMismatch {
+                client_order_id,
+                expected_genesis_hash,
+                received_genesis_hash,
+            }) if client_order_id == "O-DEEPX-FOREIGN-GENESIS"
+                && expected_genesis_hash == endpoints.genesis_hash()
+                && received_genesis_hash == [1; 32],
+        ));
+        assert!(matches!(
+            client.complete_account_registration(),
+            Err(DeepXExecutionStartupError::OutOfOrder {
+                expected: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                received: DeepXExecutionStartupEvidence::AccountRegistered,
+            }),
+        ));
+    }
+
+    #[tokio::test]
     async fn mass_reconciliation_rejects_unresolved_durable_transaction_without_advancing() {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         advance_to_mass_reconciliation(&mut client);
         let signer = derive_signer_account_id(&client.credential).unwrap();
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
         let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-UNRESOLVED"),
             signer,
@@ -2486,7 +3074,7 @@ mod tests {
             OrderSide::Buy,
             DeepXNonceReservation::TimestampOrderId { value: 42 },
             DeepXDirectRuntimeIdentity {
-                genesis_hash: [1; 32],
+                genesis_hash,
                 metadata_sha256: [2; 32],
                 spec_version: 366,
                 transaction_version: 1,
@@ -2885,7 +3473,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .route(Some(expected.identity.client_order_id))
+                .route(Some(expected.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Tracked(expected),
         );
@@ -2901,7 +3489,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .route(Some(context.identity.client_order_id))
+                .route(Some(context.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Tracked(context),
         );
@@ -2922,7 +3510,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .route(Some(original.identity.client_order_id))
+                .route(Some(original.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Tracked(original),
         );
@@ -2933,12 +3521,12 @@ mod tests {
         let registry = DeepXOrderContextRegistry::default();
 
         assert_eq!(
-            registry.route(None).unwrap(),
+            registry.route(None, None).unwrap(),
             DeepXExecutionUpdateRoute::External,
         );
         assert_eq!(
             registry
-                .route(Some(ClientOrderId::from("O-DEEPX-UNKNOWN")))
+                .route(Some(ClientOrderId::from("O-DEEPX-UNKNOWN")), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::External,
         );
@@ -2954,9 +3542,91 @@ mod tests {
 
         assert_eq!(
             registry
-                .route(Some(context.identity.client_order_id))
+                .route(Some(context.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Terminal(context),
+        );
+    }
+
+    #[rstest]
+    fn tracked_venue_order_identity_survives_terminal_transition() {
+        let client = test_client();
+        let context = OrderContext::from(&test_order("1.250"));
+        let venue_order_id = VenueOrderId::from("V-DEEPX-001");
+        client.register_order_context(context).unwrap();
+        client
+            .bind_tracked_venue_order_id(context.identity.client_order_id, venue_order_id)
+            .unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(context),
+        );
+
+        client
+            .finish_order_context(&context.identity.client_order_id)
+            .unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Terminal(context),
+        );
+    }
+
+    #[rstest]
+    fn matching_tracked_client_and_venue_identities_route_to_same_order() {
+        let client = test_client();
+        let context = OrderContext::from(&test_order("1.250"));
+        let venue_order_id = VenueOrderId::from("V-DEEPX-001");
+        client.register_order_context(context).unwrap();
+        client
+            .bind_tracked_venue_order_id(context.identity.client_order_id, venue_order_id)
+            .unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(
+                    Some(context.identity.client_order_id),
+                    Some(venue_order_id),
+                )
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(context),
+        );
+    }
+
+    #[rstest]
+    fn conflicting_tracked_venue_binding_preserves_original() {
+        let client = test_client();
+        let context = OrderContext::from(&test_order("1.250"));
+        let original = VenueOrderId::from("V-DEEPX-001");
+        let conflicting = VenueOrderId::from("V-DEEPX-002");
+        client.register_order_context(context).unwrap();
+        client
+            .bind_tracked_venue_order_id(context.identity.client_order_id, original)
+            .unwrap();
+
+        assert_eq!(
+            client.bind_tracked_venue_order_id(context.identity.client_order_id, conflicting,),
+            Err(DeepXOrderContextError::VenueOrderBindingConflict {
+                client_order_id: context.identity.client_order_id,
+                venue_order_id: original,
+            }),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(original))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(context),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(conflicting))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::External,
         );
     }
 
@@ -2971,7 +3641,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .route(Some(context.identity.client_order_id))
+                .route(Some(context.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Terminal(context),
         );
@@ -3019,7 +3689,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .route(Some(context.identity.client_order_id))
+                .route(Some(context.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Terminal(context),
         );
@@ -3057,21 +3727,46 @@ mod tests {
 
         assert_eq!(
             registry
-                .route(Some(first.identity.client_order_id))
+                .route(Some(first.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::External,
         );
         assert_eq!(
             registry
-                .route(Some(second.identity.client_order_id))
+                .route(Some(second.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Terminal(second),
         );
         assert_eq!(
             registry
-                .route(Some(third.identity.client_order_id))
+                .route(Some(third.identity.client_order_id), None)
                 .unwrap(),
             DeepXExecutionUpdateRoute::Terminal(third),
+        );
+    }
+
+    #[rstest]
+    fn terminal_context_eviction_removes_venue_order_binding() {
+        let registry = DeepXOrderContextRegistryInner::<2>::default();
+        let first = OrderContext::from(&test_order_with_id("O-DEEPX-001", "1.250"));
+        let second = OrderContext::from(&test_order_with_id("O-DEEPX-002", "2.500"));
+        let third = OrderContext::from(&test_order_with_id("O-DEEPX-003", "3.750"));
+        let first_venue_order_id = VenueOrderId::from("V-DEEPX-001");
+        for (context, venue_order_id) in [
+            (first, first_venue_order_id),
+            (second, VenueOrderId::from("V-DEEPX-002")),
+            (third, VenueOrderId::from("V-DEEPX-003")),
+        ] {
+            registry.register(context).unwrap();
+            registry
+                .bind_tracked_venue_order_id(context.identity.client_order_id, venue_order_id)
+                .unwrap();
+            registry.finish(&context.identity.client_order_id).unwrap();
+        }
+
+        assert_eq!(
+            registry.route(None, Some(first_venue_order_id)).unwrap(),
+            DeepXExecutionUpdateRoute::External,
         );
     }
 
@@ -3099,7 +3794,121 @@ mod tests {
             client
                 .route_execution_update(Some(context.client_order_id))
                 .unwrap(),
-            DeepXExecutionUpdateRoute::External,
+            DeepXExecutionUpdateRoute::RegisteredExternal(context),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(context.venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::RegisteredExternal(context),
+        );
+    }
+
+    #[rstest]
+    fn execution_update_identity_conflict_fails_closed() {
+        let client = test_client();
+        let first = test_external_order_context("O-DEEPX-EXT-001", "V-DEEPX-001");
+        let second = test_external_order_context("O-DEEPX-EXT-002", "V-DEEPX-002");
+        register_external_order(&client, first).unwrap();
+        register_external_order(&client, second).unwrap();
+
+        assert_eq!(
+            client.route_execution_update_identity(
+                Some(first.client_order_id),
+                Some(second.venue_order_id),
+            ),
+            Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id: first.client_order_id,
+                venue_order_id: second.venue_order_id,
+            }),
+        );
+    }
+
+    #[rstest]
+    fn unknown_client_identity_cannot_claim_registered_external_venue_identity() {
+        let client = test_client();
+        let external = test_external_order_context("O-DEEPX-EXT-001", "V-DEEPX-001");
+        register_external_order(&client, external).unwrap();
+        let unknown_client_order_id = ClientOrderId::from("O-DEEPX-UNKNOWN");
+
+        assert_eq!(
+            client.route_execution_update_identity(
+                Some(unknown_client_order_id),
+                Some(external.venue_order_id),
+            ),
+            Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id: unknown_client_order_id,
+                venue_order_id: external.venue_order_id,
+            }),
+        );
+    }
+
+    #[rstest]
+    fn tracked_client_identity_cannot_claim_registered_external_venue_identity() {
+        let client = test_client();
+        let tracked = OrderContext::from(&test_order_with_id("O-DEEPX-001", "1.250"));
+        let external = test_external_order_context("O-DEEPX-EXT-001", "V-DEEPX-001");
+        client.register_order_context(tracked).unwrap();
+        register_external_order(&client, external).unwrap();
+
+        assert_eq!(
+            client.route_execution_update_identity(
+                Some(tracked.identity.client_order_id),
+                Some(external.venue_order_id),
+            ),
+            Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id: tracked.identity.client_order_id,
+                venue_order_id: external.venue_order_id,
+            }),
+        );
+    }
+
+    #[rstest]
+    fn tracked_and_external_venue_ownership_cannot_overlap() {
+        let client = test_client();
+        let tracked = OrderContext::from(&test_order("1.250"));
+        let external = test_external_order_context("O-DEEPX-EXT-001", "V-DEEPX-001");
+        client.register_order_context(tracked).unwrap();
+        client
+            .bind_tracked_venue_order_id(tracked.identity.client_order_id, external.venue_order_id)
+            .unwrap();
+
+        assert_eq!(
+            register_external_order(&client, external),
+            Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                external.venue_order_id
+            )),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(external.venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(tracked),
+        );
+    }
+
+    #[rstest]
+    fn external_venue_ownership_rejects_tracked_binding() {
+        let client = test_client();
+        let tracked = OrderContext::from(&test_order("1.250"));
+        let external = test_external_order_context("O-DEEPX-EXT-001", "V-DEEPX-001");
+        register_external_order(&client, external).unwrap();
+        client.register_order_context(tracked).unwrap();
+
+        assert_eq!(
+            client.bind_tracked_venue_order_id(
+                tracked.identity.client_order_id,
+                external.venue_order_id,
+            ),
+            Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                external.venue_order_id
+            )),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(external.venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::RegisteredExternal(external),
         );
     }
 
@@ -3139,7 +3948,7 @@ mod tests {
 
         assert_eq!(
             register_external_order(&client, conflicting),
-            Err(DeepXOrderContextError::ExternalVenueConflict(
+            Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
                 original.venue_order_id
             )),
         );
@@ -3253,6 +4062,150 @@ mod tests {
     }
 
     #[rstest]
+    fn restoration_registers_complete_venue_identity_snapshot() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        let context = OrderContext::from(&test_order("1.250"));
+        let venue_order_id = VenueOrderId::from("V-DEEPX-001");
+
+        client
+            .restore_order_context_identities([DeepXRestoredOrderContext::new(
+                context,
+                Some(venue_order_id),
+            )])
+            .unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(context),
+        );
+        assert!(
+            client
+                .startup
+                .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+                .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn restoration_venue_identity_conflict_preserves_previous_snapshot() {
+        let mut client = test_client();
+        let previous = OrderContext::from(&test_order_with_id("O-DEEPX-PREVIOUS", "3.750"));
+        client.register_order_context(previous).unwrap();
+        record_instruments_loaded(&mut client);
+        let first = OrderContext::from(&test_order_with_id("O-DEEPX-001", "1.250"));
+        let second = OrderContext::from(&test_order_with_id("O-DEEPX-002", "2.500"));
+        let venue_order_id = VenueOrderId::from("V-DEEPX-DUPLICATE");
+
+        assert_eq!(
+            client.restore_order_context_identities([
+                DeepXRestoredOrderContext::new(first, Some(venue_order_id)),
+                DeepXRestoredOrderContext::new(second, Some(venue_order_id)),
+            ]),
+            Err(DeepXOrderContextRestorationError::Registry(
+                DeepXOrderContextError::VenueOrderOwnershipConflict(venue_order_id),
+            )),
+        );
+        assert_eq!(
+            client
+                .route_execution_update(Some(previous.identity.client_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(previous),
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::External,
+        );
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::OrderContextRestored),
+            Ok(()),
+        );
+    }
+
+    #[rstest]
+    fn cache_restoration_uses_configured_account_open_deepx_orders() {
+        let (mut client, cache) = test_client_with_cache();
+        let restored = test_order_with_id("O-DEEPX-RESTORED", "1.250");
+        let restored_context = OrderContext::from(&restored);
+        let restored_venue_order_id = VenueOrderId::from("V-DEEPX-RESTORED");
+        accept_order_in_cache(
+            &cache,
+            &restored,
+            AccountId::from("DEEPX-001"),
+            restored_venue_order_id,
+        );
+        let other_account = test_order_with_id("O-DEEPX-OTHER-ACCOUNT", "2.500");
+        accept_order_in_cache(
+            &cache,
+            &other_account,
+            AccountId::from("DEEPX-002"),
+            VenueOrderId::from("V-DEEPX-OTHER-ACCOUNT"),
+        );
+        let other_venue =
+            test_order_with_instrument("O-DEEPX-OTHER-VENUE", "3.750", "ETH-USDC-PERP.OTHER");
+        accept_order_in_cache(
+            &cache,
+            &other_venue,
+            AccountId::from("DEEPX-001"),
+            VenueOrderId::from("V-DEEPX-OTHER-VENUE"),
+        );
+        let initialized = test_order_with_id("O-DEEPX-INITIALIZED", "5.000");
+        cache
+            .borrow_mut()
+            .add_order(
+                initialized.clone(),
+                None,
+                Some(ClientId::from("DEEPX")),
+                false,
+            )
+            .unwrap();
+        record_instruments_loaded(&mut client);
+
+        client.restore_order_contexts_from_cache().unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(restored_venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(restored_context),
+        );
+        for excluded in [other_account, other_venue, initialized] {
+            assert_eq!(
+                client
+                    .route_execution_update(Some(excluded.client_order_id()))
+                    .unwrap(),
+                DeepXExecutionUpdateRoute::External,
+            );
+        }
+    }
+
+    #[rstest]
+    fn cache_restoration_borrow_conflict_does_not_advance_startup() {
+        let (mut client, cache) = test_client_with_cache();
+        record_instruments_loaded(&mut client);
+        let borrowed = cache.borrow_mut();
+
+        assert_eq!(
+            client.restore_order_contexts_from_cache(),
+            Err(DeepXOrderContextRestorationError::CacheBorrowConflict),
+        );
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::OrderContextRestored),
+            Ok(()),
+        );
+        drop(borrowed);
+        client.restore_order_contexts_from_cache().unwrap();
+    }
+
+    #[rstest]
     fn empty_restoration_advances_startup_explicitly() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
@@ -3271,7 +4224,11 @@ mod tests {
     fn restoration_replaces_previous_complete_snapshot() {
         let mut client = test_client();
         let original = OrderContext::from(&test_order_with_id("O-DEEPX-002", "1.250"));
+        let original_venue_order_id = VenueOrderId::from("V-DEEPX-002");
         client.register_order_context(original).unwrap();
+        client
+            .bind_tracked_venue_order_id(original.identity.client_order_id, original_venue_order_id)
+            .unwrap();
         record_instruments_loaded(&mut client);
         let new_context = OrderContext::from(&test_order_with_id("O-DEEPX-001", "1.250"));
 
@@ -3288,6 +4245,33 @@ mod tests {
                 .route_execution_update(Some(original.identity.client_order_id))
                 .unwrap(),
             DeepXExecutionUpdateRoute::External,
+        );
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(original_venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::External,
+        );
+    }
+
+    #[rstest]
+    fn restoration_retains_venue_binding_for_restored_context() {
+        let mut client = test_client();
+        let context = OrderContext::from(&test_order("1.250"));
+        let venue_order_id = VenueOrderId::from("V-DEEPX-001");
+        client.register_order_context(context).unwrap();
+        client
+            .bind_tracked_venue_order_id(context.identity.client_order_id, venue_order_id)
+            .unwrap();
+        record_instruments_loaded(&mut client);
+
+        client.restore_order_contexts([context]).unwrap();
+
+        assert_eq!(
+            client
+                .route_execution_update_identity(None, Some(venue_order_id))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Tracked(context),
         );
     }
 
@@ -3720,7 +4704,10 @@ mod tests {
 
         let error = ExecutionClient::connect(&mut client).await.unwrap_err();
 
-        assert_eq!(error.to_string(), "DeepX execution startup has not completed");
+        assert_eq!(
+            error.to_string(),
+            "DeepX execution startup has not completed"
+        );
         assert!(!client.is_connected());
         assert_eq!(client.startup.completed_steps, 0);
     }
