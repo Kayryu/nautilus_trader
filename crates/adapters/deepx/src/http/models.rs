@@ -64,12 +64,39 @@ mod optional_exact_decimal {
     }
 }
 
-/// Standard successful DeepX API response envelope.
+/// DeepX response code, including API-layer and on-chain pallet failures.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DeepXResponseCode {
+    /// Success or API-layer error code.
+    Api(u16),
+    /// On-chain runtime revert code in `pallet_index_error_index` format.
+    Pallet(String),
+}
+
+impl DeepXResponseCode {
+    /// Returns whether this is the venue success code.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Api(200))
+    }
+}
+
+impl std::fmt::Display for DeepXResponseCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Api(code) => code.fmt(f),
+            Self::Pallet(code) => code.fmt(f),
+        }
+    }
+}
+
+/// Standard DeepX API response envelope.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXApiResponse<T> {
     /// Venue response code.
-    pub code: u16,
+    pub code: DeepXResponseCode,
     /// Human-readable venue response message.
     pub msg: String,
     /// Response payload.
@@ -570,7 +597,7 @@ mod tests {
             serde_json::from_str(PERP_VOLUME_1H_RESPONSE).unwrap();
 
         validate_perp_volume_fixture_manifest(&manifest, &runtime_manifest).unwrap();
-        assert_eq!(response.code, 200);
+        assert_eq!(response.code, DeepXResponseCode::Api(200));
         assert!(!response.fail);
         assert_eq!(response.data.total_volume, Decimal::new(2_117_975, 3));
         assert_eq!(response.data.trade_count, 2_492);

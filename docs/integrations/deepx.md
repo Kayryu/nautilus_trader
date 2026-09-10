@@ -42,11 +42,14 @@ implemented and covered by unit tests:
 - Typed single-page perpetual funding-rate, long-short ratio, open-interest, raw trade, raw candle,
   raw mark-price, and raw oracle-price history reads, plus raw perpetual volume statistics and the
   raw current last price, with synchronous parameter validation and exact financial-value parsing.
-  They preserve venue response order where applicable and do not emit Nautilus data events.
+  Funding-rate, long-short-ratio, and trade responses are rejected when their deployment market ID
+  differs from the request. These reads preserve venue response order where applicable and do not
+  emit Nautilus data events.
 - A failure-atomic public market catalog which loads Spot and perpetual metadata concurrently,
   preserves deployment-provided bytes32 pair and numeric market IDs, and indexes entries by
-  canonical product-aware Nautilus identities. A separate perpetual-only `InstrumentProvider`
-  layer builds on it.
+  canonical product-aware Nautilus identities. It also resolves Spot pair and numeric perpetual
+  market IDs back to canonical instrument identities, rejecting duplicate deployment IDs without
+  changing any index. A separate perpetual-only `InstrumentProvider` layer builds on it.
 - Defensive cursor-pagination state which enforces a local page budget and rejects empty-page
   continuation and repeated cursors without assuming endpoint-specific cursor semantics. The
   cursor-based single-page HTTP methods also reject a response which claims another page without
@@ -140,8 +143,10 @@ implemented and covered by unit tests:
 - A non-operational Nautilus `ExecutionClient` foundation around `ExecutionClientCore` and
   `ExecutionEventEmitter`. Framework identity, account lookup, account-state emission, and
   idempotent lifecycle methods are wired. Unsupported order, query, and report methods return
-  explicit errors rather than the trait's successful no-op defaults, and bulk position reports do
-  not claim complete coverage. `connect` does not perform network startup and succeeds only after
+  explicit errors rather than the trait's successful no-op or composed defaults; mass-status
+  generation does not invoke granular report methods, commission inference cannot fall back to a
+  generic formula, and bulk position reports do not claim complete coverage. `connect` does not
+  perform network startup and succeeds only after
   the existing ordered startup gate has already completed. The gate remains disconnected until
   instrument preload, caller-supplied context restoration, runtime validation, private-stream
   authentication, account-state initialization, startup mass reconciliation, and account
@@ -227,6 +232,20 @@ implemented and covered by unit tests:
   resets and use FIFO eviction. Replay-state lock failure returns a typed error instead of
   panicking, while reservation cleanup remains best-effort during unwinding. No private trade
   decoder, fill report, or event emission is enabled.
+- An execution-client-owned, protocol-neutral fill-report overlap boundary for reports which have
+  already passed future fixture-backed decoding. It deduplicates only matching venue trade IDs with
+  identical economic evidence, ignores locally generated report identity and initialization
+  timestamps, orders output deterministically by event time and trade ID, and rejects conflicting
+  evidence. Reports for another account or venue are rejected before overlap processing, with
+  deterministic validation precedence and results independent of input order. It is not wired into
+  report generation and does not enable private decoding or fill reconciliation.
+- An equivalent protocol-neutral order-report overlap boundary for reports which have already
+  passed future fixture-backed decoding. It deduplicates matching venue order IDs only when every
+  venue-derived field agrees, ignores locally generated report identity and initialization
+  timestamps, rejects a client order ID split across venue order IDs, and produces deterministic
+  results and validation precedence independent of input order. It does not resolve conflicting
+  snapshots by timestamp or source precedence, is not wired into report generation, and does not
+  enable private decoding or order reconciliation.
 
 These foundations do not make the adapter operational. Apart from the two public market-list reads,
 single-page perpetual funding-rate, long-short ratio, and open-interest history primitives, one
@@ -251,7 +270,7 @@ implementation maps to the integration plan as follows:
 
 ### Phase advancement decision
 
-As of 2026-09-08, the implementation focus can advance from the pending-pool recovery milestone to
+As of 2026-09-10, the implementation focus can advance from the pending-pool recovery milestone to
 **Phase E execution and reconciliation**. The durable store, signer lease, exact transaction
 identity, one-shot submission, canonical scan, finality, reorganization, and fail-closed startup
 boundaries are sufficient foundations for developing the execution client. This does not mark
@@ -286,7 +305,9 @@ still requires:
 - Verified private-stream authentication and initial account-state semantics, followed by network
   startup coordination and deterministic report reconciliation through the `ExecutionClient`.
 
-Phase F management services and operational Python examples remain blocked. The completed Phase G
+Phase E preparatory implementation can continue, but its operational capabilities remain blocked
+by the evidence listed above. Phase F management services and operational Python examples remain
+blocked. The completed Phase G
 config, factory, and package projection does not remove the unresolved Phase D and Phase E evidence
 gates or enable a live capability. The external Phase A maintainer-approval and competing-work
 checks also remain unrecorded, so no milestone is ready for public submission as an approved
@@ -324,8 +345,17 @@ integration.
   deterministic re-signing equality of a canonical identity-derived `System.remark` payload
   against the approved fixture snapshot. It rejects any runtime the snapshot does not cover and
   the unproven sequential-nonce domain; every DeepX order call remains unsupported pending
-  authoritative golden vectors, and the fail-closed `DeepXUnsupportedBusinessCallVerifier`
-  remains the default verifier. Authoritative pool,
+  authoritative golden vectors. A fixed testnet `System.remark` regression vector now pins the
+  exact signer payload, AccountId20, Keccak ECDSA signature envelope, complete version-4
+  extrinsic, and Blake2 extrinsic hash produced by the approved runtime fixture and pinned DeepX
+  Subxt revision. The approved spec-366 metadata and current chain source agree that
+  `Subaccount.no_op` is the zero-argument pallet/call index `19/28`; a second fixed regression
+  vector pins its timestamp-nonce signer payload and complete signed extrinsic. Current chain
+  source declares spec version 369, so its other call schemas are not assumed to apply to the
+  immutable spec-366 fixture. These vectors detect local encoding drift but are not independently
+  produced SDK or venue order vectors and do not prove no-op pool replacement or acceptance
+  semantics, so the fail-closed `DeepXUnsupportedBusinessCallVerifier` remains the default
+  verifier. Authoritative pool,
   inclusion, finality, complete absence,
   exact best-block reorganization, and operator evidence can be applied through an exact
   acknowledged record and committed with CAS; signing and submission-start observations cannot
@@ -379,8 +409,11 @@ integration.
   boundary validates and atomically installs a complete caller-supplied replacement snapshot before
   advancing startup. It can derive the active snapshot from the shared execution cache by configured
   account and venue, but it does not verify database restoration, cache provenance, or venue-side
-  completeness. Account-state initialization revalidates the authenticated session immediately
-  before event dispatch, so a reconnect invalidates the prior receipt without advancing startup.
+  completeness. Account-state initialization requires an admitted authenticated frame and
+  revalidates its exact protocol-owner, authentication-token, and connection-epoch session
+  immediately before event dispatch, so a reconnect or same-epoch frame from another protocol
+  owner cannot reuse the prior receipt or advance startup. The `AccountState` remains
+  caller-supplied because no private account payload schema has been proven.
   Startup mass reconciliation holds that exact authentication epoch across durable recovery and
   rejects a stale receipt before loading or mutating transaction state. Its final startup boundary
   revalidates the receipt and verifies that the exact account-state event recorded for the current
@@ -389,6 +422,15 @@ integration.
   completeness of that account state.
   Bounded trade-ID replay state supports reserve, commit, and failure release for an already
   validated venue `TradeId`; committed IDs survive reconnect startup resets until FIFO eviction.
+  Already validated fill reports can also be merged across future pagination overlap only when the
+  same `TradeId` carries identical economic evidence; conflicts fail closed and output ordering is
+  deterministic. This boundary is not connected to the unsupported report methods.
+  Already validated order status reports have the same exact-overlap boundary keyed by
+  `VenueOrderId`, with unique non-empty `ClientOrderId` ownership. It compares all venue-derived
+  fields, so lifecycle progression, complementary partial fields, and competing source snapshots
+  deliberately fail closed until fixtures establish completeness and precedence semantics. Local
+  report identity and initialization time do not affect evidence equality. This boundary is also
+  disconnected from the unsupported report methods.
   The WebSocket single-owner path can now preserve an uncorrelated JSON frame in an authenticated
   envelope only when both its opaque session capability and ingress connection epoch are current.
   Correlated responses are completed through their request waiter and are not emitted through this
@@ -400,7 +442,8 @@ integration.
   Exact pool presence durably records acceptance; pool absence remains unresolved without a write.
   Pending-pool absence is no longer the active implementation milestone. Phase E work should now
   implement private account and order decoding, network startup coordination, one fixture-proven order command,
-  report reconciliation, and authoritative event emission. None of those surfaces exists yet.
+  semantic report reconciliation, and authoritative event emission. None of those operational
+  surfaces exists yet.
 - **Phase F - Not started:** No subaccount, delegate, quota
 - **Phase G - Partial:** This document and the strict Rust data and execution configs exist. The
   execution config
@@ -565,7 +608,8 @@ bucket timestamp earlier than an unaligned `start` and no row when both bounds e
 observed bucket timestamp. Mock tests prove typed query encoding and exact response decoding, but no
 sanitized runtime fixture or multi-page capture yet proves boundary inclusion, cursor stability,
 deduplication, completeness, freshness, or funding settlement semantics. The adapter therefore
-exposes no automatic pagination and emits no Nautilus funding events.
+exposes no automatic pagination and emits no Nautilus funding events. Every decoded page must carry
+the requested market ID; a different response ID is rejected as a terminal identity mismatch.
 
 The typed perpetual long-short ratio primitive calls
 `GET /internal/v1/market/perp/long_short_ratio` with a deployment market ID, millisecond bounds, an
@@ -577,7 +621,8 @@ buckets are omitted. A read-only testnet probe on 2026-09-01 confirmed string ra
 millisecond timestamps, and a continuation cursor for a three-row page. Mock tests prove typed query
 encoding and exact response decoding, but no sanitized runtime fixture or multi-page capture proves
 boundary inclusion, cursor stability, deduplication, completeness, or freshness. The adapter
-therefore exposes no automatic pagination or Nautilus ratio event.
+therefore exposes no automatic pagination or Nautilus ratio event. Every decoded page must carry
+the requested market ID; a different response ID is rejected as a terminal identity mismatch.
 
 The typed perpetual open-interest primitive calls
 `GET /internal/v1/market/perp/open_interest` with a deployment market ID, millisecond bounds, and an
@@ -592,6 +637,9 @@ deployment market ID, an optional positive page size, and an optional opaque cur
 only verified request order to `DESC`, preserves trade price, quantity, and fees from their original
 JSON number tokens as exact decimal values, and returns venue item order, `hasNext`, and `nextCursor`
 without interpretation. It also preserves `createdAt`, `filledDirection`, and `taker` as raw strings.
+Every item on a non-empty page must carry the requested market ID; one mismatching item rejects the
+whole page as a terminal identity mismatch. The response schema provides no page-level market ID,
+so an empty trade page has no response identity available to validate.
 A read-only testnet probe on 2026-09-01 confirmed successful pages selected by either market ID or
 market name, while an `ASC` request returned venue failure code `10012`; the adapter therefore
 exposes only the verified market-ID and descending-order single-page request. Mock tests prove typed
@@ -1201,10 +1249,13 @@ Failed or incomplete conformance leaves that capability disabled and documented 
   Both existing manifests predate structured signed-extension extraction and remain immutable with
   `signed_extensions: null`; the finalized metadata bytes now have an exact decoder-backed order
   regression test. They also predate finalized-header capture and therefore do not prove the block
-  number required for a mortality checkpoint. New captures populate both fields. The default
-  endpoint returned a TLS handshake EOF on 2026-09-02, so no replacement fixture was committed.
-  Mortal signing remains disabled pending a complete capture and the other direct-signing evidence
-  gates.
+  number required for a mortality checkpoint. New captures record the finalized header and its
+  canonical hash at that height, then re-read and validate every serialized payload, runtime
+  identity field, metadata digest, and signed-extension order before atomically publishing the
+  immutable fixture directory. The default endpoint returned a TLS handshake EOF on 2026-09-02, so
+  no replacement fixture was committed. This capture validation does not provide a signed golden
+  vector; mortal signing remains disabled pending a complete capture and the other direct-signing
+  evidence gates.
 - Maintainer approval and confirmation that no competing issue or pull request exists remain
   external contribution process gates; local implementation does not satisfy them.
 - Financial values remain integers or exact decimal values until conversion to Nautilus domain

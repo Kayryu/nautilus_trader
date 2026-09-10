@@ -36,14 +36,15 @@ use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, OmsType},
+    enums::{AccountType, LiquiditySide, OmsType},
     events::AccountState,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
     },
+    instruments::InstrumentAny,
     orders::{Order, OrderAny},
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance},
+    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
 use thiserror::Error;
 
@@ -65,7 +66,7 @@ use crate::{
         reconcile_not_included_checkpoint, reconcile_submission_pool,
         restore_timestamp_nonce_allocator,
     },
-    websocket::{DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
+    websocket::{DeepXWsAuthenticatedFrame, DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
@@ -228,6 +229,74 @@ pub enum DeepXTradeDedupError {
     /// Another thread panicked while holding the trade replay-state lock.
     #[error("DeepX trade deduplication lock is poisoned")]
     LockPoisoned,
+}
+
+/// Errors raised while merging already validated DeepX fill reports.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXFillReportMergeError {
+    /// A fill report belongs to another execution account.
+    #[error(
+        "DeepX fill report account mismatch: expected {expected}, received {received} for trade ID {trade_id}"
+    )]
+    AccountMismatch {
+        /// Configured execution account ID.
+        expected: AccountId,
+        /// Account ID carried by the fill report.
+        received: AccountId,
+        /// Venue trade ID carried by the fill report.
+        trade_id: TradeId,
+    },
+    /// A fill report belongs to another venue.
+    #[error("DeepX fill report trade ID {trade_id} has instrument venue {venue}")]
+    InstrumentVenueMismatch {
+        /// Venue trade ID carried by the fill report.
+        trade_id: TradeId,
+        /// Instrument venue carried by the fill report.
+        venue: Venue,
+    },
+    /// One venue trade ID was associated with conflicting execution evidence.
+    #[error("DeepX trade ID {0} has conflicting fill report evidence")]
+    ConflictingTrade(TradeId),
+}
+
+/// Errors raised while merging already validated DeepX order status reports.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DeepXOrderReportMergeError {
+    /// An order report belongs to another execution account.
+    #[error(
+        "DeepX order report account mismatch: expected {expected}, received {received} for venue order ID {venue_order_id}"
+    )]
+    AccountMismatch {
+        /// Configured execution account ID.
+        expected: AccountId,
+        /// Account ID carried by the order report.
+        received: AccountId,
+        /// Venue order ID carried by the order report.
+        venue_order_id: VenueOrderId,
+    },
+    /// An order report belongs to another venue.
+    #[error("DeepX order report venue order ID {venue_order_id} has instrument venue {venue}")]
+    InstrumentVenueMismatch {
+        /// Venue order ID carried by the order report.
+        venue_order_id: VenueOrderId,
+        /// Instrument venue carried by the order report.
+        venue: Venue,
+    },
+    /// One client order ID was associated with multiple venue order IDs.
+    #[error(
+        "DeepX client order ID {client_order_id} has conflicting venue order IDs {first_venue_order_id} and {second_venue_order_id}"
+    )]
+    ClientOrderIdentitySplit {
+        /// Client order ID carried by both reports.
+        client_order_id: ClientOrderId,
+        /// First venue order ID in deterministic identity order.
+        first_venue_order_id: VenueOrderId,
+        /// Second venue order ID in deterministic identity order.
+        second_venue_order_id: VenueOrderId,
+    },
+    /// One venue order ID was associated with conflicting order evidence.
+    #[error("DeepX venue order ID {0} has conflicting order report evidence")]
+    ConflictingOrder(VenueOrderId),
 }
 
 /// Errors raised while restoring the complete startup order-context set.
@@ -916,6 +985,184 @@ pub struct DeepXExecutionClient {
 }
 
 impl DeepXExecutionClient {
+    #[allow(
+        dead_code,
+        reason = "reserved for the fixture-gated order report reconciliation path"
+    )]
+    pub(crate) fn merge_validated_order_reports(
+        &self,
+        reports: impl IntoIterator<Item = OrderStatusReport>,
+    ) -> Result<Vec<OrderStatusReport>, DeepXOrderReportMergeError> {
+        fn has_same_evidence(first: &OrderStatusReport, second: &OrderStatusReport) -> bool {
+            first.account_id == second.account_id
+                && first.instrument_id == second.instrument_id
+                && first.client_order_id == second.client_order_id
+                && first.venue_order_id == second.venue_order_id
+                && first.order_side == second.order_side
+                && first.order_type == second.order_type
+                && first.time_in_force == second.time_in_force
+                && first.order_status == second.order_status
+                && first.quantity == second.quantity
+                && first.filled_qty == second.filled_qty
+                && first.ts_accepted == second.ts_accepted
+                && first.ts_last == second.ts_last
+                && first.order_list_id == second.order_list_id
+                && first.venue_position_id == second.venue_position_id
+                && first.linked_order_ids == second.linked_order_ids
+                && first.parent_order_id == second.parent_order_id
+                && first.contingency_type == second.contingency_type
+                && first.expire_time == second.expire_time
+                && first.price == second.price
+                && first.activation_price == second.activation_price
+                && first.trigger_price == second.trigger_price
+                && first.trigger_type == second.trigger_type
+                && first.limit_offset == second.limit_offset
+                && first.trailing_offset == second.trailing_offset
+                && first.trailing_offset_type == second.trailing_offset_type
+                && first.avg_px == second.avg_px
+                && first.display_qty == second.display_qty
+                && first.post_only == second.post_only
+                && first.reduce_only == second.reduce_only
+                && first.cancel_reason == second.cancel_reason
+                && first.ts_triggered == second.ts_triggered
+        }
+
+        let mut reports: Vec<_> = reports.into_iter().collect();
+        reports.sort_by_key(|report| {
+            (
+                report.venue_order_id,
+                report.account_id,
+                report.instrument_id.venue,
+                report.client_order_id,
+                report.ts_init,
+                report.report_id.to_string(),
+            )
+        });
+
+        for report in &reports {
+            if report.account_id != self.core.account_id {
+                return Err(DeepXOrderReportMergeError::AccountMismatch {
+                    expected: self.core.account_id,
+                    received: report.account_id,
+                    venue_order_id: report.venue_order_id,
+                });
+            }
+        }
+        for report in &reports {
+            if report.instrument_id.venue != *DEEPX_VENUE {
+                return Err(DeepXOrderReportMergeError::InstrumentVenueMismatch {
+                    venue_order_id: report.venue_order_id,
+                    venue: report.instrument_id.venue,
+                });
+            }
+        }
+
+        let mut venue_order_ids_by_client = HashMap::new();
+        for report in &reports {
+            if let Some(client_order_id) = report.client_order_id
+                && let Some(first_venue_order_id) =
+                    venue_order_ids_by_client.get(&client_order_id).copied()
+                && first_venue_order_id != report.venue_order_id
+            {
+                return Err(DeepXOrderReportMergeError::ClientOrderIdentitySplit {
+                    client_order_id,
+                    first_venue_order_id,
+                    second_venue_order_id: report.venue_order_id,
+                });
+            } else if let Some(client_order_id) = report.client_order_id {
+                venue_order_ids_by_client.insert(client_order_id, report.venue_order_id);
+            }
+        }
+
+        let mut reports_by_venue_order_id = HashMap::new();
+        for report in reports {
+            if let Some(existing) = reports_by_venue_order_id.get(&report.venue_order_id) {
+                if !has_same_evidence(existing, &report) {
+                    return Err(DeepXOrderReportMergeError::ConflictingOrder(
+                        report.venue_order_id,
+                    ));
+                }
+            } else {
+                reports_by_venue_order_id.insert(report.venue_order_id, report);
+            }
+        }
+
+        let mut merged: Vec<_> = reports_by_venue_order_id.into_values().collect();
+        merged.sort_by_key(|report| report.venue_order_id);
+        Ok(merged)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for the fixture-gated fill report reconciliation path"
+    )]
+    pub(crate) fn merge_validated_fill_reports(
+        &self,
+        reports: impl IntoIterator<Item = FillReport>,
+    ) -> Result<Vec<FillReport>, DeepXFillReportMergeError> {
+        fn has_same_evidence(first: &FillReport, second: &FillReport) -> bool {
+            first.account_id == second.account_id
+                && first.instrument_id == second.instrument_id
+                && first.venue_order_id == second.venue_order_id
+                && first.trade_id == second.trade_id
+                && first.order_side == second.order_side
+                && first.last_qty == second.last_qty
+                && first.last_px == second.last_px
+                && first.commission == second.commission
+                && first.liquidity_side == second.liquidity_side
+                && first.avg_px == second.avg_px
+                && first.ts_event == second.ts_event
+                && first.client_order_id == second.client_order_id
+                && first.venue_position_id == second.venue_position_id
+        }
+
+        let mut reports: Vec<_> = reports.into_iter().collect();
+        reports.sort_by_key(|report| {
+            (
+                report.trade_id,
+                report.account_id,
+                report.instrument_id.venue,
+                report.ts_event,
+                report.ts_init,
+                report.report_id.to_string(),
+            )
+        });
+
+        for report in &reports {
+            if report.account_id != self.core.account_id {
+                return Err(DeepXFillReportMergeError::AccountMismatch {
+                    expected: self.core.account_id,
+                    received: report.account_id,
+                    trade_id: report.trade_id,
+                });
+            }
+        }
+        for report in &reports {
+            if report.instrument_id.venue != *DEEPX_VENUE {
+                return Err(DeepXFillReportMergeError::InstrumentVenueMismatch {
+                    trade_id: report.trade_id,
+                    venue: report.instrument_id.venue,
+                });
+            }
+        }
+
+        let mut reports_by_trade_id = HashMap::new();
+
+        for report in reports {
+            if let Some(existing) = reports_by_trade_id.get(&report.trade_id) {
+                if !has_same_evidence(existing, &report) {
+                    return Err(DeepXFillReportMergeError::ConflictingTrade(report.trade_id));
+                }
+            } else {
+                reports_by_trade_id.insert(report.trade_id, report);
+            }
+        }
+
+        let mut merged: Vec<_> = reports_by_trade_id.into_values().collect();
+        merged.sort_by_key(|report| (report.ts_event, report.trade_id));
+        Ok(merged)
+    }
+
     fn validate_rpc_evidence(
         &self,
         endpoints: &DeepXValidatedRpcEndpoints,
@@ -1341,13 +1588,13 @@ impl DeepXExecutionClient {
     pub fn record_account_state_initialized(
         &mut self,
         protocol: &DeepXWsProtocolCore,
-        session: DeepXWsAuthenticatedSession,
+        frame: &DeepXWsAuthenticatedFrame,
         state: &AccountState,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
-        if self.startup_authenticated_session != Some(session)
-            || !protocol.is_authenticated_session(session)
+        if self.startup_authenticated_session != Some(frame.session())
+            || !protocol.is_authenticated_session(frame.session())
         {
             return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
         }
@@ -1614,6 +1861,10 @@ impl ExecutionClient for DeepXExecutionClient {
         Ok(())
     }
 
+    fn dispose(&mut self) -> anyhow::Result<()> {
+        self.stop()
+    }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.startup.is_ready() && self.core.is_connected(),
@@ -1691,6 +1942,23 @@ impl ExecutionClient for DeepXExecutionClient {
         anyhow::bail!("DeepX position status reports are not operational")
     }
 
+    async fn generate_mass_status(
+        &self,
+        _lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        anyhow::bail!("DeepX mass status reports are not operational")
+    }
+
+    fn calculate_commission(
+        &self,
+        _instrument: &InstrumentAny,
+        _last_qty: Quantity,
+        _last_px: Price,
+        _liquidity_side: LiquiditySide,
+    ) -> anyhow::Result<Option<Money>> {
+        anyhow::bail!("DeepX commission calculation is not operational")
+    }
+
     fn register_external_order(
         &self,
         client_order_id: ClientOrderId,
@@ -1731,16 +1999,19 @@ mod tests {
         cache::Cache, live::runner::replace_exec_event_sender, messages::ExecutionEvent,
     };
     use nautilus_core::{UUID4, UnixNanos, hex};
+    use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
-        enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
+        enums::{
+            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+        },
         events::{AccountState, OrderAccepted, OrderEventAny, OrderSubmitted},
         identifiers::{
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId,
             VenueOrderId,
         },
         orders::OrderTestBuilder,
-        types::{Price, Quantity},
+        types::{Money, Price, Quantity},
     };
     use rstest::rstest;
     use serde_json::{Value, json};
@@ -1767,6 +2038,7 @@ mod tests {
             DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
             DeepXTransactionRevision,
         },
+        websocket::DeepXWsFrame,
     };
 
     const GENESIS_FIXTURE: &str = include_str!(
@@ -2965,11 +3237,12 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
         client
-            .record_account_state_initialized(&protocol, session, &state)
+            .record_account_state_initialized(&protocol, &frame, &state)
             .unwrap();
         client
             .startup
@@ -2991,10 +3264,11 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
         client
-            .record_account_state_initialized(&protocol, session, &test_account_state())
+            .record_account_state_initialized(&protocol, &frame, &test_account_state())
             .unwrap();
         (protocol, session)
     }
@@ -3532,6 +3806,374 @@ mod tests {
         assert!(protocol.complete_authentication(attempt));
         let session = protocol.authenticated_session().unwrap();
         (protocol, session)
+    }
+
+    fn authenticated_account_frame(
+        protocol: &DeepXWsProtocolCore,
+        session: DeepXWsAuthenticatedSession,
+    ) -> DeepXWsAuthenticatedFrame {
+        protocol
+            .admit_authenticated_frame(
+                session.connection_epoch(),
+                session,
+                DeepXWsFrame::parse(r#"{"channel":"account","data":{}}"#).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn reconciliation_fill_report(trade_id: &str, ts_event: u64) -> FillReport {
+        FillReport::new(
+            AccountId::from("DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            VenueOrderId::from("venue-order-1"),
+            TradeId::from(trade_id),
+            OrderSide::Buy,
+            Quantity::from("0.10"),
+            Price::from("2500.00"),
+            Money::from("0.25 USDC"),
+            LiquiditySide::Taker,
+            Some(ClientOrderId::from("client-order-1")),
+            None,
+            UnixNanos::from(ts_event),
+            UnixNanos::from(ts_event + 100),
+            None,
+        )
+    }
+
+    fn reconciliation_order_report(
+        client_order_id: &str,
+        venue_order_id: &str,
+        ts_last: u64,
+    ) -> OrderStatusReport {
+        OrderStatusReport::new(
+            AccountId::from("DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            Some(ClientOrderId::from(client_order_id)),
+            VenueOrderId::from(venue_order_id),
+            Some(OrderSide::Buy),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("0.10"),
+            Quantity::zero(2),
+            UnixNanos::from(10),
+            UnixNanos::from(ts_last),
+            UnixNanos::from(ts_last + 100),
+            None,
+        )
+    }
+
+    #[rstest]
+    fn order_report_merge_deduplicates_overlap_ignoring_local_identity() {
+        let client = test_client();
+        let first = reconciliation_order_report("client-order-1", "venue-order-1", 20);
+        let mut replay = first.clone();
+        replay.report_id = UUID4::new();
+        replay.ts_init = UnixNanos::from(999);
+
+        let merged = client
+            .merge_validated_order_reports([first.clone(), replay])
+            .unwrap();
+
+        assert_eq!(merged, vec![first]);
+    }
+
+    #[rstest]
+    fn order_report_merge_orders_deterministically_by_venue_identity() {
+        let client = test_client();
+        let second = reconciliation_order_report("client-order-2", "venue-order-2", 10);
+        let first = reconciliation_order_report("client-order-1", "venue-order-1", 20);
+
+        let merged = client
+            .merge_validated_order_reports([second, first])
+            .unwrap();
+        let identities: Vec<_> = merged.iter().map(|report| report.venue_order_id).collect();
+
+        assert_eq!(
+            identities,
+            vec![
+                VenueOrderId::from("venue-order-1"),
+                VenueOrderId::from("venue-order-2"),
+            ],
+        );
+    }
+
+    #[rstest]
+    fn order_report_merge_rejects_conflicting_venue_order_evidence() {
+        let client = test_client();
+        let first = reconciliation_order_report("client-order-1", "venue-order-1", 20);
+        let mut conflicting = first.clone();
+        conflicting.filled_qty = Quantity::from("0.01");
+
+        assert_eq!(
+            client.merge_validated_order_reports([first, conflicting]),
+            Err(DeepXOrderReportMergeError::ConflictingOrder(
+                VenueOrderId::from("venue-order-1"),
+            )),
+        );
+    }
+
+    #[rstest]
+    fn order_report_merge_rejects_client_identity_split() {
+        let client = test_client();
+        let first = reconciliation_order_report("client-order-1", "venue-order-1", 10);
+        let second = reconciliation_order_report("client-order-1", "venue-order-2", 20);
+
+        assert_eq!(
+            client.merge_validated_order_reports([second, first]),
+            Err(DeepXOrderReportMergeError::ClientOrderIdentitySplit {
+                client_order_id: ClientOrderId::from("client-order-1"),
+                first_venue_order_id: VenueOrderId::from("venue-order-1"),
+                second_venue_order_id: VenueOrderId::from("venue-order-2"),
+            }),
+        );
+    }
+
+    #[rstest]
+    fn order_report_merge_is_permutation_invariant() {
+        let client = test_client();
+        let first = reconciliation_order_report("client-order-1", "venue-order-1", 20);
+        let mut replay = first.clone();
+        replay.report_id = UUID4::new();
+        replay.ts_init = UnixNanos::from(999);
+
+        let forward = client
+            .merge_validated_order_reports([first.clone(), replay.clone()])
+            .unwrap();
+        let reverse = client
+            .merge_validated_order_reports([replay, first])
+            .unwrap();
+
+        assert_eq!(forward, reverse);
+    }
+
+    #[rstest]
+    fn order_report_merge_error_precedence_is_permutation_invariant() {
+        let client = test_client();
+        let mut foreign_account =
+            reconciliation_order_report("client-order-1", "venue-order-1", 20);
+        foreign_account.account_id = AccountId::from("DEEPX-002");
+        let mut foreign_venue = reconciliation_order_report("client-order-2", "venue-order-2", 10);
+        foreign_venue.instrument_id = InstrumentId::from("ETH-USDC-PERP.OTHER");
+        let expected = Err(DeepXOrderReportMergeError::AccountMismatch {
+            expected: AccountId::from("DEEPX-001"),
+            received: AccountId::from("DEEPX-002"),
+            venue_order_id: VenueOrderId::from("venue-order-1"),
+        });
+
+        assert_eq!(
+            client.merge_validated_order_reports([foreign_account.clone(), foreign_venue.clone(),]),
+            expected,
+        );
+        assert_eq!(
+            client.merge_validated_order_reports([foreign_venue, foreign_account]),
+            expected,
+        );
+    }
+
+    #[tokio::test]
+    async fn order_report_merge_keeps_generation_unsupported() {
+        let client = test_client();
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_order_status_report(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX order status reports are not operational",
+        );
+    }
+
+    #[rstest]
+    fn fill_report_merge_deduplicates_page_overlap_ignoring_local_identity() {
+        let client = test_client();
+        let first = reconciliation_fill_report("trade-1", 20);
+        let mut replay = first.clone();
+        replay.report_id = UUID4::new();
+        replay.ts_init = UnixNanos::from(999);
+
+        let merged = client
+            .merge_validated_fill_reports([first.clone(), replay])
+            .unwrap();
+
+        assert_eq!(merged, vec![first]);
+    }
+
+    #[rstest]
+    fn fill_report_merge_orders_deterministically_by_event_and_trade_identity() {
+        let client = test_client();
+        let later = reconciliation_fill_report("trade-2", 20);
+        let same_time_later_identity = reconciliation_fill_report("trade-3", 10);
+        let earlier_identity = reconciliation_fill_report("trade-1", 10);
+
+        let merged = client
+            .merge_validated_fill_reports([later, same_time_later_identity, earlier_identity])
+            .unwrap();
+        let identities: Vec<_> = merged
+            .iter()
+            .map(|report| (report.ts_event, report.trade_id))
+            .collect();
+
+        assert_eq!(
+            identities,
+            vec![
+                (UnixNanos::from(10), TradeId::from("trade-1")),
+                (UnixNanos::from(10), TradeId::from("trade-3")),
+                (UnixNanos::from(20), TradeId::from("trade-2")),
+            ],
+        );
+    }
+
+    #[rstest]
+    fn fill_report_merge_rejects_conflicting_trade_evidence() {
+        let client = test_client();
+        let first = reconciliation_fill_report("trade-1", 20);
+        let mut conflicting = first.clone();
+        conflicting.last_qty = Quantity::from("0.20");
+
+        assert_eq!(
+            client.merge_validated_fill_reports([first, conflicting]),
+            Err(DeepXFillReportMergeError::ConflictingTrade(TradeId::from(
+                "trade-1"
+            ))),
+        );
+    }
+
+    #[rstest]
+    fn fill_report_merge_rejects_foreign_account() {
+        let client = test_client();
+        let mut report = reconciliation_fill_report("trade-1", 20);
+        report.account_id = AccountId::from("DEEPX-002");
+
+        assert_eq!(
+            client.merge_validated_fill_reports([report]),
+            Err(DeepXFillReportMergeError::AccountMismatch {
+                expected: AccountId::from("DEEPX-001"),
+                received: AccountId::from("DEEPX-002"),
+                trade_id: TradeId::from("trade-1"),
+            }),
+        );
+    }
+
+    #[rstest]
+    fn fill_report_merge_rejects_foreign_venue() {
+        let client = test_client();
+        let mut report = reconciliation_fill_report("trade-1", 20);
+        report.instrument_id = InstrumentId::from("ETH-USDC-PERP.OTHER");
+
+        assert_eq!(
+            client.merge_validated_fill_reports([report]),
+            Err(DeepXFillReportMergeError::InstrumentVenueMismatch {
+                trade_id: TradeId::from("trade-1"),
+                venue: Venue::from("OTHER"),
+            }),
+        );
+    }
+
+    #[rstest]
+    fn fill_report_merge_is_permutation_invariant() {
+        let client = test_client();
+        let first = reconciliation_fill_report("trade-1", 20);
+        let mut replay = first.clone();
+        replay.report_id = UUID4::new();
+        replay.ts_init = UnixNanos::from(999);
+
+        let forward = client
+            .merge_validated_fill_reports([first.clone(), replay.clone()])
+            .unwrap();
+        let reverse = client
+            .merge_validated_fill_reports([replay, first])
+            .unwrap();
+
+        assert_eq!(forward, reverse);
+    }
+
+    #[rstest]
+    fn fill_report_merge_error_precedence_is_permutation_invariant() {
+        let client = test_client();
+        let mut foreign_account = reconciliation_fill_report("trade-1", 20);
+        foreign_account.account_id = AccountId::from("DEEPX-002");
+        let mut foreign_venue = reconciliation_fill_report("trade-2", 10);
+        foreign_venue.instrument_id = InstrumentId::from("ETH-USDC-PERP.OTHER");
+        let expected = Err(DeepXFillReportMergeError::AccountMismatch {
+            expected: AccountId::from("DEEPX-001"),
+            received: AccountId::from("DEEPX-002"),
+            trade_id: TradeId::from("trade-1"),
+        });
+
+        assert_eq!(
+            client.merge_validated_fill_reports([foreign_account.clone(), foreign_venue.clone()]),
+            expected,
+        );
+        assert_eq!(
+            client.merge_validated_fill_reports([foreign_venue, foreign_account]),
+            expected,
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_report_generation_remains_unsupported() {
+        let client = test_client();
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "DeepX fill reports are not operational");
+    }
+
+    #[tokio::test]
+    async fn mass_status_generation_remains_unsupported() {
+        let client = test_client();
+
+        let error = ExecutionClient::generate_mass_status(&client, Some(u64::MAX))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX mass status reports are not operational",
+        );
+    }
+
+    #[rstest]
+    fn commission_calculation_remains_unsupported() {
+        let client = test_client();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+
+        let error = ExecutionClient::calculate_commission(
+            &client,
+            &instrument,
+            Quantity::from("1.000"),
+            Price::from("2500.00"),
+            LiquiditySide::Taker,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX commission calculation is not operational",
+        );
     }
 
     fn register_test_account(cache: &Rc<RefCell<Cache>>, state: AccountState) {
@@ -4656,11 +5298,12 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         let mut state = test_account_state();
         state.account_type = AccountType::Cash;
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, session, &state),
+            client.record_account_state_initialized(&protocol, &frame, &state),
             Err(DeepXExecutionStartupError::AccountStateIdentityMismatch {
                 expected_account_id: AccountId::from("DEEPX-001"),
                 expected_account_type: AccountType::Margin,
@@ -4692,12 +5335,13 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         client
-            .record_account_state_initialized(&protocol, session, &state)
+            .record_account_state_initialized(&protocol, &frame, &state)
             .unwrap();
 
         let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
@@ -4721,12 +5365,13 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
         client.emitter.set_sender(sender);
 
-        let result = client.record_account_state_initialized(&protocol, session, &state);
+        let result = client.record_account_state_initialized(&protocol, &frame, &state);
 
         assert!(matches!(
             result,
@@ -4755,13 +5400,14 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
         protocol.reset_after_reconnect(1, "test reconnect").unwrap();
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, session, &state),
+            client.record_account_state_initialized(&protocol, &frame, &state),
             Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
         );
         assert!(receiver.try_recv().is_err());
@@ -4783,12 +5429,13 @@ mod tests {
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
         let (other_protocol, other_session) = authenticated_protocol();
+        let other_frame = authenticated_account_frame(&other_protocol, other_session);
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         assert_eq!(
-            client.record_account_state_initialized(&other_protocol, other_session, &state),
+            client.record_account_state_initialized(&other_protocol, &other_frame, &state),
             Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
         );
         assert!(receiver.try_recv().is_err());
@@ -4809,6 +5456,7 @@ mod tests {
         client
             .record_private_stream_authenticated(&protocol, session)
             .unwrap();
+        let frame = authenticated_account_frame(&protocol, session);
 
         client.reset_startup();
         record_instruments_loaded(&mut client);
@@ -4824,7 +5472,7 @@ mod tests {
         let state = test_account_state();
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, session, &state),
+            client.record_account_state_initialized(&protocol, &frame, &state),
             Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
         );
         assert_eq!(client.startup_account_event_id, None);
@@ -4986,6 +5634,25 @@ mod tests {
         assert!(client.core.is_stopped());
         assert!(!client.is_connected());
         assert_eq!(client.startup.completed_steps, 0);
+    }
+
+    #[rstest]
+    fn execution_client_dispose_clears_connected_startup_state() {
+        let (mut client, cache) = test_client_with_cache();
+        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        register_test_account(&cache, state);
+        client
+            .complete_account_registration(&protocol, session)
+            .unwrap();
+        assert!(client.is_connected());
+
+        ExecutionClient::dispose(&mut client).unwrap();
+
+        assert!(client.core.is_stopped());
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 0);
+        assert_eq!(client.startup_authenticated_session, None);
+        assert_eq!(client.startup_account_event_id, None);
     }
 
     #[tokio::test]

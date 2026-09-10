@@ -18,7 +18,11 @@
 //! Run with:
 //! `cargo run -p nautilus-deepx --bin deepx-capture-runtime-fixtures`
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    env, fs,
+    path::{Component, Path, PathBuf},
+};
 
 use anyhow::{Context, ensure};
 use aws_lc_rs::digest;
@@ -63,7 +67,7 @@ struct BlockHeader {
     digest: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FixtureIdentity {
     genesis_hash: String,
     metadata_sha256: String,
@@ -71,7 +75,7 @@ struct FixtureIdentity {
     transaction_version: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FixtureRecord {
     method: String,
     params: Value,
@@ -79,7 +83,7 @@ struct FixtureRecord {
     bytes: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FixtureManifest {
     captured_at: String,
     deployment: String,
@@ -111,6 +115,17 @@ async fn main() -> anyhow::Result<()> {
     let finalized_header =
         rpc::<BlockHeader>(&client, &rpc_url, "chain_getHeader", block_params.clone()).await?;
     let block_number = parse_block_number(&finalized_header.result.number)?;
+    let finalized_block_hash = rpc::<String>(
+        &client,
+        &rpc_url,
+        "chain_getBlockHash",
+        json!([block_number]),
+    )
+    .await?;
+    ensure!(
+        finalized_block_hash.result == finalized_head.result,
+        "DeepX finalized header is not canonical at block {block_number}",
+    );
     let runtime = rpc::<RuntimeVersion>(
         &client,
         &rpc_url,
@@ -138,67 +153,110 @@ async fn main() -> anyhow::Result<()> {
         "DeepX fixture set already exists and is immutable: {}",
         fixture_dir.display(),
     );
-    fs::create_dir_all(&fixture_dir)?;
+    let staging_dir = fixture_dir.with_extension(format!("partial-{}", std::process::id()));
+    ensure!(
+        !staging_dir.exists(),
+        "DeepX fixture staging directory already exists: {}",
+        staging_dir.display(),
+    );
+    fs::create_dir_all(&staging_dir)?;
 
-    let fixtures = vec![
-        write_fixture(
-            &fixture_dir,
-            "genesis_hash.json",
-            "chain_getBlockHash",
-            json!([0]),
-            &genesis,
-        )?,
-        write_fixture(
-            &fixture_dir,
-            "finalized_head.json",
-            "chain_getFinalizedHead",
-            json!([]),
-            &finalized_head,
-        )?,
-        write_fixture(
-            &fixture_dir,
-            "finalized_header.json",
-            "chain_getHeader",
-            block_params.clone(),
-            &finalized_header,
-        )?,
-        write_fixture(
-            &fixture_dir,
-            "runtime_version.json",
-            "state_getRuntimeVersion",
-            block_params.clone(),
-            &runtime,
-        )?,
-        write_fixture(
-            &fixture_dir,
-            "metadata.json",
-            "state_getMetadata",
-            block_params,
-            &metadata,
-        )?,
-    ];
-    let manifest = FixtureManifest {
-        captured_at: Timestamp::now()
-            .display_with_offset(Offset::UTC)
-            .to_string(),
-        deployment: "testnet".to_string(),
-        endpoint_role: "runtime_identity".to_string(),
-        rpc_url,
-        block_reference: "finalized".to_string(),
-        block_hash: finalized_head.result,
-        block_number,
-        identity,
-        metadata_bytes: metadata_bytes.len(),
-        signed_extensions,
-        fixtures,
-    };
-    write_json(fixture_dir.join("manifest.json"), &manifest)?;
+    let write_result = (|| -> anyhow::Result<()> {
+        let fixtures = vec![
+            write_fixture(
+                &staging_dir,
+                "genesis_hash.json",
+                "chain_getBlockHash",
+                json!([0]),
+                &genesis,
+            )?,
+            write_fixture(
+                &staging_dir,
+                "finalized_head.json",
+                "chain_getFinalizedHead",
+                json!([]),
+                &finalized_head,
+            )?,
+            write_fixture(
+                &staging_dir,
+                "finalized_header.json",
+                "chain_getHeader",
+                block_params.clone(),
+                &finalized_header,
+            )?,
+            write_fixture(
+                &staging_dir,
+                "finalized_block_hash.json",
+                "chain_getBlockHash",
+                json!([block_number]),
+                &finalized_block_hash,
+            )?,
+            write_fixture(
+                &staging_dir,
+                "runtime_version.json",
+                "state_getRuntimeVersion",
+                block_params.clone(),
+                &runtime,
+            )?,
+            write_fixture(
+                &staging_dir,
+                "metadata.json",
+                "state_getMetadata",
+                block_params,
+                &metadata,
+            )?,
+        ];
+        let manifest = FixtureManifest {
+            captured_at: Timestamp::now()
+                .display_with_offset(Offset::UTC)
+                .to_string(),
+            deployment: "testnet".to_string(),
+            endpoint_role: "runtime_identity".to_string(),
+            rpc_url,
+            block_reference: "finalized".to_string(),
+            block_hash: finalized_head.result,
+            block_number,
+            identity,
+            metadata_bytes: metadata_bytes.len(),
+            signed_extensions,
+            fixtures,
+        };
+        write_json(staging_dir.join("manifest.json"), &manifest)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        return Err(clean_staging_after_error(&staging_dir, e));
+    }
+    publish_fixture_set(&staging_dir, &fixture_dir)?;
 
     println!(
         "Captured DeepX runtime fixtures under {}",
         fixture_dir.display()
     );
     Ok(())
+}
+
+fn publish_fixture_set(staging_dir: &Path, fixture_dir: &Path) -> anyhow::Result<()> {
+    let result = validate_written_fixture_set(staging_dir).and_then(|()| {
+        fs::rename(staging_dir, fixture_dir).with_context(|| {
+            format!(
+                "Failed to publish DeepX fixture set from {} to {}",
+                staging_dir.display(),
+                fixture_dir.display(),
+            )
+        })
+    });
+    result.map_err(|e| clean_staging_after_error(staging_dir, e))
+}
+
+fn clean_staging_after_error(staging_dir: &Path, error: anyhow::Error) -> anyhow::Error {
+    match fs::remove_dir_all(staging_dir) {
+        Ok(()) => error,
+        Err(cleanup_error) => error.context(format!(
+            "Failed to clean incomplete DeepX fixture staging directory {}: {cleanup_error}",
+            staging_dir.display(),
+        )),
+    }
 }
 
 async fn rpc<T>(
@@ -291,13 +349,271 @@ fn write_json(path: PathBuf, value: &impl Serialize) -> anyhow::Result<usize> {
     Ok(bytes.len())
 }
 
+fn validate_written_fixture_set(fixture_dir: &Path) -> anyhow::Result<()> {
+    let manifest_path = fixture_dir.join("manifest.json");
+    let manifest: FixtureManifest = read_json(&manifest_path)?;
+    let expected_fixtures = [
+        "genesis_hash.json",
+        "finalized_head.json",
+        "finalized_header.json",
+        "finalized_block_hash.json",
+        "runtime_version.json",
+        "metadata.json",
+    ];
+    ensure!(
+        manifest.fixtures.len() == expected_fixtures.len(),
+        "DeepX fixture manifest must contain exactly six payload records",
+    );
+    let mut payload_paths = BTreeSet::new();
+
+    for fixture in &manifest.fixtures {
+        let payload_path = Path::new(&fixture.payload_path);
+        ensure!(
+            matches!(
+                payload_path.components().collect::<Vec<_>>().as_slice(),
+                [Component::Normal(_)]
+            ),
+            "DeepX fixture payload path must be a file name: {}",
+            fixture.payload_path,
+        );
+        ensure!(
+            payload_paths.insert(&fixture.payload_path),
+            "DeepX fixture manifest contains duplicate payload path {}",
+            fixture.payload_path,
+        );
+        let payload_metadata =
+            fs::symlink_metadata(fixture_dir.join(payload_path)).with_context(|| {
+                format!(
+                    "Failed to inspect DeepX fixture payload {}",
+                    fixture.payload_path
+                )
+            })?;
+        ensure!(
+            payload_metadata.file_type().is_file(),
+            "DeepX fixture payload must be a regular file: {}",
+            fixture.payload_path,
+        );
+        let actual_bytes = payload_metadata.len();
+        ensure!(
+            actual_bytes == fixture.bytes as u64,
+            "DeepX fixture byte count mismatch for {}: expected {}, received {actual_bytes}",
+            fixture.payload_path,
+            fixture.bytes,
+        );
+    }
+    for payload_path in expected_fixtures {
+        fixture_record(&manifest, payload_path)?;
+    }
+
+    let genesis_record = fixture_record(&manifest, "genesis_hash.json")?;
+    ensure!(
+        genesis_record.method == "chain_getBlockHash",
+        "DeepX genesis fixture has unexpected RPC method",
+    );
+    ensure!(
+        genesis_record.params == json!([0]),
+        "DeepX genesis fixture must request block zero",
+    );
+    let genesis = read_fixture::<String>(fixture_dir, genesis_record)?;
+    ensure!(
+        genesis.result == manifest.identity.genesis_hash,
+        "DeepX fixture genesis hash does not match manifest identity",
+    );
+
+    let finalized_head_record = fixture_record(&manifest, "finalized_head.json")?;
+    ensure!(
+        finalized_head_record.method == "chain_getFinalizedHead",
+        "DeepX finalized-head fixture has unexpected RPC method",
+    );
+    ensure!(
+        finalized_head_record.params == json!([]),
+        "DeepX finalized-head fixture must not have parameters",
+    );
+    let finalized_head = read_fixture::<String>(fixture_dir, finalized_head_record)?;
+    ensure!(
+        finalized_head.result == manifest.block_hash,
+        "DeepX finalized head does not match manifest block hash",
+    );
+
+    let block_params = json!([manifest.block_hash]);
+    let header_record = fixture_record(&manifest, "finalized_header.json")?;
+    ensure!(
+        header_record.method == "chain_getHeader",
+        "DeepX finalized-header fixture has unexpected RPC method",
+    );
+    ensure!(
+        header_record.params == block_params,
+        "DeepX finalized-header fixture is not bound to the manifest block hash",
+    );
+    let header = read_fixture::<BlockHeader>(fixture_dir, header_record)?;
+    ensure!(
+        parse_block_number(&header.result.number)? == manifest.block_number,
+        "DeepX finalized header number does not match manifest block number",
+    );
+
+    let block_hash_record = fixture_record(&manifest, "finalized_block_hash.json")?;
+    ensure!(
+        block_hash_record.method == "chain_getBlockHash",
+        "DeepX finalized block-hash fixture has unexpected RPC method",
+    );
+    ensure!(
+        block_hash_record.params == json!([manifest.block_number]),
+        "DeepX finalized block-hash fixture does not request the manifest block number",
+    );
+    let block_hash = read_fixture::<String>(fixture_dir, block_hash_record)?;
+    ensure!(
+        block_hash.result == manifest.block_hash,
+        "DeepX finalized header hash does not match manifest block hash",
+    );
+
+    let runtime_record = fixture_record(&manifest, "runtime_version.json")?;
+    ensure!(
+        runtime_record.method == "state_getRuntimeVersion",
+        "DeepX runtime-version fixture has unexpected RPC method",
+    );
+    ensure!(
+        runtime_record.params == block_params,
+        "DeepX runtime-version fixture is not bound to the manifest block hash",
+    );
+    let runtime = read_fixture::<RuntimeVersion>(fixture_dir, runtime_record)?;
+    ensure!(
+        runtime.result.spec_version == manifest.identity.spec_version,
+        "DeepX runtime spec version does not match manifest identity",
+    );
+    ensure!(
+        runtime.result.transaction_version == manifest.identity.transaction_version,
+        "DeepX runtime transaction version does not match manifest identity",
+    );
+
+    let metadata_record = fixture_record(&manifest, "metadata.json")?;
+    ensure!(
+        metadata_record.method == "state_getMetadata",
+        "DeepX metadata fixture has unexpected RPC method",
+    );
+    ensure!(
+        metadata_record.params == block_params,
+        "DeepX metadata fixture is not bound to the manifest block hash",
+    );
+    let metadata = read_fixture::<String>(fixture_dir, metadata_record)?;
+    let metadata_bytes = nautilus_core::hex::decode(metadata.result.trim_start_matches("0x"))
+        .context("DeepX fixture metadata was not valid hex")?;
+    ensure!(
+        metadata_bytes.len() == manifest.metadata_bytes,
+        "DeepX metadata length does not match manifest",
+    );
+    let metadata_sha256 =
+        nautilus_core::hex::encode(digest::digest(&digest::SHA256, &metadata_bytes).as_ref());
+    ensure!(
+        metadata_sha256 == manifest.identity.metadata_sha256,
+        "DeepX metadata SHA-256 does not match manifest identity",
+    );
+    ensure!(
+        signed_extension_identifiers(&metadata_bytes)? == manifest.signed_extensions,
+        "DeepX signed-extension order does not match runtime metadata",
+    );
+    Ok(())
+}
+
+fn fixture_record<'a>(
+    manifest: &'a FixtureManifest,
+    payload_path: &str,
+) -> anyhow::Result<&'a FixtureRecord> {
+    let mut matching = manifest
+        .fixtures
+        .iter()
+        .filter(|fixture| fixture.payload_path == payload_path);
+    let fixture = matching
+        .next()
+        .with_context(|| format!("DeepX fixture manifest is missing {payload_path}"))?;
+    ensure!(
+        matching.next().is_none(),
+        "DeepX fixture manifest contains duplicate {payload_path} records",
+    );
+    Ok(fixture)
+}
+
+fn read_fixture<T>(
+    fixture_dir: &Path,
+    fixture: &FixtureRecord,
+) -> anyhow::Result<JsonRpcResponse<T>>
+where
+    T: DeserializeOwned,
+{
+    let path = fixture_dir.join(&fixture.payload_path);
+    let response: JsonRpcResponse<T> = read_json(&path)?;
+    ensure!(
+        response.jsonrpc == "2.0",
+        "DeepX fixture response for {} has unexpected JSON-RPC version: {}",
+        fixture.method,
+        response.jsonrpc,
+    );
+    ensure!(
+        response.id == 1,
+        "DeepX fixture response for {} has unexpected request ID: {}",
+        fixture.method,
+        response.id,
+    );
+    Ok(response)
+}
+
+fn read_json<T>(path: &Path) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let bytes = fs::read(path)
+        .with_context(|| format!("Failed to read DeepX fixture {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("Failed to decode DeepX fixture {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use axum::{Json, Router, routing::post};
     use rstest::rstest;
     use tokio::net::TcpListener;
 
     use super::*;
+
+    const FINALIZED_METADATA: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+    ));
+    const FINALIZED_HASH: &str =
+        "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+
+    static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFixtureDir(PathBuf);
+
+    impl TempFixtureDir {
+        fn new() -> Self {
+            let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "deepx-runtime-fixture-{}-{timestamp}-{sequence}",
+                std::process::id(),
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempFixtureDir {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+    }
 
     fn fixture_identity() -> FixtureIdentity {
         FixtureIdentity {
@@ -308,6 +624,209 @@ mod tests {
             spec_version: 366,
             transaction_version: 1,
         }
+    }
+
+    fn write_valid_fixture_set() -> TempFixtureDir {
+        let fixture_dir = TempFixtureDir::new();
+        let metadata: JsonRpcResponse<String> = serde_json::from_str(FINALIZED_METADATA).unwrap();
+        let metadata_bytes =
+            nautilus_core::hex::decode(metadata.result.trim_start_matches("0x")).unwrap();
+        let responses = [
+            (
+                "genesis_hash.json",
+                "chain_getBlockHash",
+                json!([0]),
+                json!({ "jsonrpc": "2.0", "id": 1, "result": EXPECTED_GENESIS_HASH }),
+            ),
+            (
+                "finalized_head.json",
+                "chain_getFinalizedHead",
+                json!([]),
+                json!({ "jsonrpc": "2.0", "id": 1, "result": FINALIZED_HASH }),
+            ),
+            (
+                "finalized_header.json",
+                "chain_getHeader",
+                json!([FINALIZED_HASH]),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "parentHash": "0x01",
+                        "number": "0x2a",
+                        "stateRoot": "0x02",
+                        "extrinsicsRoot": "0x03",
+                        "digest": { "logs": [] }
+                    }
+                }),
+            ),
+            (
+                "finalized_block_hash.json",
+                "chain_getBlockHash",
+                json!([42]),
+                json!({ "jsonrpc": "2.0", "id": 1, "result": FINALIZED_HASH }),
+            ),
+            (
+                "runtime_version.json",
+                "state_getRuntimeVersion",
+                json!([FINALIZED_HASH]),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "specName": "deepx",
+                        "implName": "deepx",
+                        "authoringVersion": 1,
+                        "specVersion": 366,
+                        "implVersion": 1,
+                        "apis": [],
+                        "transactionVersion": 1,
+                        "stateVersion": 1
+                    }
+                }),
+            ),
+            (
+                "metadata.json",
+                "state_getMetadata",
+                json!([FINALIZED_HASH]),
+                serde_json::to_value(&metadata).unwrap(),
+            ),
+        ];
+        let fixtures = responses
+            .into_iter()
+            .map(|(file_name, method, params, response)| {
+                write_fixture(&fixture_dir.0, file_name, method, params, &response).unwrap()
+            })
+            .collect();
+        let manifest = FixtureManifest {
+            captured_at: "2026-09-10T00:00:00Z".to_string(),
+            deployment: "testnet".to_string(),
+            endpoint_role: "runtime_identity".to_string(),
+            rpc_url: DEFAULT_RPC_URL.to_string(),
+            block_reference: "finalized".to_string(),
+            block_hash: FINALIZED_HASH.to_string(),
+            block_number: 42,
+            identity: FixtureIdentity {
+                genesis_hash: EXPECTED_GENESIS_HASH.to_string(),
+                metadata_sha256: nautilus_core::hex::encode(
+                    digest::digest(&digest::SHA256, &metadata_bytes).as_ref(),
+                ),
+                spec_version: 366,
+                transaction_version: 1,
+            },
+            metadata_bytes: metadata_bytes.len(),
+            signed_extensions: signed_extension_identifiers(&metadata_bytes).unwrap(),
+            fixtures,
+        };
+        write_json(fixture_dir.0.join("manifest.json"), &manifest).unwrap();
+        fixture_dir
+    }
+
+    #[rstest]
+    fn validates_complete_written_fixture_set() {
+        let fixture_dir = write_valid_fixture_set();
+
+        validate_written_fixture_set(&fixture_dir.0).unwrap();
+    }
+
+    #[rstest]
+    fn rejects_tampered_signed_extension_order() {
+        let fixture_dir = write_valid_fixture_set();
+        let manifest_path = fixture_dir.0.join("manifest.json");
+        let mut manifest: FixtureManifest = read_json(&manifest_path).unwrap();
+        manifest.signed_extensions.swap(0, 1);
+        write_json(manifest_path, &manifest).unwrap();
+
+        let error = validate_written_fixture_set(&fixture_dir.0).unwrap_err();
+
+        assert!(error.to_string().contains("signed-extension order"));
+    }
+
+    #[rstest]
+    fn rejects_header_for_another_block_number() {
+        let fixture_dir = write_valid_fixture_set();
+        let header_path = fixture_dir.0.join("finalized_header.json");
+        let mut header: JsonRpcResponse<BlockHeader> = read_json(&header_path).unwrap();
+        header.result.number = "0x2b".to_string();
+        let bytes = write_json(header_path, &header).unwrap();
+        let manifest_path = fixture_dir.0.join("manifest.json");
+        let mut manifest: FixtureManifest = read_json(&manifest_path).unwrap();
+        fixture_record_mut(&mut manifest, "finalized_header.json").bytes = bytes;
+        write_json(manifest_path, &manifest).unwrap();
+
+        let error = validate_written_fixture_set(&fixture_dir.0).unwrap_err();
+
+        assert!(error.to_string().contains("header number"));
+    }
+
+    #[rstest]
+    fn rejects_another_block_hash_at_header_height() {
+        let fixture_dir = write_valid_fixture_set();
+        let block_hash_path = fixture_dir.0.join("finalized_block_hash.json");
+        let mut block_hash: JsonRpcResponse<String> = read_json(&block_hash_path).unwrap();
+        block_hash.result = format!("0x{}", "ff".repeat(32));
+        let bytes = write_json(block_hash_path, &block_hash).unwrap();
+        let manifest_path = fixture_dir.0.join("manifest.json");
+        let mut manifest: FixtureManifest = read_json(&manifest_path).unwrap();
+        fixture_record_mut(&mut manifest, "finalized_block_hash.json").bytes = bytes;
+        write_json(manifest_path, &manifest).unwrap();
+
+        let error = validate_written_fixture_set(&fixture_dir.0).unwrap_err();
+
+        assert!(error.to_string().contains("header hash"));
+    }
+
+    #[rstest]
+    fn rejects_tampered_fixture_response_envelope() {
+        let fixture_dir = write_valid_fixture_set();
+        let runtime_path = fixture_dir.0.join("runtime_version.json");
+        let mut runtime: JsonRpcResponse<RuntimeVersion> = read_json(&runtime_path).unwrap();
+        runtime.id = 2;
+        let bytes = write_json(runtime_path, &runtime).unwrap();
+        let manifest_path = fixture_dir.0.join("manifest.json");
+        let mut manifest: FixtureManifest = read_json(&manifest_path).unwrap();
+        fixture_record_mut(&mut manifest, "runtime_version.json").bytes = bytes;
+        write_json(manifest_path, &manifest).unwrap();
+
+        let error = validate_written_fixture_set(&fixture_dir.0).unwrap_err();
+
+        assert!(error.to_string().contains("unexpected request ID"));
+    }
+
+    #[rstest]
+    fn publishes_valid_fixture_set_atomically() {
+        let staging_dir = write_valid_fixture_set();
+        let fixture_dir = staging_dir.0.with_extension("published");
+
+        publish_fixture_set(&staging_dir.0, &fixture_dir).unwrap();
+
+        assert!(!staging_dir.0.exists());
+        assert!(fixture_dir.join("manifest.json").is_file());
+        fs::remove_dir_all(fixture_dir).unwrap();
+    }
+
+    #[rstest]
+    fn cleans_staging_directory_when_validation_fails() {
+        let staging_dir = write_valid_fixture_set();
+        fs::remove_file(staging_dir.0.join("metadata.json")).unwrap();
+        let fixture_dir = staging_dir.0.with_extension("published");
+
+        let error = publish_fixture_set(&staging_dir.0, &fixture_dir).unwrap_err();
+
+        assert!(error.to_string().contains("metadata.json"));
+        assert!(!staging_dir.0.exists());
+        assert!(!fixture_dir.exists());
+    }
+
+    fn fixture_record_mut<'a>(
+        manifest: &'a mut FixtureManifest,
+        payload_path: &str,
+    ) -> &'a mut FixtureRecord {
+        manifest
+            .fixtures
+            .iter_mut()
+            .find(|fixture| fixture.payload_path == payload_path)
+            .unwrap()
     }
 
     #[rstest]
@@ -351,9 +870,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalized_header_request_is_bound_to_captured_hash() {
-        const FINALIZED_HASH: &str =
-            "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
-
         async fn handler(Json(payload): Json<Value>) -> Json<Value> {
             assert_eq!(payload["method"], "chain_getHeader");
             assert_eq!(payload["params"], json!([FINALIZED_HASH]));

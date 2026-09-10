@@ -71,6 +71,7 @@ pub struct DeepXWsAuthenticatedSession {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeepXWsAuthenticatedFrame {
     connection_epoch: u64,
+    session: DeepXWsAuthenticatedSession,
     value: Value,
 }
 
@@ -79,6 +80,12 @@ impl DeepXWsAuthenticatedFrame {
     #[must_use]
     pub const fn connection_epoch(&self) -> u64 {
         self.connection_epoch
+    }
+
+    /// Returns the exact authenticated session which admitted this frame.
+    #[must_use]
+    pub const fn session(&self) -> DeepXWsAuthenticatedSession {
+        self.session
     }
 
     /// Returns the complete decoded JSON frame.
@@ -254,6 +261,7 @@ impl DeepXWsProtocolCore {
         };
         Some(DeepXWsAuthenticatedFrame {
             connection_epoch,
+            session,
             value,
         })
     }
@@ -629,6 +637,7 @@ mod tests {
             .admit_authenticated_frame(9, session, frame.clone())
             .unwrap();
         assert_eq!(admitted.connection_epoch(), 9);
+        assert_eq!(admitted.session(), session);
         assert_eq!(
             admitted.value(),
             &json!({"channel": "unproven", "data": []})

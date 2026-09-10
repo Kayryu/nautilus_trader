@@ -33,9 +33,8 @@ use super::{
     DeepXReorganizationDecision, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
     DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
     DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
-    DeepXTransactionWatchError,
-    collect_finalized_recovery_scan, observe_finality, observe_reorganization,
-    observe_submission_pool,
+    DeepXTransactionWatchError, collect_finalized_recovery_scan, observe_finality,
+    observe_reorganization, observe_submission_pool,
 };
 use crate::{
     common::DeepXPrivateKey,
@@ -2655,15 +2654,10 @@ mod tests {
         let submitted =
             submitted_for_bytes(record.signed_extrinsic().unwrap().bytes().to_vec()).await;
 
-        let accepted = commit_initial_submission_acceptance(
-            &store,
-            &lease,
-            &committed,
-            &record,
-            submitted,
-        )
-        .await
-        .unwrap();
+        let accepted =
+            commit_initial_submission_acceptance(&store, &lease, &committed, &record, submitted)
+                .await
+                .unwrap();
 
         assert_eq!(
             accepted.record().lifecycle().state(),
@@ -2690,14 +2684,8 @@ mod tests {
         let submitted = submitted_for_bytes(vec![9, 8, 7]).await;
 
         assert!(matches!(
-            commit_initial_submission_acceptance(
-                &store,
-                &lease,
-                &committed,
-                &record,
-                submitted,
-            )
-            .await,
+            commit_initial_submission_acceptance(&store, &lease, &committed, &record, submitted,)
+                .await,
             Err(DeepXSubmissionAcceptanceCommitError::ExtrinsicHashMismatch),
         ));
         assert_eq!(store.current_revision(), 3);
@@ -2751,14 +2739,8 @@ mod tests {
             submitted_for_bytes(record.signed_extrinsic().unwrap().bytes().to_vec()).await;
 
         assert!(matches!(
-            commit_initial_submission_acceptance(
-                &store,
-                &lease,
-                &committed,
-                &record,
-                submitted,
-            )
-            .await,
+            commit_initial_submission_acceptance(&store, &lease, &committed, &record, submitted,)
+                .await,
             Err(DeepXSubmissionAcceptanceCommitError::Persistence(
                 DeepXTransactionPersistenceError::CommitOutcomeUnknown(_)
             )),

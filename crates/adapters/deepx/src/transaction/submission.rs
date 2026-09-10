@@ -196,9 +196,7 @@ where
                     reason,
                 });
             }
-            Err(DeepXSubmissionFailure::Ambiguous(reason))
-                if attempt == max_attempts.get() =>
-            {
+            Err(DeepXSubmissionFailure::Ambiguous(reason)) if attempt == max_attempts.get() => {
                 return Err(DeepXSubmissionRetryError::AmbiguousExhausted {
                     attempts: attempt,
                     reason,
@@ -390,10 +388,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(submitted.extrinsic_hash(), expected_hash);
-        assert_eq!(attempts.lock().unwrap().as_slice(), [
-            (expected_bytes.clone(), expected_hash),
-            (expected_bytes, expected_hash),
-        ]);
+        assert_eq!(
+            attempts.lock().unwrap().as_slice(),
+            [
+                (expected_bytes.clone(), expected_hash),
+                (expected_bytes, expected_hash),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -401,7 +402,9 @@ mod tests {
         let extrinsic = signed_remark().unwrap();
         let mut outcomes = VecDeque::from([
             Err(DeepXSubmissionFailure::ambiguous("response lost")),
-            Err(DeepXSubmissionFailure::venue_rejected("invalid transaction")),
+            Err(DeepXSubmissionFailure::venue_rejected(
+                "invalid transaction",
+            )),
             Ok(extrinsic.extrinsic_hash()),
         ]);
 

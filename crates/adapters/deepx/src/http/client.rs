@@ -207,10 +207,10 @@ impl DeepXHttpClient {
     ) -> Result<DeepXFundingRatePage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXFundingRatePage> = self
+        let page: DeepXFundingRatePage = self
             .get_json_with_query(PERP_FUNDING_RATE_PATH, &query)
             .await?;
-        let page = into_api_data(response)?;
+        validate_response_market_id("perp funding-rate", request.market_id, page.market_id)?;
         validate_cursor_page(
             "perp funding-rate",
             page.has_next,
@@ -231,10 +231,10 @@ impl DeepXHttpClient {
     ) -> Result<DeepXLongShortRatioPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXLongShortRatioPage> = self
+        let page: DeepXLongShortRatioPage = self
             .get_json_with_query(PERP_LONG_SHORT_RATIO_PATH, &query)
             .await?;
-        let page = into_api_data(response)?;
+        validate_response_market_id("perp long-short-ratio", request.market_id, page.market_id)?;
         validate_cursor_page(
             "perp long-short-ratio",
             page.has_next,
@@ -255,10 +255,8 @@ impl DeepXHttpClient {
     ) -> Result<DeepXOpenInterestPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXOpenInterestPage> = self
-            .get_json_with_query(PERP_OPEN_INTEREST_PATH, &query)
-            .await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_OPEN_INTEREST_PATH, &query)
+            .await
     }
 
     /// Returns one descending page of raw perpetual trades.
@@ -273,9 +271,10 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpTradesPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpTradesPage> =
-            self.get_json_with_query(PERP_TRADES_PATH, &query).await?;
-        let page = into_api_data(response)?;
+        let page: DeepXPerpTradesPage = self.get_json_with_query(PERP_TRADES_PATH, &query).await?;
+        for trade in &page.items {
+            validate_response_market_id("perp trades", request.market_id, trade.market_id)?;
+        }
         validate_cursor_page("perp trades", page.has_next, page.next_cursor.as_deref())?;
         Ok(page)
     }
@@ -292,9 +291,7 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpCandlesPage> =
-            self.get_json_with_query(PERP_CANDLES_PATH, &query).await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_CANDLES_PATH, &query).await
     }
 
     /// Returns one ascending page of raw one-minute perpetual mark-price history.
@@ -309,10 +306,7 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpCandlesPage> = self
-            .get_json_with_query(PERP_MARK_PRICE_PATH, &query)
-            .await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_MARK_PRICE_PATH, &query).await
     }
 
     /// Returns one ascending page of raw one-minute perpetual oracle-price history.
@@ -327,10 +321,8 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpCandlesPage> = self
-            .get_json_with_query(PERP_ORACLE_PRICE_PATH, &query)
-            .await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_ORACLE_PRICE_PATH, &query)
+            .await
     }
 
     /// Returns one perpetual volume-statistics window.
@@ -345,9 +337,7 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpVolume> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpVolume> =
-            self.get_json_with_query(PERP_VOLUME_PATH, &query).await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_VOLUME_PATH, &query).await
     }
 
     /// Returns the raw perpetual last price without assigning observation-time semantics.
@@ -362,22 +352,43 @@ impl DeepXHttpClient {
     ) -> Result<DeepXPerpLastPrice> {
         request.validate()?;
         let query = request.as_query();
-        let response: DeepXApiResponse<DeepXPerpLastPrice> = self
-            .get_json_with_query(PERP_LAST_PRICE_PATH, &query)
-            .await?;
-        into_api_data(response)
+        self.get_json_with_query(PERP_LAST_PRICE_PATH, &query).await
     }
 
     async fn get_market_data<T>(&self, path: &str) -> Result<Vec<T>>
     where
         T: DeserializeOwned,
     {
-        into_api_data(self.get_json(path).await?)
+        self.get_api_json(path).await
     }
 
-    async fn get_json_with_query<R, Q>(&self, path: &str, query: &Q) -> Result<R>
+    async fn get_api_json<T>(&self, path: &str) -> Result<T>
     where
-        R: DeserializeOwned,
+        T: DeserializeOwned,
+    {
+        validate_path(path)?;
+        let attempt = AtomicUsize::new(0);
+        self.retry_manager
+            .execute_with_retry(
+                "DeepX public HTTP GET",
+                || {
+                    let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
+                    async move {
+                        let response = self
+                            .get_json_once::<DeepXApiResponse<T>>(&self.base_urls[index], path)
+                            .await?;
+                        into_api_data(response)
+                    }
+                },
+                should_retry_http_error,
+                DeepXHttpError::from,
+            )
+            .await
+    }
+
+    async fn get_json_with_query<T, Q>(&self, path: &str, query: &Q) -> Result<T>
+    where
+        T: DeserializeOwned,
         Q: Serialize + Sync,
     {
         validate_path(path)?;
@@ -387,7 +398,16 @@ impl DeepXHttpClient {
                 "DeepX public HTTP GET",
                 || {
                     let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
-                    self.get_json_once_with_query(&self.base_urls[index], path, query)
+                    async move {
+                        let response = self
+                            .get_json_once_with_query::<DeepXApiResponse<T>, _>(
+                                &self.base_urls[index],
+                                path,
+                                query,
+                            )
+                            .await?;
+                        into_api_data(response)
+                    }
                 },
                 should_retry_http_error,
                 DeepXHttpError::from,
@@ -451,13 +471,24 @@ impl DeepXHttpClient {
 }
 
 fn into_api_data<T>(response: DeepXApiResponse<T>) -> Result<T> {
-    if response.fail || response.code != 200 {
+    if response.fail || !response.code.is_success() {
         return Err(DeepXHttpError::Api {
             code: response.code,
             message: response.msg,
         });
     }
     Ok(response.data)
+}
+
+fn validate_response_market_id(endpoint: &'static str, expected: u64, received: u64) -> Result<()> {
+    if received != expected {
+        return Err(DeepXHttpError::ResponseMarketMismatch {
+            endpoint,
+            expected,
+            received,
+        });
+    }
+    Ok(())
 }
 
 fn normalize_base_url(base_url: String) -> Result<String> {
@@ -516,7 +547,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::http::DeepXPerpVolumePeriod;
+    use crate::http::{DeepXPerpVolumePeriod, models::DeepXResponseCode};
 
     const PERP_VOLUME_1H_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_volume_1h.json");
@@ -841,6 +872,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_funding_rate_response_for_another_market() {
+        let router = Router::new().route(
+            PERP_FUNDING_RATE_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "marketId": 4,
+                        "details": [],
+                        "nextCursor": null,
+                        "hasNext": false
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXFundingRateRequest {
+            market_id: 3,
+            start_ms: 1,
+            end_ms: Some(2),
+            limit: Some(3),
+            cursor: None,
+        };
+
+        let error = client.get_perp_funding_rates(&request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::ResponseMarketMismatch {
+                endpoint: "perp funding-rate",
+                expected: 3,
+                received: 4,
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn encodes_and_decodes_perp_long_short_ratio_page_exactly() {
         let router = Router::new().route(
             PERP_LONG_SHORT_RATIO_PATH,
@@ -889,6 +959,48 @@ mod tests {
         assert_eq!(page.details[0].time, 1_788_251_280_000);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
         assert!(page.has_next);
+    }
+
+    #[tokio::test]
+    async fn rejects_long_short_ratio_response_for_another_market() {
+        let router = Router::new().route(
+            PERP_LONG_SHORT_RATIO_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "marketId": 4,
+                        "details": [],
+                        "nextCursor": null,
+                        "hasNext": false
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXLongShortRatioRequest {
+            market_id: 3,
+            start_ms: 1,
+            end_ms: Some(2),
+            limit: Some(3),
+            cursor: None,
+        };
+
+        let error = client
+            .get_perp_long_short_ratios(&request)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::ResponseMarketMismatch {
+                endpoint: "perp long-short-ratio",
+                expected: 3,
+                received: 4,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1080,6 +1192,74 @@ mod tests {
         assert_eq!(page.items[0].created_at, "2026-06-17T03:44:23.664Z");
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
         assert!(page.has_next);
+    }
+
+    #[tokio::test]
+    async fn rejects_perp_trade_response_for_another_market() {
+        let router = Router::new().route(
+            PERP_TRADES_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "items": [{
+                            "id": 1,
+                            "marketId": 3,
+                            "buyerOrderId": "2",
+                            "buyer": "0x01",
+                            "sellerOrderId": "3",
+                            "seller": "0x02",
+                            "price": "1",
+                            "size": "1",
+                            "buyerLeverage": 1,
+                            "sellerLeverage": 1,
+                            "createdAt": "2026-09-10T00:00:00Z",
+                            "filledDirection": "Long",
+                            "taker": "Buyer",
+                            "takerFee": "0",
+                            "makerFee": "0"
+                        }, {
+                            "id": 2,
+                            "marketId": 4,
+                            "buyerOrderId": "2",
+                            "buyer": "0x01",
+                            "sellerOrderId": "3",
+                            "seller": "0x02",
+                            "price": "1",
+                            "size": "1",
+                            "buyerLeverage": 1,
+                            "sellerLeverage": 1,
+                            "createdAt": "2026-09-10T00:00:00Z",
+                            "filledDirection": "Long",
+                            "taker": "Buyer",
+                            "takerFee": "0",
+                            "makerFee": "0"
+                        }],
+                        "nextCursor": null,
+                        "hasNext": false
+                    },
+                    "fail": false
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXPerpTradesRequest {
+            market_id: 3,
+            page_size: Some(3),
+            cursor: None,
+        };
+
+        let error = client.get_perp_trades(&request).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::ResponseMarketMismatch {
+                endpoint: "perp trades",
+                expected: 3,
+                received: 4,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1558,7 +1738,7 @@ mod tests {
             SPOT_MARKETS_PATH,
             get(|| async {
                 Json(json!({
-                    "code": 429,
+                    "code": 10010,
                     "msg": "rate limit exceeded",
                     "data": [],
                     "fail": true
@@ -1572,7 +1752,79 @@ mod tests {
 
         assert!(matches!(
             error,
-            DeepXHttpError::Api { code: 429, message } if message == "rate limit exceeded"
+            DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10010),
+                message,
+            } if message == "rate limit exceeded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn retries_transient_api_failure_before_returning_data() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let router = Router::new().route(
+            SPOT_MARKETS_PATH,
+            get(move || {
+                let server_attempts = Arc::clone(&server_attempts);
+                async move {
+                    if server_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Json(json!({
+                            "code": 10010,
+                            "msg": "rate limit exceeded",
+                            "data": [],
+                            "fail": true
+                        }))
+                    } else {
+                        Json(json!({
+                            "code": 200,
+                            "msg": "success",
+                            "data": [],
+                            "fail": false
+                        }))
+                    }
+                }
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new_with_endpoints(
+            [base_url],
+            Some(5),
+            None,
+            immediate_retry_config(1),
+        )
+        .unwrap();
+
+        let markets = client.get_spot_markets().await.unwrap();
+
+        assert!(markets.is_empty());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn preserves_on_chain_failure_code_in_successful_http_response() {
+        let router = Router::new().route(
+            SPOT_MARKETS_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": "19_0",
+                    "msg": "Subaccount not initialized",
+                    "data": [],
+                    "fail": true
+                }))
+            }),
+        );
+        let base_url = spawn_server(router).await;
+        let client = DeepXHttpClient::new(format!("{base_url}/"), Some(5), None).unwrap();
+
+        let error = client.get_spot_markets().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::Api {
+                code: DeepXResponseCode::Pallet(code),
+                message,
+            } if code == "19_0" && message == "Subaccount not initialized"
         ));
     }
 

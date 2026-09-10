@@ -17,7 +17,7 @@
 
 use nautilus_network::retry::RetryConfig;
 
-use super::DeepXHttpError;
+use super::{DeepXHttpError, models::DeepXResponseCode};
 
 /// Builds the default bounded retry configuration for idempotent DeepX HTTP reads.
 #[must_use]
@@ -42,9 +42,17 @@ pub fn should_retry_http_error(error: &DeepXHttpError) -> bool {
         DeepXHttpError::Http { status, .. } => {
             matches!(*status, 408 | 429) || (500..600).contains(status)
         }
-        DeepXHttpError::Api { .. }
+        DeepXHttpError::Api {
+            code: DeepXResponseCode::Api(code),
+            ..
+        } => matches!(*code, 10010 | 10012),
+        DeepXHttpError::Api {
+            code: DeepXResponseCode::Pallet(_),
+            ..
+        }
         | DeepXHttpError::Decode(_)
         | DeepXHttpError::InvalidRequest(_)
+        | DeepXHttpError::ResponseMarketMismatch { .. }
         | DeepXHttpError::InvalidPath(_)
         | DeepXHttpError::InvalidBaseUrl(_)
         | DeepXHttpError::InvalidPaginationLimit
@@ -88,16 +96,46 @@ mod tests {
     }
 
     #[rstest]
+    #[case(10010, true)]
+    #[case(10012, true)]
+    #[case(10011, false)]
+    #[case(10001, false)]
+    fn classifies_api_code(#[case] code: u16, #[case] expected: bool) {
+        let error = DeepXHttpError::Api {
+            code: DeepXResponseCode::Api(code),
+            message: String::new(),
+        };
+
+        assert_eq!(should_retry_http_error(&error), expected);
+    }
+
+    #[rstest]
+    fn does_not_retry_pallet_failure() {
+        let error = DeepXHttpError::Api {
+            code: DeepXResponseCode::Pallet("19_0".to_string()),
+            message: String::new(),
+        };
+
+        assert!(!should_retry_http_error(&error));
+    }
+
+    #[rstest]
     fn does_not_retry_local_or_decode_failures() {
         let control = DeepXHttpError::RetryControl(RetryError::Canceled);
         let path = DeepXHttpError::InvalidPath("health".to_string());
         let pagination = DeepXHttpError::PaginationLimitExceeded { max_pages: 10 };
+        let identity = DeepXHttpError::ResponseMarketMismatch {
+            endpoint: "perp trades",
+            expected: 3,
+            received: 4,
+        };
         let decode =
             DeepXHttpError::Decode(serde_json::from_str::<serde_json::Value>("{").unwrap_err());
 
         assert!(!should_retry_http_error(&control));
         assert!(!should_retry_http_error(&path));
         assert!(!should_retry_http_error(&pagination));
+        assert!(!should_retry_http_error(&identity));
         assert!(!should_retry_http_error(&decode));
     }
 }

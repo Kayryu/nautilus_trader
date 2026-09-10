@@ -18,6 +18,8 @@
 use nautilus_network::{http::HttpClientError, retry::RetryError};
 use thiserror::Error;
 
+use super::models::DeepXResponseCode;
+
 /// Result alias for DeepX HTTP operations.
 pub type Result<T> = std::result::Result<T, DeepXHttpError>;
 
@@ -35,10 +37,22 @@ pub enum DeepXHttpError {
     Decode(#[from] serde_json::Error),
     /// A successful HTTP response carried a venue-level failure envelope.
     #[error("DeepX API {code}: {message}")]
-    Api { code: u16, message: String },
+    Api {
+        code: DeepXResponseCode,
+        message: String,
+    },
     /// Typed endpoint parameters violate a local request invariant.
     #[error("invalid DeepX HTTP request: {0}")]
     InvalidRequest(String),
+    /// A successful response identified a different deployment market.
+    #[error(
+        "DeepX HTTP {endpoint} response market ID mismatch: expected {expected}, received {received}"
+    )]
+    ResponseMarketMismatch {
+        endpoint: &'static str,
+        expected: u64,
+        received: u64,
+    },
     /// A request path could escape the configured DeepX base URL.
     #[error("invalid DeepX HTTP path '{0}': expected an absolute-path reference")]
     InvalidPath(String),

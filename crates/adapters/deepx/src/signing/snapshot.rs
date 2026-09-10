@@ -1028,6 +1028,13 @@ mod tests {
             },
         );
         assert_eq!(
+            snapshot.interfaces().call("Subaccount", "no_op").unwrap(),
+            &DeepXRuntimeVariantIdentity {
+                name: "no_op".to_string(),
+                index: 28,
+            },
+        );
+        assert_eq!(
             snapshot
                 .interfaces()
                 .event("System", "ExtrinsicSuccess")

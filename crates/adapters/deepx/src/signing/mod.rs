@@ -226,8 +226,25 @@ mod tests {
     }
 
     #[rstest]
-    fn dynamic_signing_is_deterministic_for_a_fixed_snapshot_and_nonce() {
-        let service = DeepXRuntimeSnapshotService::new(snapshot());
+    fn dynamic_signing_matches_fixed_testnet_regression_vector() {
+        let snapshot = snapshot();
+        let payload = subxt_core::dynamic::tx(
+            "System",
+            "remark",
+            vec![Value::from_bytes(b"deepx-offline-signing-check")],
+        );
+        let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
+            .nonce(1_725_000_000_123)
+            .build();
+        let signer_payload = tx::create_v4_signed(&payload, snapshot.client_state(), params)
+            .unwrap()
+            .signer_payload();
+        assert_eq!(
+            hex::encode(signer_payload),
+            "00006c64656570782d6f66666c696e652d7369676e696e672d636865636b000b7b2203a29101006e0100000100000086604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+        );
+
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
         let permit = service.acquire().unwrap();
         let first = sign_dynamic_pallet_call(
             &permit,
@@ -249,8 +266,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(first, second);
-        assert!(!first.bytes().is_empty());
+        assert_eq!(
+            hex::encode(first.signer()),
+            "fcad0b19bb29d4674531d6f115237e16afce377c",
+        );
         assert_eq!(first.signer(), derive_signer_account_id(&key()).unwrap());
+        assert_eq!(
+            hex::encode(first.bytes()),
+            "f50184fcad0b19bb29d4674531d6f115237e16afce377ca524ebcf1d41cd1079a3bee1eb1b25d2ac0473e5546faa6e8fb828389f795ee933fece23b7435b4b58435d775b7d97e7430485a1ff25eca05b3ab6626f43cb9c01000b7b2203a291010000006c64656570782d6f66666c696e652d7369676e696e672d636865636b",
+        );
+        assert_eq!(
+            hex::encode(first.extrinsic_hash()),
+            "9695ee4aa7ac14ad58b7e5fd850bf6f0648df811a653c5486ba6146365f7de19",
+        );
+    }
+
+    #[rstest]
+    fn no_op_signing_matches_fixed_testnet_regression_vector() {
+        let snapshot = snapshot();
+        let payload = subxt_core::dynamic::tx("Subaccount", "no_op", Vec::<Value>::new());
+        let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
+            .nonce(1_725_000_000_124)
+            .build();
+        let signer_payload = tx::create_v4_signed(&payload, snapshot.client_state(), params)
+            .unwrap()
+            .signer_payload();
+        assert_eq!(
+            hex::encode(signer_payload),
+            "131c000b7c2203a29101006e0100000100000086604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+        );
+
+        let signed = sign_dynamic_pallet_call_with_snapshot(
+            &snapshot,
+            &key(),
+            "Subaccount",
+            "no_op",
+            Vec::new(),
+            1_725_000_000_124,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(signed.signer()),
+            "fcad0b19bb29d4674531d6f115237e16afce377c",
+        );
+        assert_eq!(
+            hex::encode(signed.bytes()),
+            "850184fcad0b19bb29d4674531d6f115237e16afce377c96c788579cf2cdda606129a7fe59b763031ddc0d19056af3c1585674b0a64d4928e9e1c787b283a9467c2207afa5c6338dd1d671df0b3aec5edb5128e79981e301000b7c2203a2910100131c",
+        );
+        assert_eq!(
+            hex::encode(signed.extrinsic_hash()),
+            "c2e2837a583ddf1e94fd0a5a177c4b6e471ac24b82a7e9fd32d600c0f674d28a",
+        );
     }
 
     #[rstest]
