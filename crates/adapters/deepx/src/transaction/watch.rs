@@ -20,12 +20,16 @@ use parity_scale_codec::{Compact, Decode};
 use serde::Deserialize;
 use serde_json::json;
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
+use subxt_core::events::{Events, Phase};
+use subxt_core::ext::scale_value::{Composite, Value as ScaleValue, ValueDef};
 use thiserror::Error;
 
 use super::{
-    DeepXCanonicalBlockEvidence, DeepXInclusionEvidence, DeepXMissedBlockScanPlan,
-    DeepXRecoveryScan, DeepXRecoveryScanCollectionError, DeepXRecoveryScanCollector,
-    DeepXRecoveryScanPlanError, DeepXReorganizationDecision, DeepXSubmissionPoolEvidence,
+    DeepXBusinessEventOutcome, DeepXCanonicalBlockEvidence, DeepXDispatchOutcome,
+    DeepXInclusionEvidence, DeepXInclusionEvidenceError, DeepXIndexedOutcome,
+    DeepXMissedBlockScanPlan, DeepXRecoveryScan, DeepXRecoveryScanCollectionError,
+    DeepXRecoveryScanCollector, DeepXRecoveryScanPlanError, DeepXReorganizationDecision,
+    DeepXSubmissionPoolEvidence, DeepXTransactionIdentity, DeepXTransactionOperation,
     classify_reorganization, plan_missed_block_scan,
 };
 use crate::{
@@ -34,7 +38,199 @@ use crate::{
         DEEPX_RECOVERY_RPC_METHODS, DEEPX_SUBMISSION_RPC_METHODS, DEEPX_WATCH_RPC_METHODS,
         DeepXValidatedRpcMethodCapabilities,
     },
+    signing::{DeepXRuntimeConfig, DeepXRuntimeInterfaceError, RuntimeSnapshot},
 };
+
+const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
+    "0x26aa394eea5630e07c48ae0c9558cef7",
+    "80d41e5e16056765bc8461851072c9d7",
+);
+
+/// Errors raised while verifying a perpetual cancellation from runtime event evidence.
+#[derive(Debug, Error)]
+pub enum DeepXPerpCancelEventVerificationError {
+    /// The approved runtime snapshot does not expose the required event.
+    #[error(transparent)]
+    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
+    /// The durable identity does not describe an event-verifiable perpetual cancellation.
+    #[error("DeepX transaction identity has no event-verifiable perpetual cancel operation")]
+    UnsupportedOperation,
+    /// Fast cancel deliberately omits the authoritative pallet cancellation event.
+    #[error("DeepX fast perpetual cancel has no authoritative pallet event")]
+    FastCancelUnsupported,
+    /// Runtime event bytes could not be decoded against the approved snapshot.
+    #[error("unable to decode DeepX runtime event evidence: {0}")]
+    Decode(#[source] subxt_core::Error),
+    /// Runtime event bytes were incomplete, count-mismatched, or contained trailing data.
+    #[error("DeepX runtime event evidence is not a complete System.Events value")]
+    MalformedEventBytes,
+    /// A cancellation event at the target index did not match the durable operation.
+    #[error("DeepX perpetual cancel event conflicts with the durable transaction identity")]
+    ConflictingEvent,
+    /// More than one matching cancellation event was observed at the target index.
+    #[error("DeepX perpetual cancel emitted duplicate matching events")]
+    DuplicateEvent,
+    /// Indexed dispatch and business-event observations could not prove inclusion.
+    #[error(transparent)]
+    InclusionEvidence(#[from] DeepXInclusionEvidenceError),
+}
+
+/// Verifies the expected business event for one durable perpetual cancel operation.
+///
+/// The event bytes must be the complete SCALE value returned from `System.Events`, including its
+/// compact event-count prefix. Only `ApplyExtrinsic` events at `extrinsic_index` are considered.
+/// Fast cancel remains unsupported because the runtime deliberately suppresses this pallet event.
+///
+/// # Errors
+///
+/// Returns an error when the runtime interface is unavailable, the operation cannot emit
+/// authoritative evidence, event decoding fails, or cancellation evidence conflicts or repeats.
+pub fn verify_perp_cancel_business_event(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXIndexedOutcome<DeepXBusinessEventOutcome>, DeepXPerpCancelEventVerificationError> {
+    snapshot
+        .interfaces()
+        .event("PerpMarket", "OrderCancelled")?;
+    let Some(DeepXTransactionOperation::PerpCancel {
+        subaccount,
+        order_id,
+        fast_cancel,
+        ..
+    }) = identity.operation()
+    else {
+        return Err(DeepXPerpCancelEventVerificationError::UnsupportedOperation);
+    };
+    if *fast_cancel {
+        return Err(DeepXPerpCancelEventVerificationError::FastCancelUnsupported);
+    }
+
+    let mut remaining = event_bytes;
+    let declared_count = Compact::<u32>::decode(&mut remaining)
+        .map_err(|_| DeepXPerpCancelEventVerificationError::MalformedEventBytes)?
+        .0;
+    let prefix_len = event_bytes.len() - remaining.len();
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    let mut matched = false;
+    let mut decoded_count = 0_u32;
+    let mut consumed_len = prefix_len;
+    for event in events.iter() {
+        let event = event.map_err(DeepXPerpCancelEventVerificationError::Decode)?;
+        decoded_count += 1;
+        consumed_len += event.bytes().len();
+        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
+            || event.pallet_name() != "PerpMarket"
+            || event.variant_name() != "OrderCancelled"
+        {
+            continue;
+        }
+        let fields = event
+            .field_values()
+            .map_err(DeepXPerpCancelEventVerificationError::Decode)?;
+        if !perp_cancel_fields_match(&fields, *subaccount, *order_id) {
+            return Err(DeepXPerpCancelEventVerificationError::ConflictingEvent);
+        }
+        if matched {
+            return Err(DeepXPerpCancelEventVerificationError::DuplicateEvent);
+        }
+        matched = true;
+    }
+    if decoded_count != declared_count || consumed_len != event_bytes.len() {
+        return Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes);
+    }
+
+    Ok(DeepXIndexedOutcome {
+        extrinsic_index,
+        outcome: if matched {
+            DeepXBusinessEventOutcome::Success
+        } else {
+            DeepXBusinessEventOutcome::NotObserved
+        },
+    })
+}
+
+fn verify_perp_cancel_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpCancelEventVerificationError> {
+    let business_event =
+        verify_perp_cancel_business_event(snapshot, identity, extrinsic_index, event_bytes)?;
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    let mut dispatch = None;
+    for event in events.iter() {
+        let event = event.map_err(DeepXPerpCancelEventVerificationError::Decode)?;
+        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
+            || event.pallet_name() != "System"
+        {
+            continue;
+        }
+        let outcome = match event.variant_name() {
+            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
+            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
+            _ => continue,
+        };
+        if dispatch.replace(outcome).is_some() {
+            return Err(DeepXPerpCancelEventVerificationError::DuplicateEvent);
+        }
+    }
+    let dispatch = DeepXIndexedOutcome {
+        extrinsic_index,
+        outcome: dispatch.ok_or(DeepXPerpCancelEventVerificationError::MalformedEventBytes)?,
+    };
+    Ok(DeepXInclusionEvidence::from_indexed_observations(
+        block_hash,
+        block_number,
+        dispatch,
+        business_event,
+    )?)
+}
+
+fn perp_cancel_fields_match(
+    fields: &Composite<u32>,
+    expected_subaccount: [u8; 20],
+    expected_order_id: u64,
+) -> bool {
+    let Composite::Named(fields) = fields else {
+        return false;
+    };
+    let field = |name| {
+        fields
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+    };
+    field("user").is_some_and(|value| value_matches_bytes(value, &expected_subaccount))
+        && field("order_id").and_then(ScaleValue::as_u128) == Some(u128::from(expected_order_id))
+        && field("reason").is_some_and(|value| {
+            matches!(&value.value, ValueDef::Variant(reason) if reason.name == "UserCanceled")
+        })
+}
+
+fn value_matches_bytes(value: &ScaleValue<u32>, expected: &[u8]) -> bool {
+    let ValueDef::Composite(bytes) = &value.value else {
+        return false;
+    };
+    let values: Vec<_> = bytes.values().collect();
+    if values.len() == 1 {
+        return value_matches_bytes(values[0], expected);
+    }
+    values.into_iter().map(ScaleValue::as_u128).eq(expected
+        .iter()
+        .copied()
+        .map(u128::from)
+        .map(Some))
+}
 
 /// Errors raised while observing transaction presence through DeepX RPC endpoints.
 #[derive(Debug, Error)]
@@ -114,6 +310,15 @@ pub enum DeepXTransactionWatchError {
         /// Index of the exact target extrinsic in the block.
         extrinsic_index: u32,
     },
+    /// The exact finalized block did not expose `System.Events` storage.
+    #[error("DeepX System.Events storage was unavailable at finalized block {0}")]
+    EventStorageUnavailable(u64),
+    /// The exact finalized block returned malformed `System.Events` storage.
+    #[error("DeepX System.Events storage at finalized block {0} was not prefixed hexadecimal")]
+    InvalidEventStorage(u64),
+    /// Runtime event evidence did not prove the durable perpetual cancellation.
+    #[error(transparent)]
+    EventVerification(#[from] DeepXPerpCancelEventVerificationError),
     /// A bounded recovery scan could not be planned safely.
     #[error(transparent)]
     ScanPlan(#[from] DeepXRecoveryScanPlanError),
@@ -461,6 +666,49 @@ pub async fn collect_finalized_recovery_scan(
     max_blocks_per_range: u64,
     target_extrinsic_hash: [u8; 32],
 ) -> Result<DeepXFinalizedRecoveryCollection, DeepXTransactionWatchError> {
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn collect_finalized_recovery_scan_with_event_evidence(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, DeepXTransactionWatchError> {
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some((snapshot, identity)),
+    )
+    .await
+}
+
+async fn collect_finalized_recovery_scan_inner(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+    event_evidence: Option<(&RuntimeSnapshot, &DeepXTransactionIdentity)>,
+) -> Result<DeepXFinalizedRecoveryCollection, DeepXTransactionWatchError> {
     let recovery_url = endpoints.url_for(DeepXRpcRole::Recovery);
     let recovery_capabilities = capabilities.for_role(DeepXRpcRole::Recovery);
     if recovery_capabilities.role() != DeepXRpcRole::Recovery
@@ -567,10 +815,32 @@ pub async fn collect_finalized_recovery_scan(
                 observe_canonical_block_at(recovery_url, block_number, target_extrinsic_hash)
                     .await?;
             if let Some(extrinsic_index) = observation.extrinsic_index() {
-                return Err(DeepXTransactionWatchError::EventEvidenceUnavailable {
-                    block_number,
+                let Some((snapshot, identity)) = event_evidence else {
+                    return Err(DeepXTransactionWatchError::EventEvidenceUnavailable {
+                        block_number,
+                        extrinsic_index,
+                    });
+                };
+                let event_bytes = fetch_system_events(
+                    recovery_url,
+                    observation.block_hash(),
+                    observation.block_number(),
+                )
+                .await?;
+                let inclusion = verify_perp_cancel_inclusion_events(
+                    snapshot,
+                    identity,
+                    observation.block_hash(),
+                    observation.block_number(),
                     extrinsic_index,
-                });
+                    &event_bytes,
+                )?;
+                blocks.push(DeepXCanonicalBlockEvidence::new(
+                    observation.block_number(),
+                    observation.block_hash(),
+                    Some(inclusion),
+                ));
+                continue;
             }
             blocks.push(DeepXCanonicalBlockEvidence::new(
                 observation.block_number(),
@@ -587,6 +857,36 @@ pub async fn collect_finalized_recovery_scan(
     };
     let scan = collector.finish(finalized_hash, pool_evidence)?;
     Ok(DeepXFinalizedRecoveryCollection::Scan(scan))
+}
+
+async fn fetch_system_events(
+    recovery_url: &str,
+    block_hash: [u8; 32],
+    block_number: u64,
+) -> Result<Vec<u8>, DeepXTransactionWatchError> {
+    let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
+    let encoded: Option<String> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getStorage",
+            "params": [SYSTEM_EVENTS_STORAGE_KEY, format!("0x{}", hex::encode(block_hash))],
+        }))
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "state_getStorage",
+            source,
+        })?;
+    let encoded = encoded.ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
+        block_number,
+    ))?;
+    let value =
+        encoded
+            .strip_prefix("0x")
+            .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
+                block_number,
+            ))?;
+    hex::decode(value).map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))
 }
 
 /// Observes exact transaction membership in the submission endpoint's pending pool.
@@ -713,10 +1013,17 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::consts::DEEPX_TESTNET_GENESIS_HASH,
+        common::{
+            DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, consts::DEEPX_TESTNET_GENESIS_HASH,
+        },
         config::{DeepXNetworkConfig, DeepXObservedRpcEndpoint, validate_rpc_endpoint_identities},
         rpc::observe_and_validate_rpc_method_capabilities,
-        transaction::DeepXRecoveryDecision,
+        signing::derive_signer_account_id,
+        transaction::{DeepXDirectRuntimeIdentity, DeepXNonceReservation, DeepXRecoveryDecision},
+    };
+    use nautilus_model::{
+        enums::OrderSide,
+        identifiers::{ClientOrderId, InstrumentId},
     };
 
     #[derive(Clone)]
@@ -799,6 +1106,322 @@ mod tests {
         .unwrap()
     }
 
+    fn runtime_snapshot() -> RuntimeSnapshot {
+        #[derive(Deserialize)]
+        struct RpcResponse {
+            result: String,
+        }
+        let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+        )))
+        .unwrap();
+        RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
+            366,
+            1,
+            &hex::decode(metadata.result.trim_start_matches("0x")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn cancel_identity(
+        subaccount: [u8; 20],
+        order_id: u64,
+        fast_cancel: bool,
+    ) -> DeepXTransactionIdentity {
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let snapshot = runtime_snapshot();
+        DeepXTransactionIdentity::new_perp_cancel(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&key).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_125,
+            },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            subaccount,
+            order_id,
+            100,
+            fast_cancel,
+        )
+    }
+
+    fn cancel_event_record(
+        snapshot: &RuntimeSnapshot,
+        extrinsic_index: u32,
+        subaccount: [u8; 20],
+        order_id: u64,
+        reason_index: u8,
+    ) -> Vec<u8> {
+        cancel_event_record_with_phase(
+            snapshot,
+            Phase::ApplyExtrinsic(extrinsic_index),
+            subaccount,
+            order_id,
+            reason_index,
+        )
+    }
+
+    fn cancel_event_record_with_phase(
+        snapshot: &RuntimeSnapshot,
+        phase: Phase,
+        subaccount: [u8; 20],
+        order_id: u64,
+        reason_index: u8,
+    ) -> Vec<u8> {
+        let pallet = snapshot.interfaces().pallet("PerpMarket").unwrap();
+        let event = snapshot
+            .interfaces()
+            .event("PerpMarket", "OrderCancelled")
+            .unwrap();
+        let mut bytes = phase.encode();
+        bytes.push(pallet.index());
+        bytes.push(event.index());
+        bytes.extend_from_slice(&subaccount);
+        order_id.encode_to(&mut bytes);
+        bytes.push(reason_index);
+        Vec::<[u8; 32]>::new().encode_to(&mut bytes);
+        bytes
+    }
+
+    fn dispatch_event_record(
+        snapshot: &RuntimeSnapshot,
+        extrinsic_index: u32,
+        success: bool,
+    ) -> Vec<u8> {
+        let pallet = snapshot.interfaces().pallet("System").unwrap();
+        let event = snapshot
+            .interfaces()
+            .event(
+                "System",
+                if success {
+                    "ExtrinsicSuccess"
+                } else {
+                    "ExtrinsicFailed"
+                },
+            )
+            .unwrap();
+        let mut bytes = Phase::ApplyExtrinsic(extrinsic_index).encode();
+        bytes.push(pallet.index());
+        bytes.push(event.index());
+        if success {
+            let dispatch_info = ScaleValue::named_composite([
+                (
+                    "weight",
+                    ScaleValue::named_composite([
+                        ("ref_time", ScaleValue::u128(0)),
+                        ("proof_size", ScaleValue::u128(0)),
+                    ]),
+                ),
+                (
+                    "call_type",
+                    ScaleValue::unnamed_variant("Timestamp", [ScaleValue::u128(0)]),
+                ),
+                (
+                    "priority",
+                    ScaleValue::unnamed_composite([ScaleValue::u128(0), ScaleValue::u128(0)]),
+                ),
+                ("class", ScaleValue::unnamed_variant("Normal", [])),
+                ("pays_fee", ScaleValue::unnamed_variant("Yes", [])),
+            ]);
+            let metadata_event = snapshot
+                .metadata()
+                .pallet_by_name("System")
+                .unwrap()
+                .event_variant_by_index(event.index())
+                .unwrap();
+            subxt_core::ext::scale_value::scale::encode_as_type(
+                &dispatch_info,
+                metadata_event.fields[0].ty.id,
+                snapshot.metadata().types(),
+                &mut bytes,
+            )
+            .unwrap();
+        } else {
+            bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        Vec::<[u8; 32]>::new().encode_to(&mut bytes);
+        bytes
+    }
+
+    fn system_events(records: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Compact(u32::try_from(records.len()).unwrap()).encode();
+        for record in records {
+            bytes.extend_from_slice(record);
+        }
+        bytes
+    }
+
+    #[rstest::rstest]
+    fn perpetual_cancel_event_requires_exact_index_and_fields() {
+        let snapshot = runtime_snapshot();
+        let subaccount = [42; 20];
+        let identity = cancel_identity(subaccount, 9001, false);
+        let events = system_events(&[cancel_event_record(&snapshot, 3, subaccount, 9001, 0)]);
+
+        assert_eq!(
+            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events).unwrap(),
+            DeepXIndexedOutcome {
+                extrinsic_index: 3,
+                outcome: DeepXBusinessEventOutcome::Success,
+            },
+        );
+    }
+
+    #[rstest::rstest]
+    fn perpetual_cancel_inclusion_requires_same_index_dispatch_and_business_event() {
+        let snapshot = runtime_snapshot();
+        let subaccount = [42; 20];
+        let identity = cancel_identity(subaccount, 9001, false);
+        let events = system_events(&[
+            cancel_event_record(&snapshot, 3, subaccount, 9001, 0),
+            dispatch_event_record(&snapshot, 3, true),
+        ]);
+
+        let inclusion =
+            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events)
+                .unwrap();
+
+        assert_eq!(inclusion.block_hash(), [41; 32]);
+        assert_eq!(inclusion.block_number(), 41);
+        assert_eq!(inclusion.extrinsic_index(), 3);
+        assert_eq!(
+            inclusion.outcome(),
+            super::super::DeepXInclusionOutcome::Success
+        );
+    }
+
+    #[rstest::rstest]
+    fn perpetual_cancel_inclusion_rejects_missing_business_event() {
+        let snapshot = runtime_snapshot();
+        let identity = cancel_identity([42; 20], 9001, false);
+        let events = system_events(&[dispatch_event_record(&snapshot, 3, true)]);
+
+        assert!(matches!(
+            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events,),
+            Err(DeepXPerpCancelEventVerificationError::InclusionEvidence(_)),
+        ));
+    }
+
+    #[rstest::rstest]
+    fn absent_or_other_extrinsic_cancel_event_is_not_observed() {
+        let snapshot = runtime_snapshot();
+        let subaccount = [42; 20];
+        let identity = cancel_identity(subaccount, 9001, false);
+
+        for events in [
+            system_events(&[]),
+            system_events(&[cancel_event_record(&snapshot, 4, subaccount, 9001, 0)]),
+            system_events(&[cancel_event_record_with_phase(
+                &snapshot,
+                Phase::Finalization,
+                subaccount,
+                9001,
+                0,
+            )]),
+        ] {
+            assert_eq!(
+                verify_perp_cancel_business_event(&snapshot, &identity, 3, &events).unwrap(),
+                DeepXIndexedOutcome {
+                    extrinsic_index: 3,
+                    outcome: DeepXBusinessEventOutcome::NotObserved,
+                },
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::wrong_user([41; 20], 9001, 0)]
+    #[case::wrong_order([42; 20], 9002, 0)]
+    #[case::wrong_reason([42; 20], 9001, 1)]
+    fn conflicting_perpetual_cancel_event_is_rejected(
+        #[case] subaccount: [u8; 20],
+        #[case] order_id: u64,
+        #[case] reason_index: u8,
+    ) {
+        let snapshot = runtime_snapshot();
+        let identity = cancel_identity([42; 20], 9001, false);
+        let events = system_events(&[cancel_event_record(
+            &snapshot,
+            3,
+            subaccount,
+            order_id,
+            reason_index,
+        )]);
+
+        assert!(matches!(
+            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+            Err(DeepXPerpCancelEventVerificationError::ConflictingEvent),
+        ));
+    }
+
+    #[rstest::rstest]
+    fn duplicate_perpetual_cancel_event_is_rejected() {
+        let snapshot = runtime_snapshot();
+        let subaccount = [42; 20];
+        let identity = cancel_identity(subaccount, 9001, false);
+        let record = cancel_event_record(&snapshot, 3, subaccount, 9001, 0);
+        let events = system_events(&[record.clone(), record]);
+
+        assert!(matches!(
+            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+            Err(DeepXPerpCancelEventVerificationError::DuplicateEvent),
+        ));
+    }
+
+    #[rstest::rstest]
+    fn malformed_perpetual_cancel_event_bytes_are_rejected() {
+        let snapshot = runtime_snapshot();
+        let identity = cancel_identity([42; 20], 9001, false);
+        let mut trailing = system_events(&[]);
+        trailing.push(0);
+
+        for events in [vec![4], trailing] {
+            assert!(matches!(
+                verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+                Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes),
+            ));
+        }
+    }
+
+    #[rstest::rstest]
+    fn unsupported_and_fast_cancel_operations_are_rejected() {
+        let snapshot = runtime_snapshot();
+        let fast_cancel = cancel_identity([42; 20], 9001, true);
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let legacy = DeepXTransactionIdentity::new(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&key).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_125,
+            },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+        );
+
+        assert!(matches!(
+            verify_perp_cancel_business_event(&snapshot, &fast_cancel, 3, &[0]),
+            Err(DeepXPerpCancelEventVerificationError::FastCancelUnsupported),
+        ));
+        assert!(matches!(
+            verify_perp_cancel_business_event(&snapshot, &legacy, 3, &[0]),
+            Err(DeepXPerpCancelEventVerificationError::UnsupportedOperation),
+        ));
+    }
+
     #[rstest::rstest]
     #[case::canonical([42; 32], Some(3), DeepXReorganizationDecision::Canonical)]
     #[case::reorganized(
@@ -832,6 +1455,7 @@ mod tests {
         finalized_hash: Option<String>,
         block_extrinsics: Arc<BTreeMap<u64, Vec<String>>>,
         pool_extrinsics: Arc<[String]>,
+        event_storage: Arc<BTreeMap<u64, String>>,
         post_checkpoint_requests: Arc<AtomicUsize>,
     }
 
@@ -845,6 +1469,7 @@ mod tests {
             "chain_getFinalizedHead"
                 | "chain_getHeader"
                 | "chain_getBlock"
+                | "state_getStorage"
                 | "author_pendingExtrinsics"
         ) {
             state
@@ -862,6 +1487,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getFinalizedHead" => json!(
@@ -888,6 +1514,11 @@ mod tests {
                     },
                 })
             }
+            "state_getStorage" => {
+                assert_eq!(request["params"][0], SYSTEM_EVENTS_STORAGE_KEY);
+                let number = decode_mock_block_hash(request["params"][1].as_str().unwrap());
+                json!(state.event_storage.get(&number))
+            }
             "author_pendingExtrinsics" => json!(state.pool_extrinsics.as_ref()),
             method => panic!("unexpected method {method}"),
         };
@@ -912,6 +1543,27 @@ mod tests {
         DeepXValidatedRpcMethodCapabilities,
         Arc<AtomicUsize>,
     ) {
+        recovery_endpoints_with_events(
+            finalized_block,
+            finalized_hash,
+            block_extrinsics,
+            pool_extrinsics,
+            BTreeMap::new(),
+        )
+        .await
+    }
+
+    async fn recovery_endpoints_with_events(
+        finalized_block: u64,
+        finalized_hash: Option<String>,
+        block_extrinsics: BTreeMap<u64, Vec<String>>,
+        pool_extrinsics: Vec<String>,
+        event_storage: BTreeMap<u64, String>,
+    ) -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let post_checkpoint_requests = Arc::new(AtomicUsize::new(0));
@@ -920,6 +1572,7 @@ mod tests {
             finalized_hash,
             block_extrinsics: Arc::new(block_extrinsics),
             pool_extrinsics: Arc::from(pool_extrinsics),
+            event_storage: Arc::new(event_storage),
             post_checkpoint_requests: Arc::clone(&post_checkpoint_requests),
         };
         tokio::spawn(async move {
@@ -966,6 +1619,7 @@ mod tests {
             finalized_hash: None,
             block_extrinsics: Arc::new(block_extrinsics),
             pool_extrinsics: Arc::from(pool_extrinsics),
+            event_storage: Arc::new(BTreeMap::new()),
             post_checkpoint_requests: Arc::new(AtomicUsize::new(0)),
         };
         tokio::spawn(async move {
@@ -1196,6 +1850,48 @@ mod tests {
                 extrinsic_index: 0,
             },
         ));
+    }
+
+    #[tokio::test]
+    async fn finalized_recovery_scan_verifies_events_at_exact_canonical_block() {
+        let snapshot = runtime_snapshot();
+        let subaccount = [42; 20];
+        let identity = cancel_identity(subaccount, 9001, false);
+        let target = extrinsic(&[1, 2, 3, 4]);
+        let target_hash = BlakeTwo256.hash(&target).0;
+        let blocks = BTreeMap::from([(41, vec![format!("0x{}", hex::encode(target))])]);
+        let events = system_events(&[
+            cancel_event_record(&snapshot, 0, subaccount, 9001, 0),
+            dispatch_event_record(&snapshot, 0, true),
+        ]);
+        let event_storage = BTreeMap::from([(41, format!("0x{}", hex::encode(events)))]);
+        let (endpoints, capabilities, _) =
+            recovery_endpoints_with_events(42, None, blocks, vec![], event_storage).await;
+
+        let collection = collect_finalized_recovery_scan_with_event_evidence(
+            &endpoints,
+            &capabilities,
+            &snapshot,
+            &identity,
+            39,
+            decode_hash(&block_hash(39)).unwrap(),
+            2,
+            target_hash,
+        )
+        .await
+        .unwrap();
+
+        let DeepXFinalizedRecoveryCollection::Scan(scan) = collection else {
+            panic!("expected a completed recovery scan");
+        };
+        assert_eq!(
+            scan.classify(),
+            DeepXRecoveryDecision::FinalizedInclusion(inclusion(
+                decode_hash(&block_hash(41)).unwrap(),
+                41,
+                0,
+            )),
+        );
     }
 
     #[tokio::test]

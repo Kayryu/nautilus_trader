@@ -55,6 +55,7 @@ pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
     "chain_getBlockHash",
     "chain_getFinalizedHead",
     "chain_getHeader",
+    "state_getStorage",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -171,12 +172,22 @@ impl DeepXObservedRuntimeSnapshot {
 }
 
 /// Result of one approved finalized runtime observation and snapshot application.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DeepXAppliedRuntimeSnapshot {
     checkpoint: DeepXFinalizedCheckpoint,
     update: DeepXRuntimeSnapshotUpdate,
-    identity: ApprovedRuntimeIdentity,
+    snapshot: RuntimeSnapshot,
 }
+
+impl PartialEq for DeepXAppliedRuntimeSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.checkpoint == other.checkpoint
+            && self.update == other.update
+            && self.identity() == other.identity()
+    }
+}
+
+impl Eq for DeepXAppliedRuntimeSnapshot {}
 
 impl DeepXAppliedRuntimeSnapshot {
     /// Returns the finalized checkpoint used for the approved observation.
@@ -194,7 +205,13 @@ impl DeepXAppliedRuntimeSnapshot {
     /// Returns the approved runtime identity observed and applied at the finalized checkpoint.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
-        &self.identity
+        self.snapshot.identity()
+    }
+
+    /// Returns the approved immutable runtime snapshot applied at the finalized checkpoint.
+    #[must_use]
+    pub const fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
     }
 }
 
@@ -524,7 +541,7 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     Ok(DeepXAppliedRuntimeSnapshot {
         checkpoint: observation.checkpoint(),
         update,
-        identity: observation.snapshot().identity().clone(),
+        snapshot: observation.into_snapshot(),
     })
 }
 

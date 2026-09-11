@@ -33,16 +33,16 @@ use super::{
     DeepXReorganizationDecision, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
     DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
     DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
-    DeepXTransactionWatchError, collect_finalized_recovery_scan, observe_finality,
-    observe_reorganization, observe_submission_pool,
+    DeepXTransactionWatchError, collect_finalized_recovery_scan_with_event_evidence,
+    observe_finality, observe_reorganization, observe_submission_pool,
 };
 use crate::{
     common::DeepXPrivateKey,
     config::DeepXValidatedRpcEndpoints,
     rpc::DeepXValidatedRpcMethodCapabilities,
     signing::{
-        RuntimeSnapshot, SignedPalletExtrinsic, SigningError, derive_signer_account_id,
-        sign_dynamic_pallet_call_with_snapshot,
+        DeepXPerpCancelParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
+        derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel,
     },
 };
 
@@ -633,6 +633,115 @@ impl fmt::Debug for DeepXRemarkCallVerifier {
     }
 }
 
+/// Fixture-gated verifier for a durable direct perpetual cancel operation.
+#[derive(Clone)]
+pub struct DeepXPerpCancelCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+    signer: [u8; 20],
+}
+
+impl DeepXPerpCancelCallVerifier {
+    /// Binds perpetual cancel verification to an approved snapshot and signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is rejected by the pinned DeepX signer implementation.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        let signer = derive_signer_account_id(&key)?;
+        Ok(Self {
+            snapshot,
+            key,
+            signer,
+        })
+    }
+
+    fn canonical_signed_cancel(
+        &self,
+        identity: &DeepXTransactionIdentity,
+    ) -> Result<SignedPalletExtrinsic, DeepXBusinessCallBindingError> {
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        let Some(super::DeepXTransactionOperation::PerpCancel {
+            subaccount,
+            order_id,
+            market_id,
+            fast_cancel,
+        }) = identity.operation()
+        else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "durable identity is not a proven perpetual cancel operation".to_string(),
+            ));
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(self.snapshot.clone());
+        let permit = service.acquire().map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!(
+                "approved DeepX runtime snapshot is unavailable: {e}"
+            ))
+        })?;
+        sign_perp_cancel(
+            &permit,
+            &self.key,
+            DeepXPerpCancelParams {
+                subaccount: *subaccount,
+                order_id: *order_id,
+                market_id: *market_id,
+                fast_cancel: *fast_cancel,
+            },
+            nonce,
+        )
+        .map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!(
+                "canonical DeepX perpetual cancel could not be encoded: {e}"
+            ))
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXPerpCancelCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        if self.signer != identity.signer() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "verifier signing key does not match the reserved signer".to_string(),
+            ));
+        }
+        if DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "verifier runtime snapshot does not match the reserved runtime".to_string(),
+            ));
+        }
+        let canonical = self.canonical_signed_cancel(identity)?;
+        if canonical.bytes() != signed_extrinsic.bytes() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not the canonical perpetual cancel for this identity"
+                    .to_string(),
+            ));
+        }
+        if canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable hash does not match the canonical perpetual cancel hash".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXPerpCancelCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXPerpCancelCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Failure to prove that signed bytes encode the reserved DeepX business operation.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXBusinessCallBindingError {
@@ -902,6 +1011,9 @@ pub enum DeepXFinalizedRecoveryCommitError {
     /// The not-included lifecycle state did not retain its required checkpoint evidence.
     #[error("DeepX not-included transaction is missing durable absence evidence")]
     MissingAbsenceEvidence,
+    /// The approved snapshot does not match the durable runtime identity being recovered.
+    #[error("DeepX finalized recovery runtime snapshot does not match durable identity")]
+    RuntimeSnapshotMismatch,
     /// Finalized-chain observation failed before any lifecycle mutation was attempted.
     #[error(transparent)]
     Watch(#[from] DeepXTransactionWatchError),
@@ -1233,6 +1345,7 @@ where
 pub async fn reconcile_not_included_checkpoint<S>(
     endpoints: &DeepXValidatedRpcEndpoints,
     capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
     store: &S,
     lease: &S::Lease,
     restored: &DeepXRestoredTransactionRecord,
@@ -1247,6 +1360,9 @@ where
             record.lifecycle().state(),
         ));
     }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
     let target_extrinsic_hash = record
         .signed_extrinsic()
         .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?
@@ -1255,9 +1371,11 @@ where
         .lifecycle()
         .absence()
         .ok_or(DeepXFinalizedRecoveryCommitError::MissingAbsenceEvidence)?;
-    let collection = collect_finalized_recovery_scan(
+    let collection = collect_finalized_recovery_scan_with_event_evidence(
         endpoints,
         capabilities,
+        snapshot,
+        record.identity(),
         absence.finalized_block_number(),
         absence.finalized_block_hash(),
         max_blocks_per_range,
@@ -1331,6 +1449,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getBlockHash" => json!(format!("0x{}", "09".repeat(32))),
@@ -1410,6 +1529,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getFinalizedHead" => {
@@ -1506,6 +1626,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
@@ -1938,11 +2059,33 @@ mod tests {
         record
     }
 
-    fn not_included_record() -> DeepXTransactionRecord {
-        let mut record = submitting_record();
-        let absence = DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap();
+    fn not_included_record_for(snapshot: &RuntimeSnapshot) -> DeepXTransactionRecord {
+        let identity = DeepXTransactionIdentity::new(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            [7; 20],
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+        );
+        let mut record = DeepXTransactionRecord::created(identity);
+        let bytes = vec![1, 2, 3];
         record
-            .apply_observation(DeepXTransactionObservation::NotIncluded(absence))
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer: record.identity().signer(),
+                nonce: 42,
+                runtime: snapshot.identity().clone(),
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::NotIncluded(
+                DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap(),
+            ))
             .unwrap();
         record
     }
@@ -2492,6 +2635,151 @@ mod tests {
 
         let debug = format!("{verifier:?}");
         assert!(debug.contains("DeepXRemarkCallVerifier"));
+        assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    fn perp_cancel_identity(
+        subaccount: [u8; 20],
+        order_id: u64,
+        market_id: u16,
+        fast_cancel: bool,
+    ) -> DeepXTransactionIdentity {
+        DeepXTransactionIdentity::new_perp_cancel(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            crate::signing::derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_125,
+            },
+            remark_runtime(),
+            subaccount,
+            order_id,
+            market_id,
+            fast_cancel,
+        )
+    }
+
+    fn perp_cancel_record(identity: &DeepXTransactionIdentity) -> DeepXTransactionRecord {
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            unreachable!("perpetual cancel records reserve a timestamp nonce");
+        };
+        let Some(crate::transaction::DeepXTransactionOperation::PerpCancel {
+            subaccount,
+            order_id,
+            market_id,
+            fast_cancel,
+        }) = identity.operation()
+        else {
+            unreachable!("perpetual cancel records retain their operation");
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let permit = service.acquire().unwrap();
+        let signed = sign_perp_cancel(
+            &permit,
+            &remark_key(),
+            DeepXPerpCancelParams {
+                subaccount: *subaccount,
+                order_id: *order_id,
+                market_id: *market_id,
+                fast_cancel: *fast_cancel,
+            },
+            nonce,
+        )
+        .unwrap();
+        let mut record = DeepXTransactionRecord::created(identity.clone());
+        record.record_signed(&signed).unwrap();
+        record
+    }
+
+    #[rstest]
+    fn perp_cancel_verifier_accepts_exact_durable_operation() {
+        let identity = perp_cancel_identity([0x11; 20], 1_725_000_000_001, 7, false);
+        let record = perp_cancel_record(&identity);
+        let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert_eq!(
+            verifier.verify(&identity, record.signed_extrinsic().unwrap()),
+            Ok(()),
+        );
+    }
+
+    #[rstest]
+    fn perp_cancel_operation_survives_durable_record_round_trip() {
+        let identity = perp_cancel_identity([0x11; 20], 1_725_000_000_001, 7, false);
+        let record = perp_cancel_record(&identity);
+
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+
+        assert_eq!(restored, record);
+        assert_eq!(restored.identity().operation(), identity.operation());
+    }
+
+    #[rstest]
+    #[case::subaccount([0x22; 20], 1_725_000_000_001, 7, false)]
+    #[case::order_id([0x11; 20], 1_725_000_000_002, 7, false)]
+    #[case::market_id([0x11; 20], 1_725_000_000_001, 8, false)]
+    #[case::fast_cancel([0x11; 20], 1_725_000_000_001, 7, true)]
+    fn perp_cancel_verifier_rejects_any_operation_field_mismatch(
+        #[case] subaccount: [u8; 20],
+        #[case] order_id: u64,
+        #[case] market_id: u16,
+        #[case] fast_cancel: bool,
+    ) {
+        let signed_identity = perp_cancel_identity([0x11; 20], 1_725_000_000_001, 7, false);
+        let record = perp_cancel_record(&signed_identity);
+        let mismatched_identity =
+            perp_cancel_identity(subaccount, order_id, market_id, fast_cancel);
+        let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&mismatched_identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
+    }
+
+    #[rstest]
+    fn perp_cancel_verifier_rejects_identity_without_proven_operation() {
+        let signed_identity = perp_cancel_identity([0x11; 20], 1_725_000_000_001, 7, false);
+        let record = perp_cancel_record(&signed_identity);
+        let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&remark_identity(), record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Unsupported(_)),
+        ));
+    }
+
+    #[rstest]
+    fn perp_cancel_verifier_rejects_another_reserved_signer() {
+        let signed_identity = perp_cancel_identity([0x11; 20], 1_725_000_000_001, 7, false);
+        let record = perp_cancel_record(&signed_identity);
+        let mismatched_identity = DeepXTransactionIdentity::new_perp_cancel(
+            ClientOrderId::new(signed_identity.client_order_id()),
+            [0x22; 20],
+            signed_identity.instrument_id(),
+            signed_identity.order_side(),
+            signed_identity.nonce(),
+            signed_identity.runtime().clone(),
+            [0x11; 20],
+            1_725_000_000_001,
+            7,
+            false,
+        );
+        let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&mismatched_identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
+    }
+
+    #[rstest]
+    fn perp_cancel_verifier_debug_output_redacts_the_private_key() {
+        let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        let debug = format!("{verifier:?}");
+        assert!(debug.contains("DeepXPerpCancelCallVerifier"));
         assert!(!debug.contains("0123456789abcdef"));
     }
 
@@ -3255,7 +3543,8 @@ mod tests {
 
     #[tokio::test]
     async fn up_to_date_not_included_checkpoint_preserves_durable_revision() {
-        let record = not_included_record();
+        let snapshot = remark_snapshot();
+        let record = not_included_record_for(&snapshot);
         let store = TestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3268,10 +3557,10 @@ mod tests {
         .unwrap();
         let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
         let (endpoints, capabilities, _) = reorganization_endpoints().await;
-
         let result = reconcile_not_included_checkpoint(
             &endpoints,
             &capabilities,
+            &snapshot,
             &store,
             &lease,
             &restored,
@@ -3290,7 +3579,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_atomic_pool_absence_durably_requires_operator_action() {
-        let record = not_included_record();
+        let snapshot = remark_snapshot();
+        let record = not_included_record_for(&snapshot);
         let store = TestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3303,10 +3593,10 @@ mod tests {
         .unwrap();
         let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
         let (endpoints, capabilities) = finalized_recovery_endpoints(74).await;
-
         let result = reconcile_not_included_checkpoint(
             &endpoints,
             &capabilities,
+            &snapshot,
             &store,
             &lease,
             &restored,
@@ -3343,10 +3633,12 @@ mod tests {
         let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
         let (endpoints, capabilities, request_count) = reorganization_endpoints().await;
         let requests_before_recovery = request_count.load(Ordering::Relaxed);
+        let snapshot = remark_snapshot();
 
         let error = reconcile_not_included_checkpoint(
             &endpoints,
             &capabilities,
+            &snapshot,
             &store,
             &lease,
             &restored,
@@ -3452,6 +3744,50 @@ mod tests {
         assert_eq!(store.current_revision(), 5);
     }
 
+    #[tokio::test]
+    async fn runtime_snapshot_mismatch_is_rejected_before_finalized_recovery_rpc() {
+        let mut record = submitting_record();
+        record
+            .apply_observation(DeepXTransactionObservation::NotIncluded(
+                DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap(),
+            ))
+            .unwrap();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let (endpoints, capabilities, request_count) = reorganization_endpoints().await;
+        let requests_before_recovery = request_count.load(Ordering::Relaxed);
+
+        let error = reconcile_not_included_checkpoint(
+            &endpoints,
+            &capabilities,
+            &remark_snapshot(),
+            &store,
+            &lease,
+            &restored,
+            10,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch,
+        ));
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            requests_before_recovery
+        );
+    }
     #[tokio::test]
     async fn stale_revision_never_releases_reconciliation_observation() {
         let record = submitting_record();

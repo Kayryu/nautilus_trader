@@ -55,7 +55,7 @@ use crate::{
     },
     providers::DeepXMarketProvider,
     rpc::{DeepXAppliedRuntimeSnapshot, DeepXValidatedRpcMethodCapabilities},
-    signing::{SigningError, derive_signer_account_id},
+    signing::{RuntimeSnapshot, SigningError, derive_signer_account_id},
     transaction::{
         DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
         DeepXPoolReconciliationCommitError, DeepXReorganizationCommitError,
@@ -980,6 +980,7 @@ pub struct DeepXExecutionClient {
     order_contexts: DeepXOrderContextRegistry,
     trade_dedup: DeepXTradeDedup<TRADE_DEDUP_CAPACITY>,
     startup: DeepXExecutionStartup,
+    runtime_snapshot: Option<RuntimeSnapshot>,
     startup_authenticated_session: Option<DeepXWsAuthenticatedSession>,
     startup_account_event_id: Option<UUID4>,
 }
@@ -1230,6 +1231,7 @@ impl DeepXExecutionClient {
             order_contexts: DeepXOrderContextRegistry::default(),
             trade_dedup: DeepXTradeDedup::default(),
             startup: DeepXExecutionStartup::default(),
+            runtime_snapshot: None,
             startup_authenticated_session: None,
             startup_account_event_id: None,
         })
@@ -1468,6 +1470,7 @@ impl DeepXExecutionClient {
         self.validate_rpc_evidence(endpoints, capabilities)?;
         self.startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)?;
+        self.runtime_snapshot = Some(applied.snapshot().clone());
         Ok(())
     }
 
@@ -1649,6 +1652,13 @@ impl DeepXExecutionClient {
             return Err(DeepXMassReconciliationError::SignerLeaseMismatch);
         }
         self.validate_rpc_evidence(endpoints, capabilities)?;
+        let snapshot =
+            self.runtime_snapshot
+                .as_ref()
+                .ok_or(DeepXExecutionStartupError::OutOfOrder {
+                    expected: DeepXExecutionStartupEvidence::RuntimeValidated,
+                    received: DeepXExecutionStartupEvidence::MassReconciliationCompleted,
+                })?;
         let restored = load_verified_committed_for_signer(store, lease).await?;
         for item in restored {
             let client_order_id = item.record().identity().client_order_id().to_string();
@@ -1691,6 +1701,7 @@ impl DeepXExecutionClient {
                 DeepXTransactionState::NotIncluded => reconcile_not_included_checkpoint(
                     endpoints,
                     capabilities,
+                    snapshot,
                     store,
                     lease,
                     &item,
@@ -1764,6 +1775,7 @@ impl DeepXExecutionClient {
     pub fn reset_startup(&mut self) {
         self.core.set_disconnected();
         self.startup.reset();
+        self.runtime_snapshot = None;
         self.startup_authenticated_session = None;
         self.startup_account_event_id = None;
     }
@@ -2484,6 +2496,7 @@ mod tests {
                                     "chain_getHeader",
                                     "state_getMetadata",
                                     "state_getRuntimeVersion",
+                                    "state_getStorage",
                                 ],
                             },
                         }));
@@ -2553,6 +2566,17 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .trim_start_matches("0x"),
+        )
+        .unwrap()
+    }
+
+    fn test_runtime_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
+            366,
+            1,
+            &metadata_fixture_bytes(),
         )
         .unwrap()
     }
@@ -2628,41 +2652,28 @@ mod tests {
         record
     }
 
-    fn not_included_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
+    fn not_included_record(
+        client: &DeepXExecutionClient,
+        snapshot: &RuntimeSnapshot,
+    ) -> DeepXTransactionRecord {
         let signer = derive_signer_account_id(&client.credential).unwrap();
-        let genesis_hash =
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let runtime = snapshot.identity();
         let mut record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-NOT-INCLUDED"),
             signer,
             InstrumentId::from("ETH-USDC-PERP.DEEPX"),
             OrderSide::Buy,
             DeepXNonceReservation::TimestampOrderId { value: 42 },
-            DeepXDirectRuntimeIdentity {
-                genesis_hash,
-                metadata_sha256: [2; 32],
-                spec_version: 366,
-                transaction_version: 1,
-                signed_extensions: vec!["CheckNonce".to_string()],
-            },
+            DeepXDirectRuntimeIdentity::from(runtime),
         ));
         let bytes = vec![12, 1, 2, 3];
-        let identity = record.identity();
-        let runtime = identity.runtime();
         record
             .record_signed(&SignedPalletExtrinsic {
                 extrinsic_hash: BlakeTwo256.hash(&bytes).0,
                 bytes,
                 signer,
                 nonce: 42,
-                runtime: ApprovedRuntimeIdentity {
-                    environment: DeepXEnvironment::Testnet,
-                    genesis_hash: runtime.genesis_hash,
-                    metadata_sha256: runtime.metadata_sha256,
-                    spec_version: runtime.spec_version,
-                    transaction_version: runtime.transaction_version,
-                    signed_extensions: runtime.signed_extensions.clone(),
-                },
+                runtime: runtime.clone(),
             })
             .unwrap();
         record
@@ -2700,6 +2711,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getFinalizedHead" => json!(format!("0x{:064x}", 73)),
@@ -2802,6 +2814,7 @@ mod tests {
                     "chain_getHeader",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
+                    "state_getStorage",
                 ],
             }),
             "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
@@ -2909,12 +2922,18 @@ mod tests {
             .record_runtime_validated(&applied, &endpoints, &capabilities)
             .unwrap();
 
+        assert_eq!(
+            client.runtime_snapshot.as_ref().unwrap().identity(),
+            applied.snapshot().identity(),
+        );
         assert!(
             client
                 .startup
                 .validate_next(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
                 .is_ok()
         );
+        client.reset_startup();
+        assert!(client.runtime_snapshot.is_none());
     }
 
     #[tokio::test]
@@ -3233,6 +3252,7 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
+        client.runtime_snapshot = Some(test_runtime_snapshot());
         let (protocol, session) = authenticated_protocol();
         client
             .record_private_stream_authenticated(&protocol, session)
@@ -3260,6 +3280,7 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
+        client.runtime_snapshot = Some(test_runtime_snapshot());
         let (protocol, session) = authenticated_protocol();
         client
             .record_private_stream_authenticated(&protocol, session)
@@ -3661,7 +3682,8 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_requires_action_for_not_included_pool_conflict() {
         let mut client = test_client();
-        let record = not_included_record(&client);
+        let snapshot = test_runtime_snapshot();
+        let record = not_included_record(&client, &snapshot);
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
         configure_rpc_url(&mut client, rpc_url);
@@ -3706,7 +3728,8 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_requires_action_after_non_atomic_pool_absence() {
         let mut client = test_client();
-        let record = not_included_record(&client);
+        let snapshot = test_runtime_snapshot();
+        let record = not_included_record(&client, &snapshot);
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) = advance_to_mass_reconciliation(&mut client);

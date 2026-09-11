@@ -24,18 +24,19 @@ mod watch;
 pub use persistence::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
     DeepXCommittedTransactionRecord, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
-    DeepXObservationCommitError, DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
-    DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
-    DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReorganizationCommitError,
-    DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSubmissionAcceptanceCommitError,
-    DeepXSubmissionPermit, DeepXSubmissionPreparationError, DeepXTransactionPersistenceError,
-    DeepXTransactionRevision, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
-    commit_initial_submission_acceptance, commit_reconciliation_observation,
-    commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
-    observe_and_commit_finality, observe_and_commit_reorganization, prepare_initial_submission,
-    prepare_signed_transaction, prepare_timestamp_reservation, reconcile_not_included_checkpoint,
-    reconcile_submission_pool, restore_timestamp_nonce_allocator, verify_signer_lease,
+    DeepXObservationCommitError, DeepXPerpCancelCallVerifier, DeepXPoolReconciliationCommitError,
+    DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXPreparedReservation,
+    DeepXPreparedSignedTransaction, DeepXPreparedSubmission, DeepXRemarkCallVerifier,
+    DeepXReorganizationCommitError, DeepXReservationPreparationError,
+    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+    DeepXSubmissionAcceptanceCommitError, DeepXSubmissionPermit, DeepXSubmissionPreparationError,
+    DeepXTransactionPersistenceError, DeepXTransactionRevision, DeepXTransactionStore,
+    DeepXUnsupportedBusinessCallVerifier, commit_initial_submission_acceptance,
+    commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
+    load_verified_committed_for_signer, observe_and_commit_finality,
+    observe_and_commit_reorganization, prepare_initial_submission, prepare_signed_transaction,
+    prepare_timestamp_reservation, reconcile_not_included_checkpoint, reconcile_submission_pool,
+    restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -48,7 +49,7 @@ pub use reservation::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION,
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXNonceReservation,
     DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionIdentity,
-    DeepXTransactionRecord, DeepXTransactionRecordError,
+    DeepXTransactionOperation, DeepXTransactionRecord, DeepXTransactionRecordError,
 };
 use serde::{Deserialize, Serialize};
 pub use submission::{
@@ -56,11 +57,13 @@ pub use submission::{
     submit_extrinsic_once, submit_with_bounded_ambiguity_retry, verify_submission_hash,
 };
 use thiserror::Error;
+pub(crate) use watch::collect_finalized_recovery_scan_with_event_evidence;
 pub use watch::{
     DeepXCanonicalBlockObservation, DeepXFinalityObservation, DeepXFinalizedRecoveryCheckpoint,
-    DeepXFinalizedRecoveryCollection, DeepXPoolObservation, DeepXTransactionWatchError,
-    collect_finalized_recovery_scan, observe_canonical_block, observe_finality,
-    observe_reorganization, observe_submission_pool,
+    DeepXFinalizedRecoveryCollection, DeepXPerpCancelEventVerificationError, DeepXPoolObservation,
+    DeepXTransactionWatchError, collect_finalized_recovery_scan, observe_canonical_block,
+    observe_finality, observe_reorganization, observe_submission_pool,
+    verify_perp_cancel_business_event,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.

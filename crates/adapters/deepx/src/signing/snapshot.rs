@@ -750,6 +750,10 @@ impl RuntimeSnapshot {
     pub(super) const fn client_state(&self) -> &ClientState<DeepXRuntimeConfig> {
         &self.client_state
     }
+
+    pub(crate) const fn metadata(&self) -> &Metadata {
+        &self.client_state.metadata
+    }
 }
 
 fn collect_variants(

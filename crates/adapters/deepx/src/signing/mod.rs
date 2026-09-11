@@ -55,6 +55,9 @@ pub enum SigningError {
     /// The private scalar was rejected by the pinned DeepX signer implementation.
     #[error("invalid DeepX secp256k1 signing key")]
     InvalidKey,
+    /// The pallet call is absent from the approved runtime interface.
+    #[error(transparent)]
+    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
     /// The dynamic call or transaction extensions could not be SCALE encoded.
     #[error("unable to encode DeepX pallet extrinsic: {0}")]
     Encode(#[source] Box<subxt_core::Error>),
@@ -89,6 +92,37 @@ pub struct SignedPalletExtrinsic {
     pub(crate) nonce: u64,
     /// Approved runtime identity used to encode and sign the extrinsic.
     pub(crate) runtime: ApprovedRuntimeIdentity,
+}
+
+/// Exact arguments for a user-requested DeepX perpetual order cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpCancelParams {
+    /// DeepX subaccount which owns the order.
+    pub subaccount: [u8; 20],
+    /// Runtime-assigned order identifier.
+    pub order_id: u64,
+    /// Perpetual market identifier.
+    pub market_id: u16,
+    /// Whether the runtime should use its high-priority cancellation path.
+    pub fast_cancel: bool,
+}
+
+impl DeepXPerpCancelParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![Value::named_composite([(
+            "params",
+            Value::named_composite([
+                ("subaccount", Value::from_bytes(self.subaccount)),
+                ("order_id", Value::u128(u128::from(self.order_id))),
+                ("market_id", Value::u128(u128::from(self.market_id))),
+                (
+                    "cancel_reason",
+                    Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
+                ),
+                ("fast_cancel", Value::bool(self.fast_cancel)),
+            ]),
+        )])]
+    }
 }
 
 impl SignedPalletExtrinsic {
@@ -156,6 +190,31 @@ pub fn sign_dynamic_pallet_call(
     )
 }
 
+/// Signs a perpetual order cancellation without submitting it.
+///
+/// The cancellation reason is fixed to the runtime's `UserCanceled` variant. As with
+/// [`sign_dynamic_pallet_call`], the caller owns nonce reservation and persistence.
+///
+/// # Errors
+///
+/// Returns an error when the key is invalid or the call cannot be encoded against the approved
+/// runtime snapshot.
+pub fn sign_perp_cancel(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXPerpCancelParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "PerpMarket",
+        "cancel_order",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
 pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     snapshot: &RuntimeSnapshot,
     key: &DeepXPrivateKey,
@@ -164,6 +223,8 @@ pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     arguments: Vec<Value>,
     nonce: u64,
 ) -> Result<SignedPalletExtrinsic, SigningError> {
+    snapshot.interfaces().call(pallet, call)?;
+
     let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
     let account_id = derive_signer_account_id(key)?;
     let payload = subxt_core::dynamic::tx(pallet, call, arguments);
@@ -320,6 +381,50 @@ mod tests {
     }
 
     #[rstest]
+    fn approved_testnet_catalog_contains_direct_market_calls() {
+        let snapshot = snapshot();
+        let interfaces = snapshot.interfaces();
+
+        for (pallet, call) in [
+            ("Subaccount", "no_op"),
+            ("SpotMarket", "place_order"),
+            ("SpotMarket", "cancel_order"),
+            ("PerpMarket", "place_order"),
+            ("PerpMarket", "cancel_order"),
+        ] {
+            interfaces.call(pallet, call).unwrap();
+        }
+    }
+
+    #[rstest]
+    fn perp_cancel_arguments_encode_against_approved_testnet_metadata() {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let signed = sign_perp_cancel(
+            &permit,
+            &key(),
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 1_725_000_000_001,
+                market_id: 7,
+                fast_cancel: false,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+
+        assert!(signed.has_valid_hash());
+        assert_eq!(
+            hex::encode(signed.bytes()),
+            "050284fcad0b19bb29d4674531d6f115237e16afce377c91034ea2dd5af54cb435089b4ddd3cca24035b700655e0a59997f0a36d25a4175a3fdad77ba793855e1961a5a6d9c9c0f9a4ce3b54ece8b92c56d2cf6ed469d300000b7d2203a291010016031111111111111111111111111111111111111111012203a29101000007000000",
+        );
+        assert_eq!(
+            hex::encode(signed.extrinsic_hash()),
+            "4bf41e0b660b46dbf14be59a261b2ded7ea510b712f27063ace34a6d6d6e94c8",
+        );
+    }
+
+    #[rstest]
     fn unknown_dynamic_call_is_rejected_without_panic() {
         let service = DeepXRuntimeSnapshotService::new(snapshot());
         let permit = service.acquire().unwrap();
@@ -332,6 +437,11 @@ mod tests {
             7,
         );
 
-        assert!(matches!(result, Err(SigningError::Encode(_))));
+        assert!(matches!(
+            result,
+            Err(SigningError::RuntimeInterface(
+                DeepXRuntimeInterfaceError::PalletUnavailable(pallet),
+            )) if pallet == "UnknownPallet"
+        ));
     }
 }

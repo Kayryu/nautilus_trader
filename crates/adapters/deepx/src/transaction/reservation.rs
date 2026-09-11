@@ -214,6 +214,23 @@ impl From<&ApprovedRuntimeIdentity> for DeepXDirectRuntimeIdentity {
     }
 }
 
+/// Protocol operation fields retained as part of a durable transaction identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DeepXTransactionOperation {
+    /// Direct `PerpMarket.cancel_order` operation.
+    PerpCancel {
+        /// Venue subaccount whose order is canceled.
+        subaccount: [u8; 20],
+        /// Venue order identifier.
+        order_id: u64,
+        /// Venue perpetual market identifier.
+        market_id: u16,
+        /// Whether the runtime should use its fast-cancel path.
+        fast_cancel: bool,
+    },
+}
+
 /// Immutable local identity persisted before a direct-pallet transaction is signed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -229,6 +246,9 @@ pub struct DeepXTransactionIdentity {
     nonce: DeepXNonceReservation,
     /// Runtime against which signing must occur.
     runtime: DeepXDirectRuntimeIdentity,
+    /// Exact protocol operation, when its schema is independently proven.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<DeepXTransactionOperation>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +260,8 @@ struct DeepXTransactionIdentityWire {
     order_side: OrderSide,
     nonce: DeepXNonceReservation,
     runtime: DeepXDirectRuntimeIdentity,
+    #[serde(default)]
+    operation: Option<DeepXTransactionOperation>,
 }
 
 impl DeepXTransactionIdentity {
@@ -260,6 +282,37 @@ impl DeepXTransactionIdentity {
             order_side,
             nonce,
             runtime,
+            operation: None,
+        }
+    }
+
+    /// Creates immutable identity for a proven direct perpetual cancel operation.
+    #[must_use]
+    pub fn new_perp_cancel(
+        client_order_id: ClientOrderId,
+        signer: [u8; 20],
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        nonce: DeepXNonceReservation,
+        runtime: DeepXDirectRuntimeIdentity,
+        subaccount: [u8; 20],
+        order_id: u64,
+        market_id: u16,
+        fast_cancel: bool,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.to_string(),
+            signer,
+            instrument_id,
+            order_side,
+            nonce,
+            runtime,
+            operation: Some(DeepXTransactionOperation::PerpCancel {
+                subaccount,
+                order_id,
+                market_id,
+                fast_cancel,
+            }),
         }
     }
 
@@ -298,6 +351,12 @@ impl DeepXTransactionIdentity {
     pub const fn runtime(&self) -> &DeepXDirectRuntimeIdentity {
         &self.runtime
     }
+
+    /// Returns the exact protocol operation retained by this identity, when proven.
+    #[must_use]
+    pub const fn operation(&self) -> Option<&DeepXTransactionOperation> {
+        self.operation.as_ref()
+    }
 }
 
 impl<'de> Deserialize<'de> for DeepXTransactionIdentity {
@@ -308,14 +367,16 @@ impl<'de> Deserialize<'de> for DeepXTransactionIdentity {
         let wire = DeepXTransactionIdentityWire::deserialize(deserializer)?;
         let client_order_id =
             ClientOrderId::new_checked(&wire.client_order_id).map_err(D::Error::custom)?;
-        Ok(Self::new(
+        let mut identity = Self::new(
             client_order_id,
             wire.signer,
             wire.instrument_id,
             wire.order_side,
             wire.nonce,
             wire.runtime,
-        ))
+        );
+        identity.operation = wire.operation;
+        Ok(identity)
     }
 }
 
