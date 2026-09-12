@@ -121,6 +121,30 @@ impl DeepXPerpCloseParams {
     }
 }
 
+/// Exact raw runtime arguments for perpetual profit and loss point management.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpProfitAndLossPointParams {
+    /// DeepX subaccount identity.
+    pub subaccount: [u8; 20],
+    /// Runtime perpetual market identifier.
+    pub market_id: u16,
+    /// Exact runtime integer, without inferred scaling or trigger semantics.
+    pub take_profit_point: u128,
+    /// Exact runtime integer, without inferred scaling or trigger semantics.
+    pub stop_loss_point: u128,
+}
+
+impl DeepXPerpProfitAndLossPointParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![
+            Value::from_bytes(self.subaccount),
+            Value::u128(u128::from(self.market_id)),
+            Value::u128(self.take_profit_point),
+            Value::u128(self.stop_loss_point),
+        ]
+    }
+}
+
 /// Exact arguments for a user-requested DeepX perpetual order cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeepXPerpCancelParams {
@@ -326,6 +350,105 @@ pub fn sign_perp_close(
     )
 }
 
+/// Signs perpetual profit and loss point management without submitting it.
+///
+/// Both points are exact runtime integers. This offline API performs no unit conversion,
+/// nonce reservation, persistence, or network access, and proves no authorization,
+/// trigger semantics, independent SDK parity, or operational management capability.
+///
+/// # Errors
+///
+/// Returns an error if the key or permitted snapshot cannot encode the management call.
+pub fn sign_perp_set_profit_and_loss_point(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXPerpProfitAndLossPointParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "PerpMarket",
+        "set_profit_and_loss_point",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Exact raw arguments for subaccount deletion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXDeleteSubaccountParams {
+    /// Exact runtime subaccount identity, without inferred authorization.
+    pub subaccount: [u8; 20],
+}
+
+impl DeepXDeleteSubaccountParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![Value::from_bytes(self.subaccount)]
+    }
+}
+
+/// Signs subaccount deletion without submitting it.
+///
+/// This offline API infers no ownership, eligibility, or deletion semantics and performs no
+/// network access, nonce allocation, persistence, replay, or live activation.
+///
+/// # Errors
+///
+/// Returns an error if the key or permitted snapshot cannot encode the call.
+pub fn sign_delete_subaccount(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXDeleteSubaccountParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "Subaccount",
+        "delete_subaccount",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Exact raw arguments for wallet delegate removal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXRemoveDelegateAccountParams {
+    /// Exact runtime delegate identity, without inferred authorization.
+    pub delegate: [u8; 20],
+}
+
+impl DeepXRemoveDelegateAccountParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![Value::from_bytes(self.delegate)]
+    }
+}
+
+/// Signs wallet delegate removal without submitting it.
+///
+/// This offline API infers no authorization or revocation semantics and performs no network
+/// access, nonce reservation, persistence, or live activation.
+///
+/// # Errors
+///
+/// Returns an error if the key or permitted snapshot cannot encode the call.
+pub fn sign_remove_delegate_account(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXRemoveDelegateAccountParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "Subaccount",
+        "remove_delegate_account",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
 /// Signs a metadata-driven Subaccount no-op without submitting it.
 ///
 /// The call has no arguments. The caller supplies the exact signed-extension nonce and owns
@@ -422,6 +545,114 @@ mod tests {
     }
 
     #[rstest]
+    fn delete_subaccount_metadata_contract() {
+        let snapshot = snapshot();
+        let pallet = snapshot.metadata().pallet_by_name("Subaccount").unwrap();
+        let call = pallet.call_variant_by_name("delete_subaccount").unwrap();
+        assert_eq!(pallet.index(), 19);
+        assert_eq!(call.index, 1);
+        assert_eq!(
+            call.fields
+                .iter()
+                .map(|field| (field.name.as_deref(), field.type_name.as_deref()))
+                .collect::<Vec<_>>(),
+            [(Some("subaccount"), Some("H160"))]
+        );
+    }
+
+    #[rstest]
+    #[case([0; 20], 0)]
+    #[case([0xff; 20], u64::MAX)]
+    #[case([0x11; 20], 63)]
+    #[case([0x22; 20], 64)]
+    fn delete_subaccount_exact_scale(#[case] subaccount: [u8; 20], #[case] nonce: u64) {
+        let snapshot = snapshot();
+        let params = DeepXDeleteSubaccountParams { subaccount };
+        let payload = subxt_core::dynamic::tx(
+            "Subaccount",
+            "delete_subaccount",
+            params.into_dynamic_arguments(),
+        );
+        let mut expected = vec![19, 1];
+        expected.extend_from_slice(&subaccount);
+        assert_eq!(
+            tx::payload::Payload::encode_call_data(&payload, snapshot.metadata()).unwrap(),
+            expected
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_delete_subaccount(&permit, &key(), params, nonce).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), nonce);
+        assert_eq!(signed.signer(), derive_signer_account_id(&key()).unwrap());
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(
+            signed,
+            sign_delete_subaccount(&permit, &key(), params, nonce).unwrap()
+        );
+        let mut changed = params;
+        changed.subaccount[19] ^= 1;
+        let other_key = DeepXPrivateKey::new(
+            "0x1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        for altered in [
+            sign_delete_subaccount(&permit, &key(), changed, nonce).unwrap(),
+            sign_delete_subaccount(&permit, &key(), params, nonce ^ 1).unwrap(),
+            sign_delete_subaccount(&permit, &other_key, params, nonce).unwrap(),
+        ] {
+            assert_ne!(signed.bytes(), altered.bytes());
+            assert_ne!(signed.extrinsic_hash(), altered.extrinsic_hash());
+        }
+    }
+
+    #[rstest]
+    #[case(vec![])]
+    #[case(vec![Value::from_bytes([0; 19])])]
+    #[case(vec![Value::from_bytes([0; 21])])]
+    #[case(vec![Value::bool(true)])]
+    #[case(vec![Value::from_bytes([0; 20]), Value::from_bytes([0; 20])])]
+    fn delete_subaccount_malformed_arguments(#[case] arguments: Vec<Value>) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        assert!(matches!(
+            sign_dynamic_pallet_call(
+                &permit,
+                &key(),
+                "Subaccount",
+                "delete_subaccount",
+                arguments,
+                0
+            ),
+            Err(SigningError::Encode(_))
+        ));
+    }
+
+    #[rstest]
+    fn delete_subaccount_runtime_change_blocks_new_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.spec_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+        assert!(
+            sign_delete_subaccount(
+                &permit,
+                &key(),
+                DeepXDeleteSubaccountParams {
+                    subaccount: [0x11; 20]
+                },
+                0,
+            )
+            .is_ok()
+        );
+    }
+
+    #[rstest]
     fn dynamic_signing_matches_fixed_testnet_regression_vector() {
         let snapshot = snapshot();
         let payload = subxt_core::dynamic::tx(
@@ -510,6 +741,109 @@ mod tests {
     }
 
     #[rstest]
+    #[case([0; 20], 0)]
+    #[case([0xff; 20], u64::MAX)]
+    #[case([0x11; 20], 63)]
+    #[case([0x22; 20], 64)]
+    fn remove_delegate_exact_scale(#[case] delegate: [u8; 20], #[case] nonce: u64) {
+        let snapshot = snapshot();
+        let pallet = snapshot.metadata().pallet_by_name("Subaccount").unwrap();
+        let call = pallet
+            .call_variant_by_name("remove_delegate_account")
+            .unwrap();
+        assert_eq!(pallet.index(), 19);
+        assert_eq!(call.index, 29);
+        assert_eq!(
+            call.fields
+                .iter()
+                .map(|field| (field.name.as_deref(), field.type_name.as_deref()))
+                .collect::<Vec<_>>(),
+            [(Some("delegate"), Some("H160"))]
+        );
+        let params = DeepXRemoveDelegateAccountParams { delegate };
+        let payload = subxt_core::dynamic::tx(
+            "Subaccount",
+            "remove_delegate_account",
+            params.into_dynamic_arguments(),
+        );
+        let mut expected = vec![19, 29];
+        expected.extend_from_slice(&delegate);
+        assert_eq!(
+            tx::payload::Payload::encode_call_data(&payload, snapshot.metadata()).unwrap(),
+            expected
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_remove_delegate_account(&permit, &key(), params, nonce).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), nonce);
+        assert_eq!(signed.signer(), derive_signer_account_id(&key()).unwrap());
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(
+            signed,
+            sign_remove_delegate_account(&permit, &key(), params, nonce).unwrap()
+        );
+        let mut changed = params;
+        changed.delegate[19] ^= 1;
+        let other_key = DeepXPrivateKey::new(
+            "0x1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        for altered in [
+            sign_remove_delegate_account(&permit, &key(), changed, nonce).unwrap(),
+            sign_remove_delegate_account(&permit, &key(), params, nonce ^ 1).unwrap(),
+            sign_remove_delegate_account(&permit, &other_key, params, nonce).unwrap(),
+        ] {
+            assert_ne!(signed.bytes(), altered.bytes());
+            assert_ne!(signed.extrinsic_hash(), altered.extrinsic_hash());
+        }
+    }
+
+    #[rstest]
+    #[case(Value::from_bytes([0; 19]))]
+    #[case(Value::from_bytes([0; 21]))]
+    #[case(Value::bool(true))]
+    fn remove_delegate_malformed_arguments(#[case] value: Value) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        assert!(matches!(
+            sign_dynamic_pallet_call(
+                &permit,
+                &key(),
+                "Subaccount",
+                "remove_delegate_account",
+                vec![value],
+                0,
+            ),
+            Err(SigningError::Encode(_))
+        ));
+    }
+
+    #[rstest]
+    fn remove_delegate_runtime_change_blocks_new_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.transaction_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+        assert!(
+            sign_remove_delegate_account(
+                &permit,
+                &key(),
+                DeepXRemoveDelegateAccountParams {
+                    delegate: [0x11; 20]
+                },
+                0,
+            )
+            .is_ok()
+        );
+    }
+
+    #[rstest]
     fn perp_close_runtime_change_blocks_new_permit() {
         let snapshot = snapshot();
         let mut changed = snapshot.identity().clone();
@@ -517,6 +851,147 @@ mod tests {
         let service = DeepXRuntimeSnapshotService::new(snapshot);
         service.observe_runtime_identity(changed).unwrap();
         assert!(service.acquire().is_err());
+    }
+
+    #[rstest]
+    #[case(0, 0, 0)]
+    #[case(u16::MAX, u128::MAX, u128::MAX)]
+    #[case(7, 123, 456)]
+    fn perp_points_exact_scale(
+        #[case] market_id: u16,
+        #[case] take_profit_point: u128,
+        #[case] stop_loss_point: u128,
+    ) {
+        let snapshot = snapshot();
+        let pallet = snapshot.metadata().pallet_by_name("PerpMarket").unwrap();
+        let call = pallet
+            .call_variant_by_name("set_profit_and_loss_point")
+            .unwrap();
+        assert_eq!(pallet.index(), 22);
+        assert_eq!(call.index, 13);
+        assert!(pallet.call_variant_by_name("modify_order").is_none());
+        assert_eq!(
+            call.fields
+                .iter()
+                .map(|field| (field.name.as_deref(), field.type_name.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("subaccount"), Some("H160")),
+                (Some("market_id"), Some("u16")),
+                (Some("take_profit_point"), Some("u128")),
+                (Some("stop_loss_point"), Some("u128")),
+            ]
+        );
+        let params = DeepXPerpProfitAndLossPointParams {
+            subaccount: [0x11; 20],
+            market_id,
+            take_profit_point,
+            stop_loss_point,
+        };
+        let mut expected = vec![22, 13];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&market_id.to_le_bytes());
+        expected.extend_from_slice(&take_profit_point.to_le_bytes());
+        expected.extend_from_slice(&stop_loss_point.to_le_bytes());
+        let payload = subxt_core::dynamic::tx(
+            "PerpMarket",
+            "set_profit_and_loss_point",
+            params.into_dynamic_arguments(),
+        );
+        assert_eq!(
+            tx::payload::Payload::encode_call_data(&payload, snapshot.metadata()).unwrap(),
+            expected
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed =
+            sign_perp_set_profit_and_loss_point(&permit, &key(), params, u64::MAX).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), u64::MAX);
+        assert_eq!(signed.signer(), derive_signer_account_id(&key()).unwrap());
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(
+            signed,
+            sign_perp_set_profit_and_loss_point(&permit, &key(), params, u64::MAX).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    fn perp_points_signed_identity_sensitivity(#[case] mutation: u8) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut params = DeepXPerpProfitAndLossPointParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            take_profit_point: 123,
+            stop_loss_point: 456,
+        };
+        let original = sign_perp_set_profit_and_loss_point(&permit, &key(), params, 125).unwrap();
+        let mut nonce = 125;
+        match mutation {
+            0 => params.subaccount[19] ^= 1,
+            1 => params.market_id += 1,
+            2 => params.take_profit_point += 1,
+            3 => params.stop_loss_point += 1,
+            4 => nonce += 1,
+            _ => unreachable!(),
+        }
+        let changed = sign_perp_set_profit_and_loss_point(&permit, &key(), params, nonce).unwrap();
+        assert_ne!(original.bytes(), changed.bytes());
+        assert_ne!(original.extrinsic_hash(), changed.extrinsic_hash());
+    }
+
+    #[rstest]
+    #[case(0, Value::from_bytes([0x11; 19]))]
+    #[case(1, Value::u128(u128::from(u16::MAX) + 1))]
+    #[case(2, Value::bool(true))]
+    #[case(3, Value::unnamed_variant("None", Vec::<Value>::new()))]
+    fn perp_points_malformed_arguments(#[case] index: usize, #[case] value: Value) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut arguments = DeepXPerpProfitAndLossPointParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            take_profit_point: 123,
+            stop_loss_point: 456,
+        }
+        .into_dynamic_arguments();
+        arguments[index] = value;
+        assert!(matches!(
+            sign_dynamic_pallet_call(
+                &permit,
+                &key(),
+                "PerpMarket",
+                "set_profit_and_loss_point",
+                arguments,
+                125
+            ),
+            Err(SigningError::Encode(_))
+        ));
+    }
+
+    #[rstest]
+    fn perp_points_runtime_change_blocks_new_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.spec_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+        let params = DeepXPerpProfitAndLossPointParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            take_profit_point: 123,
+            stop_loss_point: 456,
+        };
+        assert!(sign_perp_set_profit_and_loss_point(&permit, &key(), params, 125).is_ok());
     }
 
     #[rstest]

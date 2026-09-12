@@ -493,6 +493,52 @@ where
     })
 }
 
+/// Signs and commits a reservation only after explicit business-call verification.
+///
+/// All raw call arguments come from the durable identity. Exact call verification precedes
+/// the signed-record compare-and-set. This proves checkpoint integrity, not business success,
+/// financial units, subaccount authorization, or independent SDK parity.
+///
+/// # Errors
+///
+/// Returns an error if ownership, acknowledgement, state, operation, runtime, signing, exact
+/// call binding, or durable compare-and-set cannot be proven.
+pub async fn prepare_signed_transaction_with_verifier<S, F, V>(
+    store: &S,
+    lease: &S::Lease,
+    committed_created: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    signer: F,
+    verifier: &V,
+) -> Result<DeepXPreparedSignedTransaction, DeepXSignedTransactionPreparationError>
+where
+    S: DeepXTransactionStore,
+    F: FnOnce(&DeepXTransactionIdentity) -> Result<SignedPalletExtrinsic, SigningError>,
+    V: DeepXBusinessCallVerifier + ?Sized,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_created.verify(record)?;
+    if record.lifecycle().state() != DeepXTransactionState::Created {
+        return Err(DeepXSignedTransactionPreparationError::InvalidState);
+    }
+    let signed = signer(record.identity())?;
+    let mut signed_record = record.clone();
+    signed_record.record_signed(&signed)?;
+    let durable = signed_record.signed_extrinsic().ok_or_else(|| {
+        DeepXBusinessCallBindingError::Mismatch("signed evidence is missing".to_string())
+    })?;
+    verifier.verify(record.identity(), durable)?;
+    let committed = store
+        .compare_and_set_committed(lease, committed_created, &signed_record)
+        .await?;
+    committed.verify(&signed_record)?;
+    Ok(DeepXPreparedSignedTransaction {
+        record: signed_record,
+        committed,
+    })
+}
+
 /// Signs and commits an acknowledged perpetual close reservation without submission.
 ///
 /// All raw call arguments come from the durable identity. Exact call verification precedes
@@ -2905,6 +2951,137 @@ mod tests {
         assert_eq!(prepared.committed().revision().value(), 4);
         assert!(prepared.committed().verify(prepared.record()).is_ok());
         assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn verified_preparation_rejection_never_commits_signed_record() {
+        let record = record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let result = prepare_signed_transaction_with_verifier(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            |_| Ok(signed_for(&record)),
+            &DeepXUnsupportedBusinessCallVerifier,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DeepXSignedTransactionPreparationError::Binding(
+                DeepXBusinessCallBindingError::Unsupported(_)
+            ))
+        ));
+        assert_eq!(store.current_revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn verified_preparation_commits_exact_perp_close() {
+        let expected = perp_close_fixture(u128::MAX, None);
+        let record = DeepXTransactionRecord::created(expected.identity().clone());
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let permit = service.acquire().unwrap();
+        let key = remark_key();
+        let verifier = DeepXPerpCloseCallVerifier::new(remark_snapshot(), key.clone()).unwrap();
+        let prepared = prepare_signed_transaction_with_verifier(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            |_| {
+                crate::signing::sign_perp_close(
+                    &permit,
+                    &key,
+                    crate::signing::DeepXPerpCloseParams {
+                        subaccount: [0x11; 20],
+                        market_id: u16::MAX,
+                        price: u128::MAX,
+                        slippage: None,
+                    },
+                    u64::MAX,
+                )
+            },
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.record(), &expected);
+        assert!(prepared.committed().matches(&expected));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[rstest]
+    #[case::subaccount(0)]
+    #[case::market(1)]
+    #[case::price(2)]
+    #[case::slippage(3)]
+    #[tokio::test]
+    async fn verified_preparation_rejects_wrong_close_call(#[case] mutation: u8) {
+        let expected = perp_close_fixture(u128::MAX, None);
+        let record = DeepXTransactionRecord::created(expected.identity().clone());
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let permit = service.acquire().unwrap();
+        let key = remark_key();
+        let verifier = DeepXPerpCloseCallVerifier::new(remark_snapshot(), key.clone()).unwrap();
+        let mut params = crate::signing::DeepXPerpCloseParams {
+            subaccount: [0x11; 20],
+            market_id: u16::MAX,
+            price: u128::MAX,
+            slippage: None,
+        };
+        match mutation {
+            0 => params.subaccount = [0x12; 20],
+            1 => params.market_id -= 1,
+            2 => params.price -= 1,
+            3 => params.slippage = Some(0),
+            _ => unreachable!(),
+        }
+        let result = prepare_signed_transaction_with_verifier(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            |_| crate::signing::sign_perp_close(&permit, &key, params, u64::MAX),
+            &verifier,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DeepXSignedTransactionPreparationError::Binding(
+                DeepXBusinessCallBindingError::Mismatch(_)
+            ))
+        ));
+        assert_eq!(store.current_revision(), 3);
+        assert!(committed.matches(&record));
     }
 
     #[tokio::test]

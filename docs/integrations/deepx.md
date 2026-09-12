@@ -1,5 +1,20 @@
 # DeepX
 
+## Explicit verified offline preparation
+
+`prepare_signed_transaction_with_verifier` accepts an offline signer and an explicitly
+selected `DeepXBusinessCallVerifier`. It validates the signer lease, exact Created
+acknowledgement, signed-record invariants, and business-call binding before attempting
+the durable Signed compare-and-set. Verification failure performs no signed-record write;
+an unknown commit or mismatched acknowledgement releases no prepared transaction.
+The original `prepare_signed_transaction` remains a low-level compatibility API and
+does not provide business-call verification. Neither entry point authorizes submission,
+replay, account access, or operational capabilities.
+
+Maintainer approval was confirmed by the user on 2026-09-12 for continuing implementation.
+Existing references below to unresolved approval describe earlier milestone evidence;
+protocol parity, authorization, and live conformance gates remain unchanged.
+
 ## Explicit offline no-op signing
 
 `sign_no_op(permit, key, nonce)` signs the argument-free `Subaccount.no_op` call
@@ -42,6 +57,69 @@ Ordinary and fast buy/sell signing is supported only at this offline checkpoint 
 no submission or live execution authority and proves neither independent SDK parity nor subaccount
 authorization. Fast Spot cancel inclusion and recovery remain blocked by missing approved spec366
 event proof; local spec369 behavior is not equivalent to the captured approved spec366 tx1 runtime.
+
+## Offline subaccount deletion signing
+
+`signing::sign_delete_subaccount(permit, key, params, nonce)` accepts
+`DeepXDeleteSubaccountParams` with one exact 20-byte `subaccount` identity.
+Captured approved spec366/tx1 metadata (SHA-256
+`e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`)
+declares `Subaccount.delete_subaccount` at pallet 19, call 1, with exactly one
+direct `subaccount: H160` field. SCALE call bytes are `1301` followed by those
+20 bytes, encoded through native subxt dynamic signing under an explicit permit.
+
+Tests assert the captured metadata contract, exact SCALE encoding, zero/maximum
+addresses, zero/63/64/u64-maximum nonces, deterministic signing, address/key/nonce
+identity sensitivity, missing/extra/wrong-type/wrong-length arguments, and runtime
+change gating. Existing permits remain bound to their immutable approved snapshot.
+
+This API performs no network access, submission, nonce allocation, persistence,
+replay, or live activation. No ownership, deletion eligibility, balance constraints,
+or business success is inferred. Maintainer approval is confirmed; independent SDK
+parity, authorization, business-event/finality evidence, and live conformance remain
+gates. Local spec369 sources are not authoritative for this captured spec366 schema.
+
+## Offline wallet delegate removal signing
+
+`signing::sign_remove_delegate_account(permit, key, params, nonce)` accepts
+`DeepXRemoveDelegateAccountParams` with the exact 20-byte `delegate` runtime identity.
+Captured spec366/tx1 metadata (SHA-256
+`e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`)
+declares `Subaccount.remove_delegate_account` at pallet 19, call 29, with one direct
+`delegate: H160` field. Exact SCALE call bytes are `131d` followed by the 20 bytes.
+Native subxt dynamic encoding requires an explicit immutable runtime snapshot permit.
+
+Tests verify the decoded metadata contract and exact SCALE bytes, all-zero/all-maximum
+identities, zero/63/64/u64-maximum nonces, deterministic signing, delegate/key/nonce
+identity sensitivity, malformed arguments, and runtime-change permit gating. Existing
+permits remain bound to their approved snapshot during quiescence.
+
+This API performs no network access, nonce allocation, persistence, submission, or live
+activation. It infers no ownership, authorization, revocation timing, quota, or financial
+semantics. Maintainer approval is confirmed; independent SDK parity, authorization,
+business-event/finality evidence, and live conformance remain gates. Local spec369
+sources are not substituted for the captured fixture.
+
+## Offline perpetual profit and loss point signing
+
+`signing::sign_perp_set_profit_and_loss_point(permit, key, params, nonce)` accepts
+`DeepXPerpProfitAndLossPointParams`: 20-byte `subaccount`, u16 `market_id`, and exact
+u128 `take_profit_point` and `stop_loss_point`. Approved spec366/tx1 metadata with
+SHA-256 `e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`
+declares `PerpMarket.set_profit_and_loss_point` at pallet 22, call 13 with those
+four direct fields in that order. No direct `PerpMarket.modify_order` is present;
+this is the simple management-call fallback, not an order modification API.
+
+Encoding is metadata-driven under an explicit snapshot permit. Focused tests cover exact
+SCALE bytes, zero and maximum integers, malformed arguments, each field and nonce changing
+signed identity, deterministic signing, and runtime-change permit gating. Local spec369
+sources corroborate the signature but do not prove spec366 semantics. These tests provide
+offline regression evidence, not independent SDK parity or golden signature vectors.
+
+No financial units, zero-value meaning, trigger behavior, or ownership authorization are
+inferred. This API performs no network access, nonce allocation, persistence, submission,
+or live activation. Maintainer approval is confirmed; independent SDK parity, authorization,
+financial semantics, event/finality evidence, and live conformance remain activation gates.
 
 ## Offline perpetual close signing
 

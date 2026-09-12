@@ -38,9 +38,9 @@ pub use persistence::{
     observe_and_commit_reorganization, prepare_initial_submission,
     prepare_signed_perp_cancel_transaction, prepare_signed_perp_close_transaction,
     prepare_signed_spot_cancel_transaction, prepare_signed_transaction,
-    prepare_timestamp_reservation, reconcile_not_included_checkpoint,
-    reconcile_not_included_checkpoint_with_observer, reconcile_submission_pool,
-    restore_timestamp_nonce_allocator, verify_signer_lease,
+    prepare_signed_transaction_with_verifier, prepare_timestamp_reservation,
+    reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
+    reconcile_submission_pool, restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
