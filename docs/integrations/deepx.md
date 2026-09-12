@@ -1,5 +1,149 @@
 # DeepX
 
+## Explicit offline no-op signing
+
+`sign_no_op(permit, key, nonce)` signs the argument-free `Subaccount.no_op` call
+using the approved snapshot and pinned Ethereum-compatible ECDSA signer. Captured
+spec366/tx1 metadata (SHA-256
+`e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`)
+declares pallet index 19, call index 28, and no fields: exact SCALE call bytes are
+`131c`. Tests cover zero, compact-nonce boundaries, u64 maximum, deterministic signing,
+nonce sensitivity, complete-extrinsic regression, and runtime-change permit gating.
+Existing permits remain bound to their immutable snapshot during quiescence.
+
+This API performs no nonce allocation, persistence, submission, or RPC access. The nonce
+is an exact signed-extension integer, not an inferred timestamp or sequential nonce.
+There are no operation flags, options, or enums. No-op replacement, pool behavior,
+authorization, business success, inclusion/finality, and independent SDK parity remain
+unproven; this does not enable operational replacement or automatic replay. The SDK
+reference could not be fetched during this milestone. Local spec369 sources do not
+prove spec366 behavior. Maintainer approval and live conformance remain gates.
+
+`prepare_signed_perp_cancel_transaction(store, lease, committed_created, record, permit, key)`
+prepares ordinary or fast perpetual cancellations entirely offline. It derives the subaccount,
+order ID, market ID, fast-cancel flag, and timestamp nonce from the durable identity, verifies
+the signing key and runtime, reconstructs the canonical signed binding, and returns only after
+the store confirms the exact `Created` to `Signed` compare-and-set acknowledgement. Stale
+revisions, mismatched acknowledgements, and unknown commit outcomes fail closed. It grants no
+submission permit, activates no live command, and proves neither independent SDK parity nor
+subaccount authorization. Spot cancellation preparation remains unavailable.
+
+## Offline durable Spot cancel preparation
+
+`prepare_signed_spot_cancel_transaction(store, lease, committed_created, record, permit, key)`
+derives the subaccount, complete bytes32 pair, order ID, buy/sell and fast-cancel flags, and
+timestamp nonce exclusively from the durable reservation. It requires the current signer lease,
+exact Created acknowledgment, matching key and approved runtime permit, canonical reconstruction
+with `DeepXSpotCancelCallVerifier`, and an exact Signed compare-and-set acknowledgment before
+returning. A rejected write, stale revision, unknown commit, or conflicting acknowledgment returns
+no prepared transaction. Unknown commits require durable reconciliation, not nonce reuse.
+
+Ordinary and fast buy/sell signing is supported only at this offline checkpoint boundary. It grants
+no submission or live execution authority and proves neither independent SDK parity nor subaccount
+authorization. Fast Spot cancel inclusion and recovery remain blocked by missing approved spec366
+event proof; local spec369 behavior is not equivalent to the captured approved spec366 tx1 runtime.
+
+## Offline perpetual close signing
+
+`signing::sign_perp_close(permit, key, params, nonce)` accepts `DeepXPerpCloseParams`:
+AccountId20 `subaccount`, u16 `market_id`, raw u128 `price`, and `Option<u64>` raw `slippage`.
+The approved spec366/tx1 metadata declares `PerpMarket.close_position` at call index 14
+with those four direct arguments, in that order. The signer uses dynamic metadata encoding
+and requires a snapshot-service permit. Tests check exact SCALE fields, integer boundaries,
+optional slippage, malformed bindings, signed identity sensitivity, and runtime-change gating.
+
+The proof source is the existing runtime fixture under
+`crates/adapters/deepx/test_data/runtime/testnet/` with metadata SHA-256
+`e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`.
+No price or slippage unit conversion is inferred. This offline API does not reserve nonces,
+persist, submit, reconcile close events, or enable execution commands. Maintainer approval,
+independent SDK vectors, authorization, financial units, and live conformance remain gates.
+The local spec369 node is not evidence for spec366 semantics.
+
+`DeepXTransactionIdentity::new_perp_close(..., params)` retains all four raw call arguments
+as `DeepXTransactionOperation::PerpClose`. Durable JSON stores price as a decimal string to
+preserve the complete u128 range through tagged serde; slippage remains an optional u64.
+The explicitly selected `DeepXPerpCloseCallVerifier::new(snapshot, key)` checks byte/hash
+integrity, reserved signer, complete runtime identity, and timestamp nonce, then reconstructs
+the signed close and requires complete byte and hash equality. Its Debug output redacts the key.
+Client order ID, instrument, and order side are local context, not additional close arguments.
+
+`prepare_signed_perp_close_transaction(store, lease, committed_created, record, permit, key)`
+is an explicit offline durable checkpoint boundary. It verifies the current signer lease and
+exact Created acknowledgement, derives all raw close arguments and the timestamp nonce from
+that record, signs against the supplied permit, and verifies exact call binding before durable
+compare-and-set. Only an acknowledged Signed record is released; stale revisions, wrong keys,
+runtime mismatches, non-close identities, and unknown commit outcomes release no prepared record.
+This API neither allocates a nonce nor submits, observes inclusion, or claims business success.
+The caller must first durably create the operation-specific reservation under the store lease.
+
+This is offline regression evidence, not an independent golden vector. The default unsupported
+verifier, recovery observer, event verification, and ExecutionClient activation are unchanged.
+Close event/finality evidence, authorization, financial units, independent SDK parity, maintainer
+approval, and live conformance remain required before operational activation.
+
+## Explicit offline durable recovery observer
+
+`reconcile_not_included_checkpoint_with_observer` accepts
+`DeepXDurableRecoveryObserver::OrdinarySpotCancel` with a `DeepXSpotCancelCallVerifier`.
+The opt-in observer verifies restored durable bytes against the verifier's approved snapshot
+and signer before RPC, then uses the ordinary Spot cancel finalized collector. Fast cancels,
+foreign runtimes, and mismatched operations or identities fail closed. Canonical checkpoint
+requirements and non-atomic submission-pool absence handling are unchanged.
+
+The default observer and execution startup call remain unchanged and do not support Spot
+inclusion recovery. This API does not submit, replay, emit order events, or enable live commands.
+It establishes no independent SDK golden-vector parity; local spec369 node sources cannot
+prove spec366 behavior. Maintainer approval, independent SDK parity, authorization evidence,
+and live command wiring remain unresolved.
+
+## Raw wallet delegate configuration
+
+The Rust HTTP client provides `get_delegate_accounts_raw(address)` for read-only
+`GET /internal/v1/account/delegate-accounts` requests. It requires a `0x`-prefixed 20-byte hex
+wallet address and sends only the documented `address` query parameter through the shared
+transport, retry, failover, and venue-envelope checks. The returned
+`Box<serde_json::value::RawValue>` preserves exact JSON lexemes and opaque identifiers. Invalid
+inputs fail before transport; venue failures and malformed envelopes remain typed errors.
+
+The internal OpenAPI inspected on 2026-09-12 identifies operation `getDelegateAccounts` as
+delegates configured for a wallet owner, with one required string query parameter `address` and
+invalid-address code `10014`. The success response references generic `SingleResult`: its `data`
+property is an unstructured object, while the endpoint example shows an array. Neither establishes
+a complete delegate schema. This primitive does not validate permissions, ownership, active state,
+expiry units, freshness, or completeness, and does not authorize signing or delegate mutations.
+
+## Raw subaccount lending balances
+
+The Rust HTTP client provides `get_subaccount_balances_raw(subaccount)` for read-only
+`GET /internal/v1/account/balances` requests. It requires a `0x`-prefixed 20-byte hex address,
+encodes the single `subaccount` query parameter through the shared HTTP transport, and reuses
+the standard retry, failover, and venue-envelope checks. The returned
+`Box<serde_json::value::RawValue>` preserves exact financial JSON lexemes and opaque identities.
+Invalid inputs are rejected before transport; missing subaccounts remain typed failures.
+
+The internal OpenAPI inspected on 2026-09-12 documents this endpoint as current lending deposit
+and borrow balances matching the `user_balances` WebSocket payload. Its response references
+only the generic `SingleResult` schema. The example does not prove asset identity, units,
+interest accounting, completeness, or freshness. This primitive does not initialize a Nautilus
+account, supply trading collateral balances, enable private streams, or enable lending mutations.
+
+## Raw perpetual order lookup
+
+The Rust HTTP client provides `get_perp_order_by_id_raw(user, market_id, order_id)` for
+read-only `GET /internal/v1/account/perp/order-by-id` requests. It validates the subaccount
+address and request bounds, encodes query parameters through the shared HTTP transport,
+checks the standard venue success envelope, and returns the exact JSON payload as
+`Box<serde_json::value::RawValue>`. HTTP and venue failures remain typed errors; a missing
+order is not converted into an empty successful report.
+
+The internal OpenAPI inspected on 2026-09-12 specifies the request parameters but references
+only `SingleResult`, whose `data` is an unstructured object. Its order example is not a
+complete response contract. Status, financial fields, identity matching, timestamps, and
+Nautilus order-report conversion remain unsupported. This primitive does not enable trading
+or execution reconciliation, and callers must not treat the payload as authoritative finality
+evidence.
+
 DeepX is a decentralized exchange protocol with spot, perpetual, lending, account-management,
 quota, delegate, and bridge surfaces. The planned NautilusTrader integration is restricted to
 DeepX testnet and is not yet available for use.
@@ -9,6 +153,51 @@ SDK, permissive schema, successful submission response, or inferred behavior is 
 evidence on its own.
 
 ## Implementation status
+
+The public Rust offline `sign_spot_cancel(permit, key, params, nonce)` function accepts
+`DeepXSpotCancelParams` with an AccountId20 subaccount, deployment-provided bytes32 `pair`,
+u64 order ID, buy/sell flag, and fast-cancel flag. It fixes the reason to `UserCanceled` and
+encodes `SpotMarket.cancel_order` dynamically under an explicit runtime snapshot permit.
+Focused tests bind the field order and exact SCALE arguments to the approved spec366/tx1
+metadata fixture (SHA-256 `e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`),
+cover both flags and u64 boundaries, reject malformed dynamic bindings, and check that each
+operation field and nonce changes signed identity. The local spec369 node is not substituted
+for that fixture. These are schema/regression checks, not independent SDK signature or complete
+extrinsic parity vectors.
+
+The durable `DeepXTransactionOperation::SpotCancel` identity retains the full pair, subaccount,
+order ID, buy/sell flag, and fast-cancel flag through transaction-record serialization.
+`DeepXTransactionIdentity::new_spot_cancel` constructs it using `DeepXSpotCancelParams`.
+The explicitly selected `DeepXSpotCancelCallVerifier` reconstructs canonical signed bytes using
+its approved snapshot and key, checks byte/hash integrity, reserved signer, complete runtime
+identity, timestamp nonce, each operation field, and consistency with the Nautilus order side.
+Ordinary/fast buy/sell round trips and field, runtime, nonce, key, and malformed-evidence tests
+are offline regression evidence, not independent SDK golden vectors or authorization proof.
+
+The explicitly selected offline `verify_spot_cancel_inclusion_events` verifies ordinary Spot
+cancel inclusion with complete approved-metadata SCALE decoding, exact extrinsic index, unique
+System dispatch evidence, and matching pair, order ID, maker, side, and `UserCanceled` reason.
+Failed dispatch is authoritative without a successful business event. Synthetic dynamic metadata
+tests are regression checks, not captured independent business-event evidence. The local spec369
+node's conditional event emission does not approve spec366 fast-cancel semantics; fast Spot cancel
+therefore remains rejected. The explicitly selected read-only Rust
+`collect_finalized_spot_cancel_recovery_scan` integrates this verifier with the bounded canonical
+recovery collector. It requires an ordinary SpotCancel durable identity and its approved runtime
+snapshot, and reads events at the exact canonical block hash and extrinsic index. Successful
+dispatch still requires the matching business event; failed dispatch is authoritative without it.
+Runtime mismatch and fast or unsupported operations fail before recovery RPC access. A changed
+durable checkpoint fails closed, and non-atomic submission-pool absence remains unknown rather
+than proving `not-included`. This collector does not commit lifecycle changes or authorize replay.
+The default collector, durable execution recovery selection, and live ExecutionClient remain
+unchanged; no Spot observer is enabled automatically. Mock scans use metadata-encoded events,
+not captured golden vectors or local spec369 approval.
+
+Spot cancel remains non-operational: independent runtime-tagged signing parity,
+owner/delegate authorization, independent business
+event/finality evidence (including fast-cancel semantics), and execution lifecycle integration
+remain gates. The default unsupported verifier and generic successful-inclusion business-event
+requirement are unchanged. Framework cancel, modify, close, and other operational order commands
+remain unsupported. Maintainer approval remains unresolved; this local milestone is not a PR.
 
 The Rust adapter crate and workspace wiring now exist. The following protocol-core foundations are
 implemented and covered by unit tests:
@@ -339,13 +528,21 @@ integration.
   Reservation preparation revalidates the signer lease and durably creates the exact `created`
   record before exposing it for later signing. Signing preparation verifies that committed
   timestamp reservation and persists matching signed bytes with CAS before exposing the `signed`
-  record. Business-call binding for signed extrinsics now has exactly one proven verifier:
+  record. Business-call binding for signed extrinsics has two fixture-gated verifiers.
   `DeepXRemarkCallVerifier` binds durable signed bytes to the reserved transaction identity
   (client order ID, instrument, side, timestamp nonce, and runtime spec version) by
   deterministic re-signing equality of a canonical identity-derived `System.remark` payload
-  against the approved fixture snapshot. It rejects any runtime the snapshot does not cover and
-  the unproven sequential-nonce domain; every DeepX order call remains unsupported pending
-  authoritative golden vectors. A fixed testnet `System.remark` regression vector now pins the
+  against the approved fixture snapshot. `DeepXPerpCancelCallVerifier` performs the same exact
+  comparison for an ordinary or fast `PerpMarket.cancel_order`, binding the signer, subaccount,
+  order ID, market ID, fast-cancel flag, timestamp nonce, and approved runtime. Both reject any
+  runtime the snapshot does not cover and the unproven sequential-nonce domain.
+  Perpetual cancel verification also checks durable byte/hash integrity before re-signing.
+  Offline regression tests reject empty, truncated, trailing, and signature-corrupted payloads,
+  changed runtime identity components (including spec 369 against the spec-366 snapshot), and
+  mismatched timestamp or sequential nonce reservations. This adds no order-command capability.
+  Every other DeepX
+  order call remains unsupported pending authoritative golden vectors. A fixed testnet
+  `System.remark` regression vector now pins the
   exact signer payload, AccountId20, Keccak ECDSA signature envelope, complete version-4
   extrinsic, and Blake2 extrinsic hash produced by the approved runtime fixture and pinned DeepX
   Subxt revision. The approved spec-366 metadata and current chain source agree that
@@ -355,7 +552,10 @@ integration.
   immutable spec-366 fixture. These vectors detect local encoding drift but are not independently
   produced SDK or venue order vectors and do not prove no-op pool replacement or acceptance
   semantics, so the fail-closed `DeepXUnsupportedBusinessCallVerifier` remains the default
-  verifier. Authoritative pool,
+  verifier. Canonical perpetual-cancel event verification requires the exact extrinsic index and
+  System dispatch outcome; ordinary cancellation additionally requires the matching
+  `PerpMarket.OrderCancelled` business event, while fast cancellation follows the runtime and SDK
+  inclusion-only contract because that path suppresses the pallet event. Authoritative pool,
   inclusion, finality, complete absence,
   exact best-block reorganization, and operator evidence can be applied through an exact
   acknowledged record and committed with CAS; signing and submission-start observations cannot
@@ -830,22 +1030,22 @@ emit an order book assembled from unverified or discontinuous data.
 
 ## Order capabilities
 
-| Capability         | Spot    | Perpetual | Evidence gate                                                   |
-| ------------------ | ------- | --------- | --------------------------------------------------------------- |
-| Market order       | Planned | Planned   | Signed vector, submission, business event, inclusion, finality. |
-| Limit GTC          | Planned | Planned   | Signed vector and authoritative lifecycle evidence.             |
-| Limit IOC          | Planned | Planned   | Time-in-force and partial-fill behavior.                        |
-| Post-only          | Planned | Planned   | Crossing rejection and venue status mapping.                    |
-| Reduce-only        | -       | Planned   | Position-side and over-reduction behavior.                      |
-| Stop order         | Planned | Planned   | Trigger source, direction, and lifecycle behavior.              |
-| Modify             | Planned | Planned   | Atomicity, identity retention, and failure behavior.            |
-| Atomic replacement | Planned | Planned   | Old/new order identity and ambiguous-outcome recovery.          |
-| Close position     | -       | Planned   | Quantity, side, reduce-only, and residual-position behavior.    |
-| Cancel             | Planned | Planned   | Signed vector and terminal event evidence.                      |
-| Fast cancel        | Planned | Planned   | Authorization and authoritative success/failure evidence.       |
-| Cancel all         | Planned | Planned   | Scope and effects on unrelated strategies or subaccounts.       |
-| Batch operations   | Planned | Planned   | Per-item atomicity, result mapping, and partial failure.        |
-| No-op replacement  | Planned | Planned   | Same-nonce replacement and transaction-pool behavior.           |
+| Capability         | Spot    | Perpetual | Evidence gate                                                                      |
+| ------------------ | ------- | --------- | ---------------------------------------------------------------------------------- |
+| Market order       | Planned | Planned   | Signed vector, submission, business event, inclusion, finality.                    |
+| Limit GTC          | Planned | Planned   | Signed vector and authoritative lifecycle evidence.                                |
+| Limit IOC          | Planned | Planned   | Time-in-force and partial-fill behavior.                                           |
+| Post-only          | Planned | Planned   | Crossing rejection and venue status mapping.                                       |
+| Reduce-only        | -       | Planned   | Position-side and over-reduction behavior.                                         |
+| Stop order         | Planned | Planned   | Trigger source, direction, and lifecycle behavior.                                 |
+| Modify             | Planned | Planned   | Atomicity, identity retention, and failure behavior.                               |
+| Atomic replacement | Planned | Planned   | Old/new order identity and ambiguous-outcome recovery.                             |
+| Close position     | -       | Planned   | Quantity, side, reduce-only, and residual-position behavior.                       |
+| Cancel             | Planned | Partial   | Offline binding and indexed events; command wiring and independent vectors remain. |
+| Fast cancel        | Planned | Partial   | Offline binding and indexed dispatch; authorization and command wiring remain.     |
+| Cancel all         | Planned | Planned   | Scope and effects on unrelated strategies or subaccounts.                          |
+| Batch operations   | Planned | Planned   | Per-item atomicity, result mapping, and partial failure.                           |
+| No-op replacement  | Planned | Planned   | Same-nonce replacement and transaction-pool behavior.                              |
 
 No order capability may emit a rejection after an outcome becomes ambiguous. Recovery must merge
 relay, stream, REST, transaction-pool, block, event, and finality evidence without blindly
@@ -1118,13 +1318,18 @@ lease, matches the exact previously committed record bytes, requires a proven bu
 verifier, and compare-and-sets `signed` to `submitting` before releasing a single-use
 payload permit. Stale revisions, forged prior records, unproven call bindings, and unknown commit
 outcomes release no payload. The default verifier rejects every call because the required vectors
-have not been captured; `DeepXRemarkCallVerifier` is the one proven verifier. It deterministically
+have not been captured; two explicitly selected fixture-gated verifiers exist.
+`DeepXRemarkCallVerifier` deterministically
 re-signs the canonical `System.remark` payload derived from the reserved identity (client order
 ID, instrument, side, timestamp nonce, runtime spec version) against its approved runtime
 snapshot and requires byte-for-byte equality with the durable signed extrinsic, so bytes signed
 for any other identity, nonce, payload, or runtime cannot pass. It rejects the unproven
-sequential-nonce domain and every DeepX order call; it performs no network I/O and mutates no
-chain state. This permit is intentionally unavailable to restored reconciliation states
+sequential-nonce domain and every DeepX order call. `DeepXPerpCancelCallVerifier` applies the same
+comparison to the exact ordinary or fast perpetual-cancel operation, including signer,
+subaccount, order ID, market ID, fast-cancel flag, timestamp nonce, and runtime. Neither verifier
+performs network I/O; the perpetual-cancel verifier is not selected by the execution client and
+does not submit or enable a cancellation command. This permit is intentionally unavailable to
+restored reconciliation states
 and therefore cannot be used for automatic replay.
 
 Authoritative reconciliation observations have a separate durable commit boundary. It revalidates
@@ -1155,6 +1360,13 @@ are rejected before RPC because they do not retain that checkpoint. An unchanged
 verified idempotently through the signer lease and prior acknowledgement. Later node-local pool
 presence conflicts with the durable absence state and therefore commits `action-required`; pool
 absence remains unknown and cannot create fresh `not-included` evidence.
+`DeepXDurableRecoveryObserver::PerpCancel` explicitly selects exact durable-byte verification
+with the approved Perp signer before any recovery RPC. Ordinary and fast Perp cancellation use
+the existing canonical finalized scan and indexed dispatch/business-event verifier. Restored
+checkpoints remain idempotent; ambiguous evidence and non-atomic pool absence still require
+operator action. This offline boundary is not selected by default or wired into live startup,
+and grants no submission or replay authority. Independent SDK vectors, account authorization,
+maintainer approval, and live execution command conformance remain required gates.
 Live absence and inclusion classification remain disabled until evidence can be bound to an
 authoritative chain checkpoint and an event decoder can bind dispatch and expected business
 outcomes to the matching block extrinsic index.

@@ -94,6 +94,33 @@ pub struct SignedPalletExtrinsic {
     pub(crate) runtime: ApprovedRuntimeIdentity,
 }
 
+/// Exact raw runtime arguments for a DeepX perpetual position close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpCloseParams {
+    /// DeepX subaccount identity.
+    pub subaccount: [u8; 20],
+    /// Runtime perpetual market identifier.
+    pub market_id: u16,
+    /// Exact runtime price integer, without inferred financial scaling.
+    pub price: u128,
+    /// Optional exact runtime slippage integer, without inferred units.
+    pub slippage: Option<u64>,
+}
+
+impl DeepXPerpCloseParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![
+            Value::from_bytes(self.subaccount),
+            Value::u128(u128::from(self.market_id)),
+            Value::u128(self.price),
+            match self.slippage {
+                Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
+                None => Value::unnamed_variant("None", Vec::<Value>::new()),
+            },
+        ]
+    }
+}
+
 /// Exact arguments for a user-requested DeepX perpetual order cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeepXPerpCancelParams {
@@ -115,6 +142,40 @@ impl DeepXPerpCancelParams {
                 ("subaccount", Value::from_bytes(self.subaccount)),
                 ("order_id", Value::u128(u128::from(self.order_id))),
                 ("market_id", Value::u128(u128::from(self.market_id))),
+                (
+                    "cancel_reason",
+                    Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
+                ),
+                ("fast_cancel", Value::bool(self.fast_cancel)),
+            ]),
+        )])]
+    }
+}
+
+/// Exact arguments for a user-requested DeepX Spot order cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXSpotCancelParams {
+    /// DeepX subaccount which owns the order.
+    pub subaccount: [u8; 20],
+    /// Deployment-provided bytes32 Spot pair identifier.
+    pub pair: [u8; 32],
+    /// Runtime-assigned order identifier.
+    pub order_id: u64,
+    /// Whether the canceled order is a buy.
+    pub is_buy: bool,
+    /// Whether the runtime should use its high-priority cancellation path.
+    pub fast_cancel: bool,
+}
+
+impl DeepXSpotCancelParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![Value::named_composite([(
+            "params",
+            Value::named_composite([
+                ("subaccount", Value::from_bytes(self.subaccount)),
+                ("pair", Value::from_bytes(self.pair)),
+                ("order_id", Value::u128(u128::from(self.order_id))),
+                ("is_buy", Value::bool(self.is_buy)),
                 (
                     "cancel_reason",
                     Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
@@ -211,6 +272,80 @@ pub fn sign_perp_cancel(
         "PerpMarket",
         "cancel_order",
         params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Signs a Spot order cancellation without submitting it.
+///
+/// The pair is the deployment's bytes32 identity, not a symbol or perpetual market ID.
+/// The cancellation reason is fixed to `UserCanceled`. The caller owns nonce reservation
+/// and persistence; this offline function does not authorize operational trading.
+///
+/// # Errors
+///
+/// Returns an error when the key is invalid or the call cannot be encoded against the approved
+/// runtime snapshot.
+pub fn sign_spot_cancel(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXSpotCancelParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "SpotMarket",
+        "cancel_order",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Signs a metadata-driven perpetual position close without submitting it.
+///
+/// Price and slippage are raw runtime integers. This function establishes no financial unit
+/// semantics, authorization, SDK parity, nonce reservation, or operational close capability.
+///
+/// # Errors
+///
+/// Returns an error if the key or the permitted snapshot cannot encode the close call.
+pub fn sign_perp_close(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXPerpCloseParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "PerpMarket",
+        "close_position",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Signs a metadata-driven Subaccount no-op without submitting it.
+///
+/// The call has no arguments. The caller supplies the exact signed-extension nonce and owns
+/// reservation and persistence. This offline API proves no pool replacement, nonce-domain,
+/// authorization, inclusion, or business semantics and grants no recovery or replay authority.
+///
+/// # Errors
+///
+/// Returns an error if the key or permitted runtime cannot encode the no-op call.
+pub fn sign_no_op(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "Subaccount",
+        "no_op",
+        Vec::new(),
         nonce,
     )
 }
@@ -357,15 +492,9 @@ mod tests {
             "131c000b7c2203a29101006e0100000100000086604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
         );
 
-        let signed = sign_dynamic_pallet_call_with_snapshot(
-            &snapshot,
-            &key(),
-            "Subaccount",
-            "no_op",
-            Vec::new(),
-            1_725_000_000_124,
-        )
-        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_no_op(&permit, &key(), 1_725_000_000_124).unwrap();
         assert_eq!(
             hex::encode(signed.signer()),
             "fcad0b19bb29d4674531d6f115237e16afce377c",
@@ -378,6 +507,170 @@ mod tests {
             hex::encode(signed.extrinsic_hash()),
             "c2e2837a583ddf1e94fd0a5a177c4b6e471ac24b82a7e9fd32d600c0f674d28a",
         );
+    }
+
+    #[rstest]
+    fn perp_close_runtime_change_blocks_new_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.spec_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+    }
+
+    #[rstest]
+    #[case(0, 0, None)]
+    #[case(u16::MAX, u128::MAX, Some(u64::MAX))]
+    #[case(7, 123, Some(0))]
+    fn perp_close_exact_scale(
+        #[case] market_id: u16,
+        #[case] price: u128,
+        #[case] slippage: Option<u64>,
+    ) {
+        let snapshot = snapshot();
+        let metadata = snapshot.metadata();
+        let pallet = metadata.pallet_by_name("PerpMarket").unwrap();
+        let call = pallet.call_variant_by_name("close_position").unwrap();
+        assert_eq!(call.index, 14);
+        assert_eq!(
+            call.fields
+                .iter()
+                .map(|field| (field.name.as_deref(), field.type_name.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("subaccount"), Some("H160")),
+                (Some("market_id"), Some("u16")),
+                (Some("price"), Some("u128")),
+                (Some("slippage"), Some("Option<u64>"))
+            ]
+        );
+        let params = DeepXPerpCloseParams {
+            subaccount: [0x11; 20],
+            market_id,
+            price,
+            slippage,
+        };
+        let mut expected = vec![pallet.index(), call.index];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&market_id.to_le_bytes());
+        expected.extend_from_slice(&price.to_le_bytes());
+        expected.push(u8::from(slippage.is_some()));
+        if let Some(value) = slippage {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_perp_close(&permit, &key(), params, u64::MAX).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(signed.nonce(), u64::MAX);
+        assert_eq!(
+            signed,
+            sign_perp_close(&permit, &key(), params, u64::MAX).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    fn perp_close_signed_identity_sensitivity(#[case] mutation: u8) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut params = DeepXPerpCloseParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            price: 123,
+            slippage: None,
+        };
+        let original = sign_perp_close(&permit, &key(), params, 125).unwrap();
+        let mut nonce = 125;
+        match mutation {
+            0 => params.subaccount[19] ^= 1,
+            1 => params.market_id += 1,
+            2 => params.price += 1,
+            3 => params.slippage = Some(0),
+            4 => nonce += 1,
+            _ => unreachable!(),
+        }
+        let changed = sign_perp_close(&permit, &key(), params, nonce).unwrap();
+        assert_ne!(original.bytes(), changed.bytes());
+        assert_ne!(original.extrinsic_hash(), changed.extrinsic_hash());
+    }
+
+    #[rstest]
+    #[case(0, Value::from_bytes([0x11; 19]))]
+    #[case(1, Value::u128(u128::from(u16::MAX) + 1))]
+    #[case(2, Value::bool(true))]
+    #[case(3, Value::unnamed_variant("Some", [Value::u128(u128::from(u64::MAX) + 1)]))]
+    #[case(3, Value::unnamed_variant("Unknown", Vec::<Value>::new()))]
+    fn perp_close_malformed_arguments(#[case] index: usize, #[case] value: Value) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut arguments = DeepXPerpCloseParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            price: 123,
+            slippage: None,
+        }
+        .into_dynamic_arguments();
+        arguments[index] = value;
+        assert!(matches!(
+            sign_dynamic_pallet_call(
+                &permit,
+                &key(),
+                "PerpMarket",
+                "close_position",
+                arguments,
+                125
+            ),
+            Err(SigningError::Encode(_))
+        ));
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(63)]
+    #[case(64)]
+    #[case(u64::MAX)]
+    fn no_op_exact_metadata_contract(#[case] nonce: u64) {
+        let snapshot = snapshot();
+        let pallet = snapshot.metadata().pallet_by_name("Subaccount").unwrap();
+        let call = pallet.call_variant_by_name("no_op").unwrap();
+        assert_eq!(pallet.index(), 19);
+        assert_eq!(call.index, 28);
+        assert!(call.fields.is_empty());
+        let payload = subxt_core::dynamic::tx("Subaccount", "no_op", Vec::<Value>::new());
+        let encoded =
+            tx::payload::Payload::encode_call_data(&payload, snapshot.metadata()).unwrap();
+        assert_eq!(encoded, [19, 28]);
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_no_op(&permit, &key(), nonce).unwrap();
+        assert!(signed.bytes().ends_with(&encoded));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), nonce);
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(signed, sign_no_op(&permit, &key(), nonce).unwrap());
+        let changed = sign_no_op(&permit, &key(), nonce ^ 1).unwrap();
+        assert_ne!(signed.bytes(), changed.bytes());
+        assert_ne!(signed.extrinsic_hash(), changed.extrinsic_hash());
+    }
+
+    #[rstest]
+    fn no_op_runtime_change_blocks_new_signing_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.transaction_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+        assert!(sign_no_op(&permit, &key(), 1).is_ok());
     }
 
     #[rstest]
@@ -443,5 +736,137 @@ mod tests {
                 DeepXRuntimeInterfaceError::PalletUnavailable(pallet),
             )) if pallet == "UnknownPallet"
         ));
+    }
+
+    #[rstest]
+    #[case::subaccount(0)]
+    #[case::pair(1)]
+    #[case::order(2)]
+    #[case::side(3)]
+    #[case::fast(4)]
+    #[case::nonce(5)]
+    fn spot_cancel_changes_signed_identity(#[case] mutation: u8) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut params = DeepXSpotCancelParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            order_id: 7,
+            is_buy: false,
+            fast_cancel: false,
+        };
+        let original = sign_spot_cancel(&permit, &key(), params, 125).unwrap();
+        let mut nonce = 125;
+        match mutation {
+            0 => params.subaccount[19] ^= 1,
+            1 => params.pair[31] ^= 1,
+            2 => params.order_id += 1,
+            3 => params.is_buy = true,
+            4 => params.fast_cancel = true,
+            5 => nonce += 1,
+            _ => unreachable!(),
+        }
+        let changed = sign_spot_cancel(&permit, &key(), params, nonce).unwrap();
+        assert_ne!(original.bytes(), changed.bytes());
+        assert_ne!(original.extrinsic_hash(), changed.extrinsic_hash());
+        assert_eq!(original.runtime(), changed.runtime());
+        assert_eq!(original.signer(), changed.signer());
+    }
+
+    #[rstest]
+    #[case::short_subaccount("subaccount", Value::from_bytes([0x11; 19]))]
+    #[case::short_pair("pair", Value::from_bytes([0x22; 31]))]
+    #[case::long_pair("pair", Value::from_bytes([0x22; 33]))]
+    #[case::order_overflow("order_id", Value::u128(u128::from(u64::MAX) + 1))]
+    #[case::wrong_side_type("is_buy", Value::u128(1))]
+    #[case::unknown_reason("cancel_reason", Value::unnamed_variant("UnrecognizedCancelReason", Vec::<Value>::new()))]
+    fn spot_cancel_rejects_malformed_dynamic_binding(#[case] field: &str, #[case] value: Value) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut fields = vec![
+            ("subaccount", Value::from_bytes([0x11; 20])),
+            ("pair", Value::from_bytes([0x22; 32])),
+            ("order_id", Value::u128(7)),
+            ("is_buy", Value::bool(false)),
+            (
+                "cancel_reason",
+                Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
+            ),
+            ("fast_cancel", Value::bool(false)),
+        ];
+        fields
+            .iter_mut()
+            .find(|(name, _)| *name == field)
+            .unwrap()
+            .1 = value;
+        let result = sign_dynamic_pallet_call(
+            &permit,
+            &key(),
+            "SpotMarket",
+            "cancel_order",
+            vec![Value::named_composite([(
+                "params",
+                Value::named_composite(fields),
+            )])],
+            125,
+        );
+        assert!(matches!(result, Err(SigningError::Encode(_))));
+    }
+
+    #[rstest]
+    #[case(0, false, false)]
+    #[case(u64::MAX, true, false)]
+    #[case(1_725_000_000_001, false, true)]
+    #[case(1, true, true)]
+    fn spot_cancel_binds_spec366_schema(
+        #[case] order_id: u64,
+        #[case] is_buy: bool,
+        #[case] fast_cancel: bool,
+    ) {
+        let snapshot = snapshot();
+        let metadata = snapshot.metadata();
+        let pallet = metadata.pallet_by_name("SpotMarket").unwrap();
+        let call = pallet.call_variant_by_name("cancel_order").unwrap();
+        assert_eq!(call.fields.len(), 1);
+        assert_eq!(call.fields[0].name.as_deref(), Some("params"));
+        let params_type = metadata.types().resolve(call.fields[0].ty.id).unwrap();
+        let scale_info::TypeDef::Composite(composite) = &params_type.type_def else {
+            panic!("Spot cancel params must be a composite");
+        };
+        assert_eq!(
+            composite
+                .fields
+                .iter()
+                .map(|field| field.name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "subaccount",
+                "pair",
+                "order_id",
+                "is_buy",
+                "cancel_reason",
+                "fast_cancel"
+            ],
+        );
+        let params = DeepXSpotCancelParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            order_id,
+            is_buy,
+            fast_cancel,
+        };
+        let mut expected = vec![pallet.index(), call.index];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&params.pair);
+        expected.extend_from_slice(&order_id.to_le_bytes());
+        expected.extend_from_slice(&[u8::from(is_buy), 0, u8::from(fast_cancel)]);
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_spot_cancel(&permit, &key(), params, 1_725_000_000_125).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.signer(), derive_signer_account_id(&key()).unwrap());
+        assert_eq!(signed.nonce(), 1_725_000_000_125);
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
     }
 }

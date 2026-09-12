@@ -355,6 +355,113 @@ impl DeepXHttpClient {
         self.get_json_with_query(PERP_LAST_PRICE_PATH, &query).await
     }
 
+    /// Returns the uninterpreted payload of a perpetual order-by-ID lookup.
+    ///
+    /// The OpenAPI defines only the response envelope, so this does not produce an order report
+    /// or assign status, quantity, timestamp, or finality semantics to the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid subaccount address, zero market ID, empty order ID,
+    /// transport or HTTP failures, malformed responses, or a venue-level failure envelope.
+    pub async fn get_perp_order_by_id_raw(
+        &self,
+        user: &str,
+        market_id: u64,
+        order_id: &str,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        if user.len() != 42
+            || !user.starts_with("0x")
+            || !user.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+            || market_id == 0
+            || order_id.trim().is_empty()
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp-order-by-id requires a 20-byte hex subaccount, positive market_id, and nonempty order_id"
+                    .to_string(),
+            ));
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OrderQuery<'a> {
+            user: &'a str,
+            market_id: u64,
+            oid: &'a str,
+        }
+        self.get_json_with_query(
+            "/internal/v1/account/perp/order-by-id",
+            &OrderQuery {
+                user,
+                market_id,
+                oid: order_id,
+            },
+        )
+        .await
+    }
+
+    /// Returns the uninterpreted lending deposit and borrow balance payload for a subaccount.
+    ///
+    /// The OpenAPI defines only a generic payload schema. This read preserves exact JSON
+    /// lexemes and does not construct Nautilus account balances or prove account initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid subaccount address, transport or HTTP failures,
+    /// malformed responses, or a venue-level failure envelope.
+    pub async fn get_subaccount_balances_raw(
+        &self,
+        subaccount: &str,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        if subaccount.len() != 42
+            || !subaccount.starts_with("0x")
+            || !subaccount.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "subaccount-balances requires a 20-byte hex subaccount".to_string(),
+            ));
+        }
+        #[derive(Serialize)]
+        struct BalancesQuery<'a> {
+            subaccount: &'a str,
+        }
+        self.get_json_with_query(
+            "/internal/v1/account/balances",
+            &BalancesQuery { subaccount },
+        )
+        .await
+    }
+
+    /// Returns the uninterpreted delegate configuration payload for a wallet owner.
+    ///
+    /// The generic OpenAPI response does not prove delegate permissions, expiry, or ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid wallet address, transport or HTTP failures, malformed
+    /// responses, or a venue-level failure envelope.
+    pub async fn get_delegate_accounts_raw(
+        &self,
+        address: &str,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        if address.len() != 42
+            || !address.starts_with("0x")
+            || !address.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "delegate-accounts requires a 20-byte hex wallet address".to_string(),
+            ));
+        }
+        #[derive(Serialize)]
+        struct DelegateQuery<'a> {
+            address: &'a str,
+        }
+        self.get_json_with_query(
+            "/internal/v1/account/delegate-accounts",
+            &DelegateQuery { address },
+        )
+        .await
+    }
+
     async fn get_market_data<T>(&self, path: &str) -> Result<Vec<T>>
     where
         T: DeserializeOwned,
@@ -551,6 +658,196 @@ mod tests {
 
     const PERP_VOLUME_1H_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_volume_1h.json");
+
+    #[tokio::test]
+    async fn test_perp_order_by_id_raw() {
+        let user = "0x1111111111111111111111111111111111111111";
+        let app = Router::new().route(
+            "/internal/v1/account/perp/order-by-id",
+            get(move |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(query.len(), 3);
+                assert_eq!(query["user"], user);
+                assert_eq!(query["marketId"], "3");
+                match query["oid"].as_str() {
+                    "id&opaque=1" => r#"{"code":200,"msg":"success","fail":false,"data":{"price":0.1234567890123456789012345678,"orderId":"id&opaque=1"}}"#,
+                    "missing" => r#"{"code":10008,"msg":"not found","fail":true,"data":null}"#,
+                    _ => r#"{"code":200,"msg":"success","fail":false}"#,
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let payload = client
+            .get_perp_order_by_id_raw(user, 3, "id&opaque=1")
+            .await
+            .unwrap();
+        assert_eq!(
+            payload.get(),
+            r#"{"price":0.1234567890123456789012345678,"orderId":"id&opaque=1"}"#
+        );
+        assert!(matches!(
+            client.get_perp_order_by_id_raw(user, 3, "missing").await,
+            Err(DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10008),
+                ..
+            })
+        ));
+        assert!(
+            client
+                .get_perp_order_by_id_raw(user, 3, "malformed")
+                .await
+                .is_err()
+        );
+        for (address, market, oid) in [("invalid", 3, "1"), (user, 0, "1"), (user, 3, " ")] {
+            assert!(matches!(
+                client.get_perp_order_by_id_raw(address, market, oid).await,
+                Err(DeepXHttpError::InvalidRequest(_))
+            ));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_subaccount_balances_raw() {
+        let subaccount = "0xABCDEF1111111111111111111111111111111111";
+        let payload = r#"{"address":"opaque&account=1","assets":[{"balance":0.1234567890123456789012345678,"balanceBorrowed":"9007199254740993.000000","assetId":"000001"}]}"#;
+        let bodies = [
+            format!(r#"{{"code":200,"msg":"success","fail":false,"data":{payload}}}"#),
+            r#"{"code":10009,"msg":"not found","fail":true,"data":null}"#.to_string(),
+            r#"{"code":200,"msg":"success","fail":false}"#.to_string(),
+            r#"{"code":200,"msg":"success","data":{}}"#.to_string(),
+            "not json".to_string(),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/internal/v1/account/balances",
+            get(move |RawQuery(query): RawQuery| {
+                let body = bodies[observed.fetch_add(1, Ordering::Relaxed)].clone();
+                async move {
+                    assert_eq!(query.unwrap(), format!("subaccount={subaccount}"));
+                    body
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        for invalid in [
+            "",
+            "0x",
+            "invalid",
+            "0x111111111111111111111111111111111111111g",
+            "0X1111111111111111111111111111111111111111",
+            " 0x1111111111111111111111111111111111111111",
+            "0x1111111111111111111111111111111111111111&extra=1",
+        ] {
+            assert!(matches!(
+                client.get_subaccount_balances_raw(invalid).await,
+                Err(DeepXHttpError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            client
+                .get_subaccount_balances_raw(subaccount)
+                .await
+                .unwrap()
+                .get(),
+            payload
+        );
+        assert!(matches!(
+            client.get_subaccount_balances_raw(subaccount).await,
+            Err(DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10009),
+                ..
+            })
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                client.get_subaccount_balances_raw(subaccount).await,
+                Err(DeepXHttpError::Decode(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delegate_accounts_raw() {
+        let wallet = "0xABCDEF1111111111111111111111111111111111";
+        let payload = r#"[{"delegateAddress":"opaque&delegate=0001","validUntil":9007199254740993,"unknownFee":0.1234567890123456789012345678,"mode":"future-mode"}]"#;
+        let bodies = [
+            format!(r#"{{"code":200,"msg":"success","fail":false,"data":{payload}}}"#),
+            r#"{"code":10014,"msg":"invalid address","fail":true,"data":null}"#.to_string(),
+            r#"{"code":200,"msg":"failure","fail":true,"data":[]}"#.to_string(),
+            r#"{"code":200,"msg":"success","fail":false}"#.to_string(),
+            r#"{"code":200,"msg":"success","data":[]}"#.to_string(),
+            "not json".to_string(),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/internal/v1/account/delegate-accounts",
+            get(move |RawQuery(query): RawQuery| {
+                let body = bodies[observed.fetch_add(1, Ordering::Relaxed)].clone();
+                async move {
+                    assert_eq!(query.unwrap(), format!("address={wallet}"));
+                    body
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        for invalid in [
+            "",
+            "0x",
+            "invalid",
+            "0x111111111111111111111111111111111111111g",
+            "0X1111111111111111111111111111111111111111",
+            " 0x1111111111111111111111111111111111111111",
+            "0x1111111111111111111111111111111111111111&extra=1",
+            "0x1111111111111111111111111111111111111111\u{e9}",
+        ] {
+            assert!(matches!(
+                client.get_delegate_accounts_raw(invalid).await,
+                Err(DeepXHttpError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            client
+                .get_delegate_accounts_raw(wallet)
+                .await
+                .unwrap()
+                .get(),
+            payload
+        );
+        assert!(matches!(
+            client.get_delegate_accounts_raw(wallet).await,
+            Err(DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10014),
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.get_delegate_accounts_raw(wallet).await,
+            Err(DeepXHttpError::Api { .. })
+        ));
+        for _ in 0..3 {
+            assert!(matches!(
+                client.get_delegate_accounts_raw(wallet).await,
+                Err(DeepXHttpError::Decode(_))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        server.abort();
+    }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct HealthResponse {
