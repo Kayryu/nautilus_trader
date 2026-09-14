@@ -352,6 +352,7 @@ frame-metadata = { version = "23.0.1", default-features = false, features = [
 subxt-core = { git = "https://github.com/deepxfinance/subxt.git", rev = "2904b84ff5d6646481875e06749460dc5ebc6bbc", default-features = false, features = [
   "std",
 ] }
+sp-crypto-hashing = "0.1.0"
 subxt-signer = { git = "https://github.com/deepxfinance/subxt.git", rev = "2904b84ff5d6646481875e06749460dc5ebc6bbc", default-features = false, features = [
   "std",
   "subxt",

@@ -218,6 +218,25 @@ impl From<&ApprovedRuntimeIdentity> for DeepXDirectRuntimeIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DeepXTransactionOperation {
+    /// Direct `SpotMarket.place_order` operation with raw runtime integers.
+    SpotPlace {
+        /// Venue subaccount placing the order.
+        subaccount: [u8; 20],
+        /// Deployment-provided bytes32 pair identifier.
+        pair: [u8; 32],
+        /// Whether the order buys the base asset.
+        is_buy: bool,
+        /// Exact little-endian runtime `U256` quote amount.
+        quote_amount: [u8; 32],
+        /// Exact little-endian runtime `U256` base amount.
+        base_amount: [u8; 32],
+        /// Runtime order type and its exact associated data.
+        order_type: crate::signing::DeepXSpotOrderType,
+        /// Runtime post-only behavior.
+        post_only: crate::signing::DeepXPostOnlyParam,
+        /// Whether the order may only reduce an existing balance or liability.
+        reduce_only: bool,
+    },
     /// Direct `PerpMarket.close_position` with raw runtime integers.
     PerpClose {
         /// Venue subaccount whose position is closed.
@@ -305,6 +324,38 @@ struct DeepXTransactionIdentityWire {
 }
 
 impl DeepXTransactionIdentity {
+    /// Creates immutable identity for an offline direct Spot place operation.
+    #[must_use]
+    pub fn new_spot_place(
+        client_order_id: ClientOrderId,
+        signer: [u8; 20],
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        nonce: DeepXNonceReservation,
+        runtime: DeepXDirectRuntimeIdentity,
+        params: crate::signing::DeepXSpotPlaceParams,
+    ) -> Self {
+        let mut identity = Self::new(
+            client_order_id,
+            signer,
+            instrument_id,
+            order_side,
+            nonce,
+            runtime,
+        );
+        identity.operation = Some(DeepXTransactionOperation::SpotPlace {
+            subaccount: params.subaccount,
+            pair: params.pair,
+            is_buy: params.is_buy,
+            quote_amount: params.quote_amount,
+            base_amount: params.base_amount,
+            order_type: params.order_type,
+            post_only: params.post_only,
+            reduce_only: params.reduce_only,
+        });
+        identity
+    }
+
     /// Creates immutable identity for an offline direct perpetual close operation.
     #[must_use]
     pub fn new_perp_close(

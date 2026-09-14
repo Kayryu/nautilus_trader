@@ -16,6 +16,8 @@
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
+#[cfg(test)]
+use parity_scale_codec::Encode;
 use parity_scale_codec::{Compact, Decode};
 use serde::Deserialize;
 use serde_json::json;
@@ -45,6 +47,160 @@ const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
     "0x26aa394eea5630e07c48ae0c9558cef7",
     "80d41e5e16056765bc8461851072c9d7",
 );
+
+/// Errors raised while verifying offline Spot placement event evidence.
+#[derive(Debug, Error)]
+pub enum DeepXSpotPlaceEventVerificationError {
+    #[error(transparent)]
+    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
+    #[error("DeepX identity or runtime does not describe a supported Spot place")]
+    UnsupportedOperation,
+    #[error("unable to decode DeepX Spot place event evidence: {0}")]
+    Decode(#[source] subxt_core::Error),
+    #[error("DeepX Spot place event evidence is not a complete System.Events value")]
+    MalformedEventBytes,
+    #[error("DeepX Spot place event conflicts with the durable identity")]
+    ConflictingEvent,
+    #[error("DeepX Spot place evidence contains duplicate order state events")]
+    DuplicateEvent,
+    #[error(transparent)]
+    InclusionEvidence(#[from] DeepXInclusionEvidenceError),
+}
+
+/// Verifies Spot placement inclusion against an approved offline snapshot.
+///
+/// Successful dispatch requires a unique, same-index `StateOrderBuy` or `StateOrderSell` event
+/// whose durable input fields match the reservation. Failed dispatch is authoritative without a
+/// business event.
+///
+/// # Errors
+///
+/// Returns an error for unsupported operations, conflicting identities, incomplete SCALE,
+/// duplicate evidence, or successful dispatch without the expected business event.
+pub fn verify_spot_place_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXSpotPlaceEventVerificationError> {
+    use DeepXSpotPlaceEventVerificationError as Error;
+    let Some(DeepXTransactionOperation::SpotPlace {
+        subaccount,
+        pair,
+        is_buy,
+        quote_amount,
+        base_amount,
+        order_type,
+        post_only,
+        reduce_only,
+    }) = identity.operation()
+    else {
+        return Err(Error::UnsupportedOperation);
+    };
+    let super::DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce()
+    else {
+        return Err(Error::UnsupportedOperation);
+    };
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(Error::UnsupportedOperation);
+    }
+    let expected_side = if *is_buy {
+        nautilus_model::enums::OrderSide::Buy
+    } else {
+        nautilus_model::enums::OrderSide::Sell
+    };
+    if identity.order_side() != expected_side {
+        return Err(Error::ConflictingEvent);
+    }
+    let event_name = if *is_buy {
+        "StateOrderBuy"
+    } else {
+        "StateOrderSell"
+    };
+    snapshot.interfaces().event("SpotMarket", event_name)?;
+    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
+    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
+
+    let mut remaining = event_bytes;
+    let declared = Compact::<u32>::decode(&mut remaining)
+        .map_err(|_| Error::MalformedEventBytes)?
+        .0;
+    let mut consumed = event_bytes.len() - remaining.len();
+    let mut count = 0_u32;
+    let mut dispatch = None;
+    let mut matched = false;
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    for event in events.iter() {
+        let event = event.map_err(Error::Decode)?;
+        count += 1;
+        consumed += event.bytes().len();
+        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
+            continue;
+        }
+        if event.pallet_name() == "System" {
+            let outcome = match event.variant_name() {
+                "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
+                "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
+                _ => continue,
+            };
+            if dispatch.replace(outcome).is_some() {
+                return Err(Error::DuplicateEvent);
+            }
+        } else if event.pallet_name() == "SpotMarket" && event.variant_name() == event_name {
+            let fields = event.field_values().map_err(Error::Decode)?;
+            let Composite::Named(fields) = fields else {
+                return Err(Error::ConflictingEvent);
+            };
+            if fields.len() != 1
+                || !fields.iter().any(|(name, order)| {
+                    name == "order"
+                        && spot_place_order_matches(
+                            order,
+                            *subaccount,
+                            *pair,
+                            order_id,
+                            *quote_amount,
+                            *base_amount,
+                            *order_type,
+                            *post_only,
+                            *reduce_only,
+                            *is_buy,
+                        )
+                })
+            {
+                return Err(Error::ConflictingEvent);
+            }
+            if matched {
+                return Err(Error::DuplicateEvent);
+            }
+            matched = true;
+        }
+    }
+    if count != declared || consumed != event_bytes.len() {
+        return Err(Error::MalformedEventBytes);
+    }
+    Ok(DeepXInclusionEvidence::from_indexed_observations(
+        block_hash,
+        block_number,
+        DeepXIndexedOutcome {
+            extrinsic_index,
+            outcome: dispatch.ok_or(Error::MalformedEventBytes)?,
+        },
+        DeepXIndexedOutcome {
+            extrinsic_index,
+            outcome: if matched {
+                DeepXBusinessEventOutcome::Success
+            } else {
+                DeepXBusinessEventOutcome::NotObserved
+            },
+        },
+    )?)
+}
 
 /// Errors raised while verifying offline Spot cancellation event evidence.
 #[derive(Debug, Error)]
@@ -398,6 +554,120 @@ fn value_matches_bytes(value: &ScaleValue<u32>, expected: &[u8]) -> bool {
         .map(Some))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spot_place_order_matches(
+    value: &ScaleValue<u32>,
+    subaccount: [u8; 20],
+    pair: [u8; 32],
+    order_id: u64,
+    quote_amount: [u8; 32],
+    base_amount: [u8; 32],
+    order_type: crate::signing::DeepXSpotOrderType,
+    post_only: crate::signing::DeepXPostOnlyParam,
+    reduce_only: bool,
+    is_buy: bool,
+) -> bool {
+    let ValueDef::Composite(Composite::Named(fields)) = &value.value else {
+        return false;
+    };
+    let field = |name| {
+        fields
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+    };
+    fields.len() == 12
+        && field("id").and_then(ScaleValue::as_u128) == Some(u128::from(order_id))
+        && field("maker").is_some_and(|value| value_matches_bytes(value, &subaccount))
+        && field("pair").is_some_and(|value| value_matches_bytes(value, &pair))
+        && field("price").is_some()
+        && field("quote_amount").is_some_and(|value| value_matches_u256_le(value, &quote_amount))
+        && field("base_amount").is_some_and(|value| value_matches_u256_le(value, &base_amount))
+        && field("create_time").is_some()
+        && field("status").is_some()
+        && field("order_type").is_some_and(|value| value_matches_order_type(value, order_type))
+        && field("post_only").is_some_and(|value| value_matches_post_only(value, post_only))
+        && field("reduce_only").and_then(ScaleValue::as_bool) == Some(reduce_only)
+        && field("is_buy").and_then(ScaleValue::as_bool) == Some(is_buy)
+}
+
+fn value_matches_u256_le(value: &ScaleValue<u32>, expected: &[u8; 32]) -> bool {
+    let ValueDef::Composite(composite) = &value.value else {
+        return false;
+    };
+    let values: Vec<_> = composite.values().collect();
+    if values.len() == 1 {
+        return value_matches_u256_le(values[0], expected);
+    }
+    values.len() == 4
+        && values.iter().enumerate().all(|(index, value)| {
+            let offset = index * 8;
+            let expected_limb = u64::from_le_bytes(
+                expected[offset..offset + 8]
+                    .try_into()
+                    .expect("fixed U256 limb"),
+            );
+            value.as_u128() == Some(u128::from(expected_limb))
+        })
+}
+
+fn value_matches_order_type(
+    value: &ScaleValue<u32>,
+    expected: crate::signing::DeepXSpotOrderType,
+) -> bool {
+    let ValueDef::Variant(variant) = &value.value else {
+        return false;
+    };
+    match expected {
+        crate::signing::DeepXSpotOrderType::Limit(time_in_force) => {
+            let values: Vec<_> = variant.values.values().collect();
+            variant.name == "Limit"
+                && values.len() == 1
+                && matches!(&values[0].value, ValueDef::Variant(value)
+                    if value.name == match time_in_force {
+                        crate::signing::DeepXTimeInForce::Gtc => "GTC",
+                        crate::signing::DeepXTimeInForce::Ioc => "IOC",
+                        crate::signing::DeepXTimeInForce::Fok => "FOK",
+                    } && value.values.values().next().is_none())
+        }
+        crate::signing::DeepXSpotOrderType::Market(slippage) => {
+            let values: Vec<_> = variant.values.values().collect();
+            if variant.name != "Market" || values.len() != 1 {
+                return false;
+            }
+            let ValueDef::Variant(option) = &values[0].value else {
+                return false;
+            };
+            let option_values: Vec<_> = option.values.values().collect();
+            match slippage {
+                Some(expected) => {
+                    option.name == "Some"
+                        && option_values.len() == 1
+                        && option_values[0].as_u128() == Some(u128::from(expected))
+                }
+                None => option.name == "None" && option_values.is_empty(),
+            }
+        }
+        crate::signing::DeepXSpotOrderType::Stop => {
+            variant.name == "Stop" && variant.values.values().next().is_none()
+        }
+    }
+}
+
+fn value_matches_post_only(
+    value: &ScaleValue<u32>,
+    expected: crate::signing::DeepXPostOnlyParam,
+) -> bool {
+    let ValueDef::Variant(variant) = &value.value else {
+        return false;
+    };
+    let expected = match expected {
+        crate::signing::DeepXPostOnlyParam::None => "None",
+        crate::signing::DeepXPostOnlyParam::MustPostOnly => "MustPostOnly",
+        crate::signing::DeepXPostOnlyParam::Adaptive => "Adaptive",
+    };
+    variant.name == expected && variant.values.values().next().is_none()
+}
+
 /// Errors raised while observing transaction presence through DeepX RPC endpoints.
 #[derive(Debug, Error)]
 pub enum DeepXTransactionWatchError {
@@ -488,6 +758,9 @@ pub enum DeepXTransactionWatchError {
     /// Runtime event evidence did not prove the explicitly selected Spot cancellation.
     #[error(transparent)]
     SpotEventVerification(#[from] DeepXSpotCancelEventVerificationError),
+    /// Runtime event evidence did not prove the explicitly selected Spot placement.
+    #[error(transparent)]
+    SpotPlaceEventVerification(#[from] DeepXSpotPlaceEventVerificationError),
     /// A bounded recovery scan could not be planned safely.
     #[error(transparent)]
     ScanPlan(#[from] DeepXRecoveryScanPlanError),
@@ -896,9 +1169,49 @@ pub async fn collect_finalized_spot_cancel_recovery_scan(
     .await
 }
 
+/// Collects canonical finalized evidence for an explicitly selected Spot placement.
+///
+/// This read-only boundary verifies dispatch and the exact side-specific order state event. It
+/// does not commit, submit, replay, or enable Spot execution.
+///
+/// # Errors
+///
+/// Returns an error for a foreign runtime, unsupported operation, invalid canonical checkpoint,
+/// RPC failure, or incomplete or conflicting inclusion event evidence.
+pub async fn collect_finalized_spot_place_recovery_scan(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, DeepXTransactionWatchError> {
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.operation(),
+            Some(DeepXTransactionOperation::SpotPlace { .. })
+        )
+    {
+        return Err(DeepXSpotPlaceEventVerificationError::UnsupportedOperation.into());
+    }
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some(CancelEventEvidence::SpotPlace(snapshot, identity)),
+    )
+    .await
+}
+
 enum CancelEventEvidence<'a> {
     Perp(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
     Spot(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+    SpotPlace(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
 }
 
 pub(crate) async fn collect_finalized_recovery_scan_with_event_evidence(
@@ -1071,6 +1384,16 @@ async fn collect_finalized_recovery_scan_inner(
                             &event_bytes,
                         )?
                     }
+                    CancelEventEvidence::SpotPlace(snapshot, identity) => {
+                        verify_spot_place_inclusion_events(
+                            snapshot,
+                            identity,
+                            observation.block_hash(),
+                            observation.block_number(),
+                            extrinsic_index,
+                            &event_bytes,
+                        )?
+                    }
                 };
                 blocks.push(DeepXCanonicalBlockEvidence::new(
                     observation.block_number(),
@@ -1123,7 +1446,91 @@ async fn fetch_system_events(
             .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
                 block_number,
             ))?;
+    if value.is_empty() {
+        return Err(DeepXTransactionWatchError::InvalidEventStorage(
+            block_number,
+        ));
+    }
     hex::decode(value).map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))
+}
+
+#[cfg(test)]
+const SYSTEM_THREADS_STORAGE_KEY_PREFIX: &str = "System";
+#[cfg(test)]
+const SYSTEM_THREADS_STORAGE_ITEM: &str = "Threads";
+#[cfg(test)]
+const SYSTEM_EVENTS_MAP_STORAGE_ITEM: &str = "EventsMap";
+
+#[cfg(test)]
+fn system_map_storage_key(prefix: &str, item: &str, key: &[u8]) -> String {
+    let mut encoded = Vec::with_capacity(32 + 16);
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(prefix.as_bytes()));
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(item.as_bytes()));
+    encoded.extend_from_slice(key);
+    format!("0x{}", hex::encode(encoded))
+}
+
+#[cfg(test)]
+fn system_threads_storage_key(block_number: u64) -> String {
+    system_map_storage_key(
+        SYSTEM_THREADS_STORAGE_KEY_PREFIX,
+        SYSTEM_THREADS_STORAGE_ITEM,
+        &block_number.to_le_bytes(),
+    )
+}
+
+#[cfg(test)]
+fn system_events_map_storage_key(block_number: u64, thread: u8) -> String {
+    let block_key = sp_crypto_hashing::blake2_128(&block_number.to_le_bytes());
+    let thread_key = sp_crypto_hashing::blake2_128(&[thread]);
+    let mut encoded = Vec::with_capacity(64);
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(
+        SYSTEM_THREADS_STORAGE_KEY_PREFIX.as_bytes(),
+    ));
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(
+        SYSTEM_EVENTS_MAP_STORAGE_ITEM.as_bytes(),
+    ));
+    encoded.extend_from_slice(&block_key);
+    encoded.extend_from_slice(&thread_key);
+    format!("0x{}", hex::encode(encoded))
+}
+
+#[cfg(test)]
+fn combine_events_map_batches(
+    batches: &[Vec<u8>],
+    block_number: u64,
+) -> Result<Vec<u8>, DeepXTransactionWatchError> {
+    let mut records = Vec::new();
+    for batch in batches {
+        let mut input = batch.as_slice();
+        let count = Compact::<u32>::decode(&mut input)
+            .map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?;
+        let count = count.0 as usize;
+        if input.is_empty() && count != 0 {
+            return Err(DeepXTransactionWatchError::InvalidEventStorage(
+                block_number,
+            ));
+        }
+        records.extend_from_slice(input);
+        if !input.is_empty() && count == 0 {
+            return Err(DeepXTransactionWatchError::InvalidEventStorage(
+                block_number,
+            ));
+        }
+    }
+    let count = batches
+        .iter()
+        .try_fold(0usize, |total, batch| {
+            let mut input = batch.as_slice();
+            let count = Compact::<u32>::decode(&mut input).ok()?.0 as usize;
+            Some(total.checked_add(count)?)
+        })
+        .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
+            block_number,
+        ))?;
+    let mut combined = Compact(count as u32).encode();
+    combined.extend_from_slice(&records);
+    Ok(combined)
 }
 
 /// Observes exact transaction membership in the submission endpoint's pending pool.
@@ -1249,6 +1656,36 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn events_map_storage_keys_use_substrate_hashers() {
+        let threads = system_threads_storage_key(42);
+        let events = system_events_map_storage_key(42, 3);
+        assert_eq!(threads.len(), 82);
+        assert_eq!(events.len(), 130);
+        assert_ne!(events, system_events_map_storage_key(42, 4));
+        assert_ne!(events, system_events_map_storage_key(43, 3));
+    }
+
+    #[test]
+    fn events_map_batches_combine_compact_counts() {
+        let mut first = Compact(1_u32).encode();
+        first.push(10);
+        let mut second = Compact(2_u32).encode();
+        second.extend_from_slice(&[20, 30]);
+        let combined = combine_events_map_batches(&[first, second], 42).unwrap();
+        assert_eq!(
+            combined,
+            [Compact(3_u32).encode(), vec![10, 20, 30]].concat()
+        );
+    }
+
+    #[test]
+    fn events_map_batches_reject_nonempty_zero_count() {
+        let mut batch = Compact(0_u32).encode();
+        batch.push(1);
+        assert!(combine_events_map_batches(&[batch], 42).is_err());
+    }
     use crate::{
         common::{
             DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, consts::DEEPX_TESTNET_GENESIS_HASH,
@@ -1392,6 +1829,139 @@ mod tests {
             100,
             fast_cancel,
         )
+    }
+
+    fn spot_place_identity(is_buy: bool) -> DeepXTransactionIdentity {
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let snapshot = runtime_snapshot();
+        DeepXTransactionIdentity::new_spot_place(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&key).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC.DEEPX").unwrap(),
+            if is_buy {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            },
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_000_125,
+            },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            crate::signing::DeepXSpotPlaceParams {
+                subaccount: [0x11; 20],
+                pair: [0xa5; 32],
+                is_buy,
+                quote_amount: std::array::from_fn(|index| index as u8),
+                base_amount: std::array::from_fn(|index| (31 - index) as u8),
+                order_type: crate::signing::DeepXSpotOrderType::Limit(
+                    crate::signing::DeepXTimeInForce::Gtc,
+                ),
+                post_only: crate::signing::DeepXPostOnlyParam::MustPostOnly,
+                reduce_only: false,
+            },
+        )
+    }
+
+    fn u256_value(bytes: [u8; 32]) -> ScaleValue<()> {
+        ScaleValue::unnamed_composite([ScaleValue::unnamed_composite(bytes.chunks_exact(8).map(
+            |chunk| ScaleValue::u128(u128::from(u64::from_le_bytes(chunk.try_into().unwrap()))),
+        ))])
+    }
+
+    fn spot_place_event_record(
+        snapshot: &RuntimeSnapshot,
+        extrinsic_index: u32,
+        identity: &DeepXTransactionIdentity,
+    ) -> Vec<u8> {
+        let Some(DeepXTransactionOperation::SpotPlace {
+            subaccount,
+            pair,
+            is_buy,
+            quote_amount,
+            base_amount,
+            order_type,
+            post_only,
+            reduce_only,
+        }) = identity.operation()
+        else {
+            unreachable!()
+        };
+        let DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce() else {
+            unreachable!()
+        };
+        let pallet = snapshot.metadata().pallet_by_name("SpotMarket").unwrap();
+        let event = pallet
+            .event_variants()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event.name
+                    == if *is_buy {
+                        "StateOrderBuy"
+                    } else {
+                        "StateOrderSell"
+                    }
+            })
+            .unwrap();
+        assert_eq!(event.fields.len(), 1);
+        assert_eq!(event.fields[0].name.as_deref(), Some("order"));
+        let order_type = match order_type {
+            crate::signing::DeepXSpotOrderType::Limit(time_in_force) => {
+                let name = match time_in_force {
+                    crate::signing::DeepXTimeInForce::Gtc => "GTC",
+                    crate::signing::DeepXTimeInForce::Ioc => "IOC",
+                    crate::signing::DeepXTimeInForce::Fok => "FOK",
+                };
+                ScaleValue::unnamed_variant("Limit", [ScaleValue::unnamed_variant(name, [])])
+            }
+            crate::signing::DeepXSpotOrderType::Market(slippage) => {
+                let value = match slippage {
+                    Some(value) => {
+                        ScaleValue::unnamed_variant("Some", [ScaleValue::u128(u128::from(*value))])
+                    }
+                    None => ScaleValue::unnamed_variant("None", []),
+                };
+                ScaleValue::unnamed_variant("Market", [value])
+            }
+            crate::signing::DeepXSpotOrderType::Stop => ScaleValue::unnamed_variant("Stop", []),
+        };
+        let post_only = match post_only {
+            crate::signing::DeepXPostOnlyParam::None => "None",
+            crate::signing::DeepXPostOnlyParam::MustPostOnly => "MustPostOnly",
+            crate::signing::DeepXPostOnlyParam::Adaptive => "Adaptive",
+        };
+        let order = ScaleValue::named_composite([
+            ("id", ScaleValue::u128(u128::from(order_id))),
+            ("maker", ScaleValue::from_bytes(subaccount)),
+            ("pair", ScaleValue::from_bytes(pair)),
+            (
+                "price",
+                ScaleValue::unnamed_variant("Some", [u256_value([1; 32])]),
+            ),
+            ("quote_amount", u256_value(*quote_amount)),
+            ("base_amount", u256_value(*base_amount)),
+            ("create_time", ScaleValue::u128(42)),
+            ("status", ScaleValue::unnamed_variant("Open", [])),
+            ("order_type", order_type),
+            ("post_only", ScaleValue::unnamed_variant(post_only, [])),
+            ("reduce_only", ScaleValue::bool(*reduce_only)),
+            ("is_buy", ScaleValue::bool(*is_buy)),
+        ]);
+        let mut record = Phase::ApplyExtrinsic(extrinsic_index).encode();
+        record.extend([pallet.index(), event.index]);
+        subxt_core::ext::scale_value::scale::encode_as_type(
+            &order,
+            event.fields[0].ty.id,
+            snapshot.metadata().types(),
+            &mut record,
+        )
+        .unwrap();
+        Vec::<[u8; 32]>::new().encode_to(&mut record);
+        record
     }
 
     fn cancel_event_record(
@@ -1634,6 +2204,173 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    fn spot_place_approved_metadata_regression(#[case] is_buy: bool) {
+        let snapshot = runtime_snapshot();
+        let identity = spot_place_identity(is_buy);
+        let record = spot_place_event_record(&snapshot, 3, &identity);
+        let events = system_events(&[dispatch_event_record(&snapshot, 3, true), record.clone()]);
+        assert_eq!(
+            verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &events)
+                .unwrap()
+                .outcome(),
+            DeepXInclusionOutcome::Success
+        );
+
+        let mut changed = serde_json::to_value(&identity).unwrap();
+        changed["operation"]["quote_amount"][0] = json!(255);
+        let changed = serde_json::from_value(changed).unwrap();
+        assert!(
+            verify_spot_place_inclusion_events(&snapshot, &changed, [1; 32], 42, 3, &events)
+                .is_err()
+        );
+
+        for name in ["runtime", "nonce", "side"] {
+            let mut changed = serde_json::to_value(&identity).unwrap();
+            match name {
+                "runtime" => changed["runtime"]["spec_version"] = json!(367),
+                "nonce" => changed["nonce"]["value"] = json!(1_725_000_000_126_u64),
+                "side" => {
+                    changed["order_side"] = serde_json::to_value(if is_buy {
+                        OrderSide::Sell
+                    } else {
+                        OrderSide::Buy
+                    })
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let changed = serde_json::from_value(changed).unwrap();
+            assert!(
+                verify_spot_place_inclusion_events(&snapshot, &changed, [1; 32], 42, 3, &events)
+                    .is_err(),
+                "{name}"
+            );
+        }
+
+        let failed = system_events(&[dispatch_event_record(&snapshot, 3, false)]);
+        assert_eq!(
+            verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &failed)
+                .unwrap()
+                .outcome(),
+            DeepXInclusionOutcome::Failed
+        );
+        for invalid in [
+            system_events(&[dispatch_event_record(&snapshot, 3, true)]),
+            system_events(&[
+                dispatch_event_record(&snapshot, 3, true),
+                dispatch_event_record(&snapshot, 3, false),
+                record.clone(),
+            ]),
+            system_events(&[
+                dispatch_event_record(&snapshot, 3, true),
+                spot_place_event_record(&snapshot, 4, &identity),
+            ]),
+            system_events(&[dispatch_event_record(&snapshot, 4, false)]),
+            Vec::new(),
+            system_events(&[
+                dispatch_event_record(&snapshot, 3, true),
+                record.clone(),
+                record.clone(),
+            ]),
+            system_events(&[dispatch_event_record(&snapshot, 4, true), record.clone()]),
+            events[..events.len() - 1].to_vec(),
+            [events.as_slice(), &[0]].concat(),
+        ] {
+            assert!(
+                verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &invalid)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn spot_place_policy_metadata_matrix() {
+        use crate::signing::{DeepXPostOnlyParam, DeepXSpotOrderType, DeepXTimeInForce};
+
+        let snapshot = runtime_snapshot();
+        for is_buy in [true, false] {
+            for order_type in [
+                DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+                DeepXSpotOrderType::Limit(DeepXTimeInForce::Ioc),
+                DeepXSpotOrderType::Limit(DeepXTimeInForce::Fok),
+                DeepXSpotOrderType::Market(None),
+                DeepXSpotOrderType::Market(Some(u64::MAX)),
+                DeepXSpotOrderType::Stop,
+            ] {
+                for post_only in [
+                    DeepXPostOnlyParam::None,
+                    DeepXPostOnlyParam::MustPostOnly,
+                    DeepXPostOnlyParam::Adaptive,
+                ] {
+                    let mut wire = serde_json::to_value(spot_place_identity(is_buy)).unwrap();
+                    wire["operation"]["order_type"] = serde_json::to_value(order_type).unwrap();
+                    wire["operation"]["post_only"] = serde_json::to_value(post_only).unwrap();
+                    wire["operation"]["reduce_only"] = json!(true);
+                    let identity = serde_json::from_value(wire.clone()).unwrap();
+                    let events = system_events(&[
+                        dispatch_event_record(&snapshot, 3, true),
+                        spot_place_event_record(&snapshot, 3, &identity),
+                    ]);
+                    assert_eq!(
+                        verify_spot_place_inclusion_events(
+                            &snapshot, &identity, [1; 32], 42, 3, &events
+                        )
+                        .unwrap()
+                        .outcome(),
+                        DeepXInclusionOutcome::Success
+                    );
+                    for name in [
+                        "subaccount",
+                        "pair",
+                        "quote_amount",
+                        "base_amount",
+                        "order_type",
+                        "post_only",
+                        "reduce_only",
+                        "is_buy",
+                    ] {
+                        let mut changed = wire.clone();
+                        match name {
+                            "subaccount" | "pair" | "quote_amount" | "base_amount" => {
+                                changed["operation"][name][0] = json!(255);
+                            }
+                            "order_type" => {
+                                let other = if order_type == DeepXSpotOrderType::Stop {
+                                    DeepXSpotOrderType::Market(None)
+                                } else {
+                                    DeepXSpotOrderType::Stop
+                                };
+                                changed["operation"][name] = serde_json::to_value(other).unwrap();
+                            }
+                            "post_only" => {
+                                let other = if post_only == DeepXPostOnlyParam::None {
+                                    DeepXPostOnlyParam::Adaptive
+                                } else {
+                                    DeepXPostOnlyParam::None
+                                };
+                                changed["operation"][name] = serde_json::to_value(other).unwrap();
+                            }
+                            "reduce_only" => changed["operation"][name] = json!(false),
+                            "is_buy" => changed["operation"][name] = json!(!is_buy),
+                            _ => unreachable!(),
+                        }
+                        let changed = serde_json::from_value(changed).unwrap();
+                        assert!(
+                            verify_spot_place_inclusion_events(
+                                &snapshot, &changed, [1; 32], 42, 3, &events
+                            )
+                            .is_err(),
+                            "{order_type:?} {post_only:?} {name}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[rstest::rstest]
@@ -2043,6 +2780,66 @@ mod tests {
             .await
             .unwrap();
         (endpoints, capabilities, post_checkpoint_requests)
+    }
+
+    #[test]
+    fn finalized_event_storage_metadata_layout() {
+        let snapshot = runtime_snapshot();
+        let system = snapshot.metadata().pallet_by_name("System").unwrap();
+        let storage = system.storage().unwrap();
+        assert_eq!(storage.prefix(), "System");
+        let events = storage.entry_by_name("Events").unwrap();
+        let threads = storage.entry_by_name("Threads").unwrap();
+        let batches = storage.entry_by_name("EventsMap").unwrap();
+        assert_eq!(events.entry_type().key_ty(), None);
+        assert_eq!(threads.entry_type().key_ty(), Some(4));
+        assert_eq!(threads.entry_type().value_ty(), 2);
+        assert_eq!(batches.entry_type().key_ty(), Some(135));
+        assert_eq!(
+            batches.entry_type().value_ty(),
+            events.entry_type().value_ty()
+        );
+        assert_eq!(threads.default_bytes(), &[0]);
+        assert_eq!(batches.default_bytes(), &[0]);
+    }
+
+    #[tokio::test]
+    async fn finalized_event_storage_rejects_missing_and_malformed_values() {
+        for encoded in [None, Some("00"), Some("0x"), Some("0xgg"), Some("0x0")] {
+            let storage = encoded
+                .map(|value| BTreeMap::from([(41, value.to_string())]))
+                .unwrap_or_default();
+            let (endpoints, _, _) =
+                recovery_endpoints_with_events(42, None, BTreeMap::new(), vec![], storage).await;
+            let hash = hex::decode_array(block_hash(41).trim_start_matches("0x")).unwrap();
+            let result =
+                fetch_system_events(endpoints.url_for(DeepXRpcRole::Recovery), hash, 41).await;
+            match encoded {
+                None => assert!(matches!(
+                    result,
+                    Err(DeepXTransactionWatchError::Rpc {
+                        method: "state_getStorage",
+                        ..
+                    })
+                )),
+                Some(_) => assert!(matches!(
+                    result,
+                    Err(DeepXTransactionWatchError::InvalidEventStorage(41))
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_event_storage_preserves_exact_bytes_at_requested_block() {
+        let storage = BTreeMap::from([(41, "0x00aBff".to_string()), (42, "0x04".to_string())]);
+        let (endpoints, _, _) =
+            recovery_endpoints_with_events(42, None, BTreeMap::new(), vec![], storage).await;
+        let hash = hex::decode_array(block_hash(41).trim_start_matches("0x")).unwrap();
+        let bytes = fetch_system_events(endpoints.url_for(DeepXRpcRole::Recovery), hash, 41)
+            .await
+            .unwrap();
+        assert_eq!(bytes, vec![0, 171, 255]);
     }
 
     async fn spawn_recovery_rpc(
@@ -2484,6 +3281,66 @@ mod tests {
                 Err(DeepXTransactionWatchError::SpotEventVerification(_))
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_spot_place_recovery_scan() {
+        let snapshot = runtime_snapshot();
+        let identity = spot_place_identity(true);
+        let target = extrinsic(&[1, 2, 3, 4]);
+        let target_hash = BlakeTwo256.hash(&target).0;
+        let blocks = BTreeMap::from([(
+            41,
+            vec!["0x0400".to_string(), format!("0x{}", hex::encode(&target))],
+        )]);
+        let events = system_events(&[
+            dispatch_event_record(&snapshot, 1, true),
+            spot_place_event_record(&snapshot, 1, &identity),
+        ]);
+        let storage = BTreeMap::from([(41, format!("0x{}", hex::encode(events)))]);
+        let (endpoints, capabilities, _) =
+            recovery_endpoints_with_events(42, None, blocks, vec![], storage).await;
+
+        let collection = collect_finalized_spot_place_recovery_scan(
+            &endpoints,
+            &capabilities,
+            &snapshot,
+            &identity,
+            39,
+            decode_hash(&block_hash(39)).unwrap(),
+            2,
+            target_hash,
+        )
+        .await
+        .unwrap();
+        let DeepXFinalizedRecoveryCollection::Scan(scan) = collection else {
+            panic!("expected scan")
+        };
+        assert_eq!(
+            scan.classify(),
+            DeepXRecoveryDecision::FinalizedInclusion(inclusion(
+                decode_hash(&block_hash(41)).unwrap(),
+                41,
+                1,
+            ))
+        );
+
+        assert!(matches!(
+            collect_finalized_spot_place_recovery_scan(
+                &endpoints,
+                &capabilities,
+                &snapshot,
+                &cancel_identity([0x11; 20], 7, false),
+                39,
+                decode_hash(&block_hash(39)).unwrap(),
+                2,
+                target_hash,
+            )
+            .await,
+            Err(DeepXTransactionWatchError::SpotPlaceEventVerification(
+                DeepXSpotPlaceEventVerificationError::UnsupportedOperation
+            ))
+        ));
     }
 
     #[tokio::test]

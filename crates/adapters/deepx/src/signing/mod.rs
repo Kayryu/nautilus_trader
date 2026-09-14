@@ -17,6 +17,7 @@
 
 mod snapshot;
 
+use serde::{Deserialize, Serialize};
 pub use snapshot::{
     ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeInterfaceCatalog,
     DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface, DeepXRuntimeSnapshotPermit,
@@ -92,6 +93,185 @@ pub struct SignedPalletExtrinsic {
     pub(crate) nonce: u64,
     /// Approved runtime identity used to encode and sign the extrinsic.
     pub(crate) runtime: ApprovedRuntimeIdentity,
+}
+
+/// Runtime time-in-force variants accepted by a DeepX perpetual limit order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeepXTimeInForce {
+    /// Good until canceled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+}
+
+impl DeepXTimeInForce {
+    fn into_dynamic_value(self) -> Value {
+        let variant = match self {
+            Self::Gtc => "GTC",
+            Self::Ioc => "IOC",
+            Self::Fok => "FOK",
+        };
+        Value::unnamed_variant(variant, Vec::<Value>::new())
+    }
+}
+
+/// Runtime order-type variants accepted by a DeepX perpetual order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeepXPerpOrderType {
+    /// Limit order with an explicit time-in-force policy.
+    Limit(DeepXTimeInForce),
+    /// Market order with optional exact runtime slippage basis points.
+    Market(Option<u64>),
+    /// System stop order. This type only proves encoding and does not grant placement authority.
+    Stop,
+}
+
+impl DeepXPerpOrderType {
+    fn into_dynamic_value(self) -> Value {
+        match self {
+            Self::Limit(time_in_force) => {
+                Value::unnamed_variant("Limit", [time_in_force.into_dynamic_value()])
+            }
+            Self::Market(slippage) => Value::unnamed_variant(
+                "Market",
+                [match slippage {
+                    Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
+                    None => Value::unnamed_variant("None", Vec::<Value>::new()),
+                }],
+            ),
+            Self::Stop => Value::unnamed_variant("Stop", Vec::<Value>::new()),
+        }
+    }
+}
+
+/// Runtime post-only behavior accepted by a DeepX perpetual order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeepXPostOnlyParam {
+    /// No post-only restriction.
+    None,
+    /// Reject the order unless it posts to the book.
+    MustPostOnly,
+    /// Allow the runtime to adjust the price so the order posts.
+    Adaptive,
+}
+
+impl DeepXPostOnlyParam {
+    fn into_dynamic_value(self) -> Value {
+        let variant = match self {
+            Self::None => "None",
+            Self::MustPostOnly => "MustPostOnly",
+            Self::Adaptive => "Adaptive",
+        };
+        Value::unnamed_variant(variant, Vec::<Value>::new())
+    }
+}
+
+/// Exact raw runtime arguments for a DeepX perpetual order placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpPlaceParams {
+    /// DeepX subaccount identity.
+    pub subaccount: [u8; 20],
+    /// Runtime perpetual market identifier.
+    pub market_id: u16,
+    /// Whether the order opens or extends a long position.
+    pub is_long: bool,
+    /// Exact runtime size integer, without inferred financial scaling.
+    pub size: u128,
+    /// Exact runtime price integer, without inferred financial scaling.
+    pub price: u128,
+    /// Runtime order type and its exact associated data.
+    pub order_type: DeepXPerpOrderType,
+    /// Optional exact runtime take-profit integer.
+    pub take_profit: Option<u128>,
+    /// Optional exact runtime stop-loss integer.
+    pub stop_loss: Option<u128>,
+    /// Whether the order may only reduce an existing position.
+    pub reduce_only: bool,
+    /// Runtime post-only behavior.
+    pub post_only: DeepXPostOnlyParam,
+}
+
+impl DeepXPerpPlaceParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        let optional_u128 = |value| match value {
+            Some(value) => Value::unnamed_variant("Some", [Value::u128(value)]),
+            None => Value::unnamed_variant("None", Vec::<Value>::new()),
+        };
+        vec![Value::named_composite([(
+            "params",
+            Value::named_composite([
+                ("subaccount", Value::from_bytes(self.subaccount)),
+                ("market_id", Value::u128(u128::from(self.market_id))),
+                ("is_long", Value::bool(self.is_long)),
+                ("size", Value::u128(self.size)),
+                ("price", Value::u128(self.price)),
+                ("order_type", self.order_type.into_dynamic_value()),
+                ("take_profit", optional_u128(self.take_profit)),
+                ("stop_loss", optional_u128(self.stop_loss)),
+                ("reduce_only", Value::bool(self.reduce_only)),
+                ("post_only", self.post_only.into_dynamic_value()),
+            ]),
+        )])]
+    }
+}
+
+/// Runtime order types accepted by a DeepX Spot order.
+///
+/// Spot and perpetual placement use the same runtime `OrderType` definition in the captured
+/// metadata.
+pub type DeepXSpotOrderType = DeepXPerpOrderType;
+
+fn u256_from_le_bytes(value: [u8; 32]) -> Value {
+    let limbs = std::array::from_fn::<_, 4, _>(|index| {
+        let offset = index * 8;
+        Value::u128(u128::from(u64::from_le_bytes(
+            value[offset..offset + 8]
+                .try_into()
+                .expect("fixed U256 limb"),
+        )))
+    });
+    Value::unnamed_composite([Value::unnamed_composite(limbs)])
+}
+
+/// Exact raw runtime arguments for a DeepX Spot order placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXSpotPlaceParams {
+    /// DeepX subaccount identity.
+    pub subaccount: [u8; 20],
+    /// Deployment-provided bytes32 Spot pair identifier.
+    pub pair: [u8; 32],
+    /// Whether the order buys the base asset.
+    pub is_buy: bool,
+    /// Exact little-endian runtime `U256` quote amount.
+    pub quote_amount: [u8; 32],
+    /// Exact little-endian runtime `U256` base amount.
+    pub base_amount: [u8; 32],
+    /// Runtime order type and its exact associated data.
+    pub order_type: DeepXSpotOrderType,
+    /// Runtime post-only behavior.
+    pub post_only: DeepXPostOnlyParam,
+    /// Whether the order may only reduce an existing balance or liability.
+    pub reduce_only: bool,
+}
+
+impl DeepXSpotPlaceParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![Value::named_composite([
+            ("subaccount", Value::from_bytes(self.subaccount)),
+            ("pair", Value::from_bytes(self.pair)),
+            ("is_buy", Value::bool(self.is_buy)),
+            ("quote_amount", u256_from_le_bytes(self.quote_amount)),
+            ("base_amount", u256_from_le_bytes(self.base_amount)),
+            ("order_type", self.order_type.into_dynamic_value()),
+            ("post_only", self.post_only.into_dynamic_value()),
+            ("reduce_only", Value::bool(self.reduce_only)),
+        ])]
+    }
 }
 
 /// Exact raw runtime arguments for a DeepX perpetual position close.
@@ -271,6 +451,60 @@ pub fn sign_dynamic_pallet_call(
         pallet,
         call,
         arguments,
+        nonce,
+    )
+}
+
+/// Signs a perpetual order placement without submitting it.
+///
+/// All financial values are exact runtime integers. For the timestamp-nonce call in the captured
+/// runtime, the caller-provided nonce also becomes the runtime order ID. This offline function
+/// performs no nonce reservation, persistence, authorization, submission, or event verification
+/// and does not make perpetual trading operational.
+///
+/// # Errors
+///
+/// Returns an error when the key is invalid or the call cannot be encoded against the approved
+/// runtime snapshot.
+pub fn sign_perp_place_order(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXPerpPlaceParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "PerpMarket",
+        "place_order",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Signs a Spot order placement without submitting it.
+///
+/// Amounts are exact little-endian runtime `U256` values and the pair is the deployment's bytes32
+/// identity. For the timestamp-nonce call in the captured runtime, the caller-provided nonce also
+/// becomes the runtime order ID. This function performs no unit conversion, nonce reservation,
+/// persistence, authorization, submission, or event verification.
+///
+/// # Errors
+///
+/// Returns an error when the key is invalid or the call cannot be encoded against the approved
+/// runtime snapshot.
+pub fn sign_spot_place_order(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXSpotPlaceParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "SpotMarket",
+        "place_order",
+        params.into_dynamic_arguments(),
         nonce,
     )
 }
@@ -542,6 +776,397 @@ mod tests {
             &DeepXKeyScheme::Secp256k1,
         )
         .unwrap()
+    }
+
+    #[rstest]
+    #[case(
+        DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+        None,
+        Some(456),
+        false,
+        DeepXPostOnlyParam::None,
+        vec![0, 0],
+    )]
+    #[case(
+        DeepXPerpOrderType::Limit(DeepXTimeInForce::Ioc),
+        Some(123),
+        None,
+        true,
+        DeepXPostOnlyParam::MustPostOnly,
+        vec![0, 1],
+    )]
+    #[case(
+        DeepXPerpOrderType::Market(Some(u64::MAX)),
+        None,
+        None,
+        false,
+        DeepXPostOnlyParam::Adaptive,
+        [vec![1, 1], u64::MAX.to_le_bytes().to_vec()].concat(),
+    )]
+    #[case(
+        DeepXPerpOrderType::Stop,
+        Some(u128::MAX),
+        Some(0),
+        true,
+        DeepXPostOnlyParam::None,
+        vec![2],
+    )]
+    #[case(
+        DeepXPerpOrderType::Limit(DeepXTimeInForce::Fok),
+        None,
+        None,
+        false,
+        DeepXPostOnlyParam::None,
+        vec![0, 2],
+    )]
+    #[case(
+        DeepXPerpOrderType::Market(None),
+        None,
+        None,
+        false,
+        DeepXPostOnlyParam::None,
+        vec![1, 0],
+    )]
+    fn perp_place_exact_scale_and_signing(
+        #[case] order_type: DeepXPerpOrderType,
+        #[case] take_profit: Option<u128>,
+        #[case] stop_loss: Option<u128>,
+        #[case] reduce_only: bool,
+        #[case] post_only: DeepXPostOnlyParam,
+        #[case] order_type_prefix: Vec<u8>,
+    ) {
+        let snapshot = snapshot();
+        let metadata = snapshot.metadata();
+        let pallet = metadata.pallet_by_name("PerpMarket").unwrap();
+        let call = pallet.call_variant_by_name("place_order").unwrap();
+        assert_eq!(pallet.index(), 22);
+        assert_eq!(call.index, 2);
+        assert_eq!(call.fields.len(), 1);
+        assert_eq!(call.fields[0].name.as_deref(), Some("params"));
+        let params_type = metadata.types().resolve(call.fields[0].ty.id).unwrap();
+        let scale_info::TypeDef::Composite(composite) = &params_type.type_def else {
+            panic!("Perp place params must be a composite");
+        };
+        assert_eq!(
+            composite
+                .fields
+                .iter()
+                .map(|field| field.name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "subaccount",
+                "market_id",
+                "is_long",
+                "size",
+                "price",
+                "order_type",
+                "take_profit",
+                "stop_loss",
+                "reduce_only",
+                "post_only",
+            ]
+        );
+        let params = DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            is_long: true,
+            size: 123,
+            price: 456,
+            order_type,
+            take_profit,
+            stop_loss,
+            reduce_only,
+            post_only,
+        };
+        let mut expected = vec![22, 2];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&params.market_id.to_le_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&params.size.to_le_bytes());
+        expected.extend_from_slice(&params.price.to_le_bytes());
+        expected.extend_from_slice(&order_type_prefix);
+        for value in [take_profit, stop_loss] {
+            expected.push(u8::from(value.is_some()));
+            if let Some(value) = value {
+                expected.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        expected.push(u8::from(reduce_only));
+        expected.push(match post_only {
+            DeepXPostOnlyParam::None => 0,
+            DeepXPostOnlyParam::MustPostOnly => 1,
+            DeepXPostOnlyParam::Adaptive => 2,
+        });
+        let payload =
+            subxt_core::dynamic::tx("PerpMarket", "place_order", params.into_dynamic_arguments());
+        assert_eq!(
+            tx::payload::Payload::encode_call_data(&payload, metadata).unwrap(),
+            expected
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let nonce = 1_725_000_000_125;
+        let signed = sign_perp_place_order(&permit, &key(), params, nonce).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), nonce);
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(
+            signed,
+            sign_perp_place_order(&permit, &key(), params, nonce).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::subaccount(0)]
+    #[case::market_id(1)]
+    #[case::side(2)]
+    #[case::size(3)]
+    #[case::price(4)]
+    #[case::order_type(5)]
+    #[case::take_profit(6)]
+    #[case::stop_loss(7)]
+    #[case::reduce_only(8)]
+    #[case::post_only(9)]
+    #[case::nonce(10)]
+    fn perp_place_signed_identity_sensitivity(#[case] mutation: u8) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut params = DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            is_long: true,
+            size: 123,
+            price: 456,
+            order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+            take_profit: None,
+            stop_loss: None,
+            reduce_only: false,
+            post_only: DeepXPostOnlyParam::None,
+        };
+        let mut nonce = 1_725_000_000_125;
+        let original = sign_perp_place_order(&permit, &key(), params, nonce).unwrap();
+        match mutation {
+            0 => params.subaccount[19] ^= 1,
+            1 => params.market_id += 1,
+            2 => params.is_long = false,
+            3 => params.size += 1,
+            4 => params.price += 1,
+            5 => params.order_type = DeepXPerpOrderType::Market(None),
+            6 => params.take_profit = Some(0),
+            7 => params.stop_loss = Some(0),
+            8 => params.reduce_only = true,
+            9 => params.post_only = DeepXPostOnlyParam::MustPostOnly,
+            10 => nonce += 1,
+            _ => unreachable!(),
+        }
+        let changed = sign_perp_place_order(&permit, &key(), params, nonce).unwrap();
+        assert_ne!(original.bytes(), changed.bytes());
+        assert_ne!(original.extrinsic_hash(), changed.extrinsic_hash());
+        assert_eq!(original.runtime(), changed.runtime());
+        assert_eq!(original.signer(), changed.signer());
+    }
+
+    #[rstest]
+    fn perp_place_runtime_change_blocks_new_permit() {
+        let snapshot = snapshot();
+        let mut changed = snapshot.identity().clone();
+        changed.spec_version += 1;
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        service.observe_runtime_identity(changed).unwrap();
+        assert!(service.acquire().is_err());
+        assert!(
+            sign_perp_place_order(
+                &permit,
+                &key(),
+                DeepXPerpPlaceParams {
+                    subaccount: [0x11; 20],
+                    market_id: 7,
+                    is_long: true,
+                    size: 123,
+                    price: 456,
+                    order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                    take_profit: None,
+                    stop_loss: None,
+                    reduce_only: false,
+                    post_only: DeepXPostOnlyParam::None,
+                },
+                1_725_000_000_125,
+            )
+            .is_ok()
+        );
+    }
+
+    #[rstest]
+    fn perp_place_rejects_malformed_dynamic_binding() {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut arguments = DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            is_long: true,
+            size: 123,
+            price: 456,
+            order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+            take_profit: None,
+            stop_loss: None,
+            reduce_only: false,
+            post_only: DeepXPostOnlyParam::None,
+        }
+        .into_dynamic_arguments();
+        arguments[0] = Value::named_composite([(
+            "params",
+            Value::named_composite([("subaccount", Value::from_bytes([0x11; 19]))]),
+        )]);
+        assert!(matches!(
+            sign_dynamic_pallet_call(&permit, &key(), "PerpMarket", "place_order", arguments, 125,),
+            Err(SigningError::Encode(_))
+        ));
+    }
+
+    #[rstest]
+    #[case(
+        DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+        DeepXPostOnlyParam::None,
+        vec![0, 0],
+    )]
+    #[case(
+        DeepXSpotOrderType::Limit(DeepXTimeInForce::Ioc),
+        DeepXPostOnlyParam::MustPostOnly,
+        vec![0, 1],
+    )]
+    #[case(
+        DeepXSpotOrderType::Limit(DeepXTimeInForce::Fok),
+        DeepXPostOnlyParam::Adaptive,
+        vec![0, 2],
+    )]
+    #[case(
+        DeepXSpotOrderType::Market(Some(u64::MAX)),
+        DeepXPostOnlyParam::None,
+        [vec![1, 1], u64::MAX.to_le_bytes().to_vec()].concat(),
+    )]
+    #[case(DeepXSpotOrderType::Market(None), DeepXPostOnlyParam::None, vec![1, 0])]
+    #[case(DeepXSpotOrderType::Stop, DeepXPostOnlyParam::None, vec![2])]
+    fn spot_place_exact_scale_and_signing(
+        #[case] order_type: DeepXSpotOrderType,
+        #[case] post_only: DeepXPostOnlyParam,
+        #[case] order_type_bytes: Vec<u8>,
+    ) {
+        let snapshot = snapshot();
+        let metadata = snapshot.metadata();
+        let pallet = metadata.pallet_by_name("SpotMarket").unwrap();
+        let call = pallet.call_variant_by_name("place_order").unwrap();
+        assert_eq!(pallet.index(), 20);
+        assert_eq!(call.index, 1);
+        assert_eq!(call.fields.len(), 1);
+        assert_eq!(call.fields[0].name.as_deref(), Some("params"));
+        let params_type = metadata.types().resolve(call.fields[0].ty.id).unwrap();
+        let scale_info::TypeDef::Composite(composite) = &params_type.type_def else {
+            panic!("Spot place params must be a composite");
+        };
+        assert_eq!(
+            composite
+                .fields
+                .iter()
+                .map(|field| field.name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "subaccount",
+                "pair",
+                "is_buy",
+                "quote_amount",
+                "base_amount",
+                "order_type",
+                "post_only",
+                "reduce_only",
+            ]
+        );
+        let params = DeepXSpotPlaceParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            is_buy: true,
+            quote_amount: [0x33; 32],
+            base_amount: [0x44; 32],
+            order_type,
+            post_only,
+            reduce_only: true,
+        };
+        let mut expected = vec![20, 1];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&params.pair);
+        expected.push(1);
+        expected.extend_from_slice(&params.quote_amount);
+        expected.extend_from_slice(&params.base_amount);
+        expected.extend_from_slice(&order_type_bytes);
+        expected.push(match post_only {
+            DeepXPostOnlyParam::None => 0,
+            DeepXPostOnlyParam::MustPostOnly => 1,
+            DeepXPostOnlyParam::Adaptive => 2,
+        });
+        expected.push(1);
+        let payload =
+            subxt_core::dynamic::tx("SpotMarket", "place_order", params.into_dynamic_arguments());
+        assert_eq!(
+            tx::payload::Payload::encode_call_data(&payload, metadata).unwrap(),
+            expected
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let nonce = 1_725_000_000_126;
+        let signed = sign_spot_place_order(&permit, &key(), params, nonce).unwrap();
+        assert!(signed.bytes().ends_with(&expected));
+        assert!(signed.has_valid_hash());
+        assert_eq!(signed.nonce(), nonce);
+        assert_eq!(signed.runtime(), permit.snapshot().identity());
+        assert_eq!(
+            signed,
+            sign_spot_place_order(&permit, &key(), params, nonce).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case::subaccount(0)]
+    #[case::pair(1)]
+    #[case::side(2)]
+    #[case::quote_amount(3)]
+    #[case::base_amount(4)]
+    #[case::order_type(5)]
+    #[case::post_only(6)]
+    #[case::reduce_only(7)]
+    #[case::nonce(8)]
+    fn spot_place_signed_identity_sensitivity(#[case] mutation: u8) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let mut params = DeepXSpotPlaceParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            is_buy: true,
+            quote_amount: [0x33; 32],
+            base_amount: [0x44; 32],
+            order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+            post_only: DeepXPostOnlyParam::None,
+            reduce_only: false,
+        };
+        let mut nonce = 1_725_000_000_126;
+        let original = sign_spot_place_order(&permit, &key(), params, nonce).unwrap();
+        match mutation {
+            0 => params.subaccount[19] ^= 1,
+            1 => params.pair[31] ^= 1,
+            2 => params.is_buy = false,
+            3 => params.quote_amount[31] ^= 1,
+            4 => params.base_amount[31] ^= 1,
+            5 => params.order_type = DeepXSpotOrderType::Market(None),
+            6 => params.post_only = DeepXPostOnlyParam::MustPostOnly,
+            7 => params.reduce_only = true,
+            8 => nonce += 1,
+            _ => unreachable!(),
+        }
+        let changed = sign_spot_place_order(&permit, &key(), params, nonce).unwrap();
+        assert_ne!(original.bytes(), changed.bytes());
+        assert_ne!(original.extrinsic_hash(), changed.extrinsic_hash());
+        assert_eq!(original.runtime(), changed.runtime());
+        assert_eq!(original.signer(), changed.signer());
     }
 
     #[rstest]

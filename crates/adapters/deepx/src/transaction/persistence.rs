@@ -41,8 +41,9 @@ use crate::{
     config::DeepXValidatedRpcEndpoints,
     rpc::DeepXValidatedRpcMethodCapabilities,
     signing::{
-        DeepXPerpCancelParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
-        derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel,
+        DeepXPerpCancelParams, DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic,
+        SigningError, derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot,
+        sign_perp_cancel, sign_spot_place_order,
     },
 };
 
@@ -781,6 +782,95 @@ where
     })
 }
 
+/// Signs and commits an acknowledged Spot place reservation without submission.
+///
+/// All call arguments and the timestamp order ID come from the durable identity. Canonical
+/// reconstruction proves exact binding but does not enable submission or trading capability.
+///
+/// # Errors
+///
+/// Returns an error if ownership, acknowledgement, state, operation, side, runtime, signing,
+/// exact binding, or the durable compare-and-set cannot be proven.
+pub async fn prepare_signed_spot_place_transaction<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_created: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    permit: &crate::signing::DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+) -> Result<DeepXPreparedSignedTransaction, DeepXSignedTransactionPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_created.verify(record)?;
+    if record.lifecycle().state() != DeepXTransactionState::Created {
+        return Err(DeepXSignedTransactionPreparationError::InvalidState);
+    }
+    let identity = record.identity();
+    let Some(super::DeepXTransactionOperation::SpotPlace {
+        subaccount,
+        pair,
+        is_buy,
+        quote_amount,
+        base_amount,
+        order_type,
+        post_only,
+        reduce_only,
+    }) = identity.operation()
+    else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "durable identity is not a Spot place operation".to_string(),
+        )
+        .into());
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "sequential account nonce domain remains unproven".to_string(),
+        )
+        .into());
+    };
+    let verifier = DeepXSpotPlaceCallVerifier::new(permit.snapshot().clone(), key.clone())?;
+    if verifier.signer != identity.signer()
+        || DeepXDirectRuntimeIdentity::from(permit.snapshot().identity()) != *identity.runtime()
+    {
+        return Err(DeepXBusinessCallBindingError::Mismatch(
+            "Spot place signing key or runtime differs from reserved identity".to_string(),
+        )
+        .into());
+    }
+    let signed = sign_spot_place_order(
+        permit,
+        key,
+        DeepXSpotPlaceParams {
+            subaccount: *subaccount,
+            pair: *pair,
+            is_buy: *is_buy,
+            quote_amount: *quote_amount,
+            base_amount: *base_amount,
+            order_type: *order_type,
+            post_only: *post_only,
+            reduce_only: *reduce_only,
+        },
+        nonce,
+    )?;
+    let mut signed_record = record.clone();
+    signed_record.record_signed(&signed)?;
+    let durable = signed_record.signed_extrinsic().ok_or_else(|| {
+        DeepXBusinessCallBindingError::Mismatch("signed Spot place evidence is missing".to_string())
+    })?;
+    verifier.verify(identity, durable)?;
+    let committed = store
+        .compare_and_set_committed(lease, committed_created, &signed_record)
+        .await?;
+    committed.verify(&signed_record)?;
+    Ok(DeepXPreparedSignedTransaction {
+        record: signed_record,
+        committed,
+    })
+}
+
 /// Verifies that signed bytes encode the exact business identity reserved by the record.
 pub trait DeepXBusinessCallVerifier: Debug + Send + Sync {
     /// Verifies the call binding without mutating state or performing network I/O.
@@ -1144,6 +1234,127 @@ impl DeepXBusinessCallVerifier for DeepXPerpCancelCallVerifier {
 impl fmt::Debug for DeepXPerpCancelCallVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeepXPerpCancelCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Fixture-gated, opt-in verifier for an offline direct Spot place operation.
+#[derive(Clone)]
+pub struct DeepXSpotPlaceCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+    signer: [u8; 20],
+}
+
+impl DeepXSpotPlaceCallVerifier {
+    /// Binds Spot place verification to an approved snapshot and signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned signer rejects the key.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        let signer = derive_signer_account_id(&key)?;
+        Ok(Self {
+            snapshot,
+            key,
+            signer,
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXSpotPlaceCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        let actual_hash: [u8; 32] = subxt_core::config::Hasher::hash(
+            &subxt_core::config::substrate::BlakeTwo256,
+            signed_extrinsic.bytes(),
+        )
+        .into();
+        if signed_extrinsic.bytes().is_empty() || actual_hash != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable Spot place payload has invalid byte or hash integrity".to_string(),
+            ));
+        }
+        if self.signer != identity.signer()
+            || DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "Spot place verifier signer or runtime differs from reserved identity".to_string(),
+            ));
+        }
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        let Some(super::DeepXTransactionOperation::SpotPlace {
+            subaccount,
+            pair,
+            is_buy,
+            quote_amount,
+            base_amount,
+            order_type,
+            post_only,
+            reduce_only,
+        }) = identity.operation()
+        else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "durable identity is not a Spot place operation".to_string(),
+            ));
+        };
+        let expected_side = if *is_buy {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        if identity.order_side() != expected_side {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "Spot place side differs from reserved order side".to_string(),
+            ));
+        }
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(self.snapshot.clone());
+        let permit = service.acquire().map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!("runtime permit unavailable: {e}"))
+        })?;
+        let canonical = sign_spot_place_order(
+            &permit,
+            &self.key,
+            DeepXSpotPlaceParams {
+                subaccount: *subaccount,
+                pair: *pair,
+                is_buy: *is_buy,
+                quote_amount: *quote_amount,
+                base_amount: *base_amount,
+                order_type: *order_type,
+                post_only: *post_only,
+                reduce_only: *reduce_only,
+            },
+            nonce,
+        )
+        .map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!(
+                "canonical Spot place could not be encoded: {e}"
+            ))
+        })?;
+        if canonical.bytes() != signed_extrinsic.bytes()
+            || canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not the canonical Spot place for this identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXSpotPlaceCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXSpotPlaceCallVerifier")
             .field("snapshot", &self.snapshot.identity())
             .field("key", &"<redacted>")
             .finish()
@@ -4263,6 +4474,123 @@ mod tests {
         )
         .unwrap();
         (identity, signed)
+    }
+
+    fn spot_place_fixture(is_buy: bool) -> (DeepXTransactionIdentity, SignedPalletExtrinsic) {
+        let params = crate::signing::DeepXSpotPlaceParams {
+            subaccount: [0x11; 20],
+            pair: [0xa5; 32],
+            is_buy,
+            quote_amount: std::array::from_fn(|index| index as u8),
+            base_amount: std::array::from_fn(|index| (31 - index) as u8),
+            order_type: crate::signing::DeepXSpotOrderType::Limit(
+                crate::signing::DeepXTimeInForce::Gtc,
+            ),
+            post_only: crate::signing::DeepXPostOnlyParam::MustPostOnly,
+            reduce_only: false,
+        };
+        let nonce = 1_725_000_000_125;
+        let identity = DeepXTransactionIdentity::new_spot_place(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC.DEEPX").unwrap(),
+            if is_buy {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            },
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+            remark_runtime(),
+            params,
+        );
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::signing::sign_spot_place_order(
+            &service.acquire().unwrap(),
+            &remark_key(),
+            params,
+            nonce,
+        )
+        .unwrap();
+        (identity, signed)
+    }
+
+    #[tokio::test]
+    async fn spot_place_preparation_exact_checkpoint() {
+        let (identity, signed) = spot_place_fixture(true);
+        let record = DeepXTransactionRecord::created(identity);
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let permit = service.acquire().unwrap();
+        let mut expected = record.clone();
+        expected.record_signed(&signed).unwrap();
+        let prepared = prepare_signed_spot_place_transaction(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            &permit,
+            &remark_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.record(), &expected);
+        assert!(prepared.committed().matches(&expected));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[rstest]
+    #[case::buy(true)]
+    #[case::sell(false)]
+    fn spot_place_verifier_round_trip(#[case] is_buy: bool) {
+        let (identity, signed) = spot_place_fixture(is_buy);
+        let mut record = DeepXTransactionRecord::created(identity);
+        record.record_signed(&signed).unwrap();
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored, record);
+        let verifier = DeepXSpotPlaceCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        assert_eq!(
+            verifier.verify(restored.identity(), restored.signed_extrinsic().unwrap()),
+            Ok(())
+        );
+        assert!(!format!("{verifier:?}").contains("0123456789abcdef"));
+    }
+
+    #[rstest]
+    #[case::quote_amount(0)]
+    #[case::base_amount(1)]
+    #[case::order_side(2)]
+    #[case::nonce(3)]
+    fn spot_place_verifier_rejects_identity_mismatch(#[case] mutation: u8) {
+        let (identity, signed) = spot_place_fixture(true);
+        let mut wire = serde_json::to_value(&identity).unwrap();
+        match mutation {
+            0 => wire["operation"]["quote_amount"][0] = 0xff.into(),
+            1 => wire["operation"]["base_amount"][31] = 0xff.into(),
+            2 => wire["order_side"] = serde_json::to_value(OrderSide::Sell).unwrap(),
+            3 => {
+                wire["nonce"] =
+                    serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 1 })
+                        .unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let mismatched: DeepXTransactionIdentity = serde_json::from_value(wire).unwrap();
+        let mut record = DeepXTransactionRecord::created(identity);
+        record.record_signed(&signed).unwrap();
+        let verifier = DeepXSpotPlaceCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        assert!(matches!(
+            verifier.verify(&mismatched, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_))
+        ));
     }
 
     #[rstest]

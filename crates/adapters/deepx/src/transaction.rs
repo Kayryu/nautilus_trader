@@ -30,17 +30,18 @@ pub use persistence::{
     DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReorganizationCommitError,
     DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
     DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
-    DeepXSubmissionAcceptanceCommitError, DeepXSubmissionPermit, DeepXSubmissionPreparationError,
-    DeepXTransactionPersistenceError, DeepXTransactionRevision, DeepXTransactionStore,
-    DeepXUnsupportedBusinessCallVerifier, commit_initial_submission_acceptance,
-    commit_reconciliation_observation, commit_recovery_decision, commit_reorganization_decision,
-    load_verified_committed_for_signer, observe_and_commit_finality,
-    observe_and_commit_reorganization, prepare_initial_submission,
+    DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError, DeepXSubmissionPermit,
+    DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
+    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
+    commit_initial_submission_acceptance, commit_reconciliation_observation,
+    commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
+    observe_and_commit_finality, observe_and_commit_reorganization, prepare_initial_submission,
     prepare_signed_perp_cancel_transaction, prepare_signed_perp_close_transaction,
-    prepare_signed_spot_cancel_transaction, prepare_signed_transaction,
-    prepare_signed_transaction_with_verifier, prepare_timestamp_reservation,
-    reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
-    reconcile_submission_pool, restore_timestamp_nonce_allocator, verify_signer_lease,
+    prepare_signed_spot_cancel_transaction, prepare_signed_spot_place_transaction,
+    prepare_signed_transaction, prepare_signed_transaction_with_verifier,
+    prepare_timestamp_reservation, reconcile_not_included_checkpoint,
+    reconcile_not_included_checkpoint_with_observer, reconcile_submission_pool,
+    restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -65,10 +66,12 @@ pub(crate) use watch::collect_finalized_recovery_scan_with_event_evidence;
 pub use watch::{
     DeepXCanonicalBlockObservation, DeepXFinalityObservation, DeepXFinalizedRecoveryCheckpoint,
     DeepXFinalizedRecoveryCollection, DeepXPerpCancelEventVerificationError, DeepXPoolObservation,
-    DeepXSpotCancelEventVerificationError, DeepXTransactionWatchError,
-    collect_finalized_recovery_scan, collect_finalized_spot_cancel_recovery_scan,
+    DeepXSpotCancelEventVerificationError, DeepXSpotPlaceEventVerificationError,
+    DeepXTransactionWatchError, collect_finalized_recovery_scan,
+    collect_finalized_spot_cancel_recovery_scan, collect_finalized_spot_place_recovery_scan,
     observe_canonical_block, observe_finality, observe_reorganization, observe_submission_pool,
     verify_perp_cancel_business_event, verify_spot_cancel_inclusion_events,
+    verify_spot_place_inclusion_events,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.

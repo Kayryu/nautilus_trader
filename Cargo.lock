@@ -6204,6 +6204,7 @@ dependencies = [
  "scale-info",
  "serde",
  "serde_json",
+ "sp-crypto-hashing",
  "sqlx",
  "subxt-core",
  "subxt-signer",
