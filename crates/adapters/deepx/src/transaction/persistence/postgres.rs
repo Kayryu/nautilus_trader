@@ -17,7 +17,8 @@
 
 use std::fmt::{Debug, Formatter};
 
-use sqlx::{PgConnection, PgPool, Row};
+use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
+use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 use tokio::sync::Mutex;
 
@@ -43,6 +44,25 @@ impl DeepXPostgresTransactionStore {
     #[must_use]
     pub const fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Connects a store to the Nautilus PostgreSQL cache database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database connection cannot be established.
+    pub async fn connect(
+        options: PostgresConnectOptions,
+    ) -> Result<Self, DeepXTransactionPersistenceError> {
+        let pool = PgPoolOptions::new()
+            .connect_with(options.into())
+            .await
+            .map_err(|e| {
+                DeepXTransactionPersistenceError::BeforeCommit(format!(
+                    "failed to connect to PostgreSQL transaction store: {e}"
+                ))
+            })?;
+        Ok(Self::new(pool))
     }
 }
 

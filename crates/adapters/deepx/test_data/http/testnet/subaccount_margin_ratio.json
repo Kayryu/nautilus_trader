@@ -1,0 +1,10 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "collateral": 970.96,
+    "marginRequired": 0.0,
+    "marginRatio": null
+  },
+  "fail": false
+}

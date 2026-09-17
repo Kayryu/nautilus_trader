@@ -1,0 +1,53 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "items": [
+      {
+        "id": 185971383000008,
+        "marketId": 3,
+        "orderId": "1789445193480",
+        "isLong": true,
+        "taker": "Buyer",
+        "price": 2499.6,
+        "size": 0.3,
+        "leverage": 25,
+        "createdAt": "2026-09-15T04:06:33.757Z",
+        "filledDirection": "Long",
+        "fee": -0.149921,
+        "feeAsset": ""
+      },
+      {
+        "id": 185971191000008,
+        "marketId": 3,
+        "orderId": "1789445180000",
+        "isLong": false,
+        "taker": "Seller",
+        "price": 2499.41,
+        "size": 0.3,
+        "leverage": 25,
+        "createdAt": "2026-09-15T04:06:20.317Z",
+        "filledDirection": "Short",
+        "fee": -0.149919,
+        "feeAsset": ""
+      },
+      {
+        "id": 185969410000051,
+        "marketId": 3,
+        "orderId": "1789445053841",
+        "isLong": true,
+        "taker": "Buyer",
+        "price": 2498.76,
+        "size": 0.3,
+        "leverage": 25,
+        "createdAt": "2026-09-15T04:04:15.647Z",
+        "filledDirection": "Long",
+        "fee": -0.149837,
+        "feeAsset": ""
+      }
+    ],
+    "nextCursor": null,
+    "hasNext": false
+  },
+  "fail": false
+}

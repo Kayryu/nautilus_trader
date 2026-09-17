@@ -1,0 +1,37 @@
+{
+  "account_scope": {
+    "subaccount": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+    "wallet": "0x781ed35b167068c93dfadab41dfb680edaca4e50"
+  },
+  "captured_at": "2026-09-16T10:21:32Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The wallet and subaccount are public testnet addresses supplied by the contributor.",
+    "The fixture proves the captured market identity and nullable price representation only.",
+    "It does not prove account ownership, liquidation methodology, price units, freshness, or framework risk semantics."
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/perp/liquidate-price",
+    "query": {
+      "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+      "marketId": 3
+    }
+  },
+  "response": {
+    "content_type": "application/json",
+    "payload_path": "perp_liquidation_price_account_market_3.json",
+    "payload_sha256": "f0abecd2f170e355a0116e28bc819349bd17304d00735ca15f315108e46ac6b5",
+    "status": 200
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json",
+    "spec_version": 369,
+    "transaction_version": 1
+  }
+}

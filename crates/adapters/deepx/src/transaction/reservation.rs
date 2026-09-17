@@ -218,6 +218,33 @@ impl From<&ApprovedRuntimeIdentity> for DeepXDirectRuntimeIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DeepXTransactionOperation {
+    /// Direct `PerpMarket.place_order` with all raw runtime arguments.
+    PerpPlace {
+        /// Venue subaccount placing the order.
+        subaccount: [u8; 20],
+        /// Venue perpetual market identifier.
+        market_id: u16,
+        /// Whether the order is long.
+        is_long: bool,
+        /// Exact runtime size without inferred scaling.
+        #[serde(with = "perp_close_price")]
+        size: u128,
+        /// Exact runtime price without inferred scaling.
+        #[serde(with = "perp_close_price")]
+        price: u128,
+        /// Runtime order type and associated data.
+        order_type: crate::signing::DeepXPerpOrderType,
+        /// Optional raw take-profit point.
+        #[serde(with = "optional_perp_point")]
+        take_profit: Option<u128>,
+        /// Optional raw stop-loss point.
+        #[serde(with = "optional_perp_point")]
+        stop_loss: Option<u128>,
+        /// Whether the order may only reduce a position.
+        reduce_only: bool,
+        /// Runtime post-only behavior.
+        post_only: crate::signing::DeepXPostOnlyParam,
+    },
     /// Direct `SpotMarket.place_order` operation with raw runtime integers.
     SpotPlace {
         /// Venue subaccount placing the order.
@@ -249,6 +276,19 @@ pub enum DeepXTransactionOperation {
         /// Optional raw slippage without inferred units.
         slippage: Option<u64>,
     },
+    /// Direct `PerpMarket.set_profit_and_loss_point` with raw runtime integers.
+    PerpProfitAndLossPoint {
+        /// Venue subaccount whose points are configured.
+        subaccount: [u8; 20],
+        /// Venue perpetual market identifier.
+        market_id: u16,
+        /// Exact runtime take-profit point without inferred scaling.
+        #[serde(with = "perp_close_price")]
+        take_profit_point: u128,
+        /// Exact runtime stop-loss point without inferred scaling.
+        #[serde(with = "perp_close_price")]
+        stop_loss_point: u128,
+    },
     /// Direct `SpotMarket.cancel_order` operation with fixed `UserCanceled` reason.
     SpotCancel {
         /// Venue subaccount whose order is canceled.
@@ -273,6 +313,25 @@ pub enum DeepXTransactionOperation {
         /// Whether the runtime should use its fast-cancel path.
         fast_cancel: bool,
     },
+}
+
+mod optional_perp_point {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<u128>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(|point| point.to_string()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u128>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|point| point.parse().map_err(D::Error::custom))
+            .transpose()
+    }
 }
 
 mod perp_close_price {
@@ -356,6 +415,40 @@ impl DeepXTransactionIdentity {
         identity
     }
 
+    /// Creates immutable identity for an offline direct perpetual placement.
+    #[must_use]
+    pub fn new_perp_place(
+        client_order_id: ClientOrderId,
+        signer: [u8; 20],
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        nonce: DeepXNonceReservation,
+        runtime: DeepXDirectRuntimeIdentity,
+        params: crate::signing::DeepXPerpPlaceParams,
+    ) -> Self {
+        let mut identity = Self::new(
+            client_order_id,
+            signer,
+            instrument_id,
+            order_side,
+            nonce,
+            runtime,
+        );
+        identity.operation = Some(DeepXTransactionOperation::PerpPlace {
+            subaccount: params.subaccount,
+            market_id: params.market_id,
+            is_long: params.is_long,
+            size: params.size,
+            price: params.price,
+            order_type: params.order_type,
+            take_profit: params.take_profit,
+            stop_loss: params.stop_loss,
+            reduce_only: params.reduce_only,
+            post_only: params.post_only,
+        });
+        identity
+    }
+
     /// Creates immutable identity for an offline direct perpetual close operation.
     #[must_use]
     pub fn new_perp_close(
@@ -380,6 +473,34 @@ impl DeepXTransactionIdentity {
             market_id: params.market_id,
             price: params.price,
             slippage: params.slippage,
+        });
+        identity
+    }
+
+    /// Creates immutable identity for offline perpetual profit and loss point configuration.
+    #[must_use]
+    pub fn new_perp_profit_and_loss_point(
+        client_order_id: ClientOrderId,
+        signer: [u8; 20],
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        nonce: DeepXNonceReservation,
+        runtime: DeepXDirectRuntimeIdentity,
+        params: crate::signing::DeepXPerpProfitAndLossPointParams,
+    ) -> Self {
+        let mut identity = Self::new(
+            client_order_id,
+            signer,
+            instrument_id,
+            order_side,
+            nonce,
+            runtime,
+        );
+        identity.operation = Some(DeepXTransactionOperation::PerpProfitAndLossPoint {
+            subaccount: params.subaccount,
+            market_id: params.market_id,
+            take_profit_point: params.take_profit_point,
+            stop_loss_point: params.stop_loss_point,
         });
         identity
     }

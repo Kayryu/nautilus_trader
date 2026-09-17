@@ -1,0 +1,12 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "totalVolume": 293.50766491243,
+    "tradeCount": 1186,
+    "startTime": 1789616304067,
+    "endTime": 1789619904067,
+    "statisticTime": 1789619904067
+  },
+  "fail": false
+}

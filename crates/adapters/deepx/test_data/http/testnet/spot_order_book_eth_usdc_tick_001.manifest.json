@@ -1,0 +1,34 @@
+{
+  "captured_at": "2026-09-17T04:55:06Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_market_data",
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/market/spot/order-books",
+    "query": {
+      "pair": "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+      "tickSize": "0.01"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "spot_order_book_eth_usdc_tick_001.json",
+    "payload_sha256": "3cfb64220bd8404b40263fbb7e6c0f867ec8b78e81a43cee84364254f16059ca"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The REST snapshot is mutable and not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves bytes32 selection and positive 0.01 server-side price aggregation.",
+    "Server notionals are retained without assuming an exact unrounded price-times-quantity invariant.",
+    "Aggregation can overlap bid and ask price buckets, so the adapter does not invent an uncrossed-book invariant.",
+    "The snapshot is not converted into a framework Spot order book or treated as full exchange depth."
+  ]
+}

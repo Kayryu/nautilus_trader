@@ -20,6 +20,9 @@ use thiserror::Error;
 /// Errors emitted before DeepX WebSocket business schemas are enabled.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DeepXWsError {
+    /// No transport frame arrived within a bounded read.
+    #[error("DeepX WebSocket receive timed out")]
+    ReceiveTimeout,
     /// An inbound text frame was not valid JSON.
     #[error("invalid DeepX WebSocket JSON frame: {0}")]
     InvalidJsonFrame(String),

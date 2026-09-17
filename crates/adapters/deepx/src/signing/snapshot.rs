@@ -39,6 +39,8 @@ const TESTNET_GENESIS_HASH: &str =
 const TESTNET_METADATA_SHA256: &str =
     "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37";
 const TESTNET_SPEC_VERSION: u32 = 366;
+const TESTNET_SPEC_369_METADATA_SHA256: &str =
+    "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c";
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
 const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
@@ -682,12 +684,15 @@ impl RuntimeSnapshot {
         }
         let genesis_hash = decode_32(TESTNET_GENESIS_HASH)?;
         if observed_genesis_hash != genesis_hash
-            || observed_spec_version != TESTNET_SPEC_VERSION
             || observed_transaction_version != TESTNET_TRANSACTION_VERSION
         {
             return Err(SnapshotError::RuntimeIdentityMismatch);
         }
-        let approved_metadata_hash = decode_32(TESTNET_METADATA_SHA256)?;
+        let approved_metadata_hash = decode_32(match observed_spec_version {
+            TESTNET_SPEC_VERSION => TESTNET_METADATA_SHA256,
+            369 => TESTNET_SPEC_369_METADATA_SHA256,
+            _ => return Err(SnapshotError::RuntimeIdentityMismatch),
+        })?;
         let actual_metadata_hash: [u8; 32] = digest(&SHA256, metadata_bytes)
             .as_ref()
             .try_into()
@@ -715,7 +720,7 @@ impl RuntimeSnapshot {
             environment: environment.clone(),
             genesis_hash,
             metadata_sha256: actual_metadata_hash,
-            spec_version: TESTNET_SPEC_VERSION,
+            spec_version: observed_spec_version,
             transaction_version: TESTNET_TRANSACTION_VERSION,
             signed_extensions,
         };
@@ -723,7 +728,7 @@ impl RuntimeSnapshot {
             metadata,
             genesis_hash: H256::from(genesis_hash),
             runtime_version: RuntimeVersion {
-                spec_version: TESTNET_SPEC_VERSION,
+                spec_version: observed_spec_version,
                 transaction_version: TESTNET_TRANSACTION_VERSION,
             },
         };

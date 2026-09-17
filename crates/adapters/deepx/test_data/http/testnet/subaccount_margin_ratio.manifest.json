@@ -1,0 +1,36 @@
+{
+  "captured_at": "2026-09-16T09:30:23Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "account_scope": {
+    "wallet": "0x781ed35b167068c93dfadab41dfb680edaca4e50",
+    "subaccount": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/margin-ratio",
+    "query": {
+      "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "subaccount_margin_ratio.json",
+    "payload_sha256": "533b65163bbc3982838d8fceae73f627214872833f2b63fc8ea37c9c9f7b4d44"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "Collateral and margin requirement are mutable point-in-time observations.",
+    "The endpoint does not identify whether marginRequired uses initial or maintenance weights.",
+    "The fixture proves observed response shape and exact decimal representation only.",
+    "It does not authorize trading or construct a Nautilus margin balance."
+  ]
+}

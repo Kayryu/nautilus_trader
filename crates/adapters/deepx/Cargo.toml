@@ -24,6 +24,7 @@ crate-type = ["rlib"]
 extension-module = [
 	"nautilus-common/extension-module",
 	"nautilus-core/extension-module",
+	"nautilus-infrastructure/extension-module",
 	"nautilus-model/extension-module",
 	"nautilus-network/extension-module",
 	"pyo3/extension-module",
@@ -33,6 +34,7 @@ python = [
 	"dep:nautilus-system",
 	"nautilus-common/python",
 	"nautilus-core/python",
+	"nautilus-infrastructure/python",
 	"nautilus-model/python",
 	"nautilus-network/python",
 	"nautilus-system/python",
@@ -44,6 +46,8 @@ python = [
 nautilus-blockchain = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
+nautilus-cryptography = { workspace = true }
+nautilus-infrastructure = { workspace = true, features = ["postgres"] }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
@@ -55,6 +59,7 @@ async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }
 bon = { workspace = true }
 frame-metadata = { workspace = true }
+futures-util = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parity-scale-codec = { workspace = true }
@@ -80,8 +85,134 @@ nautilus-common = { workspace = true, features = ["live"] }
 
 axum = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "deepx-capture-runtime-fixtures"
 path = "bin/capture_runtime_fixtures.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-instruments"
+path = "bin/verify_rest_instruments.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-trade-history"
+path = "bin/verify_rest_trade_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-account-order"
+path = "bin/verify_rest_account_order.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-account-snapshot"
+path = "bin/verify_rest_account_snapshot.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-subaccount-directory"
+path = "bin/verify_rest_subaccount_directory.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-quota-history"
+path = "bin/verify_rest_quota_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-funding-fees"
+path = "bin/verify_rest_funding_fees.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-hourly-unsettled-funding"
+path = "bin/verify_rest_hourly_unsettled_funding.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-balance-changes"
+path = "bin/verify_rest_balance_changes.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-liquidation-records"
+path = "bin/verify_rest_liquidation_records.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-perp-order-book"
+path = "bin/verify_rest_perp_order_book.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-orders"
+path = "bin/verify_rest_spot_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-account-trades"
+path = "bin/verify_rest_spot_account_trades.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-order-lookup"
+path = "bin/verify_rest_spot_order_lookup.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-wallet"
+path = "bin/verify_rest_spot_wallet.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-trades"
+path = "bin/verify_rest_spot_trades.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-market"
+path = "bin/verify_rest_spot_market.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-wallet-trades"
+path = "bin/verify_rest_wallet_trades.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-wallet-orders"
+path = "bin/verify_rest_wallet_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-lending-markets"
+path = "bin/verify_rest_lending_markets.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-connection"
+path = "bin/verify_ws_connection.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-public-subscriptions"
+path = "bin/verify_ws_public_subscriptions.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-public-prices"
+path = "bin/verify_ws_public_prices.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-account-balances"
+path = "bin/verify_ws_account_balances.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-live-trades"
+path = "bin/verify_live_trades.rs"
 doc = false

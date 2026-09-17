@@ -1,0 +1,33 @@
+{
+  "captured_at": "2026-09-17T08:24:12Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/quota/history",
+    "query": {
+      "wallet": "0x0a40c3efbc3b3bebdf1fb6f0f8c612eb336b25ae",
+      "limit": 5
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "quota_history_purchase_page.json",
+    "payload_sha256": "af11065c13606a62c7c5aa754894f9cf4c16c01f1956cb247b5807b57cdef497"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The queried wallet was discovered from the public subaccount directory and is not the contributor wallet.",
+    "The contributor wallet returned a valid empty terminal quota-history page.",
+    "The fixture proves one purchase record, not activate or free record wire forms.",
+    "The mutable REST response is not pinned to a block hash and does not prove complete history or claim eligibility.",
+    "No quota mutation is submitted or authorized."
+  ]
+}

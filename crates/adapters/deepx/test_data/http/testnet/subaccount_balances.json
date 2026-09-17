@@ -1,0 +1,43 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+    "assets": [
+      {
+        "symbol": "USDC",
+        "decimals": 6,
+        "price": 1.0,
+        "balance": 999.783258,
+        "balanceUsd": 999.78,
+        "balanceBorrowed": 0.0,
+        "balanceBorrowedUsd": 0.0,
+        "borrowInterest": 0.0,
+        "borrowInterestUsd": 0.0
+      },
+      {
+        "symbol": "ETH",
+        "decimals": 18,
+        "price": 2490.275945,
+        "balance": 0.0,
+        "balanceUsd": 0.0,
+        "balanceBorrowed": 0.0,
+        "balanceBorrowedUsd": 0.0,
+        "borrowInterest": 0.0,
+        "borrowInterestUsd": 0.0
+      },
+      {
+        "symbol": "SOL",
+        "decimals": 9,
+        "price": 101.166322,
+        "balance": 0.0,
+        "balanceUsd": 0.0,
+        "balanceBorrowed": 0.0,
+        "balanceBorrowedUsd": 0.0,
+        "borrowInterest": 0.0,
+        "borrowInterestUsd": 0.0
+      }
+    ]
+  },
+  "fail": false
+}

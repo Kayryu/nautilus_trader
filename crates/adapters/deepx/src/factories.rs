@@ -191,7 +191,7 @@ mod tests {
     fn test_config() -> DeepXExecutionClientConfig {
         DeepXExecutionClientConfig::builder()
             .account_id(AccountId::from("DEEPX-001"))
-            .subaccount_id("test-subaccount".to_string())
+            .subaccount_id("0x1111111111111111111111111111111111111111".to_string())
             .private_key(
                 "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
             )
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_factory_creates_disconnected_fail_closed_client() {
+    async fn data_factory_creates_disconnected_rest_client() {
         let factory = DeepXDataClientFactory::new();
         let cache = Rc::new(RefCell::new(Cache::default()));
         let clock = Rc::new(RefCell::new(TestClock::new()));
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(client.venue(), Some(*DEEPX_VENUE));
         assert!(client.is_disconnected());
         let error = client.connect().await.unwrap_err();
-        assert!(error.to_string().contains("fixture-proven"));
+        assert!(error.to_string().contains("data event sender"));
         assert!(client.is_disconnected());
     }
 

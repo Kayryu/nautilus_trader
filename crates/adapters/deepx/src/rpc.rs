@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
+use parity_scale_codec::Decode;
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -47,6 +48,7 @@ pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
     "chain_getHeader",
     "state_getMetadata",
     "state_getRuntimeVersion",
+    "state_getStorage",
 ];
 
 /// RPC methods required from the transaction recovery endpoint.
@@ -215,6 +217,34 @@ impl DeepXAppliedRuntimeSnapshot {
     }
 }
 
+/// Finalized runtime and on-chain timestamp observed from one exact Watch checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedChainTimeEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    timestamp_ms: u64,
+}
+
+impl DeepXFinalizedChainTimeEvidence {
+    /// Returns the finalized checkpoint used for runtime and timestamp reads.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns `Timestamp.Now` decoded as Unix milliseconds.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+}
+
 /// Errors raised while collecting DeepX RPC endpoint identity.
 #[derive(Debug, Error)]
 pub enum DeepXRpcIdentityError {
@@ -320,6 +350,23 @@ pub enum DeepXRuntimeSnapshotRefreshError {
     /// Runtime change evidence or a validated snapshot conflicted with the snapshot service.
     #[error(transparent)]
     Application(#[from] DeepXRuntimeSnapshotServiceError),
+}
+
+/// Errors raised while observing finalized runtime-bound chain time.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedChainTimeError {
+    /// Watch capability evidence does not belong to the validated endpoint or lacks storage reads.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized chain-time storage reads")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// The timestamp storage request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized Timestamp.Now storage: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The timestamp storage value is not one exact non-zero SCALE `u64`.
+    #[error("DeepX finalized Timestamp.Now storage is invalid")]
+    InvalidStorage,
 }
 
 /// Collects the genesis hash directly from the configured endpoint for `role`.
@@ -543,6 +590,84 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
         update,
         snapshot: observation.into_snapshot(),
     })
+}
+
+/// Observes fixture-approved runtime identity and `Timestamp.Now` at one finalized Watch block.
+///
+/// Runtime version and metadata are validated and applied before timestamp storage is read from the
+/// exact same checkpoint. Runtime change evidence therefore blocks new signing permits even when
+/// the timestamp read later fails. This function performs no nonce allocation, signing, or
+/// submission.
+///
+/// # Errors
+///
+/// Returns an error unless capability evidence authorizes Watch storage reads, the finalized
+/// runtime is fixture-approved and can be applied, and `Timestamp.Now` is one exact non-zero SCALE
+/// `u64` value at that checkpoint.
+pub async fn observe_and_apply_finalized_chain_time(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+) -> Result<DeepXFinalizedChainTimeEvidence, DeepXFinalizedChainTimeError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_getStorage")
+    {
+        return Err(DeepXFinalizedChainTimeError::RpcCapabilitiesMismatch);
+    }
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let checkpoint = applied.checkpoint();
+    let client = BlockchainHttpRpcClient::new(
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+        None,
+        None,
+    );
+    let encoded: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getStorage",
+            "params": [
+                timestamp_now_storage_key(),
+                format!("0x{}", hex::encode(checkpoint.block_hash())),
+            ],
+        }))
+        .await
+        .map_err(DeepXFinalizedChainTimeError::Rpc)?;
+    let timestamp_ms = decode_timestamp_now(&encoded)?;
+
+    Ok(DeepXFinalizedChainTimeEvidence {
+        checkpoint,
+        runtime_identity: applied.identity().clone(),
+        timestamp_ms,
+    })
+}
+
+fn timestamp_now_storage_key() -> String {
+    let mut encoded = Vec::with_capacity(32);
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Timestamp"));
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Now"));
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn decode_timestamp_now(encoded: &str) -> Result<u64, DeepXFinalizedChainTimeError> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .ok_or(DeepXFinalizedChainTimeError::InvalidStorage)
+        .and_then(|value| {
+            hex::decode(value).map_err(|_| DeepXFinalizedChainTimeError::InvalidStorage)
+        })?;
+    let mut input = bytes.as_slice();
+    let timestamp_ms =
+        u64::decode(&mut input).map_err(|_| DeepXFinalizedChainTimeError::InvalidStorage)?;
+    if timestamp_ms == 0 || !input.is_empty() {
+        return Err(DeepXFinalizedChainTimeError::InvalidStorage);
+    }
+    Ok(timestamp_ms)
 }
 
 async fn observe_approved_finalized_runtime_snapshot_at<E>(
@@ -1013,6 +1138,116 @@ mod tests {
         assert!(service.acquire().is_ok());
     }
 
+    #[tokio::test]
+    async fn observes_runtime_bound_finalized_chain_time() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let timestamp_ms = 1_700_000_000_123u64;
+        let watch_url = spawn_runtime_snapshot_server_with(
+            366,
+            1,
+            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            Some(json!(format!(
+                "0x{}",
+                hex::encode(timestamp_ms.to_le_bytes())
+            ))),
+            None,
+            |_| {},
+            Arc::clone(&calls),
+        )
+        .await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+
+        let evidence = observe_and_apply_finalized_chain_time(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &service,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(evidence.timestamp_ms(), timestamp_ms);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity(),
+            approved_runtime_snapshot().identity()
+        );
+        assert_eq!(
+            service.acquire().unwrap().snapshot().identity(),
+            evidence.runtime_identity()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_finalized_chain_time_as_rpc_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let watch_url = spawn_runtime_snapshot_server_with(
+            366,
+            1,
+            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            None,
+            None,
+            |_| {},
+            Arc::clone(&calls),
+        )
+        .await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+
+        assert!(matches!(
+            observe_and_apply_finalized_chain_time(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &validated_capabilities(&endpoints),
+                &service,
+            )
+            .await,
+            Err(DeepXFinalizedChainTimeError::Rpc(_)),
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert!(service.acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_chain_time_without_watch_storage_capability_before_rpc() {
+        let endpoints = validated_endpoints("http://127.0.0.1:1");
+        let mut capabilities = validated_capabilities(&endpoints);
+        capabilities.watch.methods.remove("state_getStorage");
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+
+        assert!(matches!(
+            observe_and_apply_finalized_chain_time(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &capabilities,
+                &service,
+            )
+            .await,
+            Err(DeepXFinalizedChainTimeError::RpcCapabilitiesMismatch),
+        ));
+        assert!(service.acquire().is_ok());
+    }
+
+    #[rstest::rstest]
+    #[case("")]
+    #[case("42")]
+    #[case("0x")]
+    #[case("0x0000000000000000")]
+    #[case("0x01000000000000")]
+    #[case("0x010000000000000000")]
+    #[case("0xgg00000000000000")]
+    fn rejects_invalid_timestamp_now_storage(#[case] encoded: &str) {
+        assert!(matches!(
+            decode_timestamp_now(encoded),
+            Err(DeepXFinalizedChainTimeError::InvalidStorage)
+        ));
+    }
+
     #[rstest::rstest]
     #[case(367, 1, None)]
     #[case(366, 2, None)]
@@ -1032,6 +1267,7 @@ mod tests {
             spec_version,
             transaction_version,
             serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            None,
             fail_method,
             move |method| {
                 if method == "state_getMetadata" {
@@ -1107,6 +1343,7 @@ mod tests {
                 1,
                 metadata.clone(),
                 None,
+                None,
                 |_| {},
                 Arc::new(AtomicUsize::new(0)),
             )
@@ -1147,6 +1384,7 @@ mod tests {
             366,
             1,
             serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            None,
             Some(method),
             |_| {},
             Arc::new(AtomicUsize::new(0)),
@@ -1327,6 +1565,21 @@ mod tests {
         validate_rpc_endpoint_identities(&config, observations).unwrap()
     }
 
+    fn validated_capabilities(
+        endpoints: &DeepXValidatedRpcEndpoints,
+    ) -> DeepXValidatedRpcMethodCapabilities {
+        let capabilities = |role, methods: &[&str]| DeepXRpcMethodCapabilities {
+            role,
+            endpoint_url: endpoints.url_for(role).to_string(),
+            methods: methods.iter().map(|method| (*method).to_string()).collect(),
+        };
+        DeepXValidatedRpcMethodCapabilities {
+            submission: capabilities(DeepXRpcRole::Submission, DEEPX_SUBMISSION_RPC_METHODS),
+            watch: capabilities(DeepXRpcRole::Watch, DEEPX_WATCH_RPC_METHODS),
+            recovery: capabilities(DeepXRpcRole::Recovery, DEEPX_RECOVERY_RPC_METHODS),
+        }
+    }
+
     fn approved_runtime_snapshot() -> RuntimeSnapshot {
         let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
         let encoded_metadata = metadata["result"].as_str().unwrap();
@@ -1346,6 +1599,7 @@ mod tests {
             1,
             serde_json::from_str(METADATA_FIXTURE).unwrap(),
             None,
+            None,
             |_| {},
             calls,
         )
@@ -1356,6 +1610,7 @@ mod tests {
         spec_version: u32,
         transaction_version: u32,
         metadata: Value,
+        timestamp_now: Option<Value>,
         fail_method: Option<&'static str>,
         on_request: impl Fn(&str) + Clone + Send + Sync + 'static,
         calls: Arc<AtomicUsize>,
@@ -1417,6 +1672,18 @@ mod tests {
                             assert_eq!(method, "state_getMetadata");
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             metadata
+                        }
+                        5 => {
+                            assert_eq!(method, "state_getStorage");
+                            assert_eq!(
+                                request["params"],
+                                json!([timestamp_now_storage_key(), FINALIZED_HASH])
+                            );
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": timestamp_now
+                            })
                         }
                         _ => panic!("unexpected DeepX runtime snapshot request"),
                     };

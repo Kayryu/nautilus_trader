@@ -1,0 +1,1 @@
+{"code":200,"msg":"success","data":[{"market_id":1,"asset":"usdc","Rmin":"0","U1":"0.8","U2":"0.95","U3":"0.99","U4":"none","U5":"none","R1":"0.06","R2":"0.35","R3":"0.7","R4":"none","R5":"none","Rmax":"1.5","rho":"0.1"}],"fail":false}

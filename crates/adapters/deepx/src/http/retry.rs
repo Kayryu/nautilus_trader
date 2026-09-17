@@ -52,6 +52,9 @@ pub fn should_retry_http_error(error: &DeepXHttpError) -> bool {
         }
         | DeepXHttpError::Decode(_)
         | DeepXHttpError::InvalidRequest(_)
+        | DeepXHttpError::InvalidHistoryResponse { .. }
+        | DeepXHttpError::InvalidAccountResponse { .. }
+        | DeepXHttpError::InvalidTransactionStatus { .. }
         | DeepXHttpError::ResponseMarketMismatch { .. }
         | DeepXHttpError::InvalidPath(_)
         | DeepXHttpError::InvalidBaseUrl(_)

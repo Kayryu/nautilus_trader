@@ -44,6 +44,24 @@ pub enum DeepXHttpError {
     /// Typed endpoint parameters violate a local request invariant.
     #[error("invalid DeepX HTTP request: {0}")]
     InvalidRequest(String),
+    /// A decoded history page violates the requested ordering or financial invariants.
+    #[error("invalid DeepX HTTP {endpoint} response: {message}")]
+    InvalidHistoryResponse {
+        endpoint: &'static str,
+        message: String,
+    },
+    /// A decoded account-state response violates identity or financial invariants.
+    #[error("invalid DeepX HTTP {endpoint} response: {message}")]
+    InvalidAccountResponse {
+        endpoint: &'static str,
+        message: String,
+    },
+    /// A backend transaction observation violates hash identity or its documented schema.
+    #[error("invalid DeepX REST transaction status: {message}")]
+    InvalidTransactionStatus {
+        /// Protocol validation failure, not evidence of non-delivery or non-inclusion.
+        message: String,
+    },
     /// A successful response identified a different deployment market.
     #[error(
         "DeepX HTTP {endpoint} response market ID mismatch: expected {expected}, received {received}"

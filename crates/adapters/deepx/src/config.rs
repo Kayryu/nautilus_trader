@@ -18,6 +18,7 @@
 use std::fmt::{Debug, Formatter};
 
 use nautilus_core::hex;
+use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::retry::RetryConfig;
 use serde::{Deserialize, Serialize};
@@ -120,7 +121,7 @@ pub enum DeepXExecutionBackend {
     LegacyEvm,
 }
 
-/// Configuration for a fail-closed DeepX data client.
+/// Configuration for a read-only REST DeepX data client.
 #[derive(Clone, Debug, Deserialize, Serialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
@@ -135,7 +136,7 @@ pub struct DeepXDataClientConfig {
     /// Testnet network, REST failover, and read-retry configuration.
     #[builder(default)]
     pub network: DeepXNetworkConfig,
-    /// Optional proxy URL for future HTTP and WebSocket transports.
+    /// Optional proxy URL for HTTP reads and future WebSocket transport.
     pub proxy_url: Option<String>,
     /// HTTP operation timeout in seconds.
     #[builder(default = 30)]
@@ -188,6 +189,11 @@ pub struct DeepXExecutionClientConfig {
     pub subaccount_id: Option<String>,
     /// secp256k1 private key, loaded from `DEEPX_TESTNET_PRIVATE_KEY` when unset.
     pub private_key: Option<String>,
+    /// Optional proxy URL for read-only HTTP reconciliation requests.
+    pub proxy_url: Option<String>,
+    /// HTTP operation timeout in seconds.
+    #[builder(default = 30)]
+    pub http_timeout_secs: u64,
     /// Transaction encoding and submission backend.
     #[builder(default)]
     pub execution_backend: DeepXExecutionBackend,
@@ -197,6 +203,8 @@ pub struct DeepXExecutionClientConfig {
     /// Maximum accepted difference between local and chain time for timestamp nonce allocation.
     #[builder(default = DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS)]
     pub timestamp_nonce_max_clock_drift_ms: u64,
+    /// Durable PostgreSQL store for transaction records and exclusive signer ownership.
+    pub postgres_cache_database_config: Option<PostgresConnectOptions>,
     /// Testnet network and RPC-role configuration.
     #[builder(default)]
     pub network: DeepXNetworkConfig,
@@ -208,9 +216,12 @@ impl Default for DeepXExecutionClientConfig {
             account_id: AccountId::from("DEEPX-001"),
             subaccount_id: None,
             private_key: None,
+            proxy_url: None,
+            http_timeout_secs: 30,
             execution_backend: DeepXExecutionBackend::default(),
             recovery_blocks_per_range: DEFAULT_RECOVERY_BLOCKS_PER_RANGE,
             timestamp_nonce_max_clock_drift_ms: DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
+            postgres_cache_database_config: None,
             network: DeepXNetworkConfig::default(),
         }
     }
@@ -222,11 +233,17 @@ impl Debug for DeepXExecutionClientConfig {
             .field("account_id", &self.account_id)
             .field("subaccount_id", &self.subaccount_id)
             .field("private_key", &self.private_key.as_ref().map(|_| REDACTED))
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
+            .field("http_timeout_secs", &self.http_timeout_secs)
             .field("execution_backend", &self.execution_backend)
             .field("recovery_blocks_per_range", &self.recovery_blocks_per_range)
             .field(
                 "timestamp_nonce_max_clock_drift_ms",
                 &self.timestamp_nonce_max_clock_drift_ms,
+            )
+            .field(
+                "postgres_cache_database_config",
+                &self.postgres_cache_database_config,
             )
             .field("network", &self.network)
             .finish()
@@ -243,6 +260,11 @@ impl DeepXExecutionClientConfig {
                 *DEEPX_VENUE,
             )));
         }
+        if self.http_timeout_secs == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "HTTP timeout must be non-zero".to_string(),
+            ));
+        }
         if self.recovery_blocks_per_range == 0 {
             return Err(crate::common::DeepXError::InvalidConfiguration(
                 "DeepX recovery blocks per range must be greater than zero".to_string(),
@@ -254,8 +276,17 @@ impl DeepXExecutionClientConfig {
             ));
         }
         match self.subaccount_id.as_deref() {
-            Some(value) if !value.trim().is_empty() => Ok(()),
-            _ => Err(crate::common::DeepXError::InvalidConfiguration(
+            Some(value)
+                if value
+                    .strip_prefix("0x")
+                    .is_some_and(|value| hex::decode_array::<20>(value).is_ok()) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(crate::common::DeepXError::InvalidConfiguration(
+                "DeepX subaccount identity must be a 0x-prefixed AccountId20".to_string(),
+            )),
+            None => Err(crate::common::DeepXError::InvalidConfiguration(
                 "DeepX subaccount identity must be explicitly configured".to_string(),
             )),
         }
@@ -489,6 +520,29 @@ impl DeepXNetworkConfig {
         }
     }
 
+    /// Returns the upgrade endpoint, adding the documented path to a WebSocket base URL.
+    ///
+    /// Explicit non-root paths and query parameters are preserved without double-appending.
+    pub fn ws_connection_url(&self) -> Result<String> {
+        let mut url = reqwest::Url::parse(&self.ws_url()?).map_err(|_| {
+            crate::common::DeepXError::InvalidConfiguration("invalid WebSocket URL".to_string())
+        })?;
+        if !matches!(url.scheme(), "ws" | "wss")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "WebSocket URL requires ws/wss, a host, and no userinfo or fragment".to_string(),
+            ));
+        }
+        if url.path().is_empty() || url.path() == "/" {
+            url.set_path("/internal/v1/ws");
+        }
+        Ok(url.to_string())
+    }
+
     /// Returns the configured Substrate JSON-RPC URL.
     pub fn rpc_url(&self) -> Result<String> {
         self.validate()?;
@@ -618,6 +672,10 @@ mod tests {
 
         assert_eq!(config.rest_url().unwrap(), DEEPX_TESTNET_REST_URL);
         assert_eq!(config.ws_url().unwrap(), DEEPX_TESTNET_WS_URL);
+        assert_eq!(
+            config.ws_connection_url().unwrap(),
+            "wss://ws-api-testnet.deepx.fi/internal/v1/ws"
+        );
         assert_eq!(config.rpc_url().unwrap(), DEEPX_TESTNET_RPC_URL);
         assert_eq!(
             config.rpc_url_for(DeepXRpcRole::Submission).unwrap(),
@@ -634,6 +692,29 @@ mod tests {
     }
 
     #[rstest]
+    #[case("wss://example.invalid", Some("wss://example.invalid/internal/v1/ws"))]
+    #[case("ws://127.0.0.1:1234/", Some("ws://127.0.0.1:1234/internal/v1/ws"))]
+    #[case(
+        "wss://example.invalid/internal/v1/ws?session=opaque",
+        Some("wss://example.invalid/internal/v1/ws?session=opaque")
+    )]
+    #[case("wss://example.invalid/custom", Some("wss://example.invalid/custom"))]
+    #[case("https://example.invalid", None)]
+    #[case("wss://user:secret@example.invalid", None)]
+    #[case("wss://example.invalid/#fragment", None)]
+    #[case("not-a-url", None)]
+    fn ws_connection_endpoint_resolution(#[case] base: &str, #[case] expected: Option<&str>) {
+        let config = DeepXNetworkConfig {
+            base_url_ws: Some(base.to_string()),
+            ..Default::default()
+        };
+        match expected {
+            Some(expected) => assert_eq!(config.ws_connection_url().unwrap(), expected),
+            None => assert!(config.ws_connection_url().is_err()),
+        }
+    }
+
+    #[rstest]
     fn execution_config_requires_explicit_deepx_subaccount() {
         let config = DeepXExecutionClientConfig::default();
 
@@ -645,10 +726,23 @@ mod tests {
     }
 
     #[rstest]
+    fn execution_config_rejects_malformed_deepx_subaccount() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("subaccount-1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message)) if message.contains("AccountId20"),
+        ));
+    }
+
+    #[rstest]
     fn execution_config_rejects_non_deepx_account() {
         let config = DeepXExecutionClientConfig {
             account_id: AccountId::from("OTHER-001"),
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
             ..Default::default()
         };
 
@@ -661,7 +755,7 @@ mod tests {
     #[rstest]
     fn execution_config_rejects_mainnet_before_credentials() {
         let config = DeepXExecutionClientConfig {
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
             private_key: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             ),
@@ -679,12 +773,22 @@ mod tests {
     }
 
     #[rstest]
-    fn execution_config_debug_redacts_private_key() {
+    fn execution_config_debug_redacts_credentials_and_proxy() {
         const PRIVATE_KEY: &str =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const PROXY_URL: &str = "https://user:secret@proxy.example.invalid";
+        const POSTGRES_PASSWORD: &str = "postgres-secret";
         let config = DeepXExecutionClientConfig {
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
             private_key: Some(PRIVATE_KEY.to_string()),
+            proxy_url: Some(PROXY_URL.to_string()),
+            postgres_cache_database_config: Some(PostgresConnectOptions::new(
+                "localhost".to_string(),
+                5432,
+                "nautilus".to_string(),
+                POSTGRES_PASSWORD.to_string(),
+                "nautilus".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -693,12 +797,14 @@ mod tests {
         assert!(debug.contains("DirectPallet"));
         assert!(debug.contains(REDACTED));
         assert!(!debug.contains(PRIVATE_KEY));
+        assert!(!debug.contains(PROXY_URL));
+        assert!(!debug.contains(POSTGRES_PASSWORD));
     }
 
     #[rstest]
     fn execution_backend_is_explicitly_serialized() {
         let config: DeepXExecutionClientConfig = serde_json::from_str(
-            r#"{"subaccount_id":"subaccount-1","execution_backend":"legacy_evm","recovery_blocks_per_range":25}"#,
+            r#"{"subaccount_id":"0x1111111111111111111111111111111111111111","execution_backend":"legacy_evm","recovery_blocks_per_range":25}"#,
         )
         .unwrap();
 
@@ -711,6 +817,8 @@ mod tests {
     fn execution_config_defaults_to_bounded_recovery_ranges() {
         let config = DeepXExecutionClientConfig::default();
 
+        assert!(config.proxy_url.is_none());
+        assert_eq!(config.http_timeout_secs, 30);
         assert_eq!(
             config.recovery_blocks_per_range,
             DEFAULT_RECOVERY_BLOCKS_PER_RANGE
@@ -719,12 +827,27 @@ mod tests {
             config.timestamp_nonce_max_clock_drift_ms,
             DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
         );
+        assert!(config.postgres_cache_database_config.is_none());
+    }
+
+    #[rstest]
+    fn execution_config_rejects_zero_http_timeout() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
+            http_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message)) if message.contains("HTTP timeout"),
+        ));
     }
 
     #[rstest]
     fn execution_config_rejects_empty_recovery_ranges() {
         let config = DeepXExecutionClientConfig {
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
             recovery_blocks_per_range: 0,
             ..Default::default()
         };
@@ -739,7 +862,7 @@ mod tests {
     #[rstest]
     fn execution_config_rejects_zero_timestamp_nonce_clock_drift() {
         let config = DeepXExecutionClientConfig {
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
             timestamp_nonce_max_clock_drift_ms: 0,
             ..Default::default()
         };

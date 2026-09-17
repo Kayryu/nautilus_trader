@@ -1,0 +1,44 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "items": [
+      {
+        "id": 1870712120001300,
+        "asset": "USDC",
+        "balanceChange": "-0.00017",
+        "changeType": "FUNDING_FEE",
+        "time": 1789522187243,
+        "height": 187071212,
+        "eventIdx": 13,
+        "txHash": null,
+        "txHashType": null,
+        "from": null,
+        "to": null,
+        "crossChain": null,
+        "position": {
+          "id": 1659167,
+          "owner": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+          "marketId": 3
+        }
+      },
+      {
+        "id": 1867287170002000,
+        "asset": "USDC",
+        "balanceChange": "-10.235558",
+        "changeType": "SETTLEMENT",
+        "time": 1789498211115,
+        "height": 186728717,
+        "eventIdx": 20,
+        "txHash": "0x73c2f142ee6e43c3fa6d69c1275f2ec28b2f00d88a70adad61dd7b894b2f9b85",
+        "txHashType": "EXTRINSIC_HASH",
+        "from": null,
+        "to": null,
+        "crossChain": null
+      }
+    ],
+    "nextCursor": "MTc4OTQ5ODIxMTExNToxODY3Mjg3MTcwMDAyMDAw",
+    "hasNext": true
+  },
+  "fail": false
+}

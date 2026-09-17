@@ -1,0 +1,36 @@
+{
+  "account_scope": {
+    "wallet": "0x781ed35b167068c93dfadab41dfb680edaca4e50"
+  },
+  "captured_at": "2026-09-16T10:00:42Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The wallet is a public testnet address supplied by the contributor.",
+    "The fixture proves only the captured first-page fields, cursor metadata, and exact numeric representations.",
+    "It does not prove wallet ownership, complete history, cursor stability, payment currency, settlement cadence, or framework event semantics."
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/funding-fee-by-wallet",
+    "query": {
+      "address": "0x781ed35b167068c93dfadab41dfb680edaca4e50",
+      "pageSize": 2
+    }
+  },
+  "response": {
+    "content_type": "application/json",
+    "payload_path": "wallet_funding_fees_page_2.json",
+    "payload_sha256": "d694508158bf629e53f729fa1b05d61bff1c3ecf8a72aebe78d18c3e401f226c",
+    "status": 200
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json",
+    "spec_version": 369,
+    "transaction_version": 1
+  }
+}

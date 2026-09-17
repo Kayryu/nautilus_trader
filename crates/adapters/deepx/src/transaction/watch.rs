@@ -48,6 +48,417 @@ const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
     "80d41e5e16056765bc8461851072c9d7",
 );
 
+/// Failures while binding perpetual placement events to an approved durable operation.
+#[derive(Debug, Error)]
+pub enum DeepXPerpPlaceEventVerificationError {
+    /// The approved runtime does not expose the required event interface.
+    #[error(transparent)]
+    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
+    /// The operation, nonce domain, or exact runtime scope cannot be verified.
+    #[error("unsupported DeepX perpetual placement event identity")]
+    UnsupportedOperation,
+    /// SCALE event decoding failed against the approved metadata.
+    #[error("unable to decode DeepX perpetual placement events: {0}")]
+    Decode(#[source] Box<subxt_core::Error>),
+    /// System.Events was truncated, count-mismatched, or contained trailing bytes.
+    #[error("DeepX perpetual placement evidence is not complete System.Events")]
+    MalformedEventBytes,
+    /// The placement event disagrees with durable order terms.
+    #[error("DeepX perpetual placement event conflicts with durable order terms")]
+    ConflictingEvent,
+    /// The target extrinsic emitted duplicate placement or dispatch events.
+    #[error("duplicate DeepX perpetual placement evidence")]
+    DuplicateEvent,
+    /// Indexed dispatch and business evidence could not establish inclusion.
+    #[error(transparent)]
+    InclusionEvidence(#[from] DeepXInclusionEvidenceError),
+}
+
+/// Verifies complete perpetual placement dispatch and business events at one extrinsic index.
+///
+/// A successful dispatch requires exactly one matching `PerpMarket.OrderPlaced`. Both order IDs,
+/// owner, market, side, size, order type, optional points and flags must match durable inputs.
+/// Limit price must match; market price is runtime-computed and is not compared to the input.
+/// This proves indexed event binding, not block canonicality, signer authorization, or fill success.
+///
+/// # Errors
+///
+/// Returns an error for unsupported scope, malformed SCALE, conflicting/duplicate events, or
+/// successful dispatch without the expected placement event.
+pub fn verify_perp_place_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
+    use DeepXPerpPlaceEventVerificationError as Error;
+    let Some(DeepXTransactionOperation::PerpPlace { is_long, .. }) = identity.operation() else {
+        return Err(Error::UnsupportedOperation);
+    };
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(Error::UnsupportedOperation);
+    }
+    let expected_side = if *is_long {
+        nautilus_model::enums::OrderSide::Buy
+    } else {
+        nautilus_model::enums::OrderSide::Sell
+    };
+    if identity.order_side() != expected_side {
+        return Err(Error::ConflictingEvent);
+    }
+    verify_indexed_perp_events(
+        snapshot,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+        "OrderPlaced",
+        |fields| perp_place_fields_match(fields, identity, block_number),
+    )
+}
+
+/// Verifies TP/SL updates against exact durable points, including zero-to-`None` conversion.
+///
+/// Only operation-proven position fields are compared. This does not establish canonicality
+/// or authorize submission. A successful dispatch requires one matching position update.
+///
+/// # Errors
+///
+/// Returns an error for foreign scope, incomplete events, conflicting fields or missing evidence.
+pub fn verify_perp_profit_and_loss_point_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpProfitAndLossPointEventVerificationError> {
+    let Some(DeepXTransactionOperation::PerpProfitAndLossPoint {
+        subaccount,
+        market_id,
+        take_profit_point,
+        stop_loss_point,
+    }) = identity.operation()
+    else {
+        return Err(DeepXPerpProfitAndLossPointEventVerificationError::UnsupportedOperation);
+    };
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(DeepXPerpProfitAndLossPointEventVerificationError::UnsupportedOperation);
+    }
+    verify_indexed_perp_events(
+        snapshot,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+        "PositionUpdated",
+        |fields| {
+            let Composite::Named(fields) = fields else {
+                return false;
+            };
+            let field = |name| {
+                fields
+                    .iter()
+                    .find_map(|(key, value)| (key == name).then_some(value))
+            };
+            if fields.len() != 4
+                || !field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
+                || field("market_id").and_then(ScaleValue::as_u128) != Some(u128::from(*market_id))
+                || field("pnl").and_then(ScaleValue::as_i128) != Some(0)
+            {
+                return false;
+            }
+            let Some(ScaleValue {
+                value: ValueDef::Composite(Composite::Named(pos)),
+                ..
+            }) = field("pos")
+            else {
+                return false;
+            };
+            let field = |name| {
+                pos.iter()
+                    .find_map(|(key, value)| (key == name).then_some(value))
+            };
+            field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
+                && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
+                && field("take_profit").is_some_and(|v| {
+                    value_matches_optional_u128(
+                        v,
+                        (*take_profit_point != 0).then_some(*take_profit_point),
+                    )
+                })
+                && field("stop_loss").is_some_and(|v| {
+                    value_matches_optional_u128(
+                        v,
+                        (*stop_loss_point != 0).then_some(*stop_loss_point),
+                    )
+                })
+        },
+    )
+    .map_err(DeepXPerpProfitAndLossPointEventVerificationError::IndexedEvents)
+}
+
+/// Failures binding TP/SL position updates to a durable operation.
+#[derive(Debug, Error)]
+pub enum DeepXPerpProfitAndLossPointEventVerificationError {
+    /// The exact runtime, operation or nonce domain is unsupported.
+    #[error("unsupported DeepX perpetual TP/SL event identity")]
+    UnsupportedOperation,
+    /// Shared indexed perpetual dispatch/business event validation failed.
+    #[error("DeepX perpetual TP/SL indexed event verification failed: {0}")]
+    IndexedEvents(#[source] DeepXPerpPlaceEventVerificationError),
+}
+
+fn verify_indexed_perp_events(
+    snapshot: &RuntimeSnapshot,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+    event_name: &str,
+    fields_match: impl Fn(&Composite<u32>) -> bool,
+) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
+    use DeepXPerpPlaceEventVerificationError as Error;
+    snapshot.interfaces().event("PerpMarket", event_name)?;
+    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
+    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
+    let mut remaining = event_bytes;
+    let declared = Compact::<u32>::decode(&mut remaining)
+        .map_err(|_| Error::MalformedEventBytes)?
+        .0;
+    let mut consumed = event_bytes.len() - remaining.len();
+    let mut count = 0_u32;
+    let mut dispatch = None;
+    let mut matched = false;
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    for event in events.iter() {
+        let event = event.map_err(|e| Error::Decode(Box::new(e)))?;
+        count += 1;
+        consumed += event.bytes().len();
+        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
+            continue;
+        }
+        if event.pallet_name() == "System" {
+            let outcome = match event.variant_name() {
+                "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
+                "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
+                _ => continue,
+            };
+            if dispatch.replace(outcome).is_some() {
+                return Err(Error::DuplicateEvent);
+            }
+        } else if event.pallet_name() == "PerpMarket" && event.variant_name() == event_name {
+            let fields = event
+                .field_values()
+                .map_err(|e| Error::Decode(Box::new(e)))?;
+            if !fields_match(&fields) {
+                return Err(Error::ConflictingEvent);
+            }
+            if matched {
+                return Err(Error::DuplicateEvent);
+            }
+            matched = true;
+        }
+    }
+    if count != declared || consumed != event_bytes.len() {
+        return Err(Error::MalformedEventBytes);
+    }
+    Ok(DeepXInclusionEvidence::from_indexed_observations(
+        block_hash,
+        block_number,
+        DeepXIndexedOutcome {
+            extrinsic_index,
+            outcome: dispatch.ok_or(Error::MalformedEventBytes)?,
+        },
+        DeepXIndexedOutcome {
+            extrinsic_index,
+            outcome: if matched {
+                DeepXBusinessEventOutcome::Success
+            } else {
+                DeepXBusinessEventOutcome::NotObserved
+            },
+        },
+    )?)
+}
+
+fn perp_place_fields_match(
+    fields: &Composite<u32>,
+    identity: &DeepXTransactionIdentity,
+    block_number: u64,
+) -> bool {
+    let Some(DeepXTransactionOperation::PerpPlace {
+        subaccount,
+        market_id,
+        is_long,
+        size,
+        price,
+        order_type,
+        take_profit,
+        stop_loss,
+        reduce_only,
+        post_only,
+    }) = identity.operation()
+    else {
+        return false;
+    };
+    let super::DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce()
+    else {
+        return false;
+    };
+    let Composite::Named(fields) = fields else {
+        return false;
+    };
+    let field = |name| {
+        fields
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+    };
+    if fields.len() != 2
+        || field("order_id").and_then(ScaleValue::as_u128) != Some(u128::from(order_id))
+    {
+        return false;
+    }
+    let Some(ScaleValue {
+        value: ValueDef::Composite(Composite::Named(order)),
+        ..
+    }) = field("order")
+    else {
+        return false;
+    };
+    let field = |name| {
+        order
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(value))
+    };
+    let spot_order_type = match order_type {
+        crate::signing::DeepXPerpOrderType::Limit(tif) => {
+            crate::signing::DeepXSpotOrderType::Limit(*tif)
+        }
+        crate::signing::DeepXPerpOrderType::Market(slippage) => {
+            crate::signing::DeepXSpotOrderType::Market(*slippage)
+        }
+        crate::signing::DeepXPerpOrderType::Stop => return false,
+    };
+    order.len() == 16
+        && field("order_id").and_then(ScaleValue::as_u128) == Some(u128::from(order_id))
+        && field("owner").is_some_and(|value| value_matches_bytes(value, subaccount))
+        && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
+        && field("is_long").and_then(ScaleValue::as_bool) == Some(*is_long)
+        && field("size").and_then(ScaleValue::as_u128) == Some(*size)
+        && field("price").and_then(ScaleValue::as_u128).is_some_and(|actual| matches!(order_type, crate::signing::DeepXPerpOrderType::Market(_)) || actual == *price)
+        && field("order_type").is_some_and(|value| value_matches_order_type(value, spot_order_type))
+        && field("take_profit").is_some_and(|value| value_matches_optional_u128(value, *take_profit))
+        && field("stop_loss").is_some_and(|value| value_matches_optional_u128(value, *stop_loss))
+        && field("reduce_only").and_then(ScaleValue::as_bool) == Some(*reduce_only)
+        && field("post_only").is_some_and(|value| value_matches_post_only(value, *post_only))
+        && field("create_time").and_then(ScaleValue::as_u128) == Some(u128::from(block_number))
+        && field("leverage").and_then(ScaleValue::as_u128).is_some()
+        && field("status").is_some_and(|value| matches!(&value.value, ValueDef::Variant(variant) if variant.name == "Open" && variant.values.values().next().is_none()))
+        && field("size_filled").and_then(ScaleValue::as_u128) == Some(0)
+        && field("size_remain").and_then(ScaleValue::as_u128) == Some(*size)
+}
+
+fn value_matches_optional_u128(value: &ScaleValue<u32>, expected: Option<u128>) -> bool {
+    let ValueDef::Variant(variant) = &value.value else {
+        return false;
+    };
+    let values: Vec<_> = variant.values.values().collect();
+    match expected {
+        None => variant.name == "None" && values.is_empty(),
+        Some(expected) => {
+            variant.name == "Some" && values.len() == 1 && values[0].as_u128() == Some(expected)
+        }
+    }
+}
+
+/// Verifies the close-generated order without equating its account-sequence ID to the nonce.
+///
+/// This binds creation of a reduce-only order, not execution or complete position closure.
+/// Position-derived direction and size are not inferred from the durable close call.
+///
+/// # Errors
+///
+/// Returns an error for unsupported scope, malformed events or conflicting close-order terms.
+pub fn verify_perp_close_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpCloseEventVerificationError> {
+    let Some(DeepXTransactionOperation::PerpClose {
+        subaccount,
+        market_id,
+        price,
+        slippage,
+    }) = identity.operation()
+    else {
+        return Err(DeepXPerpCloseEventVerificationError::UnsupportedOperation);
+    };
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(DeepXPerpCloseEventVerificationError::UnsupportedOperation);
+    }
+    verify_indexed_perp_events(snapshot, block_hash, block_number, extrinsic_index, event_bytes,
+        "OrderPlaced", |fields| {
+            let Composite::Named(outer) = fields else { return false; };
+            let field = |name| outer.iter().find_map(|(key, value)| (key == name).then_some(value));
+            let Some(order_id) = field("order_id").and_then(ScaleValue::as_u128).filter(|id| *id <= u128::from(u64::MAX)) else { return false; };
+            let Some(ScaleValue { value: ValueDef::Composite(Composite::Named(order)), .. }) = field("order") else { return false; };
+            let field = |name| order.iter().find_map(|(key, value)| (key == name).then_some(value));
+            outer.len() == 2 && order.len() == 16
+                && field("order_id").and_then(ScaleValue::as_u128) == Some(order_id)
+                && field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
+                && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
+                && field("is_long").and_then(ScaleValue::as_bool).is_some()
+                && field("size").and_then(ScaleValue::as_u128).is_some()
+                && field("size_remain").and_then(ScaleValue::as_u128) == field("size").and_then(ScaleValue::as_u128)
+                && field("size_filled").and_then(ScaleValue::as_u128) == Some(0)
+                && field("create_time").and_then(ScaleValue::as_u128) == Some(u128::from(block_number))
+                && field("leverage").and_then(ScaleValue::as_u128).is_some()
+                && field("price").and_then(ScaleValue::as_u128).is_some_and(|actual| *price == 0 || actual == *price)
+                && field("order_type").is_some_and(|v| if *price == 0 {
+                    value_matches_order_type(v, crate::signing::DeepXSpotOrderType::Market(*slippage))
+                } else { matches!(&v.value, ValueDef::Variant(variant) if variant.name == "Stop" && variant.values.values().next().is_none()) })
+                && field("status").is_some_and(|v| matches!(&v.value, ValueDef::Variant(variant) if variant.name == "Open" && variant.values.values().next().is_none()))
+                && field("reduce_only").and_then(ScaleValue::as_bool) == Some(true)
+                && field("post_only").is_some_and(|v| value_matches_post_only(v, crate::signing::DeepXPostOnlyParam::None))
+                && field("take_profit").is_some_and(|v| value_matches_optional_u128(v, None))
+                && field("stop_loss").is_some_and(|v| value_matches_optional_u128(v, None))
+        }).map_err(DeepXPerpCloseEventVerificationError::IndexedEvents)
+}
+
+/// Failures binding a generated close order to durable call terms.
+#[derive(Debug, Error)]
+pub enum DeepXPerpCloseEventVerificationError {
+    /// The exact operation, runtime or nonce domain is unsupported.
+    #[error("unsupported DeepX perpetual close event identity")]
+    UnsupportedOperation,
+    /// Shared indexed perpetual event validation failed.
+    #[error("DeepX perpetual close indexed event verification failed: {0}")]
+    IndexedEvents(#[source] DeepXPerpPlaceEventVerificationError),
+}
+
 /// Errors raised while verifying offline Spot placement event evidence.
 #[derive(Debug, Error)]
 pub enum DeepXSpotPlaceEventVerificationError {
@@ -761,6 +1172,17 @@ pub enum DeepXTransactionWatchError {
     /// Runtime event evidence did not prove the explicitly selected Spot placement.
     #[error(transparent)]
     SpotPlaceEventVerification(#[from] DeepXSpotPlaceEventVerificationError),
+    /// Runtime events could not establish the durable perpetual placement.
+    #[error(transparent)]
+    PerpPlaceEventVerification(#[from] DeepXPerpPlaceEventVerificationError),
+    /// Close-generated order evidence conflicts with durable call terms.
+    #[error(transparent)]
+    PerpCloseEventVerification(#[from] DeepXPerpCloseEventVerificationError),
+    /// Perpetual TP/SL update evidence did not match the durable operation.
+    #[error(transparent)]
+    PerpProfitAndLossPointEventVerification(
+        #[from] DeepXPerpProfitAndLossPointEventVerificationError,
+    ),
     /// A bounded recovery scan could not be planned safely.
     #[error(transparent)]
     ScanPlan(#[from] DeepXRecoveryScanPlanError),
@@ -1212,6 +1634,149 @@ enum CancelEventEvidence<'a> {
     Perp(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
     Spot(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
     SpotPlace(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+    PerpPlace(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+    PerpClose(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+    PerpProfitAndLossPoint(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+}
+
+/// Collects bounded canonical finalized evidence for a close-generated perpetual order.
+///
+/// # Errors
+///
+/// Returns an error for unsupported scope, RPC failure or conflicting order evidence.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches bounded recovery scan inputs"
+)]
+pub async fn collect_finalized_perp_close_recovery_scan(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, Box<DeepXTransactionWatchError>> {
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.operation(),
+            Some(DeepXTransactionOperation::PerpClose { .. })
+        )
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(Box::new(
+            DeepXPerpCloseEventVerificationError::UnsupportedOperation.into(),
+        ));
+    }
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some(CancelEventEvidence::PerpClose(snapshot, identity)),
+    )
+    .await
+    .map_err(Box::new)
+}
+
+/// Collects bounded finalized recovery evidence for an explicit TP/SL update.
+///
+/// # Errors
+///
+/// Returns an error for unsupported scope, RPC failure or conflicting indexed events.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches bounded recovery scan inputs"
+)]
+pub async fn collect_finalized_perp_profit_and_loss_point_recovery_scan(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, Box<DeepXTransactionWatchError>> {
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.operation(),
+            Some(DeepXTransactionOperation::PerpProfitAndLossPoint { .. })
+        )
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(Box::new(
+            DeepXPerpProfitAndLossPointEventVerificationError::UnsupportedOperation.into(),
+        ));
+    }
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some(CancelEventEvidence::PerpProfitAndLossPoint(
+            snapshot, identity,
+        )),
+    )
+    .await
+    .map_err(Box::new)
+}
+
+/// Collects bounded finalized recovery evidence for an explicit perpetual placement.
+///
+/// # Errors
+///
+/// Returns an error for unsupported operation/runtime scope, RPC failure, or conflicting events.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches existing bounded recovery scan inputs"
+)]
+pub async fn collect_finalized_perp_place_recovery_scan(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, Box<DeepXTransactionWatchError>> {
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.operation(),
+            Some(DeepXTransactionOperation::PerpPlace { .. })
+        )
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(Box::new(
+            DeepXPerpPlaceEventVerificationError::UnsupportedOperation.into(),
+        ));
+    }
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some(CancelEventEvidence::PerpPlace(snapshot, identity)),
+    )
+    .await
+    .map_err(Box::new)
 }
 
 pub(crate) async fn collect_finalized_recovery_scan_with_event_evidence(
@@ -1364,6 +1929,36 @@ async fn collect_finalized_recovery_scan_inner(
                 )
                 .await?;
                 let inclusion = match evidence {
+                    CancelEventEvidence::PerpClose(snapshot, identity) => {
+                        verify_perp_close_inclusion_events(
+                            snapshot,
+                            identity,
+                            observation.block_hash(),
+                            observation.block_number(),
+                            extrinsic_index,
+                            &event_bytes,
+                        )?
+                    }
+                    CancelEventEvidence::PerpProfitAndLossPoint(snapshot, identity) => {
+                        verify_perp_profit_and_loss_point_inclusion_events(
+                            snapshot,
+                            identity,
+                            observation.block_hash(),
+                            observation.block_number(),
+                            extrinsic_index,
+                            &event_bytes,
+                        )?
+                    }
+                    CancelEventEvidence::PerpPlace(snapshot, identity) => {
+                        verify_perp_place_inclusion_events(
+                            snapshot,
+                            identity,
+                            observation.block_hash(),
+                            observation.block_number(),
+                            extrinsic_index,
+                            &event_bytes,
+                        )?
+                    }
                     CancelEventEvidence::Perp(snapshot, identity) => {
                         verify_perp_cancel_inclusion_events(
                             snapshot,
@@ -1652,6 +2247,7 @@ mod tests {
 
     use axum::{Json, Router, extract::State, routing::post};
     use parity_scale_codec::Encode;
+    use rstest::rstest;
     use serde_json::Value;
     use tokio::net::TcpListener;
 
@@ -1802,6 +2398,783 @@ mod tests {
             &hex::decode(metadata.result.trim_start_matches("0x")).unwrap(),
         )
         .unwrap()
+    }
+
+    fn runtime_snapshot_for_spec(spec: u32) -> RuntimeSnapshot {
+        if spec == 366 {
+            runtime_snapshot()
+        } else {
+            let metadata: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+                "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"))).unwrap();
+            RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
+                369,
+                1,
+                &hex::decode(
+                    metadata["result"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("0x"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        }
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(u128::MAX, 0)]
+    #[case(0, u128::MAX)]
+    #[case(u128::MAX, 17)]
+    fn perp_profit_and_loss_events_bind_points(
+        #[case] take: u128,
+        #[case] stop: u128,
+        #[values(366, 369)] spec: u32,
+    ) {
+        let snapshot = runtime_snapshot_for_spec(spec);
+        let baseline = cancel_identity([0x11; 20], 7, false);
+        let identity = DeepXTransactionIdentity::new_perp_profit_and_loss_point(
+            ClientOrderId::new(baseline.client_order_id()),
+            baseline.signer(),
+            baseline.instrument_id(),
+            baseline.order_side(),
+            baseline.nonce(),
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            crate::signing::DeepXPerpProfitAndLossPointParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                take_profit_point: take,
+                stop_loss_point: stop,
+            },
+        );
+        let optional = |point| {
+            if point == 0 {
+                ScaleValue::unnamed_variant("None", [])
+            } else {
+                ScaleValue::unnamed_variant("Some", [ScaleValue::u128(point)])
+            }
+        };
+        let position = ScaleValue::named_composite([
+            ("market_id", ScaleValue::u128(100)),
+            ("is_long", ScaleValue::bool(false)),
+            ("base_asset_amount", ScaleValue::u128(1)),
+            ("entry_price", ScaleValue::u128(2)),
+            ("leverage", ScaleValue::u128(3)),
+            ("last_funding_rate", ScaleValue::i128(-4)),
+            ("version", ScaleValue::u128(5)),
+            ("realized_pnl", ScaleValue::i128(-6)),
+            ("funding_payment", ScaleValue::i128(7)),
+            ("owner", ScaleValue::from_bytes([0x11; 20])),
+            ("take_profit", optional(take)),
+            ("stop_loss", optional(stop)),
+            ("last_settle_price", ScaleValue::u128(8)),
+        ]);
+        let fields = ScaleValue::named_composite([
+            ("owner", ScaleValue::from_bytes([0x11; 20])),
+            ("market_id", ScaleValue::u128(100)),
+            ("pos", position),
+            ("pnl", ScaleValue::i128(0)),
+        ]);
+        let pallet = snapshot.metadata().pallet_by_name("PerpMarket").unwrap();
+        let event = pallet
+            .event_variants()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "PositionUpdated")
+            .unwrap();
+        let encode = |fields: &ScaleValue<()>, index| {
+            let ValueDef::Composite(Composite::Named(fields)) = &fields.value else {
+                panic!();
+            };
+            let mut record = Phase::ApplyExtrinsic(index).encode();
+            record.extend([pallet.index(), event.index]);
+            for field in &event.fields {
+                let value = &fields
+                    .iter()
+                    .find(|(name, _)| Some(name) == field.name.as_ref())
+                    .unwrap()
+                    .1;
+                subxt_core::ext::scale_value::scale::encode_as_type(
+                    value,
+                    field.ty.id,
+                    snapshot.metadata().types(),
+                    &mut record,
+                )
+                .unwrap();
+            }
+            Vec::<[u8; 32]>::new().encode_to(&mut record);
+            record
+        };
+        let verify = |bytes: &[u8]| {
+            verify_perp_profit_and_loss_point_inclusion_events(
+                &snapshot, &identity, [8; 32], 42, 4, bytes,
+            )
+        };
+        let business = encode(&fields, 4);
+        let dispatch = dispatch_event_record(&snapshot, 4, true);
+        let valid = system_events(&[business.clone(), dispatch.clone()]);
+        assert!(verify(&valid).is_ok());
+        assert!(
+            verify_perp_profit_and_loss_point_inclusion_events(
+                &snapshot, &baseline, [8; 32], 42, 4, &valid
+            )
+            .is_err()
+        );
+        if spec == 369 {
+            assert!(
+                verify_perp_profit_and_loss_point_inclusion_events(
+                    &runtime_snapshot(),
+                    &identity,
+                    [8; 32],
+                    42,
+                    4,
+                    &valid
+                )
+                .is_err()
+            );
+        }
+        assert!(verify(&system_events(std::slice::from_ref(&business))).is_err());
+        assert!(
+            verify(&system_events(&[
+                business.clone(),
+                dispatch.clone(),
+                dispatch.clone()
+            ]))
+            .is_err()
+        );
+        let mut wrong_count = valid.clone();
+        wrong_count[0] = Compact(3_u32).encode()[0];
+        assert!(verify(&wrong_count).is_err());
+        assert!(
+            verify(&system_events(&[
+                business.clone(),
+                business,
+                dispatch.clone()
+            ]))
+            .is_err()
+        );
+        assert!(verify(&system_events(&[encode(&fields, 5), dispatch.clone()])).is_err());
+        assert!(verify(&system_events(std::slice::from_ref(&dispatch))).is_err());
+        assert!(
+            verify(&system_events(&[dispatch_event_record(
+                &snapshot, 4, false
+            )]))
+            .is_ok()
+        );
+        assert!(verify(&valid[..valid.len() - 1]).is_err());
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(verify(&trailing).is_err());
+        for path in [
+            "owner",
+            "market_id",
+            "pnl",
+            "pos.owner",
+            "pos.market_id",
+            "pos.take_profit",
+            "pos.stop_loss",
+        ] {
+            let mut changed = fields.clone();
+            let replacement = match path {
+                "owner" | "pos.owner" => ScaleValue::from_bytes([0x22; 20]),
+                "market_id" | "pos.market_id" => ScaleValue::u128(101),
+                "pnl" => ScaleValue::i128(1),
+                _ => ScaleValue::unnamed_variant("Some", [ScaleValue::u128(1)]),
+            };
+            let ValueDef::Composite(Composite::Named(outer)) = &mut changed.value else {
+                panic!();
+            };
+            if let Some(name) = path.strip_prefix("pos.") {
+                let pos = &mut outer.iter_mut().find(|(name, _)| name == "pos").unwrap().1;
+                let ValueDef::Composite(Composite::Named(inner)) = &mut pos.value else {
+                    panic!();
+                };
+                inner.iter_mut().find(|(key, _)| key == name).unwrap().1 = replacement;
+            } else {
+                outer.iter_mut().find(|(key, _)| key == path).unwrap().1 = replacement;
+            }
+            assert!(
+                verify(&system_events(&[encode(&changed, 4), dispatch.clone()])).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(0, None)]
+    #[case(0, Some(u64::MAX))]
+    #[case(u128::MAX, Some(19))]
+    fn perp_close_events_bind_generated_order(
+        #[case] price: u128,
+        #[case] slippage: Option<u64>,
+        #[values(366, 369)] spec: u32,
+    ) {
+        let snapshot = runtime_snapshot_for_spec(spec);
+        let baseline = perp_place_identity(true, price == 0);
+        let close = DeepXTransactionIdentity::new_perp_close(
+            ClientOrderId::new(baseline.client_order_id()),
+            baseline.signer(),
+            baseline.instrument_id(),
+            OrderSide::Sell,
+            baseline.nonce(),
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            crate::signing::DeepXPerpCloseParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                price,
+                slippage,
+            },
+        );
+        let generated = DeepXTransactionIdentity::new_perp_close(
+            ClientOrderId::new(baseline.client_order_id()),
+            baseline.signer(),
+            baseline.instrument_id(),
+            OrderSide::Sell,
+            DeepXNonceReservation::TimestampOrderId { value: 19 },
+            baseline.runtime().clone(),
+            crate::signing::DeepXPerpCloseParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                price,
+                slippage,
+            },
+        );
+        assert_ne!(generated.nonce(), close.nonce());
+        let mut order = perp_place_order_value(&baseline, 42);
+        let ValueDef::Composite(Composite::Named(fields)) = &mut order.value else {
+            panic!();
+        };
+        let mut set = |name, replacement| {
+            fields.iter_mut().find(|(key, _)| key == name).unwrap().1 = replacement;
+        };
+        set("order_id", ScaleValue::u128(19));
+        set("reduce_only", ScaleValue::bool(true));
+        set("take_profit", ScaleValue::unnamed_variant("None", []));
+        set("stop_loss", ScaleValue::unnamed_variant("None", []));
+        set(
+            "order_type",
+            if price == 0 {
+                ScaleValue::unnamed_variant(
+                    "Market",
+                    [match slippage {
+                        None => ScaleValue::unnamed_variant("None", []),
+                        Some(value) => ScaleValue::unnamed_variant(
+                            "Some",
+                            [ScaleValue::u128(u128::from(value))],
+                        ),
+                    }],
+                )
+            } else {
+                ScaleValue::unnamed_variant("Stop", [])
+            },
+        );
+        let business =
+            |order: &ScaleValue<()>| perp_place_event_record(&snapshot, 4, &generated, order);
+        let dispatch = dispatch_event_record(&snapshot, 4, true);
+        let verify = |events: &[u8]| {
+            verify_perp_close_inclusion_events(&snapshot, &close, [8; 32], 42, 4, events)
+        };
+        let valid = system_events(&[business(&order), dispatch.clone()]);
+        assert!(verify(&valid).is_ok());
+        assert!(verify(&system_events(&[business(&order)])).is_err());
+        assert!(
+            verify(&system_events(&[
+                perp_place_event_record(&snapshot, 5, &generated, &order),
+                dispatch.clone()
+            ]))
+            .is_err()
+        );
+        if spec == 369 {
+            assert!(
+                verify_perp_close_inclusion_events(
+                    &runtime_snapshot(),
+                    &close,
+                    [8; 32],
+                    42,
+                    4,
+                    &valid
+                )
+                .is_err()
+            );
+        }
+        if price != 0 {
+            let mut changed = order.clone();
+            let ValueDef::Composite(Composite::Named(fields)) = &mut changed.value else {
+                panic!();
+            };
+            fields
+                .iter_mut()
+                .find(|(name, _)| name == "price")
+                .unwrap()
+                .1 = ScaleValue::u128(1);
+            assert!(verify(&system_events(&[business(&changed), dispatch.clone()])).is_err());
+        }
+        assert!(
+            verify(&system_events(&[
+                business(&order),
+                business(&order),
+                dispatch.clone()
+            ]))
+            .is_err()
+        );
+        assert!(verify(&system_events(std::slice::from_ref(&dispatch))).is_err());
+        assert!(
+            verify(&system_events(&[dispatch_event_record(
+                &snapshot, 4, false
+            )]))
+            .is_ok()
+        );
+        assert!(verify(&valid[..valid.len() - 1]).is_err());
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(verify(&trailing).is_err());
+        for (name, replacement) in [
+            ("order_id", ScaleValue::u128(20)),
+            ("owner", ScaleValue::from_bytes([0x22; 20])),
+            ("market_id", ScaleValue::u128(101)),
+            ("reduce_only", ScaleValue::bool(false)),
+            (
+                "take_profit",
+                ScaleValue::unnamed_variant("Some", [ScaleValue::u128(1)]),
+            ),
+            (
+                "stop_loss",
+                ScaleValue::unnamed_variant("Some", [ScaleValue::u128(1)]),
+            ),
+            ("post_only", ScaleValue::unnamed_variant("MustPostOnly", [])),
+            (
+                "order_type",
+                ScaleValue::unnamed_variant(
+                    "Market",
+                    [ScaleValue::unnamed_variant("Some", [ScaleValue::u128(1)])],
+                ),
+            ),
+            ("size_filled", ScaleValue::u128(1)),
+            ("size_remain", ScaleValue::u128(1)),
+            ("create_time", ScaleValue::u128(41)),
+            ("status", ScaleValue::unnamed_variant("Filled", [])),
+        ] {
+            let mut changed = order.clone();
+            let ValueDef::Composite(Composite::Named(fields)) = &mut changed.value else {
+                panic!();
+            };
+            fields.iter_mut().find(|(key, _)| key == name).unwrap().1 = replacement;
+            assert!(
+                verify(&system_events(&[business(&changed), dispatch.clone()])).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    fn perp_place_identity(is_long: bool, market: bool) -> DeepXTransactionIdentity {
+        let baseline = cancel_identity([0x11; 20], 7, false);
+        DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new(baseline.client_order_id()),
+            baseline.signer(),
+            baseline.instrument_id(),
+            if is_long {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            },
+            baseline.nonce(),
+            baseline.runtime().clone(),
+            crate::signing::DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                is_long,
+                size: u128::MAX,
+                price: if market { 0 } else { u128::MAX },
+                order_type: if market {
+                    crate::signing::DeepXPerpOrderType::Market(Some(0))
+                } else {
+                    crate::signing::DeepXPerpOrderType::Limit(crate::signing::DeepXTimeInForce::Gtc)
+                },
+                take_profit: Some(u128::MAX),
+                stop_loss: Some(0),
+                reduce_only: false,
+                post_only: crate::signing::DeepXPostOnlyParam::None,
+            },
+        )
+    }
+
+    fn perp_place_order_value(
+        identity: &DeepXTransactionIdentity,
+        block_number: u64,
+    ) -> ScaleValue<()> {
+        let Some(DeepXTransactionOperation::PerpPlace {
+            subaccount,
+            market_id,
+            is_long,
+            size,
+            price,
+            order_type,
+            take_profit,
+            stop_loss,
+            reduce_only,
+            post_only,
+        }) = identity.operation()
+        else {
+            unreachable!();
+        };
+        let DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce() else {
+            unreachable!();
+        };
+        let optional = |point: Option<u128>| match point {
+            Some(value) => ScaleValue::unnamed_variant("Some", [ScaleValue::u128(value)]),
+            None => ScaleValue::unnamed_variant("None", []),
+        };
+        let order_type_value = match order_type {
+            crate::signing::DeepXPerpOrderType::Limit(tif) => ScaleValue::unnamed_variant(
+                "Limit",
+                [ScaleValue::unnamed_variant(
+                    match tif {
+                        crate::signing::DeepXTimeInForce::Gtc => "GTC",
+                        crate::signing::DeepXTimeInForce::Ioc => "IOC",
+                        crate::signing::DeepXTimeInForce::Fok => "FOK",
+                    },
+                    [],
+                )],
+            ),
+            crate::signing::DeepXPerpOrderType::Market(slippage) => {
+                ScaleValue::unnamed_variant("Market", [optional(slippage.map(u128::from))])
+            }
+            crate::signing::DeepXPerpOrderType::Stop => ScaleValue::unnamed_variant("Stop", []),
+        };
+        let post_only = match post_only {
+            crate::signing::DeepXPostOnlyParam::None => "None",
+            crate::signing::DeepXPostOnlyParam::MustPostOnly => "MustPostOnly",
+            crate::signing::DeepXPostOnlyParam::Adaptive => "Adaptive",
+        };
+        ScaleValue::named_composite([
+            ("order_id", ScaleValue::u128(u128::from(order_id))),
+            ("owner", ScaleValue::from_bytes(subaccount)),
+            ("market_id", ScaleValue::u128(u128::from(*market_id))),
+            ("is_long", ScaleValue::bool(*is_long)),
+            ("size", ScaleValue::u128(*size)),
+            (
+                "price",
+                ScaleValue::u128(
+                    if matches!(order_type, crate::signing::DeepXPerpOrderType::Market(_)) {
+                        123
+                    } else {
+                        *price
+                    },
+                ),
+            ),
+            ("order_type", order_type_value),
+            ("create_time", ScaleValue::u128(u128::from(block_number))),
+            ("leverage", ScaleValue::u128(25000)),
+            ("status", ScaleValue::unnamed_variant("Open", [])),
+            ("size_filled", ScaleValue::u128(0)),
+            ("size_remain", ScaleValue::u128(*size)),
+            ("take_profit", optional(*take_profit)),
+            ("stop_loss", optional(*stop_loss)),
+            ("reduce_only", ScaleValue::bool(*reduce_only)),
+            ("post_only", ScaleValue::unnamed_variant(post_only, [])),
+        ])
+    }
+
+    fn perp_place_event_record(
+        snapshot: &RuntimeSnapshot,
+        index: u32,
+        identity: &DeepXTransactionIdentity,
+        order: &ScaleValue<()>,
+    ) -> Vec<u8> {
+        let pallet = snapshot.metadata().pallet_by_name("PerpMarket").unwrap();
+        let event = pallet
+            .event_variants()
+            .unwrap()
+            .iter()
+            .find(|event| event.name == "OrderPlaced")
+            .unwrap();
+        let DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce() else {
+            unreachable!();
+        };
+        let mut record = Phase::ApplyExtrinsic(index).encode();
+        record.extend([pallet.index(), event.index]);
+        for field in &event.fields {
+            let value = match field.name.as_deref() {
+                Some("order_id") => ScaleValue::u128(u128::from(order_id)),
+                Some("order") => order.clone(),
+                _ => panic!("unexpected placement field"),
+            };
+            subxt_core::ext::scale_value::scale::encode_as_type(
+                &value,
+                field.ty.id,
+                snapshot.metadata().types(),
+                &mut record,
+            )
+            .unwrap();
+        }
+        Vec::<[u8; 32]>::new().encode_to(&mut record);
+        record
+    }
+
+    #[rstest]
+    #[case(true, false)]
+    #[case(false, false)]
+    #[case(true, true)]
+    #[case(false, true)]
+    fn perp_place_events_bind_exact_inputs(#[case] is_long: bool, #[case] market: bool) {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(is_long, market);
+        let events = system_events(&[
+            perp_place_event_record(
+                &snapshot,
+                4,
+                &identity,
+                &perp_place_order_value(&identity, 42),
+            ),
+            dispatch_event_record(&snapshot, 4, true),
+        ]);
+        let evidence =
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
+                .unwrap();
+        assert_eq!(
+            evidence.outcome,
+            super::super::DeepXInclusionOutcome::Success
+        );
+        assert_eq!(evidence.extrinsic_index, 4);
+    }
+
+    #[rstest]
+    #[case("order_id", ScaleValue::u128(1))]
+    #[case("owner", ScaleValue::from_bytes([0x22; 20]))]
+    #[case("market_id", ScaleValue::u128(1))]
+    #[case("is_long", ScaleValue::bool(false))]
+    #[case("size", ScaleValue::u128(1))]
+    #[case("price", ScaleValue::u128(1))]
+    #[case("take_profit", ScaleValue::unnamed_variant("None", []))]
+    #[case("stop_loss", ScaleValue::unnamed_variant("None", []))]
+    #[case("reduce_only", ScaleValue::bool(true))]
+    #[case("post_only", ScaleValue::unnamed_variant("MustPostOnly", []))]
+    #[case("create_time", ScaleValue::u128(43))]
+    #[case("size_filled", ScaleValue::u128(1))]
+    #[case("size_remain", ScaleValue::u128(1))]
+    #[case("status", ScaleValue::unnamed_variant("Filled", []))]
+    #[case("order_type", ScaleValue::unnamed_variant("Limit", [ScaleValue::unnamed_variant("IOC", [])]))]
+    fn perp_place_conflicting_order_fields_fail(#[case] name: &str, #[case] value: ScaleValue<()>) {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(true, false);
+        let mut order = perp_place_order_value(&identity, 42);
+        let ValueDef::Composite(Composite::Named(fields)) = &mut order.value else {
+            unreachable!();
+        };
+        *fields
+            .iter_mut()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value)
+            .unwrap() = value;
+        let events = system_events(&[
+            perp_place_event_record(&snapshot, 4, &identity, &order),
+            dispatch_event_record(&snapshot, 4, true),
+        ]);
+        assert!(matches!(
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events),
+            Err(DeepXPerpPlaceEventVerificationError::ConflictingEvent)
+        ));
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    fn perp_place_missing_duplicate_or_malformed_events_fail(#[case] mutation: u8) {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(true, false);
+        let order = perp_place_event_record(
+            &snapshot,
+            4,
+            &identity,
+            &perp_place_order_value(&identity, 42),
+        );
+        let dispatch = dispatch_event_record(&snapshot, 4, true);
+        let mut events = match mutation {
+            0 => system_events(&[dispatch]),
+            1 => system_events(&[order.clone(), order, dispatch]),
+            2 => system_events(&[order, dispatch.clone(), dispatch]),
+            _ => system_events(&[order, dispatch]),
+        };
+        if mutation == 3 {
+            events.pop();
+        }
+        if mutation == 4 {
+            events.push(0);
+        }
+        assert!(
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn perp_place_failed_dispatch_needs_no_placement_event() {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(true, false);
+        let events = system_events(&[dispatch_event_record(&snapshot, 4, false)]);
+        let evidence =
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
+                .unwrap();
+        assert_eq!(
+            evidence.outcome,
+            super::super::DeepXInclusionOutcome::Failed
+        );
+    }
+
+    #[rstest]
+    #[case(5, 4)]
+    #[case(4, 5)]
+    fn perp_place_events_at_other_indices_cannot_prove_inclusion(
+        #[case] order_index: u32,
+        #[case] dispatch_index: u32,
+    ) {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(true, false);
+        let events = system_events(&[
+            perp_place_event_record(
+                &snapshot,
+                order_index,
+                &identity,
+                &perp_place_order_value(&identity, 42),
+            ),
+            dispatch_event_record(&snapshot, dispatch_index, true),
+        ]);
+        assert!(
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn perp_place_spec369_event_binding_requires_exact_runtime_scope() {
+        let metadata: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"))).unwrap();
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
+            369,
+            1,
+            &hex::decode(
+                metadata["result"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let old_identity = perp_place_identity(true, false);
+        let mut encoded = serde_json::to_value(&old_identity).unwrap();
+        encoded["runtime"] =
+            serde_json::to_value(DeepXDirectRuntimeIdentity::from(snapshot.identity())).unwrap();
+        let identity: DeepXTransactionIdentity = serde_json::from_value(encoded).unwrap();
+        let events = system_events(&[
+            perp_place_event_record(
+                &snapshot,
+                4,
+                &identity,
+                &perp_place_order_value(&identity, 42),
+            ),
+            dispatch_event_record(&snapshot, 4, true),
+        ]);
+        assert!(
+            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
+                .is_ok()
+        );
+        assert!(matches!(
+            verify_perp_place_inclusion_events(&snapshot, &old_identity, [8; 32], 42, 4, &events),
+            Err(DeepXPerpPlaceEventVerificationError::UnsupportedOperation)
+        ));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn finalized_perp_order_scan_verifies_same_index_business_events(
+        #[values(false, true)] close: bool,
+    ) {
+        let snapshot = runtime_snapshot();
+        let identity = perp_place_identity(true, false);
+        let close_identity = DeepXTransactionIdentity::new_perp_close(
+            ClientOrderId::new(identity.client_order_id()),
+            identity.signer(),
+            identity.instrument_id(),
+            OrderSide::Sell,
+            identity.nonce(),
+            identity.runtime().clone(),
+            crate::signing::DeepXPerpCloseParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                price: u128::MAX,
+                slippage: None,
+            },
+        );
+        let mut order = perp_place_order_value(&identity, 41);
+        if close {
+            let ValueDef::Composite(Composite::Named(fields)) = &mut order.value else {
+                panic!();
+            };
+            for (name, value) in [
+                ("order_type", ScaleValue::unnamed_variant("Stop", [])),
+                ("take_profit", ScaleValue::unnamed_variant("None", [])),
+                ("stop_loss", ScaleValue::unnamed_variant("None", [])),
+                ("reduce_only", ScaleValue::bool(true)),
+            ] {
+                fields.iter_mut().find(|(key, _)| key == name).unwrap().1 = value;
+            }
+        }
+        let target = extrinsic(&[1, 2, 3, 4]);
+        let hash = BlakeTwo256.hash(&target).0;
+        let blocks = BTreeMap::from([(41, vec![format!("0x{}", hex::encode(target))])]);
+        let events = system_events(&[
+            perp_place_event_record(&snapshot, 0, &identity, &order),
+            dispatch_event_record(&snapshot, 0, true),
+        ]);
+        let storage = BTreeMap::from([(41, format!("0x{}", hex::encode(events)))]);
+        let (endpoints, capabilities, _) =
+            recovery_endpoints_with_events(42, None, blocks, vec![], storage).await;
+        let collection = if close {
+            collect_finalized_perp_close_recovery_scan(
+                &endpoints,
+                &capabilities,
+                &snapshot,
+                &close_identity,
+                39,
+                decode_hash(&block_hash(39)).unwrap(),
+                2,
+                hash,
+            )
+            .await
+            .unwrap()
+        } else {
+            collect_finalized_perp_place_recovery_scan(
+                &endpoints,
+                &capabilities,
+                &snapshot,
+                &identity,
+                39,
+                decode_hash(&block_hash(39)).unwrap(),
+                2,
+                hash,
+            )
+            .await
+            .unwrap()
+        };
+        let DeepXFinalizedRecoveryCollection::Scan(scan) = collection else {
+            panic!("expected scan");
+        };
+        assert_eq!(
+            scan.classify(),
+            DeepXRecoveryDecision::FinalizedInclusion(inclusion(
+                decode_hash(&block_hash(41)).unwrap(),
+                41,
+                0
+            ))
+        );
     }
 
     fn cancel_identity(

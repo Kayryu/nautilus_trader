@@ -22,6 +22,7 @@
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod account;
 pub mod common;
 pub mod config;
 pub mod data;
@@ -38,6 +39,7 @@ pub mod spot;
 pub mod transaction;
 pub mod websocket;
 
+pub use account::{DeepXAccountOwnershipError, DeepXAccountOwnershipProof};
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{
     DeepXDataClientConfig, DeepXExecutionBackend, DeepXExecutionClientConfig,
@@ -50,7 +52,7 @@ pub use execution::{
     DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
     DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXMassReconciliationError,
     DeepXNonceRestorationError, DeepXOrderContextError, DeepXOrderContextRestorationError,
-    DeepXRestoredOrderContext, DeepXTradeDedupError,
+    DeepXRestoredOrderContext, DeepXTradeDedupError, DeepXTransactionRuntimeError,
 };
 pub use factories::{DeepXDataClientFactory, DeepXExecutionClientFactory};
 pub use instruments::parse_perpetual_instrument;
@@ -59,11 +61,12 @@ pub use providers::{
     DeepXSpotInstrumentUnsupported,
 };
 pub use rpc::{
-    DeepXAppliedRuntimeSnapshot, DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot,
-    DeepXRpcEndpointIdentityError, DeepXRpcIdentityError, DeepXRpcMethodCapabilities,
-    DeepXRpcMethodCapabilitiesError, DeepXRpcMethodCapabilityError,
-    DeepXRuntimeSnapshotObservationError, DeepXRuntimeSnapshotRefreshError,
-    DeepXValidatedRpcMethodCapabilities, observe_and_apply_approved_finalized_runtime_snapshot,
+    DeepXAppliedRuntimeSnapshot, DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence,
+    DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot, DeepXRpcEndpointIdentityError,
+    DeepXRpcIdentityError, DeepXRpcMethodCapabilities, DeepXRpcMethodCapabilitiesError,
+    DeepXRpcMethodCapabilityError, DeepXRuntimeSnapshotObservationError,
+    DeepXRuntimeSnapshotRefreshError, DeepXValidatedRpcMethodCapabilities,
+    observe_and_apply_approved_finalized_runtime_snapshot, observe_and_apply_finalized_chain_time,
     observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
     observe_approved_finalized_runtime_snapshot, observe_rpc_endpoint_identity,
     observe_rpc_method_capabilities,

@@ -15,12 +15,22 @@
 
 //! Transport-neutral WebSocket protocol state for DeepX testnet.
 
+pub mod account;
+pub mod book;
 pub mod error;
 pub mod frame;
 pub mod handler;
 pub mod protocol;
+pub mod public;
 pub mod task;
+pub mod trades;
+pub mod transport;
 
+pub use account::{
+    DeepXWsAccountConnection, DeepXWsAccountFrame, DeepXWsAllMarket,
+    DeepXWsConfirmedAccountSubscription, DeepXWsConfirmedBalancesFrame, DeepXWsUserBalancesRequest,
+    DeepXWsUserBalancesSubscription,
+};
 pub use error::DeepXWsError;
 pub use frame::DeepXWsFrame;
 pub use handler::{

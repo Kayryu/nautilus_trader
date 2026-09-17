@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-09-17T02:43:04Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_identity",
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves one reverse delegate-to-wallet directory observation.",
+    "It does not prove freshness, authorization at signing time, ordering semantics, or mutation behavior."
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/delegator-accounts",
+    "query": {
+      "address": "0x1b856b9bf1d0ceeb0927a081c759813cd703a54f"
+    }
+  },
+  "response": {
+    "content_type": "application/json",
+    "payload_path": "delegate_delegator_accounts.json",
+    "payload_sha256": "4bf161ef23a307d70325e8935ce250817c613deb6b1c25c7e05519048abec23b",
+    "status": 200
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json",
+    "spec_version": 369,
+    "transaction_version": 1
+  }
+}

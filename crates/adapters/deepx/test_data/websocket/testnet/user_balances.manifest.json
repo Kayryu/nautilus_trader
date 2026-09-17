@@ -1,0 +1,55 @@
+{
+  "captured_at": "2026-09-15T05:56:24Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_websocket_account_data",
+  "account_scope": {
+    "wallet": "0x781ed35b167068c93dfadab41dfb680edaca4e50",
+    "subaccount": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+  },
+  "request": {
+    "action": "subscribe",
+    "market": {
+      "type": "all"
+    },
+    "subscriptions": [
+      {
+        "channel": "user_balances",
+        "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+      }
+    ],
+    "options": {
+      "compress": false
+    }
+  },
+  "acknowledgement": {
+    "type": "subscribed",
+    "market": {
+      "type": "all"
+    },
+    "subscriptions": [
+      {
+        "channel": "user_balances",
+        "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+      }
+    ],
+    "message": "Successfully subscribed to 1 channels"
+  },
+  "response": {
+    "payload_path": "user_balances.json",
+    "payload_sha256": "f2133fb9c7903fdae14f60c99d34fca6808bbda39c5811cde1d6ee2795b5f31b"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The WebSocket account channel is address-scoped and does not authenticate the subscriber.",
+    "The response is mutable and not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves the observed acknowledgement and user-balances frame shapes only.",
+    "It does not authorize trading or prove free, locked, or margin balance semantics."
+  ]
+}

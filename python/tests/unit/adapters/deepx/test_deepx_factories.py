@@ -53,9 +53,15 @@ def test_deepx_configs_default_to_testnet() -> None:
     """
     network = DeepXNetworkConfig()
     data_config = DeepXDataClientConfig(network=network)
+    execution_config = DeepXExecutionClientConfig(
+        subaccount_id="0x1111111111111111111111111111111111111111",
+    )
 
     assert network.environment == "testnet"
     assert data_config.network.environment == "testnet"
+    assert execution_config.network.environment == "testnet"
+    assert execution_config.http_timeout_secs == 30
+    assert not execution_config.has_proxy_url
 
 
 def test_deepx_network_config_rejects_mainnet() -> None:
@@ -82,11 +88,15 @@ def test_deepx_execution_config_repr_redacts_private_key() -> None:
     Test DeepX execution config repr redacts its private key.
     """
     private_key = "0000000000000000000000000000000000000000000000000000000000000001"
+    proxy_url = "https://user:secret@proxy.example.invalid"
     config = DeepXExecutionClientConfig(
-        subaccount_id="test-subaccount",
+        subaccount_id="0x1111111111111111111111111111111111111111",
         private_key=private_key,
+        proxy_url=proxy_url,
     )
 
     assert config.has_private_key
+    assert config.has_proxy_url
     assert "<redacted>" in repr(config)
     assert private_key not in repr(config)
+    assert proxy_url not in repr(config)

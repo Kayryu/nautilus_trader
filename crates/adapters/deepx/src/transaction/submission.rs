@@ -25,6 +25,113 @@ use thiserror::Error;
 use super::{DeepXSubmissionFailure, DeepXSubmissionPermit};
 use crate::signing::SignedPalletExtrinsic;
 
+/// REST acknowledgement, not verified inclusion, finality, or business success.
+#[derive(Debug)]
+pub struct DeepXRestSubmissionAcknowledgement {
+    /// Hash-verified acceptance of the exact permitted extrinsic.
+    pub submitted: DeepXSubmittedExtrinsic,
+    /// Backend action result retained without inventing confirmation semantics.
+    pub data: serde_json::Value,
+}
+
+/// REST submission failures which never authorize automatic replay or nonce reuse.
+#[derive(Debug, Error)]
+pub enum DeepXRestSubmissionError {
+    /// Local preparation could not produce a supported request, before HTTP transmission.
+    #[error("DeepX REST submission was not sent: {0}")]
+    NotSent(String),
+    /// Delivery or execution cannot be established from the backend response.
+    #[error("DeepX REST submission requires reconciliation: {0}")]
+    ReconciliationRequired(String),
+}
+
+fn rest_action(operation: &super::DeepXTransactionOperation) -> (&'static str, &'static str) {
+    use super::DeepXTransactionOperation;
+    match operation {
+        DeepXTransactionOperation::PerpPlace { .. } => ("Perp", "PlaceOrder"),
+        DeepXTransactionOperation::PerpCancel { .. } => ("Perp", "CancelOrder"),
+        DeepXTransactionOperation::PerpClose { .. } => ("Perp", "ClosePosition"),
+        DeepXTransactionOperation::PerpProfitAndLossPoint { .. } => {
+            ("Perp", "SetProfitAndLossPoint")
+        }
+        DeepXTransactionOperation::SpotPlace { .. } => ("Spot", "PlaceOrder"),
+        DeepXTransactionOperation::SpotCancel { .. } => ("Spot", "CancelOrder"),
+    }
+}
+
+fn verify_rest_acknowledgement(
+    body: &[u8],
+    bytes: &[u8],
+    expected_hash: [u8; 32],
+) -> Result<DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError> {
+    use crate::http::models::DeepXApiResponse;
+    let uncertain = |e: String| DeepXRestSubmissionError::ReconciliationRequired(e);
+    let response: DeepXApiResponse<serde_json::Value> =
+        serde_json::from_slice(body).map_err(|e| uncertain(e.to_string()))?;
+    if response.fail || !response.code.is_success() {
+        // Runtime failures may already be included and consume the timestamp nonce
+        return Err(uncertain(format!(
+            "backend code {}: {}",
+            response.code, response.msg
+        )));
+    }
+    let encoded = response
+        .data
+        .get("tx_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| uncertain("missing transaction hash".to_string()))?;
+    let node_hash = decode_node_hash(encoded).map_err(|e| uncertain(e.to_string()))?;
+    verify_submission_hash(bytes, expected_hash, node_hash)
+        .map_err(|e| uncertain(e.to_string()))?;
+    Ok(DeepXRestSubmissionAcknowledgement {
+        submitted: DeepXSubmittedExtrinsic {
+            node_hash,
+            extrinsic_hash: expected_hash,
+        },
+        data: response.data,
+    })
+}
+
+/// Consumes durably prepared submission and sends exactly one REST request to the primary URL.
+///
+/// Routing comes from the verified durable operation, not caller-supplied action labels. There is
+/// no read retry or endpoint failover. Pending acknowledgements require status polling, never
+/// resubmission. Backend action data is not canonical-chain evidence and must not finalize records.
+///
+/// # Errors
+///
+/// Returns `NotSent` for local validation failures and `ReconciliationRequired` for every failure
+/// after starting the HTTP request, including runtime reverts and invalid returned hashes.
+pub async fn submit_rest_transaction_once(
+    client: &crate::http::client::DeepXHttpClient,
+    prepared: super::DeepXPreparedSubmission,
+) -> Result<DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError> {
+    let operation = prepared.record().identity().operation().ok_or_else(|| {
+        DeepXRestSubmissionError::NotSent("missing durable operation".to_string())
+    })?;
+    let (market_type, action) = rest_action(operation);
+    let (bytes, expected_hash) = prepared.into_permit().into_payload();
+    verify_submission_hash(&bytes, expected_hash, expected_hash)
+        .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
+    let body = serde_json::to_vec(&json!({
+        "marketType": market_type,
+        "action": action,
+        "signedExtrinsic": format!("0x{}", hex::encode(&bytes)),
+    }))
+    .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
+    let response = client
+        .post_transaction_once(body)
+        .await
+        .map_err(|e| DeepXRestSubmissionError::ReconciliationRequired(e.to_string()))?;
+    if !response.status.is_success() {
+        return Err(DeepXRestSubmissionError::ReconciliationRequired(format!(
+            "HTTP {}",
+            response.status.as_u16(),
+        )));
+    }
+    verify_rest_acknowledgement(&response.body, &bytes, expected_hash)
+}
+
 /// JSON-RPC method used to submit a signed DeepX extrinsic exactly once.
 const SUBMIT_EXTRINSIC_METHOD: &str = "author_submitExtrinsic";
 
@@ -276,6 +383,107 @@ mod tests {
 
     use super::*;
     use crate::signing::{DeepXRuntimeSnapshotService, SigningError, sign_dynamic_pallet_call};
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some("pending"))]
+    #[case(Some("best"))]
+    #[case(Some("decode_failed"))]
+    fn rest_acknowledgement_preserves_backend_data(#[case] confirmation: Option<&str>) {
+        let bytes = b"exact durable extrinsic";
+        let hash = BlakeTwo256.hash(bytes).0;
+        let data = json!({
+            "tx_hash": format!("0x{}", hex::encode(hash)),
+            "order_id": "18446744073709551615",
+            "confirmation": confirmation,
+        });
+        let body = serde_json::to_vec(&json!({
+            "code": 200, "fail": false, "msg": "success", "data": data,
+        }))
+        .unwrap();
+        let acknowledgement = verify_rest_acknowledgement(&body, bytes, hash).unwrap();
+        assert_eq!(acknowledgement.submitted.node_hash(), hash);
+        assert_eq!(acknowledgement.data, data);
+    }
+
+    #[rstest]
+    #[case(json!(null))]
+    #[case(json!({}))]
+    #[case(json!({"tx_hash": 42}))]
+    #[case(json!({"tx_hash": "0x1234"}))]
+    #[case(json!({"tx_hash": "0000000000000000000000000000000000000000000000000000000000000000"}))]
+    #[case(json!({"tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000000"}))]
+    fn rest_invalid_hash_requires_reconciliation(#[case] data: Value) {
+        let bytes = b"durable";
+        let body = serde_json::to_vec(&json!({
+            "code": 200, "fail": false, "msg": "success", "data": data,
+        }))
+        .unwrap();
+        assert!(matches!(
+            verify_rest_acknowledgement(&body, bytes, BlakeTwo256.hash(bytes).0),
+            Err(DeepXRestSubmissionError::ReconciliationRequired(_))
+        ));
+    }
+
+    #[rstest]
+    #[case(json!("19_0"), true)]
+    #[case(json!(500), true)]
+    #[case(json!(200), true)]
+    #[case(json!(500), false)]
+    fn rest_backend_failure_never_proves_not_sent(#[case] code: Value, #[case] fail: bool) {
+        let body = serde_json::to_vec(&json!({
+            "code": code, "fail": fail, "msg": "runtime failure", "data": null,
+        }))
+        .unwrap();
+        assert!(matches!(
+            verify_rest_acknowledgement(&body, b"durable", [0; 32]),
+            Err(DeepXRestSubmissionError::ReconciliationRequired(_))
+        ));
+    }
+
+    #[rstest]
+    #[case(503)]
+    #[case(307)]
+    #[case(308)]
+    #[tokio::test]
+    async fn rest_post_uses_exact_body_once_without_read_failover(#[case] status: u16) {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let expected =
+            json!({"marketType": "Perp", "action": "PlaceOrder", "signedExtrinsic": "0x0102"});
+        let body = serde_json::to_vec(&expected).unwrap();
+        let router = Router::new().route(
+            "/internal/v1/chain/tx/transact",
+            post(move |Json(value): Json<Value>| {
+                let calls = observed.clone();
+                let expected = expected.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(value, expected);
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        [("Location", "/internal/v1/chain/tx/transact")],
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = crate::http::client::DeepXHttpClient::new_with_endpoints(
+            [url, "http://127.0.0.1:1".to_string()],
+            Some(2),
+            None,
+            crate::http::retry::deepx_http_retry_config(),
+        )
+        .unwrap();
+        let response = client.post_transaction_once(body).await.unwrap();
+        assert_eq!(response.status.as_u16(), status);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
 
     fn signed_remark() -> Result<SignedPalletExtrinsic, SigningError> {
         let metadata: Value = serde_json::from_str(include_str!(concat!(

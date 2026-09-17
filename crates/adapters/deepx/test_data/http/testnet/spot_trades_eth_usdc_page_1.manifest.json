@@ -1,0 +1,34 @@
+{
+  "captured_at": "2026-09-17T03:27:31Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_market_data",
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/market/spot/trades",
+    "query": {
+      "name": "ETH/USDC",
+      "pageSize": 2,
+      "sort": "DESC"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "spot_trades_eth_usdc_page_1.json",
+    "payload_sha256": "8f68a59ce122536a44b57cf5e24c02d5a559880803f1a3daae535d113abe30ed"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The REST response is mutable and not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves one nonempty descending market page and its opaque continuation cursor.",
+    "Financial JSON numeric lexemes must be decoded without routing through binary floating point.",
+    "It does not prove cursor stability, complete history, framework trade semantics, or Spot instrument quantity precision."
+  ]
+}

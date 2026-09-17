@@ -1,0 +1,36 @@
+{
+  "captured_at": "2026-09-16T10:33:08Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_market_data",
+  "limitations": [
+    "The REST response is not pinned to a block hash.",
+    "The runtime identity was independently captured from the same testnet deployment.",
+    "The fixture proves three captured hourly pool-status observations and exact decimal representations.",
+    "It does not prove asset units, bucket completeness, future ordering, freshness, or framework market-status semantics."
+  ],
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/market/lending/status-history",
+    "query": {
+      "asset": "usdc",
+      "limit": 3,
+      "marketId": 1,
+      "sort": "DESC",
+      "start": 1789430000000,
+      "timeFrame": "1h"
+    }
+  },
+  "response": {
+    "content_type": "application/json",
+    "payload_path": "lending_status_history_usdc_1h.json",
+    "payload_sha256": "85b1c98541cc94459691fd026edde6ceaaf2e7363038b79661a610f330fba7fa",
+    "status": 200
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json",
+    "spec_version": 369,
+    "transaction_version": 1
+  }
+}

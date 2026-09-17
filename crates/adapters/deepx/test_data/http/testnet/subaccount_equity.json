@@ -1,0 +1,12 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "subaccount": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+    "totalDepositsUsd": "999.78",
+    "totalBorrowsUsd": "0",
+    "unrealizedPnlUsd": "-2.73",
+    "equityUsd": "997.05"
+  },
+  "fail": false
+}

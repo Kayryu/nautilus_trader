@@ -154,7 +154,7 @@ impl DeepXMarketProvider {
     /// The previous catalog remains unchanged.
     pub async fn load_all(&mut self) -> Result<()> {
         let (spot, perpetual) = tokio::try_join!(
-            self.client.get_spot_markets(),
+            self.client.get_spot_market_entries(),
             self.client.get_perp_markets(),
         )
         .context("failed to load complete DeepX market metadata")?;
@@ -295,6 +295,7 @@ mod tests {
                                 .trim_start_matches("0x")
                                 .to_ascii_uppercase()
                                 .into();
+                            response["data"][0]["name"] = "BTC/USDC".into();
                             response["data"][0]["baseSymbol"] = "btc".into();
                             response["data"].as_array_mut().unwrap().push(duplicate);
                             return Json(response).into_response();

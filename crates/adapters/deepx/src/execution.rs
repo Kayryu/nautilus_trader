@@ -17,7 +17,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -33,10 +34,12 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
-use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext};
+use nautilus_live::{
+    ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext, task::TaskGroup,
+};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, LiquiditySide, OmsType},
+    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide},
     events::AccountState,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
@@ -44,33 +47,76 @@ use nautilus_model::{
     instruments::InstrumentAny,
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use thiserror::Error;
 
 use crate::{
+    account::DeepXAccountOwnershipProof,
     common::{DeepXEnvironment, DeepXPrivateKey, consts::DEEPX_VENUE},
     config::{
         DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXRpcRole, DeepXValidatedRpcEndpoints,
     },
-    providers::DeepXMarketProvider,
-    rpc::{DeepXAppliedRuntimeSnapshot, DeepXValidatedRpcMethodCapabilities},
-    signing::{RuntimeSnapshot, SigningError, derive_signer_account_id},
+    http::{
+        DeepXAccountSortOrder, DeepXHttpClient, DeepXPerpAccountTradeRecord,
+        DeepXPerpAccountTradesRequest, DeepXPerpOrderRecord, DeepXPerpPositionRecord,
+        DeepXPerpPositionsRequest,
+    },
+    providers::{DeepXMarketMetadata, DeepXMarketProvider},
+    rpc::{
+        DeepXAppliedRuntimeSnapshot, DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence,
+        DeepXValidatedRpcMethodCapabilities, observe_and_apply_finalized_chain_time,
+    },
+    signing::{
+        DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, RuntimeSnapshot,
+        SigningError, derive_signer_account_id,
+    },
     transaction::{
-        DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
-        DeepXPoolReconciliationCommitError, DeepXReorganizationCommitError,
-        DeepXRestoredTransactionRecord, DeepXSignerLease, DeepXTimestampNonceAllocator,
+        DeepXDurableRecoveryObserver, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
+        DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpPlaceCallVerifier,
+        DeepXPerpProfitAndLossPointCallVerifier, DeepXPoolReconciliationCommitError,
+        DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXReorganizationCommitError,
+        DeepXRestoredTransactionRecord, DeepXSignerLease, DeepXSpotCancelCallVerifier,
+        DeepXSpotPlaceCallVerifier, DeepXTimestampNonceAllocator, DeepXTransactionOperation,
         DeepXTransactionPersistenceError, DeepXTransactionRecoveryAction, DeepXTransactionState,
         DeepXTransactionStore, DeepXTransactionWatchError, load_verified_committed_for_signer,
         observe_and_commit_finality, observe_and_commit_reorganization,
-        reconcile_not_included_checkpoint, reconcile_submission_pool,
-        restore_timestamp_nonce_allocator,
+        reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
+        reconcile_submission_pool, restore_timestamp_nonce_allocator,
     },
-    websocket::{DeepXWsAuthenticatedFrame, DeepXWsAuthenticatedSession, DeepXWsProtocolCore},
+    websocket::{
+        DeepXWsAccountConnection, DeepXWsConfirmedAccountSubscription,
+        DeepXWsConfirmedBalancesFrame,
+    },
 };
 
 const TRADE_DEDUP_CAPACITY: usize = 10_000;
 const TERMINAL_CONTEXT_CAPACITY: usize = 10_000;
+const POSITION_REPORT_PAGE_SIZE: u32 = 100;
+const POSITION_REPORT_MAX_PAGES: usize = 100;
+const FILL_REPORT_PAGE_SIZE: u32 = 100;
+const FILL_REPORT_MAX_PAGES: usize = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeepXPerpetualReportMetadata {
+    price_precision: u8,
+    size_precision: u8,
+    price_increment: rust_decimal::Decimal,
+    size_increment: rust_decimal::Decimal,
+    quote_currency: Currency,
+    maker_fee_rate: rust_decimal::Decimal,
+    taker_fee_rate: rust_decimal::Decimal,
+}
+
+#[derive(Clone, Debug)]
+struct DeepXTrackedOrderQuery {
+    account_id: AccountId,
+    subaccount: String,
+    market_id: u64,
+    venue_order_id: VenueOrderId,
+    context: OrderContext,
+    ts_init: UnixNanos,
+}
 
 /// Ordered evidence required before a DeepX execution client can become connected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,10 +125,12 @@ pub enum DeepXExecutionStartupEvidence {
     InstrumentsLoaded,
     /// Durable order identity and transaction context completed restoration.
     OrderContextRestored,
-    /// Signer, subaccount, backend, RPC roles, and runtime snapshot were validated.
+    /// Backend, RPC roles, and runtime snapshot were validated.
     RuntimeValidated,
-    /// The private stream authenticated for the current connection epoch.
-    PrivateStreamAuthenticated,
+    /// REST directory and profile evidence bound the configured subaccount to the signer.
+    AccountOwnershipValidated,
+    /// The address-scoped account stream acknowledged the configured subaccount.
+    AccountStreamConfirmed,
     /// The verified account-state event for this startup epoch was received.
     AccountStateInitialized,
     /// Startup mass reconciliation completed from authoritative evidence.
@@ -114,6 +162,9 @@ pub enum DeepXExecutionStartupError {
     /// The public market catalog was loaded from an endpoint outside this execution configuration.
     #[error("DeepX market catalog endpoint does not match execution configuration")]
     MarketCatalogEndpointMismatch,
+    /// The public market catalog contains inconsistent perpetual identity indexes.
+    #[error("DeepX market catalog contains inconsistent perpetual market identity")]
+    MarketCatalogIdentityMismatch,
     /// The applied runtime snapshot belongs to another deployment environment.
     #[error("DeepX runtime deployment mismatch: expected {expected}, received {received}")]
     RuntimeEnvironmentMismatch {
@@ -134,9 +185,15 @@ pub enum DeepXExecutionStartupError {
     /// RPC method capability evidence belongs to another validated role endpoint.
     #[error("DeepX RPC method capabilities do not match validated endpoint for role {0:?}")]
     RuntimeRpcCapabilitiesMismatch(DeepXRpcRole),
-    /// The private-stream authentication receipt is not current for its protocol owner.
-    #[error("DeepX private-stream authenticated session is not current")]
-    PrivateStreamAuthenticationMismatch,
+    /// The account-stream subscription receipt is not current for its connection owner.
+    #[error("DeepX account-stream subscription is not current")]
+    AccountStreamSubscriptionMismatch,
+    /// The ownership proof belongs to another signing identity.
+    #[error("DeepX account ownership proof does not match the configured signing identity")]
+    AccountOwnershipSignerMismatch,
+    /// The ownership proof belongs to another configured subaccount.
+    #[error("DeepX account ownership proof does not match the configured subaccount")]
+    AccountOwnershipSubaccountMismatch,
     /// Account-state initialization was not recorded through the event identity boundary.
     #[error("DeepX account-state initialization evidence requires event verification")]
     AccountStateVerificationRequired,
@@ -259,6 +316,74 @@ pub enum DeepXFillReportMergeError {
     ConflictingTrade(TradeId),
 }
 
+/// Errors raised while converting validated DeepX account trades into fill reports.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum DeepXFillReportError {
+    /// The execution configuration no longer contains a subaccount identity.
+    #[error("DeepX fill reports require a configured subaccount")]
+    MissingConfiguredSubaccount,
+    /// The requested venue order identity cannot be sent or compared exactly.
+    #[error("DeepX fill report venue order ID must be an exact decimal u64")]
+    InvalidVenueOrderId,
+    /// The requested instrument was absent from the immutable startup catalog.
+    #[error("DeepX fill report has no validated perpetual market for {0}")]
+    UnknownInstrument(InstrumentId),
+    /// A REST trade belongs to a market absent from the immutable startup catalog.
+    #[error("DeepX fill report contains unknown perpetual market ID {0}")]
+    UnknownMarket(u64),
+    /// The startup catalog's forward, reverse, or report metadata disagree.
+    #[error("DeepX fill report market identity snapshot is inconsistent")]
+    MarketIdentityMismatch,
+    /// The venue taker side cannot be interpreted against the account order side.
+    #[error("unsupported DeepX fill report taker: {0}")]
+    UnsupportedTaker(String),
+    /// The venue fill-direction value is outside the chain enum.
+    #[error("unsupported DeepX fill report direction: {0}")]
+    UnsupportedFilledDirection(String),
+    /// The trade quantity is not an exact multiple of the startup instrument increment.
+    #[error("DeepX fill report quantity does not align with instrument increment")]
+    QuantityIncrementMismatch,
+    /// The trade quantity could not be represented exactly by the startup instrument precision.
+    #[error("invalid DeepX fill report quantity: {0}")]
+    QuantityConversion(String),
+    /// The trade quantity would be rounded at the startup instrument precision.
+    #[error("DeepX fill report quantity loses precision")]
+    QuantityPrecisionLoss,
+    /// The trade price is not an exact multiple of the startup instrument increment.
+    #[error("DeepX fill report price does not align with instrument increment")]
+    PriceIncrementMismatch,
+    /// The trade price could not be represented exactly by the startup instrument precision.
+    #[error("invalid DeepX fill report price: {0}")]
+    PriceConversion(String),
+    /// The trade price would be rounded at the startup instrument precision.
+    #[error("DeepX fill report price loses precision")]
+    PricePrecisionLoss,
+    /// A nonempty REST fee asset conflicts with the market quote currency.
+    #[error("DeepX fill report fee asset does not match market quote currency")]
+    FeeAssetMismatch,
+    /// The REST account-delta fee sign conflicts with the applicable market fee rate.
+    #[error("DeepX fill report fee sign conflicts with market fee rate")]
+    FeeSignMismatch,
+    /// The negated REST account-delta fee could not be represented as commission.
+    #[error("invalid DeepX fill report commission: {0}")]
+    CommissionConversion(String),
+    /// Commission would be rounded at the quote currency precision.
+    #[error("DeepX fill report commission loses precision")]
+    CommissionPrecisionLoss,
+    /// The trade timestamp is malformed or before the Unix epoch.
+    #[error("invalid DeepX fill report createdAt timestamp")]
+    InvalidTimestamp,
+    /// Registry access or identity routing failed.
+    #[error(transparent)]
+    Registry(#[from] DeepXOrderContextError),
+    /// Restored local context disagrees with the REST trade instrument.
+    #[error("DeepX fill report instrument does not match registered order context")]
+    ContextInstrumentMismatch,
+    /// Restored local context disagrees with the REST trade side.
+    #[error("DeepX fill report side does not match registered order context")]
+    ContextSideMismatch,
+}
+
 /// Errors raised while merging already validated DeepX order status reports.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXOrderReportMergeError {
@@ -299,6 +424,127 @@ pub enum DeepXOrderReportMergeError {
     ConflictingOrder(VenueOrderId),
 }
 
+/// Errors raised while converting a validated DeepX order into a tracked-order report.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum DeepXTrackedOrderReportError {
+    /// The execution configuration no longer contains a subaccount identity.
+    #[error("DeepX tracked-order report requires a configured subaccount")]
+    MissingConfiguredSubaccount,
+    /// The REST order belongs to another subaccount.
+    #[error("DeepX tracked-order report belongs to another subaccount")]
+    SubaccountMismatch,
+    /// The REST order belongs to another market.
+    #[error("DeepX tracked-order report market mismatch: expected {expected}, received {received}")]
+    MarketMismatch { expected: u64, received: u64 },
+    /// The supplied venue order ID does not match the REST order identity.
+    #[error("DeepX tracked-order report venue order ID mismatch")]
+    VenueOrderIdMismatch,
+    /// Registry access or identity routing failed.
+    #[error(transparent)]
+    Registry(#[from] DeepXOrderContextError),
+    /// The venue order ID is not bound to locally tracked order context.
+    #[error("DeepX venue order ID {0} is not bound to tracked order context")]
+    UntrackedOrder(VenueOrderId),
+    /// DeepX perpetual order quantities are base-denominated.
+    #[error("DeepX tracked-order report cannot use quote-denominated quantity context")]
+    QuoteQuantityUnsupported,
+    /// The REST side conflicts with immutable local order context.
+    #[error("DeepX tracked-order report side does not match local order context")]
+    SideMismatch,
+    /// The REST order type cannot be represented by this tracked-order boundary.
+    #[error("unsupported DeepX tracked-order report type: {0}")]
+    UnsupportedOrderType(String),
+    /// The REST order type conflicts with immutable local order context.
+    #[error("DeepX tracked-order report type does not match local order context")]
+    OrderTypeMismatch,
+    /// The REST quantity conflicts with immutable local order context.
+    #[error("DeepX tracked-order report quantity does not match local order context")]
+    QuantityMismatch,
+    /// The REST limit price conflicts with immutable local order context.
+    #[error("DeepX tracked-order report limit price does not match local order context")]
+    LimitPriceMismatch,
+    /// The REST post-only value cannot be represented by local boolean order context.
+    #[error("unsupported DeepX tracked-order report post-only value: {0}")]
+    UnsupportedPostOnly(String),
+    /// The REST post-only value conflicts with immutable local order context.
+    #[error("DeepX tracked-order report post-only value does not match local order context")]
+    PostOnlyMismatch,
+    /// The REST reduce-only value conflicts with immutable local order context.
+    #[error("DeepX tracked-order report reduce-only value does not match local order context")]
+    ReduceOnlyMismatch,
+    /// The REST order contains invalid or internally inconsistent financial values.
+    #[error("DeepX tracked-order report contains invalid financial values")]
+    InvalidFinancialValues,
+    /// Filled and remaining quantity do not reconstruct the original order quantity.
+    #[error("DeepX tracked-order report filled and remaining quantities do not equal order size")]
+    SizeAccountingMismatch,
+    /// A nonzero filled quantity has no average fill price.
+    #[error("DeepX tracked-order report is missing average fill price for executed quantity")]
+    MissingAverageFillPrice,
+    /// An unfilled order unexpectedly carries an average fill price.
+    #[error("DeepX tracked-order report has average fill price without executed quantity")]
+    UnexpectedAverageFillPrice,
+    /// The REST status cannot be represented by this tracked-order boundary.
+    #[error("unsupported DeepX tracked-order report status: {0}")]
+    UnsupportedStatus(String),
+    /// The REST status conflicts with its filled and remaining quantities.
+    #[error("DeepX tracked-order report status conflicts with executed quantities")]
+    StatusQuantityMismatch,
+    /// The REST order has no last-update timestamp required by the framework report.
+    #[error("DeepX tracked-order report is missing updatedTime")]
+    MissingUpdatedTime,
+    /// A REST timestamp is invalid or outside the framework timestamp range.
+    #[error("DeepX tracked-order report has invalid {0}")]
+    InvalidTimestamp(&'static str),
+    /// The last-update timestamp precedes order acceptance.
+    #[error("DeepX tracked-order report updatedTime precedes createTime")]
+    TimestampOrderMismatch,
+    /// Filled quantity cannot be represented at the immutable local quantity precision.
+    #[error("DeepX tracked-order report filled quantity cannot be represented: {0}")]
+    FilledQuantityConversion(String),
+    /// Filled quantity would lose information at the immutable local quantity precision.
+    #[error("DeepX tracked-order report filled quantity exceeds local quantity precision")]
+    FilledQuantityPrecisionLoss,
+}
+
+/// Errors raised while converting validated DeepX position lifecycles into current reports.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(crate) enum DeepXPositionReportError {
+    /// The execution configuration no longer contains a subaccount identity.
+    #[error("DeepX position reports require a configured subaccount")]
+    MissingConfiguredSubaccount,
+    /// The requested instrument was absent from the immutable startup catalog.
+    #[error("DeepX position report has no validated perpetual market for {0}")]
+    UnknownInstrument(InstrumentId),
+    /// The startup catalog's forward and reverse market identities disagree.
+    #[error("DeepX position report market identity snapshot is inconsistent")]
+    MarketIdentityMismatch,
+    /// A REST position belongs to another subaccount.
+    #[error("DeepX position report belongs to another subaccount")]
+    SubaccountMismatch,
+    /// A REST position belongs to a market absent from the immutable startup catalog.
+    #[error("DeepX position report contains unknown perpetual market ID {0}")]
+    UnknownMarket(u64),
+    /// A REST lifecycle status cannot be classified as current or historical.
+    #[error("unsupported DeepX position report status: {0}")]
+    UnsupportedStatus(String),
+    /// More than one current net position was returned for a market.
+    #[error("DeepX position report contains multiple open positions for market ID {0}")]
+    DuplicateOpenMarket(u64),
+    /// The position quantity could not be represented by the startup instrument precision.
+    #[error("invalid DeepX position report quantity: {0}")]
+    QuantityConversion(String),
+    /// The position quantity would be rounded at the startup instrument precision.
+    #[error("DeepX position report quantity loses precision")]
+    QuantityPrecisionLoss,
+    /// The position quantity is not an exact multiple of the startup instrument increment.
+    #[error("DeepX position report quantity does not align with instrument increment")]
+    QuantityIncrementMismatch,
+    /// A position update timestamp is malformed or before the Unix epoch.
+    #[error("invalid DeepX position report updatedAt timestamp")]
+    InvalidTimestamp,
+}
+
 /// Errors raised while restoring the complete startup order-context set.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXOrderContextRestorationError {
@@ -322,6 +568,9 @@ pub enum DeepXMassReconciliationError {
     /// The configured signing identity could not be derived.
     #[error(transparent)]
     Signing(#[from] SigningError),
+    /// The client does not own a restored durable transaction runtime.
+    #[error("DeepX transaction runtime has not been initialized")]
+    TransactionRuntimeNotInitialized,
     /// The supplied signer lease belongs to another signing identity.
     #[error("DeepX transaction store lease does not match the configured signing identity")]
     SignerLeaseMismatch,
@@ -372,6 +621,32 @@ pub enum DeepXNonceRestorationError {
     #[error("DeepX transaction store lease does not match the configured signing identity")]
     SignerLeaseMismatch,
     /// Complete durable transaction evidence could not be verified.
+    #[error(transparent)]
+    Persistence(#[from] DeepXTransactionPersistenceError),
+}
+
+/// Errors raised by the client-owned durable transaction runtime.
+#[derive(Debug, Error)]
+pub enum DeepXTransactionRuntimeError {
+    /// The client does not own a restored durable transaction runtime.
+    #[error("DeepX transaction runtime has not been initialized")]
+    NotInitialized,
+    /// RPC endpoint or capability evidence does not match execution startup.
+    #[error(transparent)]
+    Startup(#[from] DeepXExecutionStartupError),
+    /// Finalized runtime-bound chain time could not be observed.
+    #[error(transparent)]
+    ChainTime(#[from] DeepXFinalizedChainTimeError),
+    /// The retained signing snapshot service is unavailable or refreshing.
+    #[error(transparent)]
+    SnapshotService(#[from] DeepXRuntimeSnapshotServiceError),
+    /// The nonce allocator and retained signer lease identify different accounts.
+    #[error("DeepX transaction runtime signer identity mismatch")]
+    SignerIdentityMismatch,
+    /// The retained signing snapshot differs from startup runtime evidence.
+    #[error("DeepX transaction runtime signing snapshot identity mismatch")]
+    SnapshotIdentityMismatch,
+    /// The PostgreSQL signer lease is no longer current.
     #[error(transparent)]
     Persistence(#[from] DeepXTransactionPersistenceError),
 }
@@ -805,6 +1080,19 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             .copied())
     }
 
+    fn tracked_venue_order_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<VenueOrderId>, DeepXOrderContextError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| DeepXOrderContextError::LockPoisoned)?
+            .tracked_venue_by_client
+            .get(client_order_id)
+            .copied())
+    }
+
     fn external_by_venue(
         &self,
         venue_order_id: &VenueOrderId,
@@ -915,11 +1203,12 @@ struct DeepXExecutionStartup {
 }
 
 impl DeepXExecutionStartup {
-    const REQUIRED: [DeepXExecutionStartupEvidence; 7] = [
+    const REQUIRED: [DeepXExecutionStartupEvidence; 8] = [
         DeepXExecutionStartupEvidence::InstrumentsLoaded,
         DeepXExecutionStartupEvidence::OrderContextRestored,
         DeepXExecutionStartupEvidence::RuntimeValidated,
-        DeepXExecutionStartupEvidence::PrivateStreamAuthenticated,
+        DeepXExecutionStartupEvidence::AccountOwnershipValidated,
+        DeepXExecutionStartupEvidence::AccountStreamConfirmed,
         DeepXExecutionStartupEvidence::AccountStateInitialized,
         DeepXExecutionStartupEvidence::MassReconciliationCompleted,
         DeepXExecutionStartupEvidence::AccountRegistered,
@@ -967,25 +1256,597 @@ impl DeepXExecutionStartup {
     }
 }
 
-/// Non-operational DeepX execution client foundation.
+#[derive(Debug)]
+struct DeepXExecutionTransactionRuntime {
+    store: DeepXPostgresTransactionStore,
+    lease: DeepXPostgresSignerLease,
+    nonce_allocator: DeepXTimestampNonceAllocator,
+    snapshot_service: DeepXRuntimeSnapshotService,
+    restored: Vec<DeepXRestoredTransactionRecord>,
+}
+
+/// Fail-closed DeepX execution client foundation.
 ///
-/// This type owns execution identity and event construction, but intentionally does not implement
-/// order commands or network connection until venue fixtures prove those protocol semantics.
+/// This type owns execution identity, event construction, and verified read-only report queries.
+/// Order commands and autonomous network startup remain disabled until their complete protocol and
+/// recovery semantics are proven.
 #[derive(Debug)]
 pub struct DeepXExecutionClient {
     core: ExecutionClientCore,
     config: DeepXExecutionClientConfig,
     credential: DeepXPrivateKey,
+    http: DeepXHttpClient,
     emitter: ExecutionEventEmitter,
+    query_tasks: TaskGroup,
+    query_epoch: Arc<Mutex<bool>>,
+    perpetual_market_ids: HashMap<InstrumentId, u64>,
+    perpetual_instrument_ids: HashMap<u64, InstrumentId>,
+    perpetual_report_metadata: HashMap<InstrumentId, DeepXPerpetualReportMetadata>,
     order_contexts: DeepXOrderContextRegistry,
     trade_dedup: DeepXTradeDedup<TRADE_DEDUP_CAPACITY>,
     startup: DeepXExecutionStartup,
     runtime_snapshot: Option<RuntimeSnapshot>,
-    startup_authenticated_session: Option<DeepXWsAuthenticatedSession>,
+    account_ownership: Option<DeepXAccountOwnershipProof>,
+    transaction_runtime: Option<DeepXExecutionTransactionRuntime>,
+    startup_account_subscription: Option<DeepXWsConfirmedAccountSubscription>,
     startup_account_event_id: Option<UUID4>,
 }
 
 impl DeepXExecutionClient {
+    fn resolve_tracked_order_report_query(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<(VenueOrderId, InstrumentId, u64)> {
+        let venue_order_id = match (cmd.client_order_id, cmd.venue_order_id) {
+            (None, None) => {
+                anyhow::bail!(
+                    "DeepX order status report requires a client order ID or venue order ID"
+                )
+            }
+            (Some(client_order_id), requested_venue_order_id) => {
+                let bound_venue_order_id = self
+                    .order_contexts
+                    .tracked_venue_order_id(&client_order_id)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "DeepX client order ID {client_order_id} has no tracked venue order ID"
+                        )
+                    })?;
+                if requested_venue_order_id
+                    .is_some_and(|requested| requested != bound_venue_order_id)
+                {
+                    anyhow::bail!("DeepX order status report client and venue order IDs conflict");
+                }
+                bound_venue_order_id
+            }
+            (None, Some(venue_order_id)) => venue_order_id,
+        };
+        let context = match self
+            .order_contexts
+            .route(cmd.client_order_id, Some(venue_order_id))?
+        {
+            DeepXExecutionUpdateRoute::Tracked(context)
+            | DeepXExecutionUpdateRoute::Terminal(context) => context,
+            DeepXExecutionUpdateRoute::RegisteredExternal(_)
+            | DeepXExecutionUpdateRoute::External => {
+                anyhow::bail!(
+                    "DeepX venue order ID {venue_order_id} is not bound to tracked order context"
+                )
+            }
+        };
+        let instrument_id = context.identity.instrument_id;
+        if cmd
+            .instrument_id
+            .is_some_and(|requested| requested != instrument_id)
+        {
+            anyhow::bail!(
+                "DeepX order status report instrument conflicts with tracked order context"
+            );
+        }
+        let market_id = self
+            .perpetual_market_ids
+            .get(&instrument_id)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepX order status report has no validated perpetual market for {instrument_id}"
+                )
+            })?;
+        anyhow::ensure!(
+            self.perpetual_instrument_ids.get(&market_id) == Some(&instrument_id),
+            "DeepX order status report market identity snapshot is inconsistent",
+        );
+        Ok((venue_order_id, instrument_id, market_id))
+    }
+
+    fn prepare_tracked_order_query(
+        &self,
+        cmd: &QueryOrder,
+    ) -> anyhow::Result<DeepXTrackedOrderQuery> {
+        anyhow::ensure!(
+            self.core.is_connected(),
+            "DeepX order query requires a connected execution client"
+        );
+        anyhow::ensure!(
+            *self
+                .query_epoch
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DeepX order query epoch lock is poisoned"))?,
+            "DeepX order query task generation is inactive"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id,
+            "DeepX order query trader ID mismatch"
+        );
+        anyhow::ensure!(
+            cmd.client_id
+                .is_none_or(|client_id| client_id == self.core.client_id),
+            "DeepX order query client ID mismatch"
+        );
+        anyhow::ensure!(
+            cmd.params.as_ref().is_none_or(|params| params.is_empty()),
+            "DeepX order query parameters are unsupported"
+        );
+        let report_query = GenerateOrderStatusReport::new(
+            cmd.command_id,
+            cmd.ts_init,
+            Some(cmd.instrument_id),
+            Some(cmd.client_order_id),
+            cmd.venue_order_id,
+            None,
+            cmd.correlation_id,
+        );
+        let (venue_order_id, instrument_id, market_id) =
+            self.resolve_tracked_order_report_query(&report_query)?;
+        let context = match self
+            .order_contexts
+            .route(Some(cmd.client_order_id), Some(venue_order_id))?
+        {
+            DeepXExecutionUpdateRoute::Tracked(context)
+            | DeepXExecutionUpdateRoute::Terminal(context) => context,
+            DeepXExecutionUpdateRoute::RegisteredExternal(_)
+            | DeepXExecutionUpdateRoute::External => {
+                anyhow::bail!("DeepX order query requires tracked order context")
+            }
+        };
+        anyhow::ensure!(
+            context.identity.instrument_id == instrument_id,
+            "DeepX order query context instrument mismatch"
+        );
+        anyhow::ensure!(
+            context.identity.strategy_id == cmd.strategy_id,
+            "DeepX order query strategy ID mismatch"
+        );
+        let subaccount =
+            self.config.subaccount_id.clone().ok_or_else(|| {
+                anyhow::anyhow!("DeepX order query requires a configured subaccount")
+            })?;
+        Ok(DeepXTrackedOrderQuery {
+            account_id: self.core.account_id,
+            subaccount,
+            market_id,
+            venue_order_id,
+            context,
+            ts_init: cmd.ts_init,
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reserved for the fixture-gated tracked-order reconciliation path"
+    )]
+    pub(crate) fn build_tracked_order_status_report(
+        &self,
+        record: &DeepXPerpOrderRecord,
+        expected_market_id: u64,
+        venue_order_id: VenueOrderId,
+        ts_init: UnixNanos,
+    ) -> Result<OrderStatusReport, DeepXTrackedOrderReportError> {
+        let subaccount = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .ok_or(DeepXTrackedOrderReportError::MissingConfiguredSubaccount)?;
+        if !record.owner.eq_ignore_ascii_case(subaccount) {
+            return Err(DeepXTrackedOrderReportError::SubaccountMismatch);
+        }
+        if record.market_id != expected_market_id {
+            return Err(DeepXTrackedOrderReportError::MarketMismatch {
+                expected: expected_market_id,
+                received: record.market_id,
+            });
+        }
+        if record.order_id != venue_order_id.as_str() {
+            return Err(DeepXTrackedOrderReportError::VenueOrderIdMismatch);
+        }
+        let context = match self.order_contexts.route(None, Some(venue_order_id))? {
+            DeepXExecutionUpdateRoute::Tracked(context)
+            | DeepXExecutionUpdateRoute::Terminal(context) => context,
+            DeepXExecutionUpdateRoute::RegisteredExternal(_)
+            | DeepXExecutionUpdateRoute::External => {
+                return Err(DeepXTrackedOrderReportError::UntrackedOrder(venue_order_id));
+            }
+        };
+        Self::build_tracked_order_status_report_from_context(
+            record,
+            expected_market_id,
+            venue_order_id,
+            ts_init,
+            self.core.account_id,
+            subaccount,
+            context,
+        )
+    }
+
+    fn build_tracked_order_status_report_from_context(
+        record: &DeepXPerpOrderRecord,
+        expected_market_id: u64,
+        venue_order_id: VenueOrderId,
+        ts_init: UnixNanos,
+        account_id: AccountId,
+        subaccount: &str,
+        context: OrderContext,
+    ) -> Result<OrderStatusReport, DeepXTrackedOrderReportError> {
+        if !record.owner.eq_ignore_ascii_case(subaccount) {
+            return Err(DeepXTrackedOrderReportError::SubaccountMismatch);
+        }
+        if record.market_id != expected_market_id {
+            return Err(DeepXTrackedOrderReportError::MarketMismatch {
+                expected: expected_market_id,
+                received: record.market_id,
+            });
+        }
+        if record.order_id != venue_order_id.as_str() {
+            return Err(DeepXTrackedOrderReportError::VenueOrderIdMismatch);
+        }
+        if context.is_quote_quantity {
+            return Err(DeepXTrackedOrderReportError::QuoteQuantityUnsupported);
+        }
+
+        let order_side = if record.is_long {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        if order_side != context.identity.order_side {
+            return Err(DeepXTrackedOrderReportError::SideMismatch);
+        }
+        let order_type = match record.order_type.as_str() {
+            "Limit" => OrderType::Limit,
+            "Market" => OrderType::Market,
+            value => {
+                return Err(DeepXTrackedOrderReportError::UnsupportedOrderType(
+                    value.to_string(),
+                ));
+            }
+        };
+        if order_type != context.identity.order_type {
+            return Err(DeepXTrackedOrderReportError::OrderTypeMismatch);
+        }
+        if record.size != context.quantity.as_decimal() {
+            return Err(DeepXTrackedOrderReportError::QuantityMismatch);
+        }
+        let report_price = match order_type {
+            OrderType::Limit => match context.price {
+                Some(price) if price.as_decimal() == record.price => Some(price),
+                _ => return Err(DeepXTrackedOrderReportError::LimitPriceMismatch),
+            },
+            OrderType::Market => None,
+            _ => unreachable!("order type was restricted above"),
+        };
+        let post_only = match record.post_only.as_str() {
+            "None" => false,
+            "MustPostOnly" => true,
+            value => {
+                return Err(DeepXTrackedOrderReportError::UnsupportedPostOnly(
+                    value.to_string(),
+                ));
+            }
+        };
+        if post_only != context.is_post_only {
+            return Err(DeepXTrackedOrderReportError::PostOnlyMismatch);
+        }
+        if record.reduce_only != context.is_reduce_only {
+            return Err(DeepXTrackedOrderReportError::ReduceOnlyMismatch);
+        }
+        if record.size <= rust_decimal::Decimal::ZERO
+            || record.size_filled.is_sign_negative()
+            || record.size_remain.is_sign_negative()
+            || order_type == OrderType::Limit && record.price <= rust_decimal::Decimal::ZERO
+            || record
+                .avg_fill_price
+                .is_some_and(|price| price <= rust_decimal::Decimal::ZERO)
+        {
+            return Err(DeepXTrackedOrderReportError::InvalidFinancialValues);
+        }
+        if record.size_filled + record.size_remain != record.size {
+            return Err(DeepXTrackedOrderReportError::SizeAccountingMismatch);
+        }
+        let avg_fill_price = match (record.size_filled.is_zero(), record.avg_fill_price) {
+            (false, Some(price)) => Some(price),
+            (false, None) => {
+                return Err(DeepXTrackedOrderReportError::MissingAverageFillPrice);
+            }
+            (true, Some(_)) => {
+                return Err(DeepXTrackedOrderReportError::UnexpectedAverageFillPrice);
+            }
+            (true, None) => None,
+        };
+        let order_status = match record.status.as_str() {
+            "Open" => OrderStatus::Accepted,
+            "PartiallyFilled" => OrderStatus::PartiallyFilled,
+            "Filled" => OrderStatus::Filled,
+            "Canceled" => OrderStatus::Canceled,
+            "Rejected" => OrderStatus::Rejected,
+            "Expired" => OrderStatus::Expired,
+            value => {
+                return Err(DeepXTrackedOrderReportError::UnsupportedStatus(
+                    value.to_string(),
+                ));
+            }
+        };
+        let status_quantities_match = match order_status {
+            OrderStatus::Accepted | OrderStatus::Rejected => {
+                record.size_filled.is_zero() && record.size_remain == record.size
+            }
+            OrderStatus::PartiallyFilled => {
+                !record.size_filled.is_zero() && !record.size_remain.is_zero()
+            }
+            OrderStatus::Filled => {
+                record.size_filled == record.size && record.size_remain.is_zero()
+            }
+            OrderStatus::Canceled | OrderStatus::Expired => true,
+            _ => unreachable!("order status was restricted above"),
+        };
+        if !status_quantities_match {
+            return Err(DeepXTrackedOrderReportError::StatusQuantityMismatch);
+        }
+
+        let ts_accepted = parse_tracked_order_report_timestamp("createTime", &record.create_time)?;
+        let updated_time = record
+            .updated_time
+            .as_deref()
+            .ok_or(DeepXTrackedOrderReportError::MissingUpdatedTime)?;
+        let ts_last = parse_tracked_order_report_timestamp("updatedTime", updated_time)?;
+        if ts_last < ts_accepted {
+            return Err(DeepXTrackedOrderReportError::TimestampOrderMismatch);
+        }
+        let filled_qty = Quantity::from_decimal_dp(record.size_filled, context.quantity.precision)
+            .map_err(|e| DeepXTrackedOrderReportError::FilledQuantityConversion(e.to_string()))?;
+        if filled_qty.as_decimal() != record.size_filled {
+            return Err(DeepXTrackedOrderReportError::FilledQuantityPrecisionLoss);
+        }
+
+        let mut report = OrderStatusReport::new(
+            account_id,
+            context.identity.instrument_id,
+            Some(context.identity.client_order_id),
+            venue_order_id,
+            Some(order_side),
+            order_type,
+            context.time_in_force,
+            order_status,
+            context.quantity,
+            filled_qty,
+            ts_accepted,
+            ts_last,
+            ts_init,
+            None,
+        )
+        .with_post_only(post_only)
+        .with_reduce_only(record.reduce_only);
+        if let Some(price) = report_price {
+            report = report.with_price(price);
+        }
+        if let Some(avg_fill_price) = avg_fill_price {
+            report = report.with_avg_px(avg_fill_price);
+        }
+        if order_status == OrderStatus::Canceled && !record.cancel_reason.is_empty() {
+            report = report.with_cancel_reason(record.cancel_reason.clone());
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn build_position_status_report(
+        &self,
+        record: &DeepXPerpPositionRecord,
+        ts_init: UnixNanos,
+    ) -> Result<Option<PositionStatusReport>, DeepXPositionReportError> {
+        let subaccount = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .ok_or(DeepXPositionReportError::MissingConfiguredSubaccount)?;
+        if !record.owner.eq_ignore_ascii_case(subaccount) {
+            return Err(DeepXPositionReportError::SubaccountMismatch);
+        }
+        let instrument_id = self
+            .perpetual_instrument_ids
+            .get(&record.market_id)
+            .copied()
+            .ok_or(DeepXPositionReportError::UnknownMarket(record.market_id))?;
+        if self.perpetual_market_ids.get(&instrument_id) != Some(&record.market_id) {
+            return Err(DeepXPositionReportError::MarketIdentityMismatch);
+        }
+        let metadata = self
+            .perpetual_report_metadata
+            .get(&instrument_id)
+            .copied()
+            .ok_or(DeepXPositionReportError::MarketIdentityMismatch)?;
+
+        match record.status.as_str() {
+            "Closed" => return Ok(None),
+            "Open" => {}
+            value => {
+                return Err(DeepXPositionReportError::UnsupportedStatus(
+                    value.to_string(),
+                ));
+            }
+        }
+        if record.base_asset_amount <= rust_decimal::Decimal::ZERO {
+            return Err(DeepXPositionReportError::QuantityConversion(
+                "open position quantity must be positive".to_string(),
+            ));
+        }
+        if record.base_asset_amount % metadata.size_increment != rust_decimal::Decimal::ZERO {
+            return Err(DeepXPositionReportError::QuantityIncrementMismatch);
+        }
+        let quantity = Quantity::from_decimal_dp(record.base_asset_amount, metadata.size_precision)
+            .map_err(|e| DeepXPositionReportError::QuantityConversion(e.to_string()))?;
+        if quantity.as_decimal() != record.base_asset_amount {
+            return Err(DeepXPositionReportError::QuantityPrecisionLoss);
+        }
+        let timestamp = record
+            .updated_at
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| DeepXPositionReportError::InvalidTimestamp)?;
+        let nanos = u64::try_from(timestamp.as_nanosecond())
+            .map_err(|_| DeepXPositionReportError::InvalidTimestamp)?;
+        let position_side = if record.is_long {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
+        };
+
+        Ok(Some(PositionStatusReport::new(
+            self.core.account_id,
+            instrument_id,
+            position_side,
+            quantity,
+            UnixNanos::from(nanos),
+            ts_init,
+            None,
+            None,
+            Some(record.entry_price),
+        )))
+    }
+
+    pub(crate) fn build_fill_report(
+        &self,
+        record: &DeepXPerpAccountTradeRecord,
+        ts_init: UnixNanos,
+    ) -> Result<FillReport, DeepXFillReportError> {
+        let instrument_id = self
+            .perpetual_instrument_ids
+            .get(&record.market_id)
+            .copied()
+            .ok_or(DeepXFillReportError::UnknownMarket(record.market_id))?;
+        if self.perpetual_market_ids.get(&instrument_id) != Some(&record.market_id) {
+            return Err(DeepXFillReportError::MarketIdentityMismatch);
+        }
+        let metadata = self
+            .perpetual_report_metadata
+            .get(&instrument_id)
+            .copied()
+            .ok_or(DeepXFillReportError::MarketIdentityMismatch)?;
+        let order_side = if record.is_long {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        let taker_side = match record.taker.as_str() {
+            "Buyer" => OrderSide::Buy,
+            "Seller" => OrderSide::Sell,
+            value => return Err(DeepXFillReportError::UnsupportedTaker(value.to_string())),
+        };
+        if !matches!(record.filled_direction.as_str(), "Long" | "Short" | "Both") {
+            return Err(DeepXFillReportError::UnsupportedFilledDirection(
+                record.filled_direction.clone(),
+            ));
+        }
+        let liquidity_side = if taker_side == order_side {
+            LiquiditySide::Taker
+        } else {
+            LiquiditySide::Maker
+        };
+
+        if record.size % metadata.size_increment != rust_decimal::Decimal::ZERO {
+            return Err(DeepXFillReportError::QuantityIncrementMismatch);
+        }
+        let last_qty = Quantity::from_decimal_dp(record.size, metadata.size_precision)
+            .map_err(|e| DeepXFillReportError::QuantityConversion(e.to_string()))?;
+        if last_qty.as_decimal() != record.size {
+            return Err(DeepXFillReportError::QuantityPrecisionLoss);
+        }
+        if record.price % metadata.price_increment != rust_decimal::Decimal::ZERO {
+            return Err(DeepXFillReportError::PriceIncrementMismatch);
+        }
+        let last_px = Price::from_decimal_dp(record.price, metadata.price_precision)
+            .map_err(|e| DeepXFillReportError::PriceConversion(e.to_string()))?;
+        if last_px.as_decimal() != record.price {
+            return Err(DeepXFillReportError::PricePrecisionLoss);
+        }
+
+        if !record.fee_asset.is_empty()
+            && !record
+                .fee_asset
+                .eq_ignore_ascii_case(metadata.quote_currency.code.as_str())
+        {
+            return Err(DeepXFillReportError::FeeAssetMismatch);
+        }
+        let fee_rate = match liquidity_side {
+            LiquiditySide::Maker => metadata.maker_fee_rate,
+            LiquiditySide::Taker => metadata.taker_fee_rate,
+            _ => unreachable!("liquidity side was restricted above"),
+        };
+        if fee_rate > rust_decimal::Decimal::ZERO && record.fee > rust_decimal::Decimal::ZERO
+            || fee_rate < rust_decimal::Decimal::ZERO && record.fee < rust_decimal::Decimal::ZERO
+            || fee_rate == rust_decimal::Decimal::ZERO && record.fee != rust_decimal::Decimal::ZERO
+        {
+            return Err(DeepXFillReportError::FeeSignMismatch);
+        }
+        let commission_value = -record.fee;
+        let commission = Money::from_decimal(commission_value, metadata.quote_currency)
+            .map_err(|e| DeepXFillReportError::CommissionConversion(e.to_string()))?;
+        if commission.as_decimal() != commission_value {
+            return Err(DeepXFillReportError::CommissionPrecisionLoss);
+        }
+
+        let venue_order_id = VenueOrderId::new(record.order_id.as_str());
+        let client_order_id = match self.order_contexts.route(None, Some(venue_order_id))? {
+            DeepXExecutionUpdateRoute::Tracked(context)
+            | DeepXExecutionUpdateRoute::Terminal(context) => {
+                if context.identity.instrument_id != instrument_id {
+                    return Err(DeepXFillReportError::ContextInstrumentMismatch);
+                }
+                if context.identity.order_side != order_side {
+                    return Err(DeepXFillReportError::ContextSideMismatch);
+                }
+                Some(context.identity.client_order_id)
+            }
+            DeepXExecutionUpdateRoute::RegisteredExternal(context) => {
+                if context.instrument_id != instrument_id {
+                    return Err(DeepXFillReportError::ContextInstrumentMismatch);
+                }
+                Some(context.client_order_id)
+            }
+            DeepXExecutionUpdateRoute::External => None,
+        };
+        let timestamp = record
+            .created_at
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| DeepXFillReportError::InvalidTimestamp)?;
+        let nanos = u64::try_from(timestamp.as_nanosecond())
+            .map_err(|_| DeepXFillReportError::InvalidTimestamp)?;
+
+        Ok(FillReport::new(
+            self.core.account_id,
+            instrument_id,
+            venue_order_id,
+            TradeId::new(record.id.to_string()),
+            order_side,
+            last_qty,
+            last_px,
+            commission,
+            liquidity_side,
+            client_order_id,
+            None,
+            UnixNanos::from(nanos),
+            ts_init,
+            None,
+        ))
+    }
+
     #[allow(
         dead_code,
         reason = "reserved for the fixture-gated order report reconciliation path"
@@ -1215,6 +2076,11 @@ impl DeepXExecutionClient {
             "DeepX execution core account ID must match configured account ID",
         );
         let credential = config.resolve_private_key()?;
+        let http = DeepXHttpClient::from_network_config(
+            &config.network,
+            Some(config.http_timeout_secs),
+            config.proxy_url.clone(),
+        )?;
         let emitter = ExecutionEventEmitter::new(
             get_atomic_clock_realtime(),
             core.trader_id,
@@ -1227,12 +2093,20 @@ impl DeepXExecutionClient {
             core,
             config,
             credential,
+            http,
             emitter,
+            query_tasks: TaskGroup::default(),
+            query_epoch: Arc::new(Mutex::new(false)),
+            perpetual_market_ids: HashMap::new(),
+            perpetual_instrument_ids: HashMap::new(),
+            perpetual_report_metadata: HashMap::new(),
             order_contexts: DeepXOrderContextRegistry::default(),
             trade_dedup: DeepXTradeDedup::default(),
             startup: DeepXExecutionStartup::default(),
             runtime_snapshot: None,
-            startup_authenticated_session: None,
+            account_ownership: None,
+            transaction_runtime: None,
+            startup_account_subscription: None,
             startup_account_event_id: None,
         })
     }
@@ -1356,8 +2230,51 @@ impl DeepXExecutionClient {
         if provider.is_empty() {
             return Err(DeepXExecutionStartupError::MarketCatalogEmpty);
         }
+        let mut perpetual_market_ids = HashMap::new();
+        let mut perpetual_instrument_ids = HashMap::new();
+        let mut perpetual_report_metadata = HashMap::new();
+        for instrument_id in provider.instrument_ids() {
+            let Some(DeepXMarketMetadata::Perpetual(market)) = provider.market(&instrument_id)
+            else {
+                continue;
+            };
+            if market.order_spec_step_size <= rust_decimal::Decimal::ZERO {
+                return Err(DeepXExecutionStartupError::MarketCatalogIdentityMismatch);
+            }
+            let size_increment = Quantity::from_decimal(market.order_spec_step_size)
+                .map_err(|_| DeepXExecutionStartupError::MarketCatalogIdentityMismatch)?;
+            let price_increment = Price::from_decimal(market.order_spec_tick_size)
+                .map_err(|_| DeepXExecutionStartupError::MarketCatalogIdentityMismatch)?;
+            let report_metadata = DeepXPerpetualReportMetadata {
+                price_precision: price_increment.precision,
+                size_precision: size_increment.precision,
+                price_increment: market.order_spec_tick_size,
+                size_increment: market.order_spec_step_size,
+                quote_currency: Currency::get_or_create_crypto(
+                    market.quote_symbol.to_ascii_uppercase(),
+                ),
+                maker_fee_rate: market.maker_fee_rate,
+                taker_fee_rate: market.taker_fee_rate,
+            };
+            if provider.perpetual_instrument_id(market.id) != Some(instrument_id)
+                || perpetual_market_ids
+                    .insert(instrument_id, market.id)
+                    .is_some()
+                || perpetual_instrument_ids
+                    .insert(market.id, instrument_id)
+                    .is_some()
+                || perpetual_report_metadata
+                    .insert(instrument_id, report_metadata)
+                    .is_some()
+            {
+                return Err(DeepXExecutionStartupError::MarketCatalogIdentityMismatch);
+            }
+        }
         self.startup
             .record(DeepXExecutionStartupEvidence::InstrumentsLoaded)?;
+        self.perpetual_market_ids = perpetual_market_ids;
+        self.perpetual_instrument_ids = perpetual_instrument_ids;
+        self.perpetual_report_metadata = perpetual_report_metadata;
         Ok(())
     }
 
@@ -1474,25 +2391,61 @@ impl DeepXExecutionClient {
         Ok(())
     }
 
-    /// Verifies current private-stream authentication and advances the startup gate.
+    /// Verifies signer-bound subaccount ownership and advances the startup gate.
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for private-stream authentication and the
-    /// supplied receipt is still current for the protocol owner and connection epoch.
-    pub fn record_private_stream_authenticated(
+    /// Returns an error unless startup is waiting for ownership validation and the proof matches
+    /// both the configured signing key and configured AccountId20 subaccount.
+    pub fn record_account_ownership_validated(
         &mut self,
-        protocol: &DeepXWsProtocolCore,
-        session: DeepXWsAuthenticatedSession,
+        proof: DeepXAccountOwnershipProof,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
-            .validate_next(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)?;
-        if !protocol.is_authenticated_session(session) {
-            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+            .validate_next(DeepXExecutionStartupEvidence::AccountOwnershipValidated)?;
+        if derive_signer_account_id(&self.credential).ok() != Some(proof.signer()) {
+            return Err(DeepXExecutionStartupError::AccountOwnershipSignerMismatch);
+        }
+        let configured = format!("0x{}", nautilus_core::hex::encode(proof.subaccount()));
+        if !self
+            .config
+            .subaccount_id
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&configured))
+        {
+            return Err(DeepXExecutionStartupError::AccountOwnershipSubaccountMismatch);
         }
         self.startup
-            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)?;
-        self.startup_authenticated_session = Some(session);
+            .record(DeepXExecutionStartupEvidence::AccountOwnershipValidated)?;
+        self.account_ownership = Some(proof);
+        Ok(())
+    }
+
+    /// Verifies the current address-scoped account subscription and advances the startup gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless startup is waiting for account-stream confirmation, the supplied
+    /// receipt is current for its connection, and it matches the configured owned subaccount.
+    pub fn record_account_stream_confirmed(
+        &mut self,
+        connection: &DeepXWsAccountConnection,
+        subscription: DeepXWsConfirmedAccountSubscription,
+    ) -> Result<(), DeepXExecutionStartupError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::AccountStreamConfirmed)?;
+        if !connection.is_current_subscription(subscription)
+            || self
+                .account_ownership
+                .as_ref()
+                .map(|proof| proof.subaccount())
+                != Some(subscription.subaccount())
+        {
+            return Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch);
+        }
+        self.startup
+            .record(DeepXExecutionStartupEvidence::AccountStreamConfirmed)?;
+        self.startup_account_subscription = Some(subscription);
         Ok(())
     }
 
@@ -1581,25 +2534,144 @@ impl DeepXExecutionClient {
         .map_err(Into::into)
     }
 
+    /// Acquires exclusive signer ownership and restores transaction state from PostgreSQL.
+    ///
+    /// The runtime remains owned by this client until startup is reset, stopped, or disconnected.
+    /// Initializing it does not authorize signing or submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless a durable database is configured, finalized runtime and account
+    /// ownership evidence are current, and the signer lease and complete durable record set can be
+    /// restored exactly once for this startup epoch.
+    pub async fn initialize_transaction_runtime(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.core.is_connected(),
+            "DeepX transaction runtime must be initialized before connection"
+        );
+        anyhow::ensure!(
+            self.transaction_runtime.is_none(),
+            "DeepX transaction runtime is already initialized"
+        );
+        let options = self
+            .config
+            .postgres_cache_database_config
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("DeepX transaction runtime requires a PostgreSQL cache database")
+            })?;
+        let snapshot = self.runtime_snapshot.clone().ok_or_else(|| {
+            anyhow::anyhow!("DeepX transaction runtime requires validated runtime evidence")
+        })?;
+        anyhow::ensure!(
+            self.account_ownership.is_some(),
+            "DeepX transaction runtime requires validated account ownership"
+        );
+
+        let signer = derive_signer_account_id(&self.credential)?;
+        let store = DeepXPostgresTransactionStore::connect(options).await?;
+        let lease = store.acquire_signer_lease(signer).await?;
+        let (nonce_allocator, restored) = self
+            .restore_timestamp_nonce_allocator(&store, &lease)
+            .await?;
+        self.transaction_runtime = Some(DeepXExecutionTransactionRuntime {
+            store,
+            lease,
+            nonce_allocator,
+            snapshot_service: DeepXRuntimeSnapshotService::new(snapshot),
+            restored,
+        });
+        Ok(())
+    }
+
+    /// Returns whether this startup epoch owns a restored durable transaction runtime.
+    #[must_use]
+    pub const fn transaction_runtime_is_initialized(&self) -> bool {
+        self.transaction_runtime.is_some()
+    }
+
+    /// Returns the number of durable signer records restored into the current runtime.
+    #[must_use]
+    pub fn restored_transaction_count(&self) -> Option<usize> {
+        self.transaction_runtime
+            .as_ref()
+            .map(|runtime| runtime.restored.len())
+    }
+
+    /// Verifies that the current durable runtime still owns its signer lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no runtime is initialized, its signer identities differ, or the
+    /// PostgreSQL lease is no longer current.
+    pub async fn verify_transaction_runtime(&self) -> Result<(), DeepXTransactionRuntimeError> {
+        let runtime = self
+            .transaction_runtime
+            .as_ref()
+            .ok_or(DeepXTransactionRuntimeError::NotInitialized)?;
+        if runtime.nonce_allocator.signer() != runtime.lease.signer() {
+            return Err(DeepXTransactionRuntimeError::SignerIdentityMismatch);
+        }
+        let permit = runtime.snapshot_service.acquire()?;
+        if self
+            .runtime_snapshot
+            .as_ref()
+            .map(RuntimeSnapshot::identity)
+            != Some(permit.snapshot().identity())
+        {
+            return Err(DeepXTransactionRuntimeError::SnapshotIdentityMismatch);
+        }
+        runtime.store.verify_signer_lease(&runtime.lease).await?;
+        Ok(())
+    }
+
+    /// Refreshes approved runtime evidence and reads finalized chain time through the owned runtime.
+    ///
+    /// This operation performs no nonce allocation, signing, persistence mutation, or submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the runtime is initialized, RPC evidence still matches startup, the
+    /// observed runtime remains fixture-approved, and `Timestamp.Now` is valid at the exact
+    /// finalized Watch checkpoint.
+    pub async fn observe_finalized_chain_time(
+        &self,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
+    ) -> Result<DeepXFinalizedChainTimeEvidence, DeepXTransactionRuntimeError> {
+        let runtime = self
+            .transaction_runtime
+            .as_ref()
+            .ok_or(DeepXTransactionRuntimeError::NotInitialized)?;
+        self.validate_rpc_evidence(endpoints, capabilities)?;
+        Ok(observe_and_apply_finalized_chain_time(
+            &self.config.network.environment,
+            endpoints,
+            capabilities,
+            &runtime.snapshot_service,
+        )
+        .await?)
+    }
+
     /// Verifies, emits, and records the account-state event for the current startup epoch.
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for account-state initialization, the private
-    /// stream authentication is still current, and the event matches the configured execution
-    /// account identity and type, or event dispatch fails.
+    /// Returns an error unless startup is waiting for account-state initialization, the confirmed
+    /// balance frame belongs to the current account subscription, and the event matches the
+    /// configured execution account identity and type, or event dispatch fails.
     pub fn record_account_state_initialized(
         &mut self,
-        protocol: &DeepXWsProtocolCore,
-        frame: &DeepXWsAuthenticatedFrame,
+        connection: &DeepXWsAccountConnection,
+        frame: &DeepXWsConfirmedBalancesFrame,
         state: &AccountState,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
-        if self.startup_authenticated_session != Some(frame.session())
-            || !protocol.is_authenticated_session(frame.session())
+        if self.startup_account_subscription != Some(frame.subscription())
+            || !connection.is_current_subscription(frame.subscription())
         {
-            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+            return Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch);
         }
         if state.account_id != self.core.account_id || state.account_type != self.core.account_type
         {
@@ -1626,13 +2698,40 @@ impl DeepXExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for mass reconciliation, the current store lease
-    /// belongs to the configured signing key, the private-stream authentication is still current,
+    /// Returns an error unless startup is waiting for mass reconciliation, the client owns its
+    /// durable transaction runtime and signer lease, the account subscription is still current,
     /// and every durable transaction is complete.
-    pub async fn record_mass_reconciliation_completed<S>(
+    pub async fn record_mass_reconciliation_completed(
         &mut self,
-        protocol: &DeepXWsProtocolCore,
-        session: DeepXWsAuthenticatedSession,
+        connection: &DeepXWsAccountConnection,
+        subscription: DeepXWsConfirmedAccountSubscription,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
+    ) -> Result<(), DeepXMassReconciliationError> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        let runtime = self
+            .transaction_runtime
+            .as_ref()
+            .ok_or(DeepXMassReconciliationError::TransactionRuntimeNotInitialized)?;
+        self.reconcile_durable_transactions(
+            connection,
+            subscription,
+            endpoints,
+            capabilities,
+            &runtime.store,
+            &runtime.lease,
+        )
+        .await?;
+        self.startup
+            .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        Ok(())
+    }
+
+    async fn reconcile_durable_transactions<S>(
+        &self,
+        connection: &DeepXWsAccountConnection,
+        subscription: DeepXWsConfirmedAccountSubscription,
         endpoints: &DeepXValidatedRpcEndpoints,
         capabilities: &DeepXValidatedRpcMethodCapabilities,
         store: &S,
@@ -1641,12 +2740,10 @@ impl DeepXExecutionClient {
     where
         S: DeepXTransactionStore,
     {
-        self.startup
-            .validate_next(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
-        if self.startup_authenticated_session != Some(session)
-            || !protocol.is_authenticated_session(session)
+        if self.startup_account_subscription != Some(subscription)
+            || !connection.is_current_subscription(subscription)
         {
-            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch.into());
+            return Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch.into());
         }
         if lease.signer() != derive_signer_account_id(&self.credential)? {
             return Err(DeepXMassReconciliationError::SignerLeaseMismatch);
@@ -1698,18 +2795,135 @@ impl DeepXExecutionClient {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                DeepXTransactionState::NotIncluded => reconcile_not_included_checkpoint(
-                    endpoints,
-                    capabilities,
-                    snapshot,
-                    store,
-                    lease,
-                    &item,
-                    self.config.recovery_blocks_per_range,
-                )
-                .await?
-                .record()
-                .recovery_action(),
+                DeepXTransactionState::NotIncluded => {
+                    let committed = if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpPlace { .. })
+                    ) {
+                        let verifier = DeepXPerpPlaceCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::PerpPlace(&verifier),
+                        )
+                        .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpClose { .. })
+                    ) {
+                        let verifier = DeepXPerpCloseCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::PerpClose(&verifier),
+                        )
+                        .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpProfitAndLossPoint { .. })
+                    ) {
+                        let verifier = DeepXPerpProfitAndLossPointCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(&verifier),
+                        )
+                        .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::SpotPlace { .. })
+                    ) {
+                        let verifier = DeepXSpotPlaceCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::SpotPlace(&verifier),
+                        )
+                        .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::SpotCancel { .. })
+                    ) {
+                        let verifier = DeepXSpotCancelCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::OrdinarySpotCancel(&verifier),
+                        )
+                        .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpCancel { .. })
+                    ) {
+                        let verifier = DeepXPerpCancelCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::PerpCancel(&verifier),
+                        )
+                        .await?
+                    } else {
+                        reconcile_not_included_checkpoint(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                        )
+                        .await?
+                    };
+                    committed.record().recovery_action()
+                }
                 _ => item.record().recovery_action(),
             };
             if action != DeepXTransactionRecoveryAction::Complete {
@@ -1719,8 +2933,6 @@ impl DeepXExecutionClient {
                 });
             }
         }
-        self.startup
-            .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
         Ok(())
     }
 
@@ -1728,20 +2940,20 @@ impl DeepXExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error unless startup is waiting for account registration, the private-stream
-    /// authentication is still current, and the configured account exists in the shared execution
+    /// Returns an error unless startup is waiting for account registration, the account-stream
+    /// subscription is still current, and the configured account exists in the shared execution
     /// cache.
     pub fn complete_account_registration(
         &mut self,
-        protocol: &DeepXWsProtocolCore,
-        session: DeepXWsAuthenticatedSession,
+        connection: &DeepXWsAccountConnection,
+        subscription: DeepXWsConfirmedAccountSubscription,
     ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::AccountRegistered)?;
-        if self.startup_authenticated_session != Some(session)
-            || !protocol.is_authenticated_session(session)
+        if self.startup_account_subscription != Some(subscription)
+            || !connection.is_current_subscription(subscription)
         {
-            return Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch);
+            return Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch);
         }
         let event_id = self
             .startup_account_event_id
@@ -1773,11 +2985,20 @@ impl DeepXExecutionClient {
 
     /// Clears startup evidence and marks the execution core disconnected.
     pub fn reset_startup(&mut self) {
+        if let Ok(mut active) = self.query_epoch.lock() {
+            *active = false;
+        }
+        self.query_tasks.abort();
         self.core.set_disconnected();
         self.startup.reset();
         self.runtime_snapshot = None;
-        self.startup_authenticated_session = None;
+        self.account_ownership = None;
+        self.transaction_runtime = None;
+        self.startup_account_subscription = None;
         self.startup_account_event_id = None;
+        self.perpetual_market_ids.clear();
+        self.perpetual_instrument_ids.clear();
+        self.perpetual_report_metadata.clear();
     }
 
     /// Returns whether the execution core passed every startup gate.
@@ -1803,6 +3024,18 @@ impl DeepXExecutionClient {
     pub const fn emitter(&self) -> &ExecutionEventEmitter {
         &self.emitter
     }
+}
+
+fn parse_tracked_order_report_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<UnixNanos, DeepXTrackedOrderReportError> {
+    let timestamp = value
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| DeepXTrackedOrderReportError::InvalidTimestamp(field))?;
+    let nanos = u64::try_from(timestamp.as_nanosecond())
+        .map_err(|_| DeepXTrackedOrderReportError::InvalidTimestamp(field))?;
+    Ok(UnixNanos::from(nanos))
 }
 
 #[async_trait(?Send)]
@@ -1882,11 +3115,24 @@ impl ExecutionClient for DeepXExecutionClient {
             self.startup.is_ready() && self.core.is_connected(),
             "DeepX execution startup has not completed",
         );
+        if !self.query_tasks.is_open() {
+            self.query_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+                .await?;
+            self.query_tasks.start_generation()?;
+        }
+        *self
+            .query_epoch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepX order query epoch lock is poisoned"))? = true;
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.reset_startup();
+        self.query_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await?;
         Ok(())
     }
 
@@ -1918,19 +3164,122 @@ impl ExecutionClient for DeepXExecutionClient {
         anyhow::bail!("DeepX batch cancellation is not operational")
     }
 
-    fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX account queries are not operational")
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.core.is_connected(),
+            "DeepX account query requires a connected execution client"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id,
+            "DeepX account query trader ID mismatch"
+        );
+        anyhow::ensure!(
+            cmd.client_id
+                .is_none_or(|client_id| client_id == self.core.client_id),
+            "DeepX account query client ID mismatch"
+        );
+        anyhow::ensure!(
+            cmd.account_id == self.core.account_id,
+            "DeepX account query account ID mismatch"
+        );
+        anyhow::ensure!(
+            cmd.params.as_ref().is_none_or(|params| params.is_empty()),
+            "DeepX account query parameters are unsupported"
+        );
+        let startup_event_id = self
+            .startup_account_event_id
+            .ok_or_else(|| anyhow::anyhow!("DeepX account query has no current startup event"))?;
+        let state = {
+            let cache = self.core.try_cache().map_err(|_| {
+                anyhow::anyhow!("DeepX account query cache is already mutably borrowed")
+            })?;
+            let account = cache.account(&self.core.account_id).ok_or_else(|| {
+                anyhow::anyhow!("DeepX account query account is not registered in the cache")
+            })?;
+            let events = account.events();
+            let baseline = events
+                .iter()
+                .position(|state| state.event_id == startup_event_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DeepX account query current startup event is not registered in the cache"
+                    )
+                })?;
+            let state = events[baseline..]
+                .iter()
+                .rev()
+                .find(|state| state.is_reported)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DeepX account query has no current reported account state")
+                })?;
+            anyhow::ensure!(
+                state.account_id == self.core.account_id
+                    && state.account_type == self.core.account_type,
+                "DeepX account query cached account identity mismatch"
+            );
+            state
+        };
+        self.emitter.try_send_account_state(state)
     }
 
-    fn query_order(&self, _cmd: QueryOrder) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX order queries are not operational")
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        let query = self.prepare_tracked_order_query(&cmd)?;
+        let http = self.http.clone();
+        let emitter = self.emitter.clone();
+        let epoch = Arc::clone(&self.query_epoch);
+        self.query_tasks.spawn(async move {
+            let result = async {
+                let record = http
+                    .get_perp_order_by_id(
+                        &query.subaccount,
+                        query.market_id,
+                        query.venue_order_id.as_str(),
+                    )
+                    .await?;
+                Self::build_tracked_order_status_report_from_context(
+                    &record,
+                    query.market_id,
+                    query.venue_order_id,
+                    query.ts_init,
+                    query.account_id,
+                    &query.subaccount,
+                    query.context,
+                )
+                .map_err(anyhow::Error::from)
+            }
+            .await;
+            match result {
+                Ok(report) => match epoch.lock() {
+                    Ok(active) if *active => emitter.send_order_status_report(report),
+                    Ok(_) => {}
+                    Err(_) => log::error!("DeepX order query epoch lock is poisoned"),
+                },
+                Err(e) => log::error!("DeepX order query failed: {e}"),
+            }
+        })?;
+        Ok(())
     }
 
     async fn generate_order_status_report(
         &self,
-        _cmd: &GenerateOrderStatusReport,
+        cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        anyhow::bail!("DeepX order status reports are not operational")
+        let (venue_order_id, _instrument_id, market_id) =
+            self.resolve_tracked_order_report_query(cmd)?;
+        let subaccount = self.config.subaccount_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("DeepX order status report requires a configured subaccount")
+        })?;
+        let record = self
+            .http
+            .get_perp_order_by_id(subaccount, market_id, venue_order_id.as_str())
+            .await?;
+        Ok(Some(self.build_tracked_order_status_report(
+            &record,
+            market_id,
+            venue_order_id,
+            cmd.ts_init,
+        )?))
     }
 
     async fn generate_order_status_reports(
@@ -1942,16 +3291,161 @@ impl ExecutionClient for DeepXExecutionClient {
 
     async fn generate_fill_reports(
         &self,
-        _cmd: GenerateFillReports,
+        cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        anyhow::bail!("DeepX fill reports are not operational")
+        anyhow::ensure!(
+            !cmd.start
+                .zip(cmd.end)
+                .is_some_and(|(start, end)| start > end),
+            "DeepX fill report start must not exceed end",
+        );
+        let subaccount = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .ok_or(DeepXFillReportError::MissingConfiguredSubaccount)?;
+        if let Some(venue_order_id) = cmd.venue_order_id
+            && (venue_order_id.as_str().is_empty()
+                || !venue_order_id
+                    .as_str()
+                    .bytes()
+                    .all(|value| value.is_ascii_digit())
+                || venue_order_id.as_str().parse::<u64>().is_err())
+        {
+            return Err(DeepXFillReportError::InvalidVenueOrderId.into());
+        }
+        let market_id = cmd
+            .instrument_id
+            .map(|instrument_id| {
+                let market_id = self
+                    .perpetual_market_ids
+                    .get(&instrument_id)
+                    .copied()
+                    .ok_or(DeepXFillReportError::UnknownInstrument(instrument_id))?;
+                if self.perpetual_instrument_ids.get(&market_id) != Some(&instrument_id)
+                    || !self.perpetual_report_metadata.contains_key(&instrument_id)
+                {
+                    return Err(DeepXFillReportError::MarketIdentityMismatch);
+                }
+                Ok(market_id)
+            })
+            .transpose()?;
+        if market_id.is_none()
+            && (self.perpetual_market_ids.is_empty()
+                || self.perpetual_market_ids.len() != self.perpetual_instrument_ids.len()
+                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len())
+        {
+            return Err(DeepXFillReportError::MarketIdentityMismatch.into());
+        }
+
+        let pages = self
+            .http
+            .get_perp_account_trade_pages(
+                &DeepXPerpAccountTradesRequest {
+                    subaccount: subaccount.to_string(),
+                    order_id: None,
+                    market_id,
+                    is_long: None,
+                    cursor: None,
+                    sort: DeepXAccountSortOrder::Ascending,
+                    start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
+                    end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
+                    page_size: Some(FILL_REPORT_PAGE_SIZE),
+                },
+                FILL_REPORT_MAX_PAGES,
+            )
+            .await?;
+        let mut reports = Vec::new();
+        for record in pages.into_iter().flat_map(|page| page.items) {
+            if cmd
+                .venue_order_id
+                .is_some_and(|venue_order_id| venue_order_id.as_str() != record.order_id)
+            {
+                continue;
+            }
+            let report = self.build_fill_report(&record, cmd.ts_init)?;
+            if cmd.start.is_some_and(|start| report.ts_event < start)
+                || cmd.end.is_some_and(|end| report.ts_event > end)
+            {
+                continue;
+            }
+            reports.push(report);
+        }
+        Ok(self.merge_validated_fill_reports(reports)?)
     }
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionStatusReports,
+        cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        anyhow::bail!("DeepX position status reports are not operational")
+        anyhow::ensure!(
+            !cmd.start
+                .zip(cmd.end)
+                .is_some_and(|(start, end)| start > end),
+            "DeepX position report start must not exceed end",
+        );
+        let subaccount = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .ok_or(DeepXPositionReportError::MissingConfiguredSubaccount)?;
+        let market_id = cmd
+            .instrument_id
+            .map(|instrument_id| {
+                let market_id = self
+                    .perpetual_market_ids
+                    .get(&instrument_id)
+                    .copied()
+                    .ok_or(DeepXPositionReportError::UnknownInstrument(instrument_id))?;
+                if self.perpetual_instrument_ids.get(&market_id) != Some(&instrument_id)
+                    || !self.perpetual_report_metadata.contains_key(&instrument_id)
+                {
+                    return Err(DeepXPositionReportError::MarketIdentityMismatch);
+                }
+                Ok(market_id)
+            })
+            .transpose()?;
+        if market_id.is_none()
+            && (self.perpetual_market_ids.is_empty()
+                || self.perpetual_market_ids.len() != self.perpetual_instrument_ids.len()
+                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len())
+        {
+            return Err(DeepXPositionReportError::MarketIdentityMismatch.into());
+        }
+
+        let pages = self
+            .http
+            .get_perp_position_pages(
+                &DeepXPerpPositionsRequest {
+                    subaccount: subaccount.to_string(),
+                    market_id,
+                    only_closed: Some(false),
+                    cursor: None,
+                    page_size: Some(POSITION_REPORT_PAGE_SIZE),
+                },
+                POSITION_REPORT_MAX_PAGES,
+            )
+            .await?;
+        let mut open_markets = HashSet::new();
+        let mut reports = Vec::new();
+        for record in pages.into_iter().flat_map(|page| page.items) {
+            if let Some(report) = self.build_position_status_report(&record, cmd.ts_init)? {
+                if !open_markets.insert(record.market_id) {
+                    return Err(
+                        DeepXPositionReportError::DuplicateOpenMarket(record.market_id).into(),
+                    );
+                }
+                reports.push(report);
+            }
+        }
+        if let Some(start) = cmd.start {
+            reports.retain(|report| report.ts_last >= start);
+        }
+        if let Some(end) = cmd.end {
+            reports.retain(|report| report.ts_last <= end);
+        }
+        reports.sort_by_key(|report| report.instrument_id);
+        Ok(reports)
     }
 
     async fn generate_mass_status(
@@ -1996,15 +3490,18 @@ impl ExecutionClient for DeepXExecutionClient {
 mod tests {
     use std::{
         cell::RefCell,
+        num::NonZeroUsize,
         rc::Rc,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use axum::{
         Json, Router,
+        extract::ws::{Message as WsMessage, WebSocketUpgrade},
         routing::{get, post},
     };
     use nautilus_common::{
@@ -2015,7 +3512,8 @@ mod tests {
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
         enums::{
-            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
+            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
+            TimeInForce,
         },
         events::{AccountState, OrderAccepted, OrderEventAny, OrderSubmitted},
         identifiers::{
@@ -2032,8 +3530,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        account::verify_account_ownership,
         common::consts::DEEPX_TESTNET_GENESIS_HASH,
         config::{DeepXObservedRpcEndpoint, validate_rpc_endpoint_identities},
+        http::{
+            DeepXAccountPage, DeepXApiResponse, DeepXPerpOrderRecord, DeepXSubaccountProfile,
+            DeepXWalletSubaccounts,
+        },
         rpc::{
             DeepXValidatedRpcMethodCapabilities,
             observe_and_apply_approved_finalized_runtime_snapshot,
@@ -2050,7 +3553,10 @@ mod tests {
             DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
             DeepXTransactionRevision,
         },
-        websocket::DeepXWsFrame,
+        websocket::{
+            DeepXWsAccountConnection, DeepXWsConfirmedAccountSubscription,
+            DeepXWsConfirmedBalancesFrame,
+        },
     };
 
     const GENESIS_FIXTURE: &str = include_str!(
@@ -2073,6 +3579,13 @@ mod tests {
             genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
          metadata.json"
     );
+    const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
+        include_str!("../test_data/http/testnet/perp_history_orders_account_market_3.json");
+    const PERP_POSITIONS_ACCOUNT_RESPONSE: &str =
+        include_str!("../test_data/http/testnet/perp_positions_account_market_3.json");
+    const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str =
+        include_str!("../test_data/http/testnet/perp_account_trades_account_market_3.json");
+    const TEST_SUBACCOUNT: &str = "0x1111111111111111111111111111111111111111";
 
     #[derive(Debug)]
     struct TestSignerLease {
@@ -2311,6 +3824,103 @@ mod tests {
             .build()
     }
 
+    fn tracked_limit_order() -> OrderAny {
+        OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-REPORT"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.3"))
+            .price(Price::from("2499.05"))
+            .time_in_force(TimeInForce::Gtc)
+            .build()
+    }
+
+    fn tracked_limit_order_record() -> DeepXPerpOrderRecord {
+        let response: DeepXApiResponse<DeepXAccountPage<DeepXPerpOrderRecord>> =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut record = response.data.items[2].clone();
+        record.owner = TEST_SUBACCOUNT.to_string();
+        record
+    }
+
+    fn tracked_limit_report_fixture() -> (DeepXExecutionClient, DeepXPerpOrderRecord, VenueOrderId)
+    {
+        let client = test_client();
+        let order = tracked_limit_order();
+        let record = tracked_limit_order_record();
+        let venue_order_id = VenueOrderId::from(record.order_id.as_str());
+        client.register_order(&order).unwrap();
+        client
+            .bind_tracked_venue_order_id(order.client_order_id(), venue_order_id)
+            .unwrap();
+        (client, record, venue_order_id)
+    }
+
+    async fn report_test_client(path: &'static str, mut response: Value) -> DeepXExecutionClient {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        for item in response["data"]["items"].as_array_mut().unwrap() {
+            item["owner"] = TEST_SUBACCOUNT.into();
+        }
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            )
+            .route(
+                path,
+                get(move || {
+                    let response = response.clone();
+                    async move { Json(response) }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base_url = format!("http://{address}");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("DEEPX"),
+            *DEEPX_VENUE,
+            OmsType::Netting,
+            AccountId::from("DEEPX-001"),
+            AccountType::Margin,
+            None,
+            cache,
+        );
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some(TEST_SUBACCOUNT.to_string()),
+            private_key: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            http_timeout_secs: 5,
+            network: crate::config::DeepXNetworkConfig {
+                base_url_rest: Some(base_url),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        let mut provider = DeepXMarketProvider::new(client.http.clone());
+        provider.load_all().await.unwrap();
+        client.record_instruments_loaded(&provider).unwrap();
+        client
+    }
+
+    async fn position_report_test_client(response: Value) -> DeepXExecutionClient {
+        report_test_client("/internal/v1/account/position", response).await
+    }
+
+    async fn fill_report_test_client(response: Value) -> DeepXExecutionClient {
+        report_test_client("/internal/v1/account/perp/trades", response).await
+    }
+
     fn accept_order_in_cache(
         cache: &Rc<RefCell<Cache>>,
         order: &OrderAny,
@@ -2396,7 +4006,7 @@ mod tests {
             Rc::clone(&cache),
         );
         let config = DeepXExecutionClientConfig {
-            subaccount_id: Some("subaccount-1".to_string()),
+            subaccount_id: Some(TEST_SUBACCOUNT.to_string()),
             private_key: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             ),
@@ -2452,6 +4062,34 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::InstrumentsLoaded)
             .unwrap();
+    }
+
+    fn account_ownership_proof(
+        credential: &DeepXPrivateKey,
+        subaccount: &str,
+    ) -> DeepXAccountOwnershipProof {
+        let signer = derive_signer_account_id(credential).unwrap();
+        let wallet = format!("0x{}", hex::encode(signer));
+        let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.to_string()]);
+        let profile = DeepXSubaccountProfile {
+            authority: wallet,
+            address: subaccount.to_string(),
+            name: "test".to_string(),
+            status: "Active".to_string(),
+            spot_positions: Vec::new(),
+            next_order_id: 1,
+            spot_margin_trading_enabled: false,
+            margin_strategy: "Cross".to_string(),
+            height: 1,
+            created_at: 1,
+        };
+        verify_account_ownership(credential, subaccount, &directory, &profile).unwrap()
+    }
+
+    fn record_account_ownership(client: &mut DeepXExecutionClient) {
+        let subaccount = client.config.subaccount_id.clone().unwrap();
+        let proof = account_ownership_proof(&client.credential, &subaccount);
+        client.record_account_ownership_validated(proof).unwrap();
     }
 
     async fn applied_runtime_evidence() -> (
@@ -2929,15 +4567,58 @@ mod tests {
         assert!(
             client
                 .startup
-                .validate_next(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+                .validate_next(DeepXExecutionStartupEvidence::AccountOwnershipValidated)
                 .is_ok()
         );
         client.reset_startup();
         assert!(client.runtime_snapshot.is_none());
+        assert!(client.account_ownership.is_none());
+    }
+
+    #[rstest]
+    fn account_ownership_startup_rejects_foreign_signer_and_subaccount_without_advancing() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let subaccount = client.config.subaccount_id.clone().unwrap();
+        let foreign_key = DeepXPrivateKey::new(
+            "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &crate::common::DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let foreign_signer = account_ownership_proof(&foreign_key, &subaccount);
+
+        assert_eq!(
+            client.record_account_ownership_validated(foreign_signer),
+            Err(DeepXExecutionStartupError::AccountOwnershipSignerMismatch),
+        );
+
+        let proof = account_ownership_proof(&client.credential, &subaccount);
+        client.config.subaccount_id =
+            Some("0x2222222222222222222222222222222222222222".to_string());
+        assert_eq!(
+            client.record_account_ownership_validated(proof),
+            Err(DeepXExecutionStartupError::AccountOwnershipSubaccountMismatch),
+        );
+        assert!(client.account_ownership.is_none());
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::AccountOwnershipValidated),
+            Ok(()),
+        );
+
+        client.config.subaccount_id = Some(subaccount);
+        client.record_account_ownership_validated(proof).unwrap();
+        assert_eq!(client.account_ownership, Some(proof));
     }
 
     #[tokio::test]
-    async fn private_stream_startup_accepts_current_authenticated_session() {
+    async fn account_stream_startup_accepts_current_subscription() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
         client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
@@ -2948,13 +4629,11 @@ mod tests {
         client
             .record_runtime_validated(&applied, &endpoints, &capabilities)
             .unwrap();
-        let mut protocol = DeepXWsProtocolCore::new('/');
-        let (attempt, _) = protocol.begin_authentication().unwrap();
-        assert!(protocol.complete_authentication(attempt));
-        let session = protocol.authenticated_session().unwrap();
+        record_account_ownership(&mut client);
+        let (connection, subscription, _) = confirmed_account_stream().await;
 
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
 
         assert!(
@@ -2966,7 +4645,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_stream_startup_rejects_session_from_stale_connection_without_advancing() {
+    async fn transaction_runtime_requires_configured_durable_database() {
+        let mut client = test_client();
+
+        let error = client.initialize_transaction_runtime().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a PostgreSQL cache database")
+        );
+        assert!(!client.transaction_runtime_is_initialized());
+        assert_eq!(client.restored_transaction_count(), None);
+        assert!(client.verify_transaction_runtime().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn account_stream_startup_rejects_stale_subscription_without_advancing() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
         client.config.network.base_url_rpc_submission = Some(rpc_url.clone());
@@ -2977,24 +4672,18 @@ mod tests {
         client
             .record_runtime_validated(&applied, &endpoints, &capabilities)
             .unwrap();
-        let mut protocol = DeepXWsProtocolCore::new('/');
-        let (stale_attempt, _) = protocol.begin_authentication().unwrap();
-        assert!(protocol.complete_authentication(stale_attempt));
-        let stale_session = protocol.authenticated_session().unwrap();
-        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+        record_account_ownership(&mut client);
+        let (mut stale_connection, stale_subscription, _) = confirmed_account_stream().await;
+        stale_connection.close().await.unwrap();
 
         assert_eq!(
-            client.record_private_stream_authenticated(&protocol, stale_session),
-            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+            client.record_account_stream_confirmed(&stale_connection, stale_subscription),
+            Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch),
         );
 
-        let (current_attempt, _) = protocol.begin_authentication().unwrap();
-        assert!(protocol.complete_authentication(current_attempt));
+        let (connection, subscription, _) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(
-                &protocol,
-                protocol.authenticated_session().unwrap(),
-            )
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
     }
 
@@ -3122,7 +4811,58 @@ mod tests {
 
         client.record_instruments_loaded(&provider).unwrap();
 
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        assert_eq!(client.perpetual_market_ids.get(&instrument_id), Some(&3));
+        assert_eq!(
+            client.perpetual_instrument_ids.get(&3),
+            Some(&instrument_id)
+        );
+        let metadata = client
+            .perpetual_report_metadata
+            .get(&instrument_id)
+            .unwrap();
+        assert_eq!(metadata.size_precision, 4);
+        assert_eq!(metadata.price_precision, 4);
+        assert_eq!(metadata.size_increment, rust_decimal::Decimal::new(10, 4));
+        assert_eq!(metadata.price_increment, rust_decimal::Decimal::new(100, 4));
+        assert_eq!(metadata.quote_currency, Currency::USDC());
         assert!(client.restore_order_contexts([]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn instrument_catalog_snapshot_is_cleared_on_startup_reset() {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http_client = DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut provider = DeepXMarketProvider::new(http_client);
+        provider.load_all().await.unwrap();
+        let mut client = test_client();
+        client.config.network.base_url_rest = Some(format!("http://{address}"));
+        client.record_instruments_loaded(&provider).unwrap();
+
+        client.reset_startup();
+
+        assert!(client.perpetual_market_ids.is_empty());
+        assert!(client.perpetual_instrument_ids.is_empty());
+        assert!(client.perpetual_report_metadata.is_empty());
+        assert_eq!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::InstrumentsLoaded),
+            Ok(()),
+        );
     }
 
     #[tokio::test]
@@ -3239,12 +4979,12 @@ mod tests {
         );
     }
 
-    fn advance_through_mass_reconciliation(
+    async fn advance_through_mass_reconciliation(
         client: &mut DeepXExecutionClient,
     ) -> (
         AccountState,
-        DeepXWsProtocolCore,
-        DeepXWsAuthenticatedSession,
+        DeepXWsAccountConnection,
+        DeepXWsConfirmedAccountSubscription,
     ) {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
@@ -3253,27 +4993,30 @@ mod tests {
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
         client.runtime_snapshot = Some(test_runtime_snapshot());
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
         client
-            .record_account_state_initialized(&protocol, &frame, &state)
+            .record_account_state_initialized(&connection, &frame, &state)
             .unwrap();
         client
             .startup
             .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)
             .unwrap();
-        (state, protocol, session)
+        (state, connection, subscription)
     }
 
-    fn advance_to_mass_reconciliation(
+    async fn advance_to_mass_reconciliation(
         client: &mut DeepXExecutionClient,
-    ) -> (DeepXWsProtocolCore, DeepXWsAuthenticatedSession) {
+    ) -> (
+        DeepXWsAccountConnection,
+        DeepXWsConfirmedAccountSubscription,
+    ) {
         record_instruments_loaded(client);
         client.restore_order_contexts([]).unwrap();
         client
@@ -3281,17 +5024,70 @@ mod tests {
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
         client.runtime_snapshot = Some(test_runtime_snapshot());
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
         client
-            .record_account_state_initialized(&protocol, &frame, &test_account_state())
+            .record_account_state_initialized(&connection, &frame, &test_account_state())
             .unwrap();
-        (protocol, session)
+        (connection, subscription)
+    }
+
+    async fn record_mass_reconciliation_completed_with_store<S>(
+        client: &mut DeepXExecutionClient,
+        connection: &DeepXWsAccountConnection,
+        subscription: DeepXWsConfirmedAccountSubscription,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
+        store: &S,
+        lease: &S::Lease,
+    ) -> Result<(), DeepXMassReconciliationError>
+    where
+        S: DeepXTransactionStore,
+    {
+        client
+            .startup
+            .validate_next(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        client
+            .reconcile_durable_transactions(
+                connection,
+                subscription,
+                endpoints,
+                capabilities,
+                store,
+                lease,
+            )
+            .await?;
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_requires_owned_transaction_runtime_without_advancing() {
+        let mut client = test_client();
+        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        configure_rpc_url(&mut client, rpc_url);
+        let (connection, subscription) = advance_to_mass_reconciliation(&mut client).await;
+
+        assert!(matches!(
+            client
+                .record_mass_reconciliation_completed(
+                    &connection,
+                    subscription,
+                    &endpoints,
+                    &capabilities,
+                )
+                .await,
+            Err(DeepXMassReconciliationError::TransactionRuntimeNotInitialized),
+        ));
+        assert_eq!(client.startup.completed_steps, 6);
+        assert!(!client.is_connected());
     }
 
     #[tokio::test]
@@ -3299,24 +5095,24 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = TestTransactionStore {
             restored: Vec::new(),
         };
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let lease = store.acquire_signer_lease(signer).await.unwrap();
 
-        client
-            .record_mass_reconciliation_completed(
-                &protocol,
-                session,
-                &endpoints,
-                &capabilities,
-                &store,
-                &lease,
-            )
-            .await
-            .unwrap();
+        record_mass_reconciliation_completed_with_store(
+            &mut client,
+            &protocol,
+            session,
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             client.complete_account_registration(&protocol, session),
@@ -3329,23 +5125,23 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = TestTransactionStore {
             restored: Vec::new(),
         };
         let lease = TestSignerLease { signer: [42; 20] };
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::SignerLeaseMismatch),
         ));
         assert!(matches!(
@@ -3362,7 +5158,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
             ClientOrderId::from("O-DEEPX-FOREIGN-GENESIS"),
@@ -3390,8 +5186,8 @@ mod tests {
         let lease = TestSignerLease { signer };
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
                     &protocol,
                     session,
                     &endpoints,
@@ -3422,7 +5218,7 @@ mod tests {
         let mut client = test_client();
         let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let genesis_hash =
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
@@ -3452,16 +5248,16 @@ mod tests {
         let lease = TestSignerLease { signer };
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::RecreateSigningInputs,
                 ..
@@ -3483,7 +5279,7 @@ mod tests {
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3491,16 +5287,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
                 ..
@@ -3520,7 +5316,7 @@ mod tests {
         let record = submitting_record(&client);
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&[8, 99, 98]]).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3528,16 +5324,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
                 ..
@@ -3559,24 +5355,24 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence(72, &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
             .await
             .unwrap();
 
-        client
-            .record_mass_reconciliation_completed(
-                &protocol,
-                session,
-                &endpoints,
-                &capabilities,
-                &store,
-                &lease,
-            )
-            .await
-            .unwrap();
+        record_mass_reconciliation_completed_with_store(
+            &mut client,
+            &protocol,
+            session,
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(store.current_revision(), 5);
         assert_eq!(canonical_requests.load(Ordering::Relaxed), 2);
@@ -3594,7 +5390,7 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence(71, &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3602,16 +5398,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
                 ..
@@ -3637,7 +5433,7 @@ mod tests {
         let (rpc_url, endpoints, capabilities, canonical_requests) =
             finality_evidence_with_hash(72, [9; 32], &signed_bytes).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3645,16 +5441,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::ReconciliationRequired,
                 ..
@@ -3687,7 +5483,7 @@ mod tests {
         let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3695,16 +5491,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::OperatorActionRequired,
                 ..
@@ -3732,7 +5528,7 @@ mod tests {
         let record = not_included_record(&client, &snapshot);
         let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -3740,16 +5536,16 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &protocol,
+                session,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::UnresolvedTransaction {
                 action: DeepXTransactionRecoveryAction::OperatorActionRequired,
                 ..
@@ -3770,34 +5566,226 @@ mod tests {
         ));
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn mass_reconciliation_rejects_stale_session_without_mutation() {
+    async fn mass_reconciliation_selects_verified_operation_observer(
+        #[case] corrupt: bool,
+        #[values(0, 1, 2, 3, 4, 5, 6)] operation: u8,
+    ) {
         let mut client = test_client();
-        let record = submitting_record(&client);
-        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
-        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
+        let snapshot = test_runtime_snapshot();
+        let params = crate::signing::DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 3,
+            is_long: true,
+            size: 1,
+            price: 100,
+            order_type: crate::signing::DeepXPerpOrderType::Limit(
+                crate::signing::DeepXTimeInForce::Gtc,
+            ),
+            take_profit: None,
+            stop_loss: None,
+            reduce_only: false,
+            post_only: crate::signing::DeepXPostOnlyParam::None,
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let mut signed = crate::signing::sign_perp_place_order(
+            &service.acquire().unwrap(),
+            &client.credential,
+            params,
+            42,
+        )
+        .unwrap();
+        let mut identity = DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new("O-DEEPX-PERP-RECOVERY"),
+            signed.signer(),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            params,
+        );
+        let permit = service.acquire().unwrap();
+        match operation {
+            0 => {}
+            1 | 2 => {
+                let params = crate::signing::DeepXSpotPlaceParams {
+                    subaccount: [0x11; 20],
+                    pair: [0x22; 32],
+                    is_buy: operation == 1,
+                    quote_amount: [0x33; 32],
+                    base_amount: [0x44; 32],
+                    order_type: crate::signing::DeepXSpotOrderType::Limit(
+                        crate::signing::DeepXTimeInForce::Gtc,
+                    ),
+                    post_only: crate::signing::DeepXPostOnlyParam::None,
+                    reduce_only: false,
+                };
+                signed =
+                    crate::signing::sign_spot_place_order(&permit, &client.credential, params, 42)
+                        .unwrap();
+                identity = DeepXTransactionIdentity::new_spot_place(
+                    ClientOrderId::new("O-DEEPX-SPOT-RECOVERY"),
+                    signed.signer(),
+                    InstrumentId::from("ETH-USDC.DEEPX"),
+                    if params.is_buy {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    },
+                    DeepXNonceReservation::TimestampOrderId { value: 42 },
+                    DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+                    params,
+                );
+            }
+            3 | 4 => {
+                let params = crate::signing::DeepXPerpCancelParams {
+                    subaccount: [0x11; 20],
+                    order_id: 7,
+                    market_id: 3,
+                    fast_cancel: operation == 4,
+                };
+                signed = crate::signing::sign_perp_cancel(&permit, &client.credential, params, 42)
+                    .unwrap();
+                identity = DeepXTransactionIdentity::new_perp_cancel(
+                    ClientOrderId::new("O-DEEPX-PERP-CANCEL-RECOVERY"),
+                    signed.signer(),
+                    InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+                    OrderSide::Buy,
+                    DeepXNonceReservation::TimestampOrderId { value: 42 },
+                    DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+                    params.subaccount,
+                    params.order_id,
+                    params.market_id,
+                    params.fast_cancel,
+                );
+            }
+            _ => {
+                let params = crate::signing::DeepXSpotCancelParams {
+                    subaccount: [0x11; 20],
+                    pair: [0x22; 32],
+                    order_id: 7,
+                    is_buy: true,
+                    fast_cancel: operation == 6,
+                };
+                signed = crate::signing::sign_spot_cancel(&permit, &client.credential, params, 42)
+                    .unwrap();
+                identity = DeepXTransactionIdentity::new_spot_cancel(
+                    ClientOrderId::new("O-DEEPX-SPOT-CANCEL-RECOVERY"),
+                    signed.signer(),
+                    InstrumentId::from("ETH-USDC.DEEPX"),
+                    OrderSide::Buy,
+                    DeepXNonceReservation::TimestampOrderId { value: 42 },
+                    DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+                    params,
+                );
+            }
+        }
+        if corrupt {
+            signed.bytes[30] ^= 1;
+            signed.extrinsic_hash = BlakeTwo256.hash(&signed.bytes).0;
+        }
+        let mut record = DeepXTransactionRecord::created(identity);
+        record.record_signed(&signed).unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::NotIncluded(
+                not_included_record(&client, &snapshot)
+                    .lifecycle()
+                    .absence()
+                    .unwrap(),
+            ))
+            .unwrap();
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
         configure_rpc_url(&mut client, rpc_url);
-        let (mut protocol, session) = advance_to_mass_reconciliation(&mut client);
+        let (protocol, session) = advance_to_mass_reconciliation(&mut client).await;
         let store = FinalityTestStore::new(4, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
             .await
             .unwrap();
-        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+        let result = record_mass_reconciliation_completed_with_store(
+            &mut client,
+            &protocol,
+            session,
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+        )
+        .await;
+        if operation == 6 {
+            assert!(matches!(result, Err(DeepXMassReconciliationError::FinalizedRecovery(
+                DeepXFinalizedRecoveryCommitError::Watch(DeepXTransactionWatchError::SpotEventVerification(
+                    crate::transaction::DeepXSpotCancelEventVerificationError::FastCancelUnsupported
+                ))
+            ))));
+            assert_eq!(store.current_revision(), 4);
+            assert_eq!(
+                store.persisted_record().lifecycle().state(),
+                DeepXTransactionState::NotIncluded
+            );
+        } else if corrupt {
+            assert!(matches!(
+                result,
+                Err(DeepXMassReconciliationError::FinalizedRecovery(
+                    DeepXFinalizedRecoveryCommitError::Binding(_)
+                ))
+            ));
+            assert_eq!(store.current_revision(), 4);
+            assert_eq!(
+                store.persisted_record().lifecycle().state(),
+                DeepXTransactionState::NotIncluded
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                    action: DeepXTransactionRecoveryAction::OperatorActionRequired,
+                    ..
+                })
+            ));
+            assert_eq!(store.current_revision(), 5);
+            assert_eq!(
+                store.persisted_record().lifecycle().state(),
+                DeepXTransactionState::ActionRequired
+            );
+        }
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_rejects_stale_subscription_without_mutation() {
+        let mut client = test_client();
+        let record = submitting_record(&client);
+        let signed_bytes = record.signed_extrinsic().unwrap().bytes().to_vec();
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[&signed_bytes]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        let (mut connection, subscription) = advance_to_mass_reconciliation(&mut client).await;
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
 
         assert!(matches!(
-            client
-                .record_mass_reconciliation_completed(
-                    &protocol,
-                    session,
-                    &endpoints,
-                    &capabilities,
-                    &store,
-                    &lease,
-                )
-                .await,
+            record_mass_reconciliation_completed_with_store(
+                &mut client,
+                &connection,
+                subscription,
+                &endpoints,
+                &capabilities,
+                &store,
+                &lease,
+            )
+            .await,
             Err(DeepXMassReconciliationError::Startup(
-                DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch,
+                DeepXExecutionStartupError::AccountStreamSubscriptionMismatch,
             )),
         ));
         assert_eq!(store.current_revision(), 4);
@@ -3805,7 +5793,7 @@ mod tests {
             store.persisted_record().lifecycle().state(),
             DeepXTransactionState::Submitting,
         );
-        assert_eq!(client.startup.completed_steps, 5);
+        assert_eq!(client.startup.completed_steps, 6);
         assert!(!client.is_connected());
     }
 
@@ -3823,25 +5811,120 @@ mod tests {
         )
     }
 
-    fn authenticated_protocol() -> (DeepXWsProtocolCore, DeepXWsAuthenticatedSession) {
-        let mut protocol = DeepXWsProtocolCore::new('/');
-        let (attempt, _) = protocol.begin_authentication().unwrap();
-        assert!(protocol.complete_authentication(attempt));
-        let session = protocol.authenticated_session().unwrap();
-        (protocol, session)
+    fn account_query() -> QueryAccount {
+        QueryAccount::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("DEEPX")),
+            AccountId::from("DEEPX-001"),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
     }
 
-    fn authenticated_account_frame(
-        protocol: &DeepXWsProtocolCore,
-        session: DeepXWsAuthenticatedSession,
-    ) -> DeepXWsAuthenticatedFrame {
-        protocol
-            .admit_authenticated_frame(
-                session.connection_epoch(),
-                session,
-                DeepXWsFrame::parse(r#"{"channel":"account","data":{}}"#).unwrap(),
-            )
-            .unwrap()
+    fn tracked_order_query(order: &OrderAny, venue_order_id: Option<VenueOrderId>) -> QueryOrder {
+        QueryOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("DEEPX")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            venue_order_id,
+            UUID4::new(),
+            UnixNanos::from(123_456_789),
+            None,
+            None,
+        )
+    }
+
+    fn account_query_client() -> (
+        DeepXExecutionClient,
+        Rc<RefCell<Cache>>,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+        AccountState,
+    ) {
+        let (mut client, cache) = test_client_with_cache();
+        let state = test_account_state();
+        register_test_account(&cache, state.clone());
+        client.startup_account_event_id = Some(state.event_id);
+        client.core.set_connected();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        (client, cache, receiver, state)
+    }
+
+    async fn confirmed_account_stream() -> (
+        DeepXWsAccountConnection,
+        DeepXWsConfirmedAccountSubscription,
+        DeepXWsConfirmedBalancesFrame,
+    ) {
+        const SUBACCOUNT: &str = "0x1111111111111111111111111111111111111111";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/internal/v1/ws",
+            get(|upgrade: WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|mut socket| async move {
+                    let Some(Ok(WsMessage::Text(request))) = socket.recv().await else {
+                        panic!("expected account subscription request");
+                    };
+                    let request: Value = serde_json::from_str(&request).unwrap();
+                    assert_eq!(request["market"]["type"], "all");
+                    assert_eq!(request["subscriptions"][0]["address"], SUBACCOUNT);
+                    socket
+                        .send(WsMessage::Text(
+                            json!({
+                                "type": "subscribed",
+                                "market": {"type": "all"},
+                                "subscriptions": [{
+                                    "channel": "user_balances",
+                                    "address": SUBACCOUNT
+                                }],
+                                "message": "Successfully subscribed to 1 channels"
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    socket
+                        .send(WsMessage::Text(
+                            json!({
+                                "type": "data",
+                                "channel": "user_balances",
+                                "market": {"type": "all"},
+                                "data": {"address": SUBACCOUNT, "assets": []},
+                                "timestamp": 1_789_451_784_924_u64
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    while socket.recv().await.is_some() {}
+                })
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_ws: Some(format!("ws://{address}")),
+            ..Default::default()
+        };
+        let mut connection = DeepXWsAccountConnection::connect(
+            &network,
+            None,
+            Duration::from_secs(1),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+        let subscription = connection
+            .subscribe_user_balances(SUBACCOUNT)
+            .await
+            .unwrap();
+        let frame = connection.next_balances(subscription).await.unwrap();
+        (connection, subscription, frame)
     }
 
     fn reconciliation_fill_report(trade_id: &str, ts_event: u64) -> FillReport {
@@ -3884,6 +5967,459 @@ mod tests {
             UnixNanos::from(ts_last + 100),
             None,
         )
+    }
+
+    #[rstest]
+    fn tracked_order_report_preserves_validated_local_and_rest_evidence() {
+        let (client, record, venue_order_id) = tracked_limit_report_fixture();
+        let ts_init = UnixNanos::from(1_000_000);
+
+        let report = client
+            .build_tracked_order_status_report(&record, 3, venue_order_id, ts_init)
+            .unwrap();
+
+        assert_eq!(report.account_id, AccountId::from("DEEPX-001"));
+        assert_eq!(
+            report.instrument_id,
+            InstrumentId::from("ETH-USDC-PERP.DEEPX")
+        );
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("O-DEEPX-REPORT"))
+        );
+        assert_eq!(report.venue_order_id, venue_order_id);
+        assert_eq!(report.order_side, Some(OrderSide::Buy));
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.time_in_force, TimeInForce::Gtc);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, Quantity::from("0.3"));
+        assert_eq!(report.filled_qty, Quantity::from("0.3"));
+        assert_eq!(report.price, Some(Price::from("2499.05")));
+        assert_eq!(report.avg_px, record.avg_fill_price);
+        assert!(!report.post_only);
+        assert!(!report.reduce_only);
+        assert_eq!(report.ts_init, ts_init);
+        assert_eq!(
+            report.ts_accepted,
+            parse_tracked_order_report_timestamp("createTime", &record.create_time).unwrap()
+        );
+        assert_eq!(report.ts_last, report.ts_accepted);
+    }
+
+    #[rstest]
+    #[case("Open", OrderStatus::Accepted)]
+    #[case("PartiallyFilled", OrderStatus::PartiallyFilled)]
+    #[case("Filled", OrderStatus::Filled)]
+    #[case("Canceled", OrderStatus::Canceled)]
+    #[case("Rejected", OrderStatus::Rejected)]
+    #[case("Expired", OrderStatus::Expired)]
+    fn tracked_order_report_maps_documented_chain_statuses(
+        #[case] venue_status: &str,
+        #[case] expected: OrderStatus,
+    ) {
+        let (client, mut record, venue_order_id) = tracked_limit_report_fixture();
+        record.status = venue_status.to_string();
+        if venue_status == "PartiallyFilled" {
+            record.size_filled = "0.1".parse().unwrap();
+            record.size_remain = "0.2".parse().unwrap();
+        } else if venue_status != "Filled" {
+            record.size_filled = rust_decimal::Decimal::ZERO;
+            record.size_remain = record.size;
+            record.avg_fill_price = None;
+        }
+        if venue_status == "Canceled" {
+            record.cancel_reason = "UserCanceled".to_string();
+        }
+
+        let report = client
+            .build_tracked_order_status_report(&record, 3, venue_order_id, UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(report.order_status, expected);
+        assert_eq!(
+            report.cancel_reason.as_deref(),
+            (venue_status == "Canceled").then_some("UserCanceled")
+        );
+    }
+
+    #[rstest]
+    fn tracked_order_report_accepts_retained_terminal_context() {
+        let (client, record, venue_order_id) = tracked_limit_report_fixture();
+        client
+            .finish_order_context(&ClientOrderId::from("O-DEEPX-REPORT"))
+            .unwrap();
+
+        let report = client
+            .build_tracked_order_status_report(&record, 3, venue_order_id, UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+    }
+
+    #[rstest]
+    fn tracked_market_order_report_does_not_publish_venue_slippage_guard_as_price() {
+        let client = test_client();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .client_order_id(ClientOrderId::from("O-DEEPX-MARKET-REPORT"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.3"))
+            .time_in_force(TimeInForce::Ioc)
+            .build();
+        let response: DeepXApiResponse<DeepXAccountPage<DeepXPerpOrderRecord>> =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut record = response.data.items[0].clone();
+        record.owner = TEST_SUBACCOUNT.to_string();
+        let venue_order_id = VenueOrderId::from(record.order_id.as_str());
+        client.register_order(&order).unwrap();
+        client
+            .bind_tracked_venue_order_id(order.client_order_id(), venue_order_id)
+            .unwrap();
+
+        let report = client
+            .build_tracked_order_status_report(&record, 3, venue_order_id, UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(report.time_in_force, TimeInForce::Ioc);
+        assert_eq!(report.price, None);
+    }
+
+    #[rstest]
+    fn tracked_limit_order_report_maps_confirmed_post_only_context() {
+        let client = test_client();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-POST-ONLY-REPORT"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.3"))
+            .price(Price::from("2499.05"))
+            .time_in_force(TimeInForce::Gtc)
+            .post_only(true)
+            .build();
+        let mut record = tracked_limit_order_record();
+        record.post_only = "MustPostOnly".to_string();
+        let venue_order_id = VenueOrderId::from(record.order_id.as_str());
+        client.register_order(&order).unwrap();
+        client
+            .bind_tracked_venue_order_id(order.client_order_id(), venue_order_id)
+            .unwrap();
+
+        let report = client
+            .build_tracked_order_status_report(&record, 3, venue_order_id, UnixNanos::default())
+            .unwrap();
+
+        assert!(report.post_only);
+    }
+
+    #[rstest]
+    fn tracked_order_report_rejects_identity_and_immutable_term_mismatches() {
+        let (client, record, venue_order_id) = tracked_limit_report_fixture();
+
+        let mut mismatched = record.clone();
+        mismatched.owner = "0x2222222222222222222222222222222222222222".to_string();
+        assert_eq!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::SubaccountMismatch),
+        );
+        assert_eq!(
+            client.build_tracked_order_status_report(
+                &record,
+                4,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::MarketMismatch {
+                expected: 4,
+                received: 3,
+            }),
+        );
+        assert_eq!(
+            client.build_tracked_order_status_report(
+                &record,
+                3,
+                VenueOrderId::from("999"),
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::VenueOrderIdMismatch),
+        );
+
+        let mut mismatched = record.clone();
+        mismatched.is_long = false;
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::SideMismatch),
+        ));
+        let mut mismatched = record.clone();
+        mismatched.order_type = "Market".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::OrderTypeMismatch),
+        ));
+        let mut mismatched = record.clone();
+        mismatched.size = "0.4".parse().unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::QuantityMismatch),
+        ));
+        let mut mismatched = record.clone();
+        mismatched.price = "2499.06".parse().unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::LimitPriceMismatch),
+        ));
+        let mut mismatched = record.clone();
+        mismatched.post_only = "MustPostOnly".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::PostOnlyMismatch),
+        ));
+        let mut mismatched = record.clone();
+        mismatched.reduce_only = true;
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &mismatched,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::ReduceOnlyMismatch),
+        ));
+    }
+
+    #[rstest]
+    fn tracked_order_report_rejects_unproven_or_inconsistent_rest_semantics() {
+        let (client, record, venue_order_id) = tracked_limit_report_fixture();
+
+        let mut invalid = record.clone();
+        invalid.order_type = "Stop".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UnsupportedOrderType(value)) if value == "Stop",
+        ));
+        let mut invalid = record.clone();
+        invalid.post_only = "Adaptive".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UnsupportedPostOnly(value)) if value == "Adaptive",
+        ));
+        let mut invalid = record.clone();
+        invalid.size_filled = "0.1".parse().unwrap();
+        invalid.size_remain = "0.1".parse().unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::SizeAccountingMismatch),
+        ));
+        let mut invalid = record.clone();
+        invalid.avg_fill_price = None;
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::MissingAverageFillPrice),
+        ));
+        let mut invalid = record.clone();
+        invalid.size_filled = rust_decimal::Decimal::ZERO;
+        invalid.size_remain = invalid.size;
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UnexpectedAverageFillPrice),
+        ));
+        let mut invalid = record.clone();
+        invalid.status = "Unknown".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UnsupportedStatus(value)) if value == "Unknown",
+        ));
+        let mut invalid = record.clone();
+        invalid.status = "Open".to_string();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::StatusQuantityMismatch),
+        ));
+        let mut invalid = record.clone();
+        invalid.status = "Filled".to_string();
+        invalid.size_filled = "0.1".parse().unwrap();
+        invalid.size_remain = "0.2".parse().unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::StatusQuantityMismatch),
+        ));
+        let mut invalid = record.clone();
+        invalid.updated_time = None;
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::MissingUpdatedTime),
+        ));
+        let mut invalid = record.clone();
+        invalid.updated_time = Some("invalid".to_string());
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::InvalidTimestamp(
+                "updatedTime"
+            )),
+        ));
+        let mut invalid = record.clone();
+        invalid.updated_time = Some("2026-09-15T04:04:14.647Z".to_string());
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::TimestampOrderMismatch),
+        ));
+        let mut invalid = record;
+        invalid.status = "PartiallyFilled".to_string();
+        invalid.size_filled = "0.05".parse().unwrap();
+        invalid.size_remain = "0.25".parse().unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &invalid,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::FilledQuantityPrecisionLoss),
+        ));
+    }
+
+    #[rstest]
+    fn tracked_order_report_rejects_untracked_external_and_quote_quantity_context() {
+        let record = tracked_limit_order_record();
+        let venue_order_id = VenueOrderId::from(record.order_id.as_str());
+        let client = test_client();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &record,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UntrackedOrder(id)) if id == venue_order_id,
+        ));
+
+        let client = test_client();
+        register_external_order(
+            &client,
+            test_external_order_context("O-DEEPX-EXTERNAL", venue_order_id.as_str()),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &record,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::UntrackedOrder(id)) if id == venue_order_id,
+        ));
+
+        let client = test_client();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-QUOTE-REPORT"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.3"))
+            .price(Price::from("2499.05"))
+            .time_in_force(TimeInForce::Gtc)
+            .quote_quantity(true)
+            .build();
+        client.register_order(&order).unwrap();
+        client
+            .bind_tracked_venue_order_id(order.client_order_id(), venue_order_id)
+            .unwrap();
+        assert!(matches!(
+            client.build_tracked_order_status_report(
+                &record,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::QuoteQuantityUnsupported),
+        ));
     }
 
     #[rstest]
@@ -3995,7 +6531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn order_report_merge_keeps_generation_unsupported() {
+    async fn order_report_generation_rejects_missing_identity() {
         let client = test_client();
         let command = GenerateOrderStatusReport::new(
             UUID4::new(),
@@ -4013,7 +6549,390 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "DeepX order status reports are not operational",
+            "DeepX order status report requires a client order ID or venue order ID",
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_order_report_generation_uses_validated_catalog_and_rest_record() {
+        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        let mut fixture: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = fixture["data"]["items"][2].take();
+        order["owner"] = TEST_SUBACCOUNT.into();
+        let order_response = json!({
+            "code": 200,
+            "msg": "success",
+            "data": order,
+            "fail": false,
+        });
+        let router = Router::new()
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(|| async { SPOT_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/market/perp/markets",
+                get(|| async { PERP_RESPONSE }),
+            )
+            .route(
+                "/internal/v1/account/perp/order-by-id",
+                get(move || {
+                    let response = order_response.clone();
+                    async move { Json(response) }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base_url = format!("http://{address}");
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TRADER-001"),
+            ClientId::from("DEEPX"),
+            *DEEPX_VENUE,
+            OmsType::Netting,
+            AccountId::from("DEEPX-001"),
+            AccountType::Margin,
+            None,
+            Rc::clone(&cache),
+        );
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some(TEST_SUBACCOUNT.to_string()),
+            private_key: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            http_timeout_secs: 5,
+            network: crate::config::DeepXNetworkConfig {
+                base_url_rest: Some(base_url),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        let mut provider = DeepXMarketProvider::new(client.http.clone());
+        provider.load_all().await.unwrap();
+        client.record_instruments_loaded(&provider).unwrap();
+        let tracked_order = tracked_limit_order();
+        let venue_order_id = VenueOrderId::from("1789445053841");
+        client.register_order(&tracked_order).unwrap();
+        client
+            .bind_tracked_venue_order_id(tracked_order.client_order_id(), venue_order_id)
+            .unwrap();
+        let ts_init = UnixNanos::from(123_456_789);
+
+        for (client_order_id, requested_venue_order_id) in [
+            (Some(tracked_order.client_order_id()), None),
+            (None, Some(venue_order_id)),
+            (Some(tracked_order.client_order_id()), Some(venue_order_id)),
+        ] {
+            let command = GenerateOrderStatusReport::new(
+                UUID4::new(),
+                ts_init,
+                Some(tracked_order.instrument_id()),
+                client_order_id,
+                requested_venue_order_id,
+                None,
+                None,
+            );
+            let report = ExecutionClient::generate_order_status_report(&client, &command)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                report.client_order_id,
+                Some(tracked_order.client_order_id())
+            );
+            assert_eq!(report.venue_order_id, venue_order_id);
+            assert_eq!(report.instrument_id, tracked_order.instrument_id());
+            assert_eq!(report.order_status, OrderStatus::Filled);
+            assert_eq!(report.ts_init, ts_init);
+        }
+
+        client.core.set_connected();
+        *client.query_epoch.lock().unwrap() = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        ExecutionClient::query_order(
+            &client,
+            tracked_order_query(&tracked_order, Some(venue_order_id)),
+        )
+        .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ExecutionEvent::Report(nautilus_common::messages::execution::ExecutionReport::Order(
+            report,
+        )) = event
+        else {
+            panic!("expected queried order status report")
+        };
+        assert_eq!(
+            report.client_order_id,
+            Some(tracked_order.client_order_id())
+        );
+        assert_eq!(report.venue_order_id, venue_order_id);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.ts_init, UnixNanos::from(123_456_789));
+        client.reset_startup();
+        client
+            .query_tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tracked_order_report_generation_rejects_command_identity_conflicts() {
+        let (mut client, _, venue_order_id) = tracked_limit_report_fixture();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        client.perpetual_market_ids.insert(instrument_id, 3);
+        client.perpetual_instrument_ids.insert(3, instrument_id);
+        let command = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("BTC-USDC-PERP.DEEPX")),
+            Some(ClientOrderId::from("O-DEEPX-REPORT")),
+            Some(venue_order_id),
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_order_status_report(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX order status report instrument conflicts with tracked order context",
+        );
+    }
+
+    #[rstest]
+    #[case("disconnected")]
+    #[case("inactive")]
+    #[case("trader")]
+    #[case("client")]
+    #[case("strategy")]
+    #[case("instrument")]
+    #[case("client-order")]
+    #[case("venue-order")]
+    #[case("params")]
+    fn tracked_order_query_rejects_unbound_command_identity(#[case] invalid: &str) {
+        let (mut client, _, venue_order_id) = tracked_limit_report_fixture();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        client.perpetual_market_ids.insert(instrument_id, 3);
+        client.perpetual_instrument_ids.insert(3, instrument_id);
+        client.core.set_connected();
+        *client.query_epoch.lock().unwrap() = true;
+        let order = tracked_limit_order();
+        let mut command = tracked_order_query(&order, Some(venue_order_id));
+        match invalid {
+            "disconnected" => client.core.set_disconnected(),
+            "inactive" => *client.query_epoch.lock().unwrap() = false,
+            "trader" => command.trader_id = TraderId::from("OTHER-001"),
+            "client" => command.client_id = Some(ClientId::from("OTHER")),
+            "strategy" => command.strategy_id = StrategyId::from("OTHER-001"),
+            "instrument" => command.instrument_id = InstrumentId::from("BTC-USDC-PERP.DEEPX"),
+            "client-order" => command.client_order_id = ClientOrderId::from("O-OTHER-001"),
+            "venue-order" => command.venue_order_id = Some(VenueOrderId::from("999")),
+            "params" => {
+                let mut params = Params::new();
+                params.insert("unsupported".to_string(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(client.prepare_tracked_order_query(&command).is_err());
+        assert!(client.query_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_retires_order_query_generation_before_reconnect() {
+        let mut client = test_client();
+        client.core.set_connected();
+        *client.query_epoch.lock().unwrap() = true;
+        client
+            .query_tasks
+            .spawn(std::future::pending::<()>())
+            .unwrap();
+
+        ExecutionClient::disconnect(&mut client).await.unwrap();
+
+        assert!(!client.core.is_connected());
+        assert!(!*client.query_epoch.lock().unwrap());
+        assert!(!client.query_tasks.is_open());
+        assert!(client.query_tasks.is_empty());
+
+        client.startup.completed_steps = DeepXExecutionStartup::REQUIRED.len();
+        client.core.set_connected();
+        ExecutionClient::connect(&mut client).await.unwrap();
+        assert!(client.query_tasks.is_open());
+        assert!(*client.query_epoch.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn position_report_generation_converts_only_current_open_lifecycle() {
+        let response = serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        let client = position_report_test_client(response).await;
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let ts_init = UnixNanos::from(123_456_789);
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            ts_init,
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_position_status_reports(&client, &command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.account_id, AccountId::from("DEEPX-001"));
+        assert_eq!(report.instrument_id, instrument_id);
+        assert_eq!(report.position_side, PositionSide::Long);
+        assert_eq!(report.quantity, Quantity::from("0.300"));
+        assert_eq!(report.quantity.precision, 4);
+        assert_eq!(report.signed_decimal_qty, rust_decimal::Decimal::new(3, 1));
+        assert_eq!(
+            report.avg_px_open,
+            Some(rust_decimal::Decimal::new(24_996, 1))
+        );
+        assert_eq!(report.ts_last, UnixNanos::from(1_789_445_193_757_000_000),);
+        assert_eq!(report.ts_init, ts_init);
+        assert_eq!(report.venue_position_id, None);
+
+        let all_markets =
+            GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
+        let reports = ExecutionClient::generate_position_status_reports(&client, &all_markets)
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].instrument_id, instrument_id);
+
+        let before_update = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            ts_init,
+            Some(instrument_id),
+            None,
+            Some(UnixNanos::from(1_789_445_193_756_999_999)),
+            None,
+            None,
+        );
+        let reports = ExecutionClient::generate_position_status_reports(&client, &before_update)
+            .await
+            .unwrap();
+        assert!(reports.is_empty());
+    }
+
+    #[tokio::test]
+    async fn position_report_conversion_rejects_unknown_status_and_precision_loss() {
+        let response = serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        let client = position_report_test_client(response).await;
+        let response: DeepXApiResponse<DeepXAccountPage<DeepXPerpPositionRecord>> =
+            serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        let mut record = response.data.items[0].clone();
+        record.owner = TEST_SUBACCOUNT.to_string();
+        record.status = "Liquidated".to_string();
+
+        assert_eq!(
+            client.build_position_status_report(&record, UnixNanos::default()),
+            Err(DeepXPositionReportError::UnsupportedStatus(
+                "Liquidated".to_string()
+            )),
+        );
+
+        record.status = "Open".to_string();
+        record.base_asset_amount = rust_decimal::Decimal::new(3_001, 4);
+        assert_eq!(
+            client.build_position_status_report(&record, UnixNanos::default()),
+            Err(DeepXPositionReportError::QuantityIncrementMismatch),
+        );
+    }
+
+    #[tokio::test]
+    async fn position_report_generation_rejects_duplicate_open_market() {
+        let mut response: Value = serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        response["data"]["items"][1]["status"] = "Open".into();
+        response["data"]["items"][1]["closePrice"] = Value::Null;
+        response["data"]["items"][1]["closeBlockNum"] = Value::Null;
+        response["data"]["items"][1]["closeTime"] = Value::Null;
+        response["data"]["items"][1]["closeEventIdx"] = Value::Null;
+        let client = position_report_test_client(response).await;
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_position_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX position report contains multiple open positions for market ID 3",
+        );
+    }
+
+    #[tokio::test]
+    async fn position_report_generation_rejects_missing_catalog_before_http() {
+        let client = test_client();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_position_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("DeepX position report has no validated perpetual market for {instrument_id}"),
+        );
+    }
+
+    #[tokio::test]
+    async fn position_report_generation_rejects_reversed_time_bounds_before_http() {
+        let client = test_client();
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(UnixNanos::from(2)),
+            Some(UnixNanos::from(1)),
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_position_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX position report start must not exceed end",
         );
     }
 
@@ -4145,8 +7064,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fill_report_generation_remains_unsupported() {
-        let client = test_client();
+    async fn fill_report_generation_maps_taker_trades_exactly() {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let client = fill_report_test_client(response).await;
+        let ts_init = UnixNanos::from(123);
+        let command =
+            GenerateFillReports::new(UUID4::new(), ts_init, None, None, None, None, None, None);
+
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].trade_id, TradeId::from("185969410000051"));
+        assert_eq!(
+            reports[0].venue_order_id,
+            VenueOrderId::from("1789445053841")
+        );
+        assert_eq!(reports[0].order_side, OrderSide::Buy);
+        assert_eq!(reports[0].last_qty, Quantity::from("0.3000"));
+        assert_eq!(reports[0].last_px, Price::from("2498.7600"));
+        assert_eq!(reports[0].commission, Money::from("0.149837 USDC"));
+        assert_eq!(reports[0].liquidity_side, LiquiditySide::Taker);
+        assert_eq!(
+            reports[0].ts_event,
+            UnixNanos::from(1_789_445_055_647_000_000),
+        );
+        assert_eq!(reports[0].ts_init, ts_init);
+        assert_eq!(reports[0].client_order_id, None);
+        assert_eq!(reports[1].trade_id, TradeId::from("185971191000008"));
+        assert_eq!(reports[1].order_side, OrderSide::Sell);
+        assert_eq!(reports[2].trade_id, TradeId::from("185971383000008"));
+    }
+
+    #[tokio::test]
+    async fn fill_report_generation_maps_maker_rebate_and_tracked_identity() {
+        let mut response: Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        response["data"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        response["data"]["items"][0]["isLong"] = false.into();
+        response["data"]["items"][0]["fee"] = serde_json::json!(0.074988);
+        let client = fill_report_test_client(response).await;
+        let order = tracked_limit_order();
+        let venue_order_id = VenueOrderId::from("1789445193480");
+        client.register_order(&order).unwrap();
+        client
+            .bind_tracked_venue_order_id(order.client_order_id(), venue_order_id)
+            .unwrap();
         let command = GenerateFillReports::new(
             UUID4::new(),
             UnixNanos::default(),
@@ -4162,7 +7129,180 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "DeepX fill reports are not operational");
+        assert_eq!(
+            error.to_string(),
+            "DeepX fill report side does not match registered order context",
+        );
+
+        let mut response: DeepXApiResponse<DeepXAccountPage<DeepXPerpAccountTradeRecord>> =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let mut record = response.data.items.remove(0);
+        record.fee = rust_decimal::Decimal::new(74_988, 6);
+        record.taker = "Seller".to_string();
+        let report = client
+            .build_fill_report(&record, UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(report.client_order_id, Some(order.client_order_id()));
+        assert_eq!(report.liquidity_side, LiquiditySide::Maker);
+        assert_eq!(report.commission, Money::from("-0.074988 USDC"));
+    }
+
+    #[tokio::test]
+    async fn fill_report_generation_applies_order_and_exact_time_filters() {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let client = fill_report_test_client(response).await;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(VenueOrderId::from("1789445180000")),
+            None,
+            None,
+            None,
+            None,
+        );
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trade_id, TradeId::from("185971191000008"));
+
+        let mut response: Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        response["data"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(2);
+        let client = fill_report_test_client(response).await;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            Some(UnixNanos::from(1_789_445_180_317_000_001)),
+            None,
+            None,
+            None,
+        );
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trade_id, TradeId::from("185971383000008"));
+    }
+
+    #[tokio::test]
+    async fn fill_report_conversion_rejects_invalid_venue_semantics() {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let client = fill_report_test_client(response).await;
+        let response: DeepXApiResponse<DeepXAccountPage<DeepXPerpAccountTradeRecord>> =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let record = &response.data.items[0];
+
+        let mut invalid = record.clone();
+        invalid.fee_asset = "ETH".to_string();
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::FeeAssetMismatch),
+        );
+
+        invalid = record.clone();
+        invalid.fee = -invalid.fee;
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::FeeSignMismatch),
+        );
+
+        invalid = record.clone();
+        invalid.taker = "Neither".to_string();
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::UnsupportedTaker(
+                "Neither".to_string()
+            )),
+        );
+
+        invalid = record.clone();
+        invalid.filled_direction = "Flat".to_string();
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::UnsupportedFilledDirection(
+                "Flat".to_string()
+            )),
+        );
+
+        invalid = record.clone();
+        invalid.price = rust_decimal::Decimal::new(24_996_001, 4);
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::PriceIncrementMismatch),
+        );
+
+        invalid = record.clone();
+        invalid.size = rust_decimal::Decimal::new(3_001, 4);
+        assert_eq!(
+            client.build_fill_report(&invalid, UnixNanos::default()),
+            Err(DeepXFillReportError::QuantityIncrementMismatch),
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_report_generation_rejects_invalid_request_before_http() {
+        let client = test_client();
+        let invalid_order = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(VenueOrderId::from("not-decimal")),
+            None,
+            None,
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, invalid_order)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX fill report venue order ID must be an exact decimal u64",
+        );
+
+        let reversed_time = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            Some(UnixNanos::from(2)),
+            Some(UnixNanos::from(1)),
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, reversed_time)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX fill report start must not exceed end",
+        );
+
+        let missing_catalog = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, missing_catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX fill report has no validated perpetual market for ETH-USDC-PERP.DEEPX",
+        );
     }
 
     #[tokio::test]
@@ -5308,8 +8448,8 @@ mod tests {
         );
     }
 
-    #[rstest]
-    fn account_state_initialization_rejects_wrong_account_type() {
+    #[tokio::test]
+    async fn account_state_initialization_rejects_wrong_account_type() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5317,16 +8457,16 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
         let mut state = test_account_state();
         state.account_type = AccountType::Cash;
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, &frame, &state),
+            client.record_account_state_initialized(&connection, &frame, &state),
             Err(DeepXExecutionStartupError::AccountStateIdentityMismatch {
                 expected_account_id: AccountId::from("DEEPX-001"),
                 expected_account_type: AccountType::Margin,
@@ -5345,8 +8485,8 @@ mod tests {
         );
     }
 
-    #[rstest]
-    fn account_state_initialization_dispatches_exact_event() {
+    #[tokio::test]
+    async fn account_state_initialization_dispatches_exact_event() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5354,17 +8494,17 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         client
-            .record_account_state_initialized(&protocol, &frame, &state)
+            .record_account_state_initialized(&connection, &frame, &state)
             .unwrap();
 
         let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
@@ -5372,11 +8512,11 @@ mod tests {
         };
         assert_eq!(dispatched, state);
         assert_eq!(client.startup_account_event_id, Some(state.event_id));
-        assert_eq!(client.startup.completed_steps, 5);
+        assert_eq!(client.startup.completed_steps, 6);
     }
 
-    #[rstest]
-    fn account_state_initialization_dispatch_failure_does_not_advance_startup() {
+    #[tokio::test]
+    async fn account_state_initialization_dispatch_failure_does_not_advance_startup() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5384,24 +8524,24 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
         let state = test_account_state();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         drop(receiver);
         client.emitter.set_sender(sender);
 
-        let result = client.record_account_state_initialized(&protocol, &frame, &state);
+        let result = client.record_account_state_initialized(&connection, &frame, &state);
 
         assert!(matches!(
             result,
             Err(DeepXExecutionStartupError::AccountStateDispatchFailed(_)),
         ));
         assert_eq!(client.startup_account_event_id, None);
-        assert_eq!(client.startup.completed_steps, 4);
+        assert_eq!(client.startup.completed_steps, 5);
         assert_eq!(
             client
                 .startup
@@ -5410,8 +8550,8 @@ mod tests {
         );
     }
 
-    #[rstest]
-    fn account_state_initialization_rejects_stale_authenticated_session_without_dispatch() {
+    #[tokio::test]
+    async fn account_state_initialization_rejects_stale_subscription_without_dispatch() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5419,27 +8559,27 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (mut protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (mut connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
-        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+        connection.close().await.unwrap();
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, &frame, &state),
-            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+            client.record_account_state_initialized(&connection, &frame, &state),
+            Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch),
         );
         assert!(receiver.try_recv().is_err());
         assert_eq!(client.startup_account_event_id, None);
-        assert_eq!(client.startup.completed_steps, 4);
+        assert_eq!(client.startup.completed_steps, 5);
     }
 
-    #[rstest]
-    fn account_state_initialization_rejects_session_from_another_protocol_owner() {
+    #[tokio::test]
+    async fn account_state_initialization_rejects_frame_from_another_connection() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5447,27 +8587,27 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (connection, subscription, _) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let (other_protocol, other_session) = authenticated_protocol();
-        let other_frame = authenticated_account_frame(&other_protocol, other_session);
+        let (other_connection, _, other_frame) = confirmed_account_stream().await;
         let state = test_account_state();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(sender);
 
         assert_eq!(
-            client.record_account_state_initialized(&other_protocol, &other_frame, &state),
-            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+            client.record_account_state_initialized(&other_connection, &other_frame, &state),
+            Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch),
         );
         assert!(receiver.try_recv().is_err());
         assert_eq!(client.startup_account_event_id, None);
-        assert_eq!(client.startup.completed_steps, 4);
+        assert_eq!(client.startup.completed_steps, 5);
     }
 
-    #[rstest]
-    fn reset_clears_authenticated_session_receipt() {
+    #[tokio::test]
+    async fn reset_clears_ownership_and_account_subscription_receipts() {
         let mut client = test_client();
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
@@ -5475,40 +8615,43 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
-        let (protocol, session) = authenticated_protocol();
+        record_account_ownership(&mut client);
+        let (connection, subscription, frame) = confirmed_account_stream().await;
         client
-            .record_private_stream_authenticated(&protocol, session)
+            .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
-        let frame = authenticated_account_frame(&protocol, session);
 
         client.reset_startup();
+        assert!(client.account_ownership.is_none());
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
         client
             .startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)
             .unwrap();
+        record_account_ownership(&mut client);
         client
             .startup
-            .record(DeepXExecutionStartupEvidence::PrivateStreamAuthenticated)
+            .record(DeepXExecutionStartupEvidence::AccountStreamConfirmed)
             .unwrap();
         let state = test_account_state();
 
         assert_eq!(
-            client.record_account_state_initialized(&protocol, &frame, &state),
-            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+            client.record_account_state_initialized(&connection, &frame, &state),
+            Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch),
         );
         assert_eq!(client.startup_account_event_id, None);
-        assert_eq!(client.startup.completed_steps, 4);
+        assert_eq!(client.startup.completed_steps, 5);
     }
 
-    #[rstest]
-    fn account_registration_requires_configured_account_in_cache() {
+    #[tokio::test]
+    async fn account_registration_requires_configured_account_in_cache() {
         let mut client = test_client();
-        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
 
         assert_eq!(
-            client.complete_account_registration(&protocol, session),
+            client.complete_account_registration(&connection, subscription),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered {
                 account_id: AccountId::from("DEEPX-001"),
                 event_id: state.event_id,
@@ -5517,46 +8660,153 @@ mod tests {
         assert!(!client.is_connected());
     }
 
-    #[rstest]
-    fn account_registration_connects_after_cache_verification() {
+    #[tokio::test]
+    async fn account_registration_connects_after_cache_verification() {
         let (mut client, cache) = test_client_with_cache();
-        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, state);
 
         client
-            .complete_account_registration(&protocol, session)
+            .complete_account_registration(&connection, subscription)
             .unwrap();
 
         assert!(client.is_connected());
     }
 
     #[rstest]
-    fn account_registration_reports_cache_borrow_conflict() {
+    fn account_query_replays_latest_state_after_current_startup_baseline() {
+        let (client, cache, mut receiver, initial) = account_query_client();
+        let latest = AccountState::new(
+            initial.account_id,
+            initial.account_type,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(2_000u64),
+            UnixNanos::from(3_000u64),
+            None,
+        );
+        cache.borrow_mut().update_account_state(&latest).unwrap();
+        let mut command = account_query();
+        command.params = Some(Params::new());
+
+        ExecutionClient::query_account(&client, command).unwrap();
+
+        let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
+            panic!("expected account state event")
+        };
+        assert_eq!(dispatched, latest);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn account_query_does_not_replay_locally_calculated_state() {
+        let (client, cache, mut receiver, baseline) = account_query_client();
+        let calculated = AccountState::new(
+            baseline.account_id,
+            baseline.account_type,
+            vec![],
+            vec![],
+            false,
+            UUID4::new(),
+            UnixNanos::from(2_000u64),
+            UnixNanos::from(3_000u64),
+            None,
+        );
+        cache
+            .borrow_mut()
+            .update_account_state(&calculated)
+            .unwrap();
+
+        ExecutionClient::query_account(&client, account_query()).unwrap();
+
+        let ExecutionEvent::Account(dispatched) = receiver.try_recv().unwrap() else {
+            panic!("expected account state event")
+        };
+        assert_eq!(dispatched, baseline);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case("disconnected")]
+    #[case("trader")]
+    #[case("client")]
+    #[case("account")]
+    #[case("params")]
+    #[case("stale-startup")]
+    fn invalid_account_query_never_replays_cached_state(#[case] invalid: &str) {
+        let (mut client, _cache, mut receiver, _) = account_query_client();
+        let mut command = account_query();
+        match invalid {
+            "disconnected" => client.core.set_disconnected(),
+            "trader" => command.trader_id = TraderId::from("OTHER-001"),
+            "client" => command.client_id = Some(ClientId::from("OTHER")),
+            "account" => command.account_id = AccountId::from("DEEPX-002"),
+            "params" => {
+                let mut params = Params::new();
+                params.insert("unsupported".to_string(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            "stale-startup" => client.startup_account_event_id = Some(UUID4::new()),
+            _ => unreachable!(),
+        }
+
+        assert!(ExecutionClient::query_account(&client, command).is_err());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn account_query_reports_cache_borrow_conflict_without_panicking() {
+        let (client, cache, mut receiver, _) = account_query_client();
+        let borrowed = cache.borrow_mut();
+
+        let error = ExecutionClient::query_account(&client, account_query()).unwrap_err();
+
+        assert!(error.to_string().contains("mutably borrowed"));
+        assert!(receiver.try_recv().is_err());
+        drop(borrowed);
+    }
+
+    #[rstest]
+    fn account_query_reports_dispatch_failure() {
+        let (client, _cache, receiver, _) = account_query_client();
+        drop(receiver);
+
+        let error = ExecutionClient::query_account(&client, account_query()).unwrap_err();
+
+        assert!(error.to_string().contains("Failed to send account state"));
+    }
+
+    #[tokio::test]
+    async fn account_registration_reports_cache_borrow_conflict() {
         let (mut client, cache) = test_client_with_cache();
-        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, state);
         let borrowed = cache.borrow_mut();
 
         assert_eq!(
-            client.complete_account_registration(&protocol, session),
+            client.complete_account_registration(&connection, subscription),
             Err(DeepXExecutionStartupError::CacheBorrowConflict),
         );
         assert!(!client.is_connected());
         drop(borrowed);
         client
-            .complete_account_registration(&protocol, session)
+            .complete_account_registration(&connection, subscription)
             .unwrap();
         assert!(client.is_connected());
     }
 
-    #[rstest]
-    fn account_registration_checks_startup_order_before_cache() {
+    #[tokio::test]
+    async fn account_registration_checks_startup_order_before_cache() {
         let (mut client, cache) = test_client_with_cache();
         register_test_account(&cache, test_account_state());
-        let (protocol, session) = authenticated_protocol();
+        let (connection, subscription, _) = confirmed_account_stream().await;
 
         assert_eq!(
-            client.complete_account_registration(&protocol, session),
+            client.complete_account_registration(&connection, subscription),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -5565,18 +8815,19 @@ mod tests {
         assert!(!client.is_connected());
     }
 
-    #[rstest]
-    fn reconnect_requires_startup_replay_before_cached_account_registration() {
+    #[tokio::test]
+    async fn reconnect_requires_startup_replay_before_cached_account_registration() {
         let (mut client, cache) = test_client_with_cache();
-        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, state);
         client
-            .complete_account_registration(&protocol, session)
+            .complete_account_registration(&connection, subscription)
             .unwrap();
         client.reset_startup();
 
         assert_eq!(
-            client.complete_account_registration(&protocol, session),
+            client.complete_account_registration(&connection, subscription),
             Err(DeepXExecutionStartupError::OutOfOrder {
                 expected: DeepXExecutionStartupEvidence::InstrumentsLoaded,
                 received: DeepXExecutionStartupEvidence::AccountRegistered,
@@ -5585,21 +8836,21 @@ mod tests {
         assert!(!client.is_connected());
     }
 
-    #[rstest]
-    fn reconnect_rejects_account_state_from_previous_startup_epoch() {
+    #[tokio::test]
+    async fn reconnect_rejects_account_state_from_previous_startup_epoch() {
         let (mut client, cache) = test_client_with_cache();
-        let (initial_state, initial_protocol, initial_session) =
-            advance_through_mass_reconciliation(&mut client);
+        let (initial_state, initial_connection, initial_subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, initial_state);
         client
-            .complete_account_registration(&initial_protocol, initial_session)
+            .complete_account_registration(&initial_connection, initial_subscription)
             .unwrap();
         client.reset_startup();
-        let (current_state, current_protocol, current_session) =
-            advance_through_mass_reconciliation(&mut client);
+        let (current_state, current_connection, current_subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
 
         assert_eq!(
-            client.complete_account_registration(&current_protocol, current_session),
+            client.complete_account_registration(&current_connection, current_subscription),
             Err(DeepXExecutionStartupError::AccountStateNotRegistered {
                 account_id: AccountId::from("DEEPX-001"),
                 event_id: current_state.event_id,
@@ -5608,19 +8859,20 @@ mod tests {
         assert!(!client.is_connected());
     }
 
-    #[rstest]
-    fn account_registration_rejects_session_invalidated_after_account_state() {
+    #[tokio::test]
+    async fn account_registration_rejects_subscription_invalidated_after_account_state() {
         let (mut client, cache) = test_client_with_cache();
-        let (state, mut protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, mut connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, state);
-        protocol.reset_after_reconnect(1, "test reconnect").unwrap();
+        connection.close().await.unwrap();
 
         assert_eq!(
-            client.complete_account_registration(&protocol, session),
-            Err(DeepXExecutionStartupError::PrivateStreamAuthenticationMismatch),
+            client.complete_account_registration(&connection, subscription),
+            Err(DeepXExecutionStartupError::AccountStreamSubscriptionMismatch),
         );
         assert!(!client.is_connected());
-        assert_eq!(client.startup.completed_steps, 6);
+        assert_eq!(client.startup.completed_steps, 7);
     }
 
     #[rstest]
@@ -5659,13 +8911,14 @@ mod tests {
         assert_eq!(client.startup.completed_steps, 0);
     }
 
-    #[rstest]
-    fn execution_client_dispose_clears_connected_startup_state() {
+    #[tokio::test]
+    async fn execution_client_dispose_clears_connected_startup_state() {
         let (mut client, cache) = test_client_with_cache();
-        let (state, protocol, session) = advance_through_mass_reconciliation(&mut client);
+        let (state, connection, subscription) =
+            advance_through_mass_reconciliation(&mut client).await;
         register_test_account(&cache, state);
         client
-            .complete_account_registration(&protocol, session)
+            .complete_account_registration(&connection, subscription)
             .unwrap();
         assert!(client.is_connected());
 
@@ -5674,7 +8927,7 @@ mod tests {
         assert!(client.core.is_stopped());
         assert!(!client.is_connected());
         assert_eq!(client.startup.completed_steps, 0);
-        assert_eq!(client.startup_authenticated_session, None);
+        assert_eq!(client.startup_account_subscription, None);
         assert_eq!(client.startup_account_event_id, None);
     }
 

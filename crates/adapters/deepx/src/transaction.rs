@@ -15,33 +15,41 @@
 
 //! Evidence-driven lifecycle primitives for DeepX transactions.
 
+mod direct;
 mod persistence;
 mod recovery;
 mod reservation;
+mod rest_status;
 mod submission;
 mod watch;
 
+pub use direct::{
+    DeepXDirectPalletCallVerifier, DeepXDirectPalletRestoreError,
+    load_verified_direct_pallet_for_signer, prepare_signed_direct_pallet_transaction,
+};
 pub use persistence::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedObservation,
     DeepXCommittedTransactionRecord, DeepXDurableRecoveryObserver, DeepXFinalityCommitError,
     DeepXFinalizedRecoveryCommitError, DeepXObservationCommitError, DeepXPerpCancelCallVerifier,
-    DeepXPerpCloseCallVerifier, DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
-    DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
-    DeepXPreparedSubmission, DeepXRemarkCallVerifier, DeepXReorganizationCommitError,
-    DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
-    DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError, DeepXSubmissionPermit,
-    DeepXSubmissionPreparationError, DeepXTransactionPersistenceError, DeepXTransactionRevision,
-    DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
+    DeepXPerpCloseCallVerifier, DeepXPerpPlaceCallVerifier,
+    DeepXPerpProfitAndLossPointCallVerifier, DeepXPoolReconciliationCommitError,
+    DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXPreparedReservation,
+    DeepXPreparedSignedTransaction, DeepXPreparedSubmission, DeepXRemarkCallVerifier,
+    DeepXReorganizationCommitError, DeepXReservationPreparationError,
+    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+    DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError,
+    DeepXSubmissionPermit, DeepXSubmissionPreparationError, DeepXTransactionPersistenceError,
+    DeepXTransactionRevision, DeepXTransactionStore, DeepXUnsupportedBusinessCallVerifier,
     commit_initial_submission_acceptance, commit_reconciliation_observation,
     commit_recovery_decision, commit_reorganization_decision, load_verified_committed_for_signer,
     observe_and_commit_finality, observe_and_commit_reorganization, prepare_initial_submission,
-    prepare_signed_perp_cancel_transaction, prepare_signed_perp_close_transaction,
-    prepare_signed_spot_cancel_transaction, prepare_signed_spot_place_transaction,
-    prepare_signed_transaction, prepare_signed_transaction_with_verifier,
-    prepare_timestamp_reservation, reconcile_not_included_checkpoint,
-    reconcile_not_included_checkpoint_with_observer, reconcile_submission_pool,
-    restore_timestamp_nonce_allocator, verify_signer_lease,
+    prepare_perp_place_reservation, prepare_signed_perp_cancel_transaction,
+    prepare_signed_perp_close_transaction, prepare_signed_perp_place_transaction,
+    prepare_signed_perp_profit_and_loss_point_transaction, prepare_signed_spot_cancel_transaction,
+    prepare_signed_spot_place_transaction, prepare_signed_transaction,
+    prepare_signed_transaction_with_verifier, prepare_timestamp_reservation,
+    reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
+    reconcile_submission_pool, restore_timestamp_nonce_allocator, verify_signer_lease,
 };
 pub use recovery::{
     DeepXCanonicalBlockEvidence, DeepXMissedBlockScanPlan, DeepXRecoveryDecision,
@@ -56,22 +64,33 @@ pub use reservation::{
     DeepXTimestampNonceAllocator, DeepXTimestampNonceError, DeepXTransactionIdentity,
     DeepXTransactionOperation, DeepXTransactionRecord, DeepXTransactionRecordError,
 };
+pub use rest_status::{
+    DeepXRestStatusPollPolicy, DeepXRestStatusPollResult, DeepXRestStatusPollTermination,
+    DeepXRestTransactionConfirmation, DeepXRestTransactionStatus, get_rest_transaction_status,
+    poll_rest_transaction_status,
+};
 use serde::{Deserialize, Serialize};
 pub use submission::{
-    DeepXSubmissionError, DeepXSubmissionRetryError, DeepXSubmittedExtrinsic,
-    submit_extrinsic_once, submit_with_bounded_ambiguity_retry, verify_submission_hash,
+    DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError, DeepXSubmissionError,
+    DeepXSubmissionRetryError, DeepXSubmittedExtrinsic, submit_extrinsic_once,
+    submit_rest_transaction_once, submit_with_bounded_ambiguity_retry, verify_submission_hash,
 };
 use thiserror::Error;
 pub(crate) use watch::collect_finalized_recovery_scan_with_event_evidence;
 pub use watch::{
     DeepXCanonicalBlockObservation, DeepXFinalityObservation, DeepXFinalizedRecoveryCheckpoint,
-    DeepXFinalizedRecoveryCollection, DeepXPerpCancelEventVerificationError, DeepXPoolObservation,
+    DeepXFinalizedRecoveryCollection, DeepXPerpCancelEventVerificationError,
+    DeepXPerpCloseEventVerificationError, DeepXPerpPlaceEventVerificationError,
+    DeepXPerpProfitAndLossPointEventVerificationError, DeepXPoolObservation,
     DeepXSpotCancelEventVerificationError, DeepXSpotPlaceEventVerificationError,
-    DeepXTransactionWatchError, collect_finalized_recovery_scan,
+    DeepXTransactionWatchError, collect_finalized_perp_close_recovery_scan,
+    collect_finalized_perp_place_recovery_scan,
+    collect_finalized_perp_profit_and_loss_point_recovery_scan, collect_finalized_recovery_scan,
     collect_finalized_spot_cancel_recovery_scan, collect_finalized_spot_place_recovery_scan,
     observe_canonical_block, observe_finality, observe_reorganization, observe_submission_pool,
-    verify_perp_cancel_business_event, verify_spot_cancel_inclusion_events,
-    verify_spot_place_inclusion_events,
+    verify_perp_cancel_business_event, verify_perp_close_inclusion_events,
+    verify_perp_place_inclusion_events, verify_perp_profit_and_loss_point_inclusion_events,
+    verify_spot_cancel_inclusion_events, verify_spot_place_inclusion_events,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.

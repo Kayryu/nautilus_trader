@@ -411,6 +411,50 @@ where
     Ok(DeepXPreparedReservation { record, committed })
 }
 
+/// Allocates and durably creates an operation-specific perpetual placement reservation.
+///
+/// The nonce is never rolled back, including after unknown durable create outcomes. This
+/// performs no signing or submission and assumes no price or size unit conversion.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, timestamp allocation, durable create, or the exact
+/// Created acknowledgement cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_perp_place_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    params: crate::signing::DeepXPerpPlaceParams,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    if lease.signer() != allocator.signer() {
+        return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
+    }
+    store.verify_signer_lease(lease).await?;
+    let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
+    let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_place(
+        client_order_id,
+        allocator.signer(),
+        instrument_id,
+        order_side,
+        nonce,
+        runtime,
+        params,
+    ));
+    let committed = store.create_committed(lease, &record).await?;
+    committed.verify(&record)?;
+    Ok(DeepXPreparedReservation { record, committed })
+}
+
 /// Failure while signing and durably committing a reserved transaction.
 #[derive(Debug, Error)]
 pub enum DeepXSignedTransactionPreparationError {
@@ -540,6 +584,79 @@ where
     })
 }
 
+/// Signs and durably commits an acknowledged perpetual placement entirely offline.
+///
+/// Every raw argument and the timestamp nonce comes from the reservation. This does not
+/// authorize submission, infer financial scaling, or prove business success.
+///
+/// # Errors
+///
+/// Returns an error if the lease, Created acknowledgement, exact call binding, signing,
+/// or Signed compare-and-set acknowledgement cannot be proven.
+pub async fn prepare_signed_perp_place_transaction<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_created: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    permit: &crate::signing::DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+) -> Result<DeepXPreparedSignedTransaction, DeepXSignedTransactionPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    let params = perp_place_params(record.identity())?;
+    let DeepXNonceReservation::TimestampOrderId { value: nonce } = record.identity().nonce() else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "sequential account nonce domain remains unproven".to_string(),
+        )
+        .into());
+    };
+    let verifier = DeepXPerpPlaceCallVerifier::new(permit.snapshot().clone(), key.clone())?;
+    prepare_signed_transaction_with_verifier(
+        store,
+        lease,
+        committed_created,
+        record,
+        |_| crate::signing::sign_perp_place_order(permit, key, params, nonce),
+        &verifier,
+    )
+    .await
+}
+
+fn perp_place_params(
+    identity: &DeepXTransactionIdentity,
+) -> Result<crate::signing::DeepXPerpPlaceParams, DeepXBusinessCallBindingError> {
+    let Some(super::DeepXTransactionOperation::PerpPlace {
+        subaccount,
+        market_id,
+        is_long,
+        size,
+        price,
+        order_type,
+        take_profit,
+        stop_loss,
+        reduce_only,
+        post_only,
+    }) = identity.operation()
+    else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "durable identity is not a perpetual placement operation".to_string(),
+        ));
+    };
+    Ok(crate::signing::DeepXPerpPlaceParams {
+        subaccount: *subaccount,
+        market_id: *market_id,
+        is_long: *is_long,
+        size: *size,
+        price: *price,
+        order_type: *order_type,
+        take_profit: *take_profit,
+        stop_loss: *stop_loss,
+        reduce_only: *reduce_only,
+        post_only: *post_only,
+    })
+}
+
 /// Signs and commits an acknowledged perpetual close reservation without submission.
 ///
 /// All raw call arguments come from the durable identity. Exact call verification precedes
@@ -611,6 +728,68 @@ where
     Ok(DeepXPreparedSignedTransaction {
         record: signed_record,
         committed,
+    })
+}
+
+/// Signs and commits acknowledged perpetual profit and loss points entirely offline.
+///
+/// Arguments and timestamp nonce come exclusively from the durable identity. This does not
+/// authorize submission or prove financial units, ownership, or business success.
+///
+/// # Errors
+///
+/// Returns an error if lease ownership, Created acknowledgement, operation, signing, call
+/// binding, or the exact durable Signed acknowledgement cannot be proven.
+pub async fn prepare_signed_perp_profit_and_loss_point_transaction<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_created: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    permit: &crate::signing::DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+) -> Result<DeepXPreparedSignedTransaction, DeepXSignedTransactionPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    let verifier =
+        DeepXPerpProfitAndLossPointCallVerifier::new(permit.snapshot().clone(), key.clone())?;
+    let params = perp_profit_and_loss_point_params(record.identity())?;
+    let DeepXNonceReservation::TimestampOrderId { value: nonce } = record.identity().nonce() else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "sequential account nonce domain remains unproven".to_string(),
+        )
+        .into());
+    };
+    prepare_signed_transaction_with_verifier(
+        store,
+        lease,
+        committed_created,
+        record,
+        |_| crate::signing::sign_perp_set_profit_and_loss_point(permit, key, params, nonce),
+        &verifier,
+    )
+    .await
+}
+
+fn perp_profit_and_loss_point_params(
+    identity: &DeepXTransactionIdentity,
+) -> Result<crate::signing::DeepXPerpProfitAndLossPointParams, DeepXBusinessCallBindingError> {
+    let Some(super::DeepXTransactionOperation::PerpProfitAndLossPoint {
+        subaccount,
+        market_id,
+        take_profit_point,
+        stop_loss_point,
+    }) = identity.operation()
+    else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "durable identity is not a perpetual profit and loss point operation".to_string(),
+        ));
+    };
+    Ok(crate::signing::DeepXPerpProfitAndLossPointParams {
+        subaccount: *subaccount,
+        market_id: *market_id,
+        take_profit_point: *take_profit_point,
+        stop_loss_point: *stop_loss_point,
     })
 }
 
@@ -1014,6 +1193,90 @@ impl fmt::Debug for DeepXRemarkCallVerifier {
     }
 }
 
+/// Opt-in canonical signed-call verifier for an offline perpetual placement.
+#[derive(Clone)]
+pub struct DeepXPerpPlaceCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+    signer: [u8; 20],
+}
+
+impl DeepXPerpPlaceCallVerifier {
+    /// Binds verification to an approved runtime snapshot and signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned signer rejects the key.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        let signer = derive_signer_account_id(&key)?;
+        Ok(Self {
+            snapshot,
+            key,
+            signer,
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXPerpPlaceCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        let actual_hash: [u8; 32] = subxt_core::config::Hasher::hash(
+            &subxt_core::config::substrate::BlakeTwo256,
+            signed_extrinsic.bytes(),
+        )
+        .into();
+        if signed_extrinsic.bytes().is_empty() || actual_hash != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable perpetual placement has invalid byte or hash integrity".to_string(),
+            ));
+        }
+        if self.signer != identity.signer()
+            || DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "perpetual placement verifier signer or runtime differs from reservation"
+                    .to_string(),
+            ));
+        }
+        let params = perp_place_params(identity)?;
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(self.snapshot.clone());
+        let permit = service.acquire().map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!("runtime permit unavailable: {e}"))
+        })?;
+        let canonical = crate::signing::sign_perp_place_order(&permit, &self.key, params, nonce)
+            .map_err(|e| {
+                DeepXBusinessCallBindingError::Unsupported(format!(
+                    "canonical perpetual placement could not be encoded: {e}"
+                ))
+            })?;
+        if canonical.bytes() != signed_extrinsic.bytes()
+            || canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not canonical perpetual placement for this identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXPerpPlaceCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXPerpPlaceCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Opt-in exact-call verifier for an offline perpetual close reservation.
 ///
 /// Deterministic reconstruction proves byte binding, not independent SDK parity, financial
@@ -1115,6 +1378,93 @@ impl DeepXBusinessCallVerifier for DeepXPerpCloseCallVerifier {
 impl fmt::Debug for DeepXPerpCloseCallVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeepXPerpCloseCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Opt-in canonical binding verifier for offline perpetual profit and loss points.
+#[derive(Clone)]
+pub struct DeepXPerpProfitAndLossPointCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+    signer: [u8; 20],
+}
+
+impl DeepXPerpProfitAndLossPointCallVerifier {
+    /// Binds verification to an approved snapshot and signing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned signer rejects the key.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        let signer = derive_signer_account_id(&key)?;
+        Ok(Self {
+            snapshot,
+            key,
+            signer,
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXPerpProfitAndLossPointCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        let actual_hash: [u8; 32] = subxt_core::config::Hasher::hash(
+            &subxt_core::config::substrate::BlakeTwo256,
+            signed_extrinsic.bytes(),
+        )
+        .into();
+        if signed_extrinsic.bytes().is_empty() || actual_hash != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable profit and loss point payload has invalid byte or hash integrity"
+                    .to_string(),
+            ));
+        }
+        if self.signer != identity.signer()
+            || DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "profit and loss point verifier signer or runtime differs from reservation"
+                    .to_string(),
+            ));
+        }
+        let params = perp_profit_and_loss_point_params(identity)?;
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(self.snapshot.clone());
+        let permit = service.acquire().map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!("runtime permit unavailable: {e}"))
+        })?;
+        let canonical =
+            crate::signing::sign_perp_set_profit_and_loss_point(&permit, &self.key, params, nonce)
+                .map_err(|e| {
+                    DeepXBusinessCallBindingError::Unsupported(format!(
+                        "canonical profit and loss points could not be encoded: {e}"
+                    ))
+                })?;
+        if canonical.bytes() != signed_extrinsic.bytes()
+            || canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not canonical profit and loss points for this identity"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXPerpProfitAndLossPointCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXPerpProfitAndLossPointCallVerifier")
             .field("snapshot", &self.snapshot.identity())
             .field("key", &"<redacted>")
             .finish()
@@ -2112,8 +2462,16 @@ pub enum DeepXDurableRecoveryObserver<'a> {
     Default,
     /// Verifies an ordinary Spot cancel using exact durable bytes and an approved snapshot.
     OrdinarySpotCancel(&'a DeepXSpotCancelCallVerifier),
+    /// Verifies Spot placement using canonical durable bytes before event observation.
+    SpotPlace(&'a DeepXSpotPlaceCallVerifier),
     /// Verifies an ordinary or fast Perp cancel using exact durable bytes.
     PerpCancel(&'a DeepXPerpCancelCallVerifier),
+    /// Verifies perpetual placement using canonical durable bytes before event observation.
+    PerpPlace(&'a DeepXPerpPlaceCallVerifier),
+    /// Verifies close canonical signed bytes before observing the generated order.
+    PerpClose(&'a DeepXPerpCloseCallVerifier),
+    /// Verifies TP/SL canonical signed bytes before observing position updates.
+    PerpProfitAndLossPoint(&'a DeepXPerpProfitAndLossPointCallVerifier),
 }
 
 /// Reconciles a durable checkpoint with an explicitly selected offline observer.
@@ -2157,6 +2515,18 @@ where
     if let DeepXDurableRecoveryObserver::PerpCancel(verifier) = &observer {
         verifier.verify(record.identity(), signed_extrinsic)?;
     }
+    if let DeepXDurableRecoveryObserver::SpotPlace(verifier) = &observer {
+        verifier.verify(record.identity(), signed_extrinsic)?;
+    }
+    if let DeepXDurableRecoveryObserver::PerpPlace(verifier) = &observer {
+        verifier.verify(record.identity(), signed_extrinsic)?;
+    }
+    if let DeepXDurableRecoveryObserver::PerpClose(verifier) = &observer {
+        verifier.verify(record.identity(), signed_extrinsic)?;
+    }
+    if let DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(verifier) = &observer {
+        verifier.verify(record.identity(), signed_extrinsic)?;
+    }
     if let DeepXDurableRecoveryObserver::OrdinarySpotCancel(verifier) = &observer {
         if matches!(
             record.identity().operation(),
@@ -2173,6 +2543,61 @@ where
         verifier.verify(record.identity(), signed_extrinsic)?;
     }
     let collection = match observer {
+        DeepXDurableRecoveryObserver::SpotPlace(_) => {
+            super::collect_finalized_spot_place_recovery_scan(
+                endpoints,
+                capabilities,
+                snapshot,
+                record.identity(),
+                absence.finalized_block_number(),
+                absence.finalized_block_hash(),
+                max_blocks_per_range,
+                target_extrinsic_hash,
+            )
+            .await?
+        }
+        DeepXDurableRecoveryObserver::PerpClose(_) => {
+            super::collect_finalized_perp_close_recovery_scan(
+                endpoints,
+                capabilities,
+                snapshot,
+                record.identity(),
+                absence.finalized_block_number(),
+                absence.finalized_block_hash(),
+                max_blocks_per_range,
+                target_extrinsic_hash,
+            )
+            .await
+            .map_err(|e| *e)?
+        }
+        DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(_) => {
+            super::collect_finalized_perp_profit_and_loss_point_recovery_scan(
+                endpoints,
+                capabilities,
+                snapshot,
+                record.identity(),
+                absence.finalized_block_number(),
+                absence.finalized_block_hash(),
+                max_blocks_per_range,
+                target_extrinsic_hash,
+            )
+            .await
+            .map_err(|e| *e)?
+        }
+        DeepXDurableRecoveryObserver::PerpPlace(_) => {
+            super::collect_finalized_perp_place_recovery_scan(
+                endpoints,
+                capabilities,
+                snapshot,
+                record.identity(),
+                absence.finalized_block_number(),
+                absence.finalized_block_hash(),
+                max_blocks_per_range,
+                target_extrinsic_hash,
+            )
+            .await
+            .map_err(|e| *e)?
+        }
         DeepXDurableRecoveryObserver::Default | DeepXDurableRecoveryObserver::PerpCancel(_) => {
             collect_finalized_recovery_scan_with_event_evidence(
                 endpoints,
@@ -3603,6 +4028,1174 @@ mod tests {
         let debug = format!("{verifier:?}");
         assert!(debug.contains("DeepXRemarkCallVerifier"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn perp_place_reserve_sign_and_prepare_initial_submission() {
+        let store = TestStore::empty();
+        let key = remark_key();
+        let signer = derive_signer_account_id(&key).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+        let allocator = DeepXTimestampNonceAllocator::from_records(signer, [], 10);
+        let params = perp_place_params(perp_place_fixture(u128::MAX, None).identity()).unwrap();
+        let created = prepare_perp_place_reservation(
+            &store,
+            &lease,
+            &allocator,
+            1_725_000_000_125,
+            1_725_000_000_125,
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            remark_runtime(),
+            params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.committed().revision().value(), 1);
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = prepare_signed_perp_place_transaction(
+            &store,
+            &lease,
+            created.committed(),
+            created.record(),
+            &service.acquire().unwrap(),
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signed.committed().revision().value(), 2);
+        let verifier = DeepXPerpPlaceCallVerifier::new(remark_snapshot(), key).unwrap();
+        let submitting = prepare_initial_submission(
+            &store,
+            &lease,
+            signed.committed(),
+            signed.record(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            submitting.record().lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+        assert_eq!(submitting.committed().revision().value(), 3);
+        let (bytes, hash) = submitting.into_permit().into_payload();
+        let durable = signed.record().signed_extrinsic().unwrap();
+        assert_eq!(bytes, durable.bytes());
+        assert_eq!(hash, durable.extrinsic_hash());
+        assert!(
+            prepare_initial_submission(
+                &store,
+                &lease,
+                signed.committed(),
+                signed.record(),
+                &verifier,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.current_revision(), 3);
+        assert_eq!(allocator.last_reserved(), Some(1_725_000_000_125));
+    }
+
+    fn direct_operation_fixture(operation: u8) -> DeepXTransactionRecord {
+        match operation {
+            0 => perp_place_fixture(u128::MAX, Some(u128::MAX)),
+            1 => perp_close_fixture(u128::MAX, Some(u64::MAX)),
+            2 => profit_and_loss_fixture(u128::MAX, 0),
+            3 | 4 => perp_cancel_record(&perp_cancel_identity(
+                [0x11; 20],
+                1_725_000_000_001,
+                7,
+                operation == 4,
+            )),
+            5 | 6 => {
+                let (identity, signed) = spot_place_fixture(operation == 5);
+                let mut record = DeepXTransactionRecord::created(identity);
+                record.record_signed(&signed).unwrap();
+                record
+            }
+            7 | 8 => {
+                let (identity, signed) = spot_cancel_fixture(true, operation == 8);
+                let mut record = DeepXTransactionRecord::created(identity);
+                record.record_signed(&signed).unwrap();
+                record
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    #[case(7)]
+    #[case(8)]
+    #[tokio::test]
+    async fn direct_dispatch_prepares_restores_and_binds_submission(#[case] operation: u8) {
+        let baseline = direct_operation_fixture(operation);
+        let created = DeepXTransactionRecord::created(baseline.identity().clone());
+        let store = TestStore::empty();
+        let lease = store
+            .acquire_signer_lease(created.identity().signer())
+            .await
+            .unwrap();
+        let committed = store.create_committed(&lease, &created).await.unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
+            &store,
+            &lease,
+            &committed,
+            &created,
+            &service.acquire().unwrap(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            signed.record().signed_extrinsic(),
+            baseline.signed_extrinsic()
+        );
+        assert_eq!(signed.committed().revision().value(), 2);
+        let restored =
+            crate::transaction::load_verified_direct_pallet_for_signer(&store, &lease, &verifier)
+                .await
+                .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].record(), signed.record());
+        let submitting = prepare_initial_submission(
+            &store,
+            &lease,
+            signed.committed(),
+            signed.record(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(submitting.committed().revision().value(), 3);
+        let (bytes, hash) = submitting.into_permit().into_payload();
+        assert_eq!(bytes, baseline.signed_extrinsic().unwrap().bytes());
+        assert_eq!(hash, baseline.signed_extrinsic().unwrap().extrinsic_hash());
+        assert!(
+            crate::transaction::prepare_signed_direct_pallet_transaction(
+                &store,
+                &lease,
+                &committed,
+                &created,
+                &service.acquire().unwrap(),
+                &verifier,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.current_revision(), 3);
+    }
+
+    #[rstest]
+    #[case(0, "Perp", "PlaceOrder")]
+    #[case(1, "Perp", "ClosePosition")]
+    #[case(2, "Perp", "SetProfitAndLossPoint")]
+    #[case(3, "Perp", "CancelOrder")]
+    #[case(4, "Perp", "CancelOrder")]
+    #[case(5, "Spot", "PlaceOrder")]
+    #[case(6, "Spot", "PlaceOrder")]
+    #[case(7, "Spot", "CancelOrder")]
+    #[case(8, "Spot", "CancelOrder")]
+    #[tokio::test]
+    async fn durable_direct_operation_rest_submission(
+        #[case] operation: u8,
+        #[case] market_type: &'static str,
+        #[case] action: &'static str,
+    ) {
+        use axum::{Json, Router, routing::post};
+        use nautilus_core::hex;
+        let baseline = direct_operation_fixture(operation);
+        let created = DeepXTransactionRecord::created(baseline.identity().clone());
+        let store = TestStore::empty();
+        let lease = store
+            .acquire_signer_lease(created.identity().signer())
+            .await
+            .unwrap();
+        let committed = store.create_committed(&lease, &created).await.unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
+            &store,
+            &lease,
+            &committed,
+            &created,
+            &service.acquire().unwrap(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let prepared = prepare_initial_submission(
+            &store,
+            &lease,
+            signed.committed(),
+            signed.record(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let hash = baseline.signed_extrinsic().unwrap().extrinsic_hash();
+        let expected = serde_json::json!({
+            "marketType": market_type, "action": action,
+            "signedExtrinsic": format!("0x{}", hex::encode(baseline.signed_extrinsic().unwrap().bytes())),
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route("/internal/v1/chain/tx/transact", post(move |Json(value): Json<serde_json::Value>| {
+            let expected = expected.clone();
+            let calls = observed.clone();
+            async move {
+                assert_eq!(value, expected);
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Json(serde_json::json!({
+                    "code": 200, "fail": false, "msg": "success",
+                    "data": { "tx_hash": format!("0x{}", hex::encode(hash)), "confirmation": "pending" },
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = crate::http::client::DeepXHttpClient::new(url, Some(2), None).unwrap();
+        let acknowledgement = crate::transaction::submit_rest_transaction_once(&client, prepared)
+            .await
+            .unwrap();
+        assert_eq!(acknowledgement.submitted.extrinsic_hash(), hash);
+        assert_eq!(acknowledgement.data["confirmation"], "pending");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(store.current_revision(), 3);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    #[case(7)]
+    #[case(8)]
+    #[tokio::test]
+    async fn rest_acceptance_and_pending_status_poll_never_claim_finality(#[case] operation: u8) {
+        use crate::transaction::{
+            DeepXRestStatusPollPolicy, DeepXRestStatusPollTermination, DeepXTransactionOperation,
+            poll_rest_transaction_status, submit_rest_transaction_once,
+        };
+        use axum::{
+            Json, Router,
+            extract::Query,
+            routing::{get, post},
+        };
+        use nautilus_core::hex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let record = direct_operation_fixture(operation);
+        let hash = record.signed_extrinsic().unwrap().extrinsic_hash();
+        let order_id = match record.identity().operation().unwrap() {
+            DeepXTransactionOperation::PerpPlace { .. }
+            | DeepXTransactionOperation::SpotPlace { .. } => {
+                let DeepXNonceReservation::TimestampOrderId { value } = record.identity().nonce()
+                else {
+                    unreachable!();
+                };
+                value.to_string()
+            }
+            DeepXTransactionOperation::PerpCancel { order_id, .. }
+            | DeepXTransactionOperation::SpotCancel { order_id, .. } => order_id.to_string(),
+            DeepXTransactionOperation::PerpClose { .. } => "7".to_string(),
+            DeepXTransactionOperation::PerpProfitAndLossPoint { .. } => String::new(),
+        };
+        let expected_order_id = if order_id.is_empty() {
+            None
+        } else {
+            Some(order_id.parse::<u64>().unwrap())
+        };
+        let store = TestStore::new(2, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let prepared =
+            prepare_initial_submission(&store, &lease, restored[0].committed(), &record, &verifier)
+                .await
+                .unwrap();
+        let submitting = prepared.record().clone();
+        let committed = prepared.committed().clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let gets = Arc::new(AtomicUsize::new(0));
+        let observed_posts = posts.clone();
+        let observed_gets = gets.clone();
+        let app = Router::new().route("/internal/v1/chain/tx/transact", post(move || {
+            observed_posts.fetch_add(1, Ordering::Relaxed);
+            async move { Json(serde_json::json!({
+                "code": 200, "msg": "success", "fail": false,
+                "data": { "tx_hash": format!("0x{}", hex::encode(hash)), "order_id": "", "confirmation": "pending" },
+            })) }
+        })).route("/internal/v1/chain/tx/status", get(move |Query(query): Query<std::collections::HashMap<String, String>>| {
+            let attempt = observed_gets.fetch_add(1, Ordering::Relaxed);
+            let order_id = order_id.clone();
+            async move {
+                assert_eq!(query.len(), 1);
+                assert_eq!(query["txHash"], format!("0x{}", hex::encode(hash)));
+                Json(serde_json::json!({
+                    "code": 200, "msg": "success", "fail": false,
+                    "data": { "tx_hash": format!("0x{}", hex::encode(hash)), "order_id": if attempt == 0 { "" } else { order_id.as_str() },
+                        "confirmation": if attempt == 0 { "pending" } else { "best" }, "status": "included" },
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::http::DeepXHttpClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let acknowledgement = submit_rest_transaction_once(&client, prepared)
+            .await
+            .unwrap();
+        let accepted = commit_initial_submission_acceptance(
+            &store,
+            &lease,
+            &committed,
+            &submitting,
+            acknowledgement.submitted,
+        )
+        .await
+        .unwrap();
+        let policy = DeepXRestStatusPollPolicy {
+            max_attempts: NonZeroU32::new(3).unwrap(),
+            interval: std::time::Duration::from_millis(1),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let result = poll_rest_transaction_status(
+            &client,
+            hash,
+            policy,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let retained = store.load_committed_for_signer(&lease).await.unwrap();
+
+        assert_eq!(result.termination, DeepXRestStatusPollTermination::Best);
+        assert_eq!(result.attempts, 2);
+        let observation = result.last_observation.unwrap();
+        assert_eq!(observation.extrinsic_hash(), hash);
+        assert_eq!(observation.order_id(), expected_order_id);
+        assert_eq!(retained[0].record(), accepted.record());
+        assert_eq!(
+            retained[0].record().lifecycle().state(),
+            DeepXTransactionState::Accepted
+        );
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+        assert_eq!(gets.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    #[case(7)]
+    #[case(8)]
+    #[tokio::test]
+    async fn direct_dispatch_rejects_foreign_scope_before_durable_write(#[case] operation: u8) {
+        let baseline = direct_operation_fixture(operation);
+        let created = DeepXTransactionRecord::created(baseline.identity().clone());
+        let store = TestStore::new(1, &created);
+        let lease = store
+            .acquire_signer_lease(created.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &created,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x22; 20],
+        )
+        .unwrap();
+        assert!(matches!(
+            verifier.verify(baseline.identity(), baseline.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_))
+        ));
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        assert!(matches!(
+            crate::transaction::prepare_signed_direct_pallet_transaction(
+                &store,
+                &lease,
+                &committed,
+                &created,
+                &service.acquire().unwrap(),
+                &verifier,
+            )
+            .await,
+            Err(DeepXSignedTransactionPreparationError::Binding(
+                DeepXBusinessCallBindingError::Mismatch(_)
+            ))
+        ));
+        assert_eq!(store.current_revision(), 1);
+        assert!(
+            DeepXTransactionRecord::decode(&store.encoded_record.lock().unwrap())
+                .unwrap()
+                .signed_extrinsic()
+                .is_none()
+        );
+    }
+
+    #[rstest]
+    #[case("signer")]
+    #[case("runtime")]
+    #[case("subaccount")]
+    #[case("operation")]
+    #[case("nonce")]
+    #[case("price")]
+    fn direct_verifier_rejects_identity_mutations_across_operation_dispatch(
+        #[case] mutation: &str,
+    ) {
+        let baseline = direct_operation_fixture(0);
+        let mut identity = serde_json::to_value(baseline.identity()).unwrap();
+        match mutation {
+            "signer" => identity["signer"] = serde_json::to_value([0x22u8; 20]).unwrap(),
+            "runtime" => identity["runtime"]["spec_version"] = json!(999),
+            "subaccount" => {
+                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap()
+            }
+            "operation" => {
+                identity["operation"] =
+                    serde_json::to_value(direct_operation_fixture(1).identity().operation())
+                        .unwrap();
+            }
+            "nonce" => {
+                identity["nonce"] =
+                    serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 123 })
+                        .unwrap()
+            }
+            "price" => identity["operation"]["price"] = json!("1"),
+            _ => unreachable!(),
+        }
+        let identity: DeepXTransactionIdentity = serde_json::from_value(identity).unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        assert!(
+            verifier
+                .verify(&identity, baseline.signed_extrinsic().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_verifier_rejects_legacy_remark_and_redacts_credentials() {
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let baseline = remark_record(&remark_identity());
+        assert!(matches!(
+            verifier.verify(baseline.identity(), baseline.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Unsupported(_))
+        ));
+        let debug = format!("{verifier:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    #[derive(Debug)]
+    struct DirectRestoreStore {
+        owner: TestStore,
+        records: Vec<DeepXRestoredTransactionRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeepXTransactionStore for DirectRestoreStore {
+        type Lease = TestLease;
+
+        async fn acquire_signer_lease(
+            &self,
+            signer: [u8; 20],
+        ) -> Result<Self::Lease, DeepXTransactionPersistenceError> {
+            self.owner.acquire_signer_lease(signer).await
+        }
+
+        async fn verify_signer_lease(
+            &self,
+            lease: &Self::Lease,
+        ) -> Result<(), DeepXTransactionPersistenceError> {
+            self.owner.verify_signer_lease(lease).await
+        }
+
+        async fn load_committed_for_signer(
+            &self,
+            lease: &Self::Lease,
+        ) -> Result<Vec<DeepXRestoredTransactionRecord>, DeepXTransactionPersistenceError> {
+            self.verify_signer_lease(lease).await?;
+            Ok(self.records.clone())
+        }
+
+        async fn create_committed(
+            &self,
+            _lease: &Self::Lease,
+            _record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            panic!("restoration must not create records")
+        }
+
+        async fn compare_and_set_committed(
+            &self,
+            _lease: &Self::Lease,
+            _expected: &DeepXCommittedTransactionRecord,
+            _record: &DeepXTransactionRecord,
+        ) -> Result<DeepXCommittedTransactionRecord, DeepXTransactionPersistenceError> {
+            panic!("restoration must not mutate records")
+        }
+    }
+
+    #[rstest]
+    #[case("valid")]
+    #[case("foreign")]
+    #[case("wrong-call")]
+    #[case("legacy")]
+    #[case("sequential")]
+    #[tokio::test]
+    async fn direct_restore_is_failure_atomic_for_mixed_records(#[case] corruption: &str) {
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let mut records = Vec::new();
+        for operation in 0..9 {
+            let baseline = direct_operation_fixture(operation);
+            let mut identity = serde_json::to_value(baseline.identity()).unwrap();
+            identity["client_order_id"] = json!(format!("O-DIRECT-{operation}"));
+            identity["nonce"] = serde_json::to_value(DeepXNonceReservation::TimestampOrderId {
+                value: 1_725_000_001_000 + u64::from(operation),
+            })
+            .unwrap();
+            let created =
+                DeepXTransactionRecord::created(serde_json::from_value(identity).unwrap());
+            let store = TestStore::new(1, &created);
+            let lease = store
+                .acquire_signer_lease(created.identity().signer())
+                .await
+                .unwrap();
+            let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+                &created,
+                DeepXTransactionRevision::new(1),
+            )
+            .unwrap();
+            let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
+                &store,
+                &lease,
+                &committed,
+                &created,
+                &service.acquire().unwrap(),
+                &verifier,
+            )
+            .await
+            .unwrap();
+            records.push(
+                DeepXRestoredTransactionRecord::new(
+                    signed.record().clone(),
+                    signed.committed().clone(),
+                )
+                .unwrap(),
+            );
+        }
+        let mut identity = serde_json::to_value(records[0].record().identity()).unwrap();
+        identity["client_order_id"] = json!("O-DIRECT-CREATED");
+        identity["nonce"] = serde_json::to_value(DeepXNonceReservation::TimestampOrderId {
+            value: 1_725_000_001_009,
+        })
+        .unwrap();
+        match corruption {
+            "foreign" => {
+                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap()
+            }
+            "legacy" => {
+                identity.as_object_mut().unwrap().remove("operation");
+            }
+            "sequential" => {
+                identity["nonce"] = serde_json::to_value(DeepXNonceReservation::SequentialAccount {
+                    account_index: 0,
+                    nonce: 1,
+                })
+                .unwrap()
+            }
+            _ => {}
+        }
+        let mut last = DeepXTransactionRecord::created(serde_json::from_value(identity).unwrap());
+        if corruption == "wrong-call" {
+            let signed = sign_dynamic_pallet_call_with_snapshot(
+                &remark_snapshot(),
+                &remark_key(),
+                "System",
+                "remark",
+                vec![Value::from_bytes(b"not-the-reserved-operation")],
+                1_725_000_001_009,
+            )
+            .unwrap();
+            last.record_signed(&signed).unwrap();
+        }
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &last,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        records.push(DeepXRestoredTransactionRecord::new(last, committed).unwrap());
+        let store = DirectRestoreStore {
+            owner: TestStore::empty(),
+            records,
+        };
+        let lease = store
+            .acquire_signer_lease(derive_signer_account_id(&remark_key()).unwrap())
+            .await
+            .unwrap();
+        let result =
+            crate::transaction::load_verified_direct_pallet_for_signer(&store, &lease, &verifier)
+                .await;
+        if corruption == "valid" {
+            let restored = result.unwrap();
+            assert_eq!(restored.len(), 10);
+            assert!(restored[9].record().signed_extrinsic().is_none());
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::transaction::DeepXDirectPalletRestoreError::Binding(
+                    _
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_restore_rejects_foreign_lease_even_for_empty_store() {
+        let store = TestStore::empty();
+        let lease = store.acquire_signer_lease([0x22; 20]).await.unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::transaction::load_verified_direct_pallet_for_signer(&store, &lease, &verifier,)
+                .await,
+            Err(
+                crate::transaction::DeepXDirectPalletRestoreError::Persistence(
+                    DeepXTransactionPersistenceError::LeaseMismatch,
+                )
+            )
+        ));
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    #[case(7)]
+    #[case(8)]
+    #[tokio::test]
+    async fn direct_dispatch_supports_exact_captured_spec369(#[case] operation: u8) {
+        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json",
+        )))
+        .unwrap();
+        let metadata = nautilus_core::hex::decode(
+            response["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let snapshot = crate::signing::RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            remark_snapshot().identity().genesis_hash,
+            369,
+            1,
+            &metadata,
+        )
+        .unwrap();
+        let baseline = direct_operation_fixture(operation);
+        let mut identity = serde_json::to_value(baseline.identity()).unwrap();
+        identity["runtime"] =
+            serde_json::to_value(DeepXDirectRuntimeIdentity::from(snapshot.identity())).unwrap();
+        let created = DeepXTransactionRecord::created(serde_json::from_value(identity).unwrap());
+        let store = TestStore::new(1, &created);
+        let lease = store
+            .acquire_signer_lease(created.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &created,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            snapshot.clone(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot);
+        let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
+            &store,
+            &lease,
+            &committed,
+            &created,
+            &service.acquire().unwrap(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::transaction::load_verified_direct_pallet_for_signer(&store, &lease, &verifier,)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let old_verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        assert!(
+            old_verifier
+                .verify(
+                    signed.record().identity(),
+                    signed.record().signed_extrinsic().unwrap()
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn perp_place_unknown_create_never_reuses_reserved_nonce() {
+        let store = TestStore {
+            create_outcome_unknown: true,
+            ..TestStore::empty()
+        };
+        let signer = derive_signer_account_id(&remark_key()).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+        let allocator = DeepXTimestampNonceAllocator::from_records(signer, [], 10);
+        let params = perp_place_params(perp_place_fixture(1, None).identity()).unwrap();
+        assert!(matches!(
+            prepare_perp_place_reservation(
+                &store,
+                &lease,
+                &allocator,
+                1_000,
+                1_001,
+                ClientOrderId::new("O-19700101-000000-001-001-1"),
+                InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+                OrderSide::Buy,
+                remark_runtime(),
+                params,
+            )
+            .await,
+            Err(DeepXReservationPreparationError::Persistence(
+                DeepXTransactionPersistenceError::CommitOutcomeUnknown(_)
+            ))
+        ));
+        assert_eq!(allocator.last_reserved(), Some(1_001));
+        assert_eq!(
+            allocator.reserve(1_000, 1_001).unwrap(),
+            DeepXNonceReservation::TimestampOrderId { value: 1_002 }
+        );
+    }
+
+    fn perp_place_fixture(size: u128, point: Option<u128>) -> DeepXTransactionRecord {
+        let params = crate::signing::DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 7,
+            is_long: true,
+            size,
+            price: u128::MAX,
+            order_type: crate::signing::DeepXPerpOrderType::Limit(
+                crate::signing::DeepXTimeInForce::Gtc,
+            ),
+            take_profit: point,
+            stop_loss: point,
+            reduce_only: false,
+            post_only: crate::signing::DeepXPostOnlyParam::None,
+        };
+        let identity = DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: u64::MAX },
+            remark_runtime(),
+            params,
+        );
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::signing::sign_perp_place_order(
+            &service.acquire().unwrap(),
+            &remark_key(),
+            params,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut record = DeepXTransactionRecord::created(identity);
+        record.record_signed(&signed).unwrap();
+        record
+    }
+
+    #[rstest]
+    #[case(0, None)]
+    #[case(u128::MAX, Some(0))]
+    #[case(u128::MAX, Some(u128::MAX))]
+    #[tokio::test]
+    async fn perp_place_preparation_round_trip(#[case] size: u128, #[case] point: Option<u128>) {
+        let expected = perp_place_fixture(size, point);
+        let restored = DeepXTransactionRecord::decode(&expected.encode().unwrap()).unwrap();
+        assert_eq!(restored, expected);
+        let verifier = DeepXPerpPlaceCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        verifier
+            .verify(restored.identity(), restored.signed_extrinsic().unwrap())
+            .unwrap();
+        assert!(
+            DeepXUnsupportedBusinessCallVerifier
+                .verify(restored.identity(), restored.signed_extrinsic().unwrap(),)
+                .is_err()
+        );
+        assert!(format!("{verifier:?}").contains("<redacted>"));
+        let record = DeepXTransactionRecord::created(expected.identity().clone());
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let prepared = prepare_signed_perp_place_transaction(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            &service.acquire().unwrap(),
+            &remark_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.record(), &expected);
+        assert!(prepared.committed().matches(&expected));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    #[case(7)]
+    #[case(8)]
+    #[case(9)]
+    #[case(10)]
+    #[case(11)]
+    #[case(12)]
+    fn perp_place_verifier_rejects_identity_changes(#[case] mutation: u8) {
+        let record = perp_place_fixture(u128::MAX, Some(u128::MAX));
+        let mut json = serde_json::to_value(record.identity()).unwrap();
+        match mutation {
+            0 => json["operation"]["subaccount"][0] = serde_json::json!(0),
+            1 => json["operation"]["market_id"] = serde_json::json!(0),
+            2 => json["operation"]["is_long"] = serde_json::json!(false),
+            3 => json["operation"]["size"] = serde_json::json!("0"),
+            4 => json["operation"]["price"] = serde_json::json!("0"),
+            5 => json["operation"]["order_type"] = serde_json::json!({"limit": "ioc"}),
+            6 => json["operation"]["take_profit"] = serde_json::json!("0"),
+            7 => json["operation"]["stop_loss"] = serde_json::Value::Null,
+            8 => json["operation"]["reduce_only"] = serde_json::json!(true),
+            9 => json["operation"]["post_only"] = serde_json::json!("adaptive"),
+            10 => json["signer"][0] = serde_json::json!(0),
+            11 => json["nonce"]["value"] = serde_json::json!(0),
+            _ => json["operation"] = serde_json::Value::Null,
+        }
+        let identity: DeepXTransactionIdentity = serde_json::from_value(json).unwrap();
+        let verifier = DeepXPerpPlaceCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        assert!(
+            verifier
+                .verify(&identity, record.signed_extrinsic().unwrap())
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case::stale_revision(0)]
+    #[case::wrong_key(1)]
+    #[case::wrong_lease(2)]
+    #[case::unknown_commit(3)]
+    #[case::wrong_operation(4)]
+    #[case::conflicting_acknowledgement(5)]
+    #[tokio::test]
+    async fn perp_place_preparation_fails_closed(#[case] mutation: u8) {
+        let expected = perp_place_fixture(u128::MAX, None);
+        let record = if mutation == 4 {
+            DeepXTransactionRecord::created(perp_close_fixture(0, None).identity().clone())
+        } else {
+            DeepXTransactionRecord::created(expected.identity().clone())
+        };
+        let store = TestStore {
+            commit_outcome_unknown: mutation == 3,
+            signed_commit_fault: if mutation == 5 { 1 } else { 0 },
+            ..TestStore::new(3, &record)
+        };
+        let mut lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        if mutation == 2 {
+            lease.signer = [0xff; 20];
+        }
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(if mutation == 0 { 2 } else { 3 }),
+        )
+        .unwrap();
+        let key = if mutation == 1 {
+            DeepXPrivateKey::new(&"22".repeat(32), &crate::common::DeepXKeyScheme::Secp256k1)
+                .unwrap()
+        } else {
+            remark_key()
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        assert!(
+            prepare_signed_perp_place_transaction(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                &service.acquire().unwrap(),
+                &key,
+            )
+            .await
+            .is_err()
+        );
+        if mutation < 3 || mutation == 4 {
+            assert_eq!(store.current_revision(), 3);
+        }
+    }
+
+    fn profit_and_loss_fixture(take: u128, stop: u128) -> DeepXTransactionRecord {
+        let params = crate::signing::DeepXPerpProfitAndLossPointParams {
+            subaccount: [0x11; 20],
+            market_id: u16::MAX,
+            take_profit_point: take,
+            stop_loss_point: stop,
+        };
+        let identity = DeepXTransactionIdentity::new_perp_profit_and_loss_point(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: u64::MAX },
+            remark_runtime(),
+            params,
+        );
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::signing::sign_perp_set_profit_and_loss_point(
+            &service.acquire().unwrap(),
+            &remark_key(),
+            params,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut record = DeepXTransactionRecord::created(identity);
+        record.record_signed(&signed).unwrap();
+        record
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(u128::MAX, 0)]
+    #[case(0, u128::MAX)]
+    #[case(u128::MAX, u128::MAX)]
+    #[tokio::test]
+    async fn profit_and_loss_preparation_round_trip(#[case] take: u128, #[case] stop: u128) {
+        let expected = profit_and_loss_fixture(take, stop);
+        let json = serde_json::to_string(&expected).unwrap();
+        assert!(json.contains(&format!("\"take_profit_point\":\"{take}\"")));
+        assert!(json.contains(&format!("\"stop_loss_point\":\"{stop}\"")));
+        let restored: DeepXTransactionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, expected);
+        let verifier =
+            DeepXPerpProfitAndLossPointCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        verifier
+            .verify(restored.identity(), restored.signed_extrinsic().unwrap())
+            .unwrap();
+        assert!(!format!("{verifier:?}").contains("0123456789abcdef"));
+        let record = DeepXTransactionRecord::created(expected.identity().clone());
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let prepared = prepare_signed_perp_profit_and_loss_point_transaction(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            &service.acquire().unwrap(),
+            &remark_key(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.record(), &expected);
+        assert!(prepared.committed().matches(&expected));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    #[case(6)]
+    fn profit_and_loss_verifier_rejects_identity_changes(#[case] mutation: u8) {
+        let record = profit_and_loss_fixture(u128::MAX, u128::MAX);
+        let mut json = serde_json::to_value(record.identity()).unwrap();
+        match mutation {
+            0 => json["operation"]["subaccount"][0] = serde_json::json!(0),
+            1 => json["operation"]["market_id"] = serde_json::json!(0),
+            2 => json["operation"]["take_profit_point"] = serde_json::json!("0"),
+            3 => json["operation"]["stop_loss_point"] = serde_json::json!("0"),
+            4 => json["signer"][0] = serde_json::json!(0),
+            5 => json["nonce"]["value"] = serde_json::json!(0),
+            _ => json["operation"] = serde_json::Value::Null,
+        }
+        let identity: DeepXTransactionIdentity = serde_json::from_value(json).unwrap();
+        let verifier =
+            DeepXPerpProfitAndLossPointCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        assert!(
+            verifier
+                .verify(&identity, record.signed_extrinsic().unwrap())
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case::stale_revision(0)]
+    #[case::wrong_key(1)]
+    #[case::wrong_lease(2)]
+    #[case::unknown_commit(3)]
+    #[case::wrong_operation(4)]
+    #[case::conflicting_acknowledgement(5)]
+    #[tokio::test]
+    async fn profit_and_loss_preparation_fails_closed(#[case] mutation: u8) {
+        let expected = profit_and_loss_fixture(u128::MAX, 0);
+        let record = if mutation == 4 {
+            DeepXTransactionRecord::created(perp_close_fixture(0, None).identity().clone())
+        } else {
+            DeepXTransactionRecord::created(expected.identity().clone())
+        };
+        let store = TestStore {
+            commit_outcome_unknown: mutation == 3,
+            signed_commit_fault: if mutation == 5 { 1 } else { 0 },
+            ..TestStore::new(3, &record)
+        };
+        let mut lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        if mutation == 2 {
+            lease.signer = [0xff; 20];
+        }
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(if mutation == 0 { 2 } else { 3 }),
+        )
+        .unwrap();
+        let key = if mutation == 1 {
+            DeepXPrivateKey::new(&"22".repeat(32), &crate::common::DeepXKeyScheme::Secp256k1)
+                .unwrap()
+        } else {
+            remark_key()
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let result = prepare_signed_perp_profit_and_loss_point_transaction(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            &service.acquire().unwrap(),
+            &key,
+        )
+        .await;
+        assert!(result.is_err());
+        if mutation < 3 || mutation == 4 {
+            assert_eq!(store.current_revision(), 3);
+        }
     }
 
     fn perp_close_fixture(price: u128, slippage: Option<u64>) -> DeepXTransactionRecord {
@@ -5966,6 +7559,112 @@ mod tests {
             assert_eq!(requests.load(Ordering::Relaxed), before);
         }
         assert_eq!(store.current_revision(), if scenario == 1 { 5 } else { 4 });
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[tokio::test]
+    async fn durable_operation_observer_checks_binding_before_rpc(
+        #[case] scenario: u8,
+        #[values(0, 1, 2, 5, 6)] operation: u8,
+    ) {
+        let snapshot = remark_snapshot();
+        let mut record = if scenario == 2 {
+            direct_operation_fixture(3)
+        } else {
+            direct_operation_fixture(operation)
+        };
+        if scenario == 4 {
+            let DeepXNonceReservation::TimestampOrderId { value: nonce } =
+                record.identity().nonce()
+            else {
+                unreachable!();
+            };
+            let mut signed = SignedPalletExtrinsic {
+                bytes: record.signed_extrinsic().unwrap().bytes().to_vec(),
+                extrinsic_hash: record.signed_extrinsic().unwrap().extrinsic_hash(),
+                signer: record.identity().signer(),
+                nonce,
+                runtime: snapshot.identity().clone(),
+            };
+            signed.bytes[30] ^= 1;
+            signed.extrinsic_hash = BlakeTwo256.hash(&signed.bytes).0;
+            record = DeepXTransactionRecord::created(record.identity().clone());
+            record.record_signed(&signed).unwrap();
+        }
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::NotIncluded(
+                DeepXAbsenceEvidence::new(70, 72, [9; 32], true, true).unwrap(),
+            ))
+            .unwrap();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        let key = if scenario == 3 {
+            DeepXPrivateKey::new(
+                "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                &crate::common::DeepXKeyScheme::Secp256k1,
+            )
+            .unwrap()
+        } else {
+            remark_key()
+        };
+        let place_verifier =
+            DeepXPerpPlaceCallVerifier::new(snapshot.clone(), key.clone()).unwrap();
+        let point_verifier =
+            DeepXPerpProfitAndLossPointCallVerifier::new(snapshot.clone(), key.clone()).unwrap();
+        let close_verifier =
+            DeepXPerpCloseCallVerifier::new(snapshot.clone(), key.clone()).unwrap();
+        let spot_verifier = DeepXSpotPlaceCallVerifier::new(snapshot.clone(), key).unwrap();
+        let (endpoints, capabilities, requests) = reorganization_endpoints().await;
+        let before = requests.load(Ordering::Relaxed);
+        let (endpoints, capabilities) = if scenario == 1 {
+            finalized_recovery_endpoints(74).await
+        } else {
+            (endpoints, capabilities)
+        };
+        let result = reconcile_not_included_checkpoint_with_observer(
+            &endpoints,
+            &capabilities,
+            &snapshot,
+            &store,
+            &lease,
+            &restored[0],
+            10,
+            match operation {
+                0 => DeepXDurableRecoveryObserver::PerpPlace(&place_verifier),
+                1 => DeepXDurableRecoveryObserver::PerpClose(&close_verifier),
+                2 => DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(&point_verifier),
+                _ => DeepXDurableRecoveryObserver::SpotPlace(&spot_verifier),
+            },
+        )
+        .await;
+        if scenario <= 1 {
+            let result = result.unwrap();
+            assert_eq!(
+                result.record().lifecycle().state(),
+                if scenario == 0 {
+                    DeepXTransactionState::NotIncluded
+                } else {
+                    DeepXTransactionState::ActionRequired
+                }
+            );
+            assert_eq!(store.current_revision(), if scenario == 0 { 4 } else { 5 });
+        } else {
+            assert!(result.is_err());
+            assert_eq!(requests.load(Ordering::Relaxed), before);
+            assert_eq!(store.current_revision(), 4);
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,17 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "authority": "0x781ed35b167068c93dfadab41dfb680edaca4e50",
+    "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc",
+    "name": "kazee",
+    "status": "Active",
+    "spotPositions": [],
+    "nextOrderId": 1,
+    "spotMarginTradingEnabled": false,
+    "marginStrategy": "Cross",
+    "height": 50070126,
+    "createdAt": 1779848876302
+  },
+  "fail": false
+}

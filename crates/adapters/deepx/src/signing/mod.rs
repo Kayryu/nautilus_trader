@@ -1278,6 +1278,111 @@ mod tests {
     }
 
     #[rstest]
+    fn spec369_matches_independent_sdk_vectors() {
+        let response: RpcResponse = serde_json::from_str(include_str!(
+            "../../test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"
+        )).unwrap();
+        let bytes = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let old_snapshot = snapshot();
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &crate::common::DeepXEnvironment::Testnet,
+            old_snapshot.identity().genesis_hash,
+            369,
+            1,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(snapshot.identity().spec_version, 369);
+        assert_eq!(
+            hex::encode(snapshot.identity().metadata_sha256),
+            "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c"
+        );
+        assert!(
+            RuntimeSnapshot::approved_testnet(
+                &crate::common::DeepXEnvironment::Testnet,
+                old_snapshot.identity().genesis_hash,
+                366,
+                1,
+                &bytes,
+            )
+            .is_err()
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let no_op = sign_no_op(&permit, &key(), 1_725_000_000_124).unwrap();
+        assert_eq!(
+            hex::encode(no_op.bytes()),
+            "850184fcad0b19bb29d4674531d6f115237e16afce377cee66eb79a74f1ead51bd7f068610f3b1381a77f9ed0032dcdecf089f220e95c66442eba016e0c53cfc32eba2c0f6f646206f4f84681b82429dcb49b8df422b1b00000b7c2203a2910100131c",
+        );
+        let remark = sign_dynamic_pallet_call(
+            &permit,
+            &key(),
+            "System",
+            "remark",
+            vec![Value::from_bytes(b"deepx-offline-signing-check")],
+            1_725_000_000_123,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(remark.bytes()),
+            "f50184fcad0b19bb29d4674531d6f115237e16afce377cc66f72cdc7c5e16824473501762652d8acd5d3ed2c6881563864a93d5a01a4a262e0c2f5fc2e2698e245e70775805742adf3cc4770446bb807177ff0df87799801000b7b2203a291010000006c64656570782d6f66666c696e652d7369676e696e672d636865636b",
+        );
+        let place = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: u128::MAX,
+                price: u128::MAX,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: Some(u128::MAX),
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(place.bytes()),
+            "b90284fcad0b19bb29d4674531d6f115237e16afce377cbfb9294139140c58ea9fb2de1dd0727359f52ad0f969c5e0fcd042ce886cef677527ee2e5bade3c20164af2fe16976826a1a23eba0d47d081f085ec31746725b00000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+        );
+        assert!(no_op.has_valid_hash() && remark.has_valid_hash() && place.has_valid_hash());
+    }
+
+    #[rstest]
+    fn perp_place_matches_independent_sdk_vector() {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let signed = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: u128::MAX,
+                price: u128::MAX,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: Some(u128::MAX),
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        // Generated independently by the pinned SDK builder with captured spec366 metadata.
+        assert_eq!(
+            hex::encode(signed.bytes()),
+            "b90284fcad0b19bb29d4674531d6f115237e16afce377c20f3fc4c9d8b313e32298602a7336f137e453ac098c95812f909033f5df1dba341ef8e7b770ef911213478b6361a4223cc117f1b5ec9545621ff1c66f6ba031700000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+        );
+        assert!(signed.has_valid_hash());
+    }
+
+    #[rstest]
     fn dynamic_signing_matches_fixed_testnet_regression_vector() {
         let snapshot = snapshot();
         let payload = subxt_core::dynamic::tx(

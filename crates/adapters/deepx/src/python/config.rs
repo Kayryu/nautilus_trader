@@ -16,6 +16,7 @@
 //! Python bindings for DeepX configuration.
 
 use nautilus_core::python::to_pyvalue_err;
+use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::identifiers::AccountId;
 use pyo3::prelude::*;
 
@@ -187,18 +188,30 @@ impl DeepXExecutionClientConfig {
         account_id = None,
         subaccount_id = None,
         private_key = None,
+        proxy_url = None,
+        http_timeout_secs = None,
         execution_backend = None,
         recovery_blocks_per_range = None,
         timestamp_nonce_max_clock_drift_ms = None,
+        postgres_cache_database_config = None,
         network = None,
     ))]
     fn py_new(
         account_id: Option<AccountId>,
         subaccount_id: Option<String>,
         private_key: Option<String>,
+        proxy_url: Option<String>,
+        http_timeout_secs: Option<u64>,
         execution_backend: Option<String>,
         recovery_blocks_per_range: Option<u64>,
         timestamp_nonce_max_clock_drift_ms: Option<u64>,
+        #[gen_stub(
+            override_type(
+                type_repr = "typing.Optional[nautilus_trader.infrastructure.PostgresConnectOptions]",
+                imports = ("typing", "nautilus_trader.infrastructure"),
+            ),
+        )]
+        postgres_cache_database_config: Option<PostgresConnectOptions>,
         network: Option<DeepXNetworkConfig>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
@@ -216,11 +229,14 @@ impl DeepXExecutionClientConfig {
             account_id: account_id.unwrap_or(defaults.account_id),
             subaccount_id,
             private_key,
+            proxy_url,
+            http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             execution_backend,
             recovery_blocks_per_range: recovery_blocks_per_range
                 .unwrap_or(defaults.recovery_blocks_per_range),
             timestamp_nonce_max_clock_drift_ms: timestamp_nonce_max_clock_drift_ms
                 .unwrap_or(defaults.timestamp_nonce_max_clock_drift_ms),
+            postgres_cache_database_config,
             network: network.unwrap_or(defaults.network),
         };
         config.validate().map_err(to_pyvalue_err)?;
@@ -230,6 +246,16 @@ impl DeepXExecutionClientConfig {
     #[getter]
     const fn has_private_key(&self) -> bool {
         self.private_key.is_some()
+    }
+
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    #[getter]
+    const fn has_postgres_cache_database_config(&self) -> bool {
+        self.postgres_cache_database_config.is_some()
     }
 
     #[getter]
@@ -248,6 +274,7 @@ impl DeepXExecutionClientConfig {
 nautilus_core::impl_pyo3_config_getters!(DeepXExecutionClientConfig {
     account_id: AccountId,
     subaccount_id: Option<String>,
+    http_timeout_secs: u64,
     recovery_blocks_per_range: u64,
     timestamp_nonce_max_clock_drift_ms: u64,
     network: DeepXNetworkConfig,
@@ -290,9 +317,12 @@ mod tests {
         Python::initialize();
         let error = DeepXExecutionClientConfig::py_new(
             None,
-            Some("test-subaccount".to_string()),
+            Some("0x1111111111111111111111111111111111111111".to_string()),
+            None,
+            None,
             None,
             Some("automatic".to_string()),
+            None,
             None,
             None,
             None,
@@ -307,22 +337,37 @@ mod tests {
     }
 
     #[rstest]
-    fn execution_config_repr_redacts_private_key() {
+    fn execution_config_repr_redacts_sensitive_values() {
         let private_key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let proxy_url = "https://user:secret@proxy.example.invalid";
+        let postgres_password = "postgres-secret";
         let config = DeepXExecutionClientConfig::py_new(
             None,
-            Some("test-subaccount".to_string()),
+            Some("0x1111111111111111111111111111111111111111".to_string()),
             Some(private_key.to_string()),
+            Some(proxy_url.to_string()),
             None,
             None,
             None,
+            None,
+            Some(PostgresConnectOptions::new(
+                "localhost".to_string(),
+                5432,
+                "nautilus".to_string(),
+                postgres_password.to_string(),
+                "nautilus".to_string(),
+            )),
             None,
         )
         .unwrap();
 
         let representation = config.__repr__();
         assert!(config.has_private_key());
+        assert!(config.has_proxy_url());
+        assert!(config.has_postgres_cache_database_config());
         assert!(representation.contains("<redacted>"));
         assert!(!representation.contains(private_key));
+        assert!(!representation.contains(proxy_url));
+        assert!(!representation.contains(postgres_password));
     }
 }

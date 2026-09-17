@@ -3,6 +3,7 @@
 
 import typing
 
+from nautilus_trader import infrastructure
 from nautilus_trader import model
 
 __all__ = [
@@ -51,6 +52,8 @@ class DeepXExecutionClientConfig:
     @property
     def subaccount_id(self) -> str | None: ...
     @property
+    def http_timeout_secs(self) -> int: ...
+    @property
     def recovery_blocks_per_range(self) -> int: ...
     @property
     def timestamp_nonce_max_clock_drift_ms(self) -> int: ...
@@ -61,13 +64,20 @@ class DeepXExecutionClientConfig:
         account_id: model.AccountId | None = None,
         subaccount_id: str | None = None,
         private_key: str | None = None,
+        proxy_url: str | None = None,
+        http_timeout_secs: int | None = None,
         execution_backend: str | None = None,
         recovery_blocks_per_range: int | None = None,
         timestamp_nonce_max_clock_drift_ms: int | None = None,
+        postgres_cache_database_config: infrastructure.PostgresConnectOptions | None = None,
         network: DeepXNetworkConfig | None = None,
     ) -> None: ...
     @property
     def has_private_key(self) -> bool: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
+    @property
+    def has_postgres_cache_database_config(self) -> bool: ...
     @property
     def execution_backend(self) -> str: ...
 

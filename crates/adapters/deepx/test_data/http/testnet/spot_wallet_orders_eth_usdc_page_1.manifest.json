@@ -1,0 +1,36 @@
+{
+  "captured_at": "2026-09-17T07:52:04Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/spot/orders-by-wallet",
+    "query": {
+      "address": "0x89bb0946046588f4f257ffc71bd3231aba13474a",
+      "name": "ETH/USDC",
+      "pageSize": 5,
+      "sort": "DESC"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "spot_wallet_orders_eth_usdc_page_1.json",
+    "payload_sha256": "b0df8500ad9957a945f84a8dcf332c5818d1d07b03429b25813dbbd474935073"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "spec_version": 369,
+    "transaction_version": 1,
+    "source_manifest": "../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+  },
+  "limitations": [
+    "The REST response is mutable and not pinned to a block hash.",
+    "The queried wallet and subaccount were discovered from public Spot activity and are not the contributor wallet.",
+    "The response does not echo the requested wallet, so wallet ownership cannot be independently rebound.",
+    "The fixture proves one nonempty descending ETH/USDC page and a global continuation cursor, not complete wallet history.",
+    "Venue order enums and signed fee ownership remain uninterpreted.",
+    "No framework order report is constructed from this response."
+  ]
+}
