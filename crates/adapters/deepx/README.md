@@ -91,11 +91,18 @@ price, order type, optional points and flags, and initial order state. Market pr
 by the runtime and is not compared to the signed placeholder. Failed dispatch needs no placement
 event. The offline verifier does not establish block canonicality or fill success.
 `collect_finalized_perp_place_recovery_scan` combines this verifier with the existing bounded
-canonical-block scanner. `DeepXDurableRecoveryObserver::PerpPlace` additionally verifies exact
-retained signed bytes before querying recovery RPC. Execution startup selects it for not-included
-perpetual placements. Unresolved evidence still blocks readiness; neither boundary submits or
-replays orders. Tests encode synthetic events against captured spec366/spec369 metadata; real
-perpetual placement inclusion/business-event captures remain outstanding.
+canonical-block scanner. Current version 7 durable placement records retain the exact finalized
+block number and hash observed before nonce reservation. Startup verifies the retained signed call and
+uses that checkpoint to scan restored `submitting` and `accepted` placements; an exact finalized
+inclusion commits the in-block and finalized transitions separately. It also selects
+`DeepXDurableRecoveryObserver::PerpPlace` for later not-included scans. Pool absence remains
+unresolved and never authorizes replay. DeepX stores finalized events in `System.EventsMap` batches
+when standard
+`System.Events` is absent. Recovery reads the inclusive last index from
+`System.Threads(block_number)`, requires every batch, and reconstructs one complete event vector.
+The captured spec369 block `185969410` proves successful dispatch and the exact perpetual
+placement at extrinsic index 8. Synthetic spec366/spec369 cases retain broader malformed and
+field-conflict coverage.
 
 `DeepXDirectPalletCallVerifier::new(snapshot, key, subaccount)` provides an explicit
 runtime/signer/subaccount-scoped entry point for perpetual placement, close, profit/loss points,
@@ -354,6 +361,20 @@ boundary against the contributor-provided account. The OpenAPI defines no authen
 challenge, token, or signature for these address-scoped user channels, so subscription
 acknowledgement is not signer authentication or authorization.
 
+The execution client can retain that exact acknowledged connection and read confirmed balance
+frames through its own subscription proof. Bounded receive timeout preserves the connection for a
+retry; a closed, malformed, or foreign stream revokes both the connection and proof. This read
+boundary does not infer framework free/locked balances. A separate client-owned initialization
+boundary accepts a caller-provided `AccountState`, revalidates the retained connection, frame
+subscription, and framework identity together, then dispatches that exact event. The caller remains
+responsible for independently establishing complete account-state semantics.
+
+The following production startup boundaries also use only the client-owned account connection.
+Mass reconciliation consumes the retained validated RPC evidence and durable PostgreSQL runtime;
+final account registration revalidates the same subscription before checking the current-epoch
+account event in cache. A missing or stale owned connection revokes its retained proof and neither
+boundary advances startup.
+
 These REST and WebSocket observations are mutable and not block-pinned. They do not establish
 free/locked balances or margin requirements, initialize framework account state, construct reports,
 authorize mutations, or enable trading commands. Execution startup accepts the connection-owned
@@ -368,9 +389,12 @@ checks System remark, Subaccount no-op, and one perpetual limit-placement vector
 signing tests as well to verify the current implementation against those bytes. These limited
 vectors do not prove every operation, authorization, financial scaling, or live conformance.
 
-Execution startup can reconcile durable submitting transactions against exact pending-pool
-membership. Pool presence records acceptance; pool absence remains unresolved and does not
-authorize a new order or prove non-inclusion. Further pending-pool absence work is not the active
+Execution startup reconciles version 7 perpetual placements from their durable pre-submission
+finalized checkpoint before consulting exact pending-pool membership. Canonical event evidence can
+advance a restored submitting or accepted placement through two durable commits to finality. Pool
+presence records acceptance; pool absence remains unresolved and does not authorize a new order or
+prove non-inclusion. Version 6 and older records are detected and rejected during PostgreSQL
+restoration rather than silently omitted. Further pending-pool absence work is not the active
 milestone; development now proceeds with the Phase E execution client, private event decoding, and
 report reconciliation. Any future submission retry must be bounded and retransmit only the exact
 durably recorded signed extrinsic. It must never allocate a new order identity or nonce after an
@@ -386,17 +410,142 @@ transaction store. After finalized runtime and account ownership validation, the
 can acquire and retain the PostgreSQL signer lease, restore the complete durable signer record set,
 and seed its timestamp nonce allocator. Reset, stop, and disconnect drop that runtime and release
 the lease. Startup mass reconciliation uses only this client-owned store and lease; callers cannot
-inject a temporary persistence boundary. This initialization does not authorize signing,
-submission, or replay, and order commands remain disabled.
+inject a temporary persistence boundary. The runtime also retains the fixture-approved snapshot
+service. Its read-only chain-time operation first validates and applies runtime version and metadata
+from one finalized Watch checkpoint, then strictly decodes `Timestamp.Now` as one non-zero SCALE
+`u64` from that exact block hash. A runtime change is latched before any later timestamp-read
+failure. This operation does not allocate a nonce, sign, persist a transaction, submit, or replay,
+and order commands remain disabled. A separate client-owned perpetual placement reservation
+boundary combines that observation with the retained signer lease, allocator, snapshot permit, and
+store. It rejects account/subaccount and instrument/market mismatches, holds the runtime permit
+through the durable create, and releases only the exact acknowledged `created` record. The record
+atomically retains the finalized block number and hash from the same runtime and timestamp
+observation, providing a complete pre-submission recovery boundary. It also requires the Nautilus
+order side to match the runtime's `is_long` direction. It still performs no
+signing or submission and is not connected to an execution command. A second client-owned offline
+boundary accepts only that acknowledged reservation, revalidates its signer, subaccount, market,
+direction, and retained runtime, reconstructs every call argument and the timestamp nonce from the
+durable identity, and returns signed bytes only after their exact CAS commit. It creates no
+transmission permit, performs no network submission, and remains disconnected from order commands.
+A third client-owned boundary revalidates that durable signed record and its canonical call,
+commits the `submitting` transition, and only then releases a single-use transmission permit. It
+does not consume that permit, perform network I/O, authorize retry or replay, or enable an order
+command. The preparation can be split into the permit and its exact durable submitting context, so
+consuming the permit never discards reconciliation authority. A client-owned acceptance boundary
+commits `accepted` only from opaque hash-verified submission evidence matching that context; it also
+performs no network I/O. A transport-neutral client coordinator can consume the permit exactly once
+while holding the signer lease and runtime permit. It does not choose an endpoint or retry, and
+returns the durable context for accepted, not-sent, rejected, ambiguous, and hash-mismatch outcomes.
+`submit_direct_pallet_once_classified` is the conservative JSON-RPC transport for such a one-shot
+attempt. Empty bytes and a locally inconsistent Blake2-256 hash return `NotSent` before any request.
+After `author_submitExtrinsic` starts, transport errors, JSON-RPC errors, malformed responses, and
+returned-hash mismatches are all `Ambiguous`; the shared RPC client cannot prove an authoritative
+venue rejection or non-delivery. The transport never retries. An opt-in client-owned method can use
+it only after complete startup, from the exact Submission endpoint and capability evidence retained
+during runtime validation, while holding the signer lease and runtime permit. Reset, stop, and
+disconnect erase that evidence. It remains disconnected from the framework `submit_order` command.
+`build_perp_place_params` now provides the pure framework-to-runtime mapping boundary for simple
+perpetual Limit GTC and Limit IOC orders. It binds the command and initialized-order identities,
+configured subaccount, immutable market ID, minimums and increments; converts quantity with the
+market `baseDecimal` and price with the chain-defined `1e6` scale; and maps buy/sell, reduce-only,
+and supported post-only behavior exactly. It rejects Market, Stop, FOK, IOC+post-only, quote
+quantity, advanced order fields, inexact units, and out-of-range IDs before nonce allocation,
+persistence, signing, or network access. `prepare_framework_perp_place_submission` composes that
+mapping with the exact retained startup evidence, immutable order-context registration, finalized
+chain-time observation, durable timestamp reservation, offline signing, and the CAS-committed
+`submitting` transition. Mapping and startup failures occur before context mutation or nonce
+allocation. The explicit workflow performs no transaction transmission or framework event
+emission; `submit_order` remains fail-closed.
+`classify_perp_place_framework_order_events` is the pure evidence boundary for durable framework
+event coordination. A durably committed `submitting` state is eligible for `OrderSubmitted`, but a
+submission-pool acknowledgement is not `OrderAccepted` and best-block inclusion is not terminal.
+Only finalized successful `PerpMarket.OrderPlaced` evidence is eligible for `OrderAccepted`, with
+the event-verified timestamp nonce as venue order ID; finalized authoritative failure is eligible
+for `OrderRejected`. Not-included evidence never implies rejection, and `ActionRequired` fails
+classification because its prior submission state is not retained. Eligibility is not an emission
+receipt: durable staging and crash-safe delivery acknowledgement are required before startup can
+complete. They do not enable `submit_order`. Version 5 framework-owned placement records added
+the exact trader, strategy, instrument,
+client order, account, command, initialized-order, correlation and causation identity, both command
+and order initialization timestamps, and distinct preallocated submitted and terminal event IDs.
+The framework preparation path validates this context before nonce allocation and commits it with
+the initial reservation. Generic opt-in transaction records retain no framework context and cannot
+be classified as event authority. Version 6 added a pending-only durable outbox. Version 7 records
+exact consumer acknowledgement for each staged event. Revision-checked CAS stages currently
+eligible events with stable IDs and first timestamps; repeated staging retains those values,
+terminal payloads must match finalized evidence, and generic records cannot carry an outbox. The
+staged entry also retains whether its terminal event came from reconciliation.
+A pure materializer reconstructs `OrderSubmitted`, `OrderAccepted`, or `OrderRejected` in transition
+order with the exact durable fields and the original command as causation. Staging and
+materialization perform no channel send. The execution ingress acknowledges only events found
+byte-for-byte in canonical order history.
+An identical replay returns `AlreadyApplied`, while an event-ID collision, missing order, generic
+runner path, or unapplied transition is not acknowledged. Channel admission never completes the
+receipt. With no cache backing the receipt proves only in-memory application; with PostgreSQL or
+Redis backing the ingress waits for the database worker to complete the idempotent event write.
+PostgreSQL accepts an existing ID only when the complete stored payload matches. Redis likewise
+avoids a duplicate append on exact replay and confirms only after rebuilding the order and updating
+its indexes. A write failure, payload conflict, or dropped worker returns `Failed`; adapters without
+receipt support remain `Unconfirmed`. Only an exact `Applied` or `AlreadyApplied` receipt paired
+with `Persisted` can be committed through signer-lease and revision-checked CAS. That commit marks
+the exact event acknowledged; all other outcomes leave it pending, and a terminal event cannot be
+acknowledged before its submitted predecessor. The receipt does not mutate the outbox by itself.
+At the end of mass reconciliation, a startup coordinator reloads the latest committed records,
+stages eligible events, emits only pending entries in transition order, waits up to 30 seconds per
+receipt, and commits each acknowledgement before proceeding. Dispatch failure, timeout, a dropped
+receipt sender, an unconfirmed result, or any CAS uncertainty leaves the event pending and blocks
+startup. Exact replay after a crash is accepted through `AlreadyApplied` plus a fresh durable
+database receipt. This recovered-event path does not transmit transactions; framework
+`submit_order` remains fail-closed.
+`verify_perp_order_record_for_durable_place` separately binds one typed REST order observation to
+the exact durable perpetual placement. It requires the timestamp nonce/order ID, subaccount,
+three-way instrument/market identity, direction, exact size and price scales, supported Limit
+GTC/IOC call, optional points, reduce-only/post-only flags, signed/lifecycle hash, REST
+`EXTRINSIC_HASH`, and a nonzero reported height to agree. REST does not expose time in force, so
+GTC versus IOC remains a fact retained by the durable signed call rather than REST evidence. The
+returned height is explicitly a mutable backend observation: this verifier does not establish
+canonical inclusion, dispatch success, a business event, or finality, and it does not emit a
+framework event or relax the submission gate.
+`observe_finalized_transaction_location` independently waits until the Watch endpoint's finalized
+head reaches a requested REST height, then recomputes every extrinsic hash in that exact canonical
+block and returns only one unique matching index. A missing or duplicate target fails closed.
+`verify_finalized_perp_order_evidence` combines that location with the REST/durable binding only
+when transaction hash and block height agree. The combined object deliberately remains separate
+from `DeepXInclusionEvidence`: finalized transaction membership plus mutable REST corroboration
+alone does not prove runtime dispatch or an authoritative business event. Authoritative event
+proof is instead obtained independently by the exact-block recovery scanner. Neither REST
+combiner advances the durable lifecycle or emits `OrderAccepted`.
 Idempotent public HTTP reads support strictly validated bounded retry timing and ordered testnet
 endpoint failover. Cursor-based reads fail closed when a response claims another page without a
 usable continuation cursor. Bounded raw perpetual trade and funding history support explicit
 pagination; other history endpoints remain single-page reads. Execution startup binds the loaded
 market catalog to that complete endpoint list. The execution client can produce a tracked
 single-order status report, bounded current perpetual-position reports, and bounded perpetual fill
-reports from that immutable catalog. It can replay the current account state and asynchronously
-query one tracked perpetual order after startup. Network startup, order commands, bulk order
-reports, and mass status remain non-operational and fail explicitly.
+reports from that immutable catalog. It can also calculate exact linear-perpetual maker rebates and
+taker commissions when the supplied instrument, quantity, price, and liquidity side match that
+catalog; a value requiring quote-currency rounding fails instead of being estimated. It can replay
+the current account state and asynchronously query one tracked perpetual order after startup.
+Network startup, order commands, bulk order reports, and mass status remain non-operational and
+fail explicitly.
+
+The execution client can collect the runtime startup step through one read-only coordinator. It
+validates chain identity and advertised methods for the configured Submission, Watch, and Recovery
+RPC roles, bootstraps from the identity-validated Watch endpoint, and atomically applies a second
+finalized fixture-approved snapshot before retaining any evidence. Any failure leaves the startup
+gate unchanged. This does not initialize PostgreSQL transaction state, connect an account stream,
+authorize signing, or make order submission operational.
+
+The following ownership step also has a read-only coordinator. It derives the wallet identity from
+the configured signing key, retrieves the wallet directory and configured subaccount profile, and
+retains a proof only when both REST observations bind the same active account relationship. A
+caller-supplied wallet cannot substitute for the signer-derived identity. This remains point-in-time
+REST evidence and does not prove stream authentication, freshness, or transaction authorization.
+
+The execution client can then open and retain the exact address-scoped `user_balances` connection.
+It advances only after the acknowledgement matches the retained signer-bound ownership proof.
+Foreign acknowledgements are terminal and are never retained. Async disconnect performs a bounded
+close handshake; synchronous reset revokes the subscription proof and drops the task-free transport.
+This connection step does not interpret balances or emit an account state.
 
 Perpetual fill reports read at most 100 pages of 100 account trades for the configured subaccount.
 They preserve venue trade and order identities, apply optional instrument, venue-order, and exact

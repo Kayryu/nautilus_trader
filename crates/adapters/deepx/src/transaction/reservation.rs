@@ -17,10 +17,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nautilus_core::hex;
+use nautilus_core::{UUID4, UnixNanos, hex};
 use nautilus_model::{
     enums::OrderSide,
-    identifiers::{ClientOrderId, InstrumentId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
@@ -33,10 +33,345 @@ use super::{
 use crate::signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic};
 
 /// Version of the durable DeepX transaction record schema.
-pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 3;
+pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 7;
 
 /// Namespace used for DeepX transaction records in the generic cache.
-pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v3:";
+pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v7:";
+
+/// Immutable framework command and event identity retained for crash recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepXFrameworkOrderContext {
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    command_id: UUID4,
+    command_ts_init: UnixNanos,
+    order_init_id: UUID4,
+    order_ts_init: UnixNanos,
+    correlation_id: Option<UUID4>,
+    causation_id: Option<UUID4>,
+    submitted_event_id: UUID4,
+    terminal_event_id: UUID4,
+}
+
+impl DeepXFrameworkOrderContext {
+    /// Creates immutable framework identity before a durable order reservation.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        account_id: AccountId,
+        command_id: UUID4,
+        command_ts_init: UnixNanos,
+        order_init_id: UUID4,
+        order_ts_init: UnixNanos,
+        correlation_id: Option<UUID4>,
+        causation_id: Option<UUID4>,
+        submitted_event_id: UUID4,
+        terminal_event_id: UUID4,
+    ) -> Self {
+        Self {
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            account_id,
+            command_id,
+            command_ts_init,
+            order_init_id,
+            order_ts_init,
+            correlation_id,
+            causation_id,
+            submitted_event_id,
+            terminal_event_id,
+        }
+    }
+
+    /// Returns the trader which issued the command.
+    #[must_use]
+    pub const fn trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    /// Returns the strategy which owns the order.
+    #[must_use]
+    pub const fn strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
+    /// Returns the framework instrument identity.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the framework client order identity.
+    #[must_use]
+    pub const fn client_order_id(&self) -> ClientOrderId {
+        self.client_order_id
+    }
+
+    /// Returns the execution account assigned to the command.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the framework command identity.
+    #[must_use]
+    pub const fn command_id(&self) -> UUID4 {
+        self.command_id
+    }
+
+    /// Returns the framework command initialization timestamp.
+    #[must_use]
+    pub const fn command_ts_init(&self) -> UnixNanos {
+        self.command_ts_init
+    }
+
+    /// Returns the initialized-order event identity.
+    #[must_use]
+    pub const fn order_init_id(&self) -> UUID4 {
+        self.order_init_id
+    }
+
+    /// Returns the initialized order timestamp.
+    #[must_use]
+    pub const fn order_ts_init(&self) -> UnixNanos {
+        self.order_ts_init
+    }
+
+    /// Returns the optional command correlation identity.
+    #[must_use]
+    pub const fn correlation_id(&self) -> Option<UUID4> {
+        self.correlation_id
+    }
+
+    /// Returns the optional command causation identity.
+    #[must_use]
+    pub const fn causation_id(&self) -> Option<UUID4> {
+        self.causation_id
+    }
+
+    /// Returns the stable future `OrderSubmitted` event identity.
+    #[must_use]
+    pub const fn submitted_event_id(&self) -> UUID4 {
+        self.submitted_event_id
+    }
+
+    /// Returns the stable mutually exclusive terminal event identity.
+    #[must_use]
+    pub const fn terminal_event_id(&self) -> UUID4 {
+        self.terminal_event_id
+    }
+
+    pub(crate) fn has_distinct_event_identity(&self) -> bool {
+        self.command_id != self.order_init_id
+            && self.command_id != self.submitted_event_id
+            && self.command_id != self.terminal_event_id
+            && self.order_init_id != self.submitted_event_id
+            && self.order_init_id != self.terminal_event_id
+            && self.submitted_event_id != self.terminal_event_id
+    }
+
+    fn matches_identity(&self, identity: &DeepXTransactionIdentity) -> bool {
+        self.client_order_id.as_str() == identity.client_order_id()
+            && self.instrument_id == identity.instrument_id()
+            && self.has_distinct_event_identity()
+    }
+}
+
+/// Immutable framework order-event payload retained before any delivery attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DeepXFrameworkOrderEventPayload {
+    /// The durable transaction crossed the submission-start boundary.
+    Submitted,
+    /// Finalized business evidence proved venue acceptance.
+    Accepted {
+        /// Venue order ID proved by the finalized placement event.
+        venue_order_id: u64,
+    },
+    /// Finalized dispatch or business evidence proved venue rejection.
+    Rejected,
+}
+
+/// One framework order event staged durably before any delivery attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepXFrameworkOrderEventStage {
+    event_id: UUID4,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+    payload: DeepXFrameworkOrderEventPayload,
+    acknowledged: bool,
+}
+
+impl DeepXFrameworkOrderEventStage {
+    /// Creates one immutable staged framework order event.
+    #[must_use]
+    pub const fn new(
+        event_id: UUID4,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+        reconciliation: bool,
+        payload: DeepXFrameworkOrderEventPayload,
+    ) -> Self {
+        Self {
+            event_id,
+            ts_event,
+            ts_init,
+            reconciliation,
+            payload,
+            acknowledged: false,
+        }
+    }
+
+    /// Returns the stable framework event identity.
+    #[must_use]
+    pub const fn event_id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    /// Returns the durable event timestamp.
+    #[must_use]
+    pub const fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    /// Returns the durable event initialization timestamp.
+    #[must_use]
+    pub const fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+
+    /// Returns whether the event was derived while reconciling restored state.
+    #[must_use]
+    pub const fn reconciliation(&self) -> bool {
+        self.reconciliation
+    }
+
+    /// Returns the immutable staged event payload.
+    #[must_use]
+    pub const fn payload(&self) -> DeepXFrameworkOrderEventPayload {
+        self.payload
+    }
+
+    /// Returns whether the canonical consumer durably acknowledged this exact event.
+    #[must_use]
+    pub const fn is_acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+
+    pub(crate) fn acknowledge(&mut self) -> bool {
+        if self.acknowledged {
+            false
+        } else {
+            self.acknowledged = true;
+            true
+        }
+    }
+}
+
+/// Durable framework order-event staging state.
+///
+/// Entries remain pending until the canonical consumer confirms application and durable cache
+/// persistence for the exact stable event ID.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepXFrameworkOrderOutbox {
+    submitted: Option<DeepXFrameworkOrderEventStage>,
+    terminal: Option<DeepXFrameworkOrderEventStage>,
+}
+
+impl DeepXFrameworkOrderOutbox {
+    /// Creates an empty pending framework order-event outbox.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            submitted: None,
+            terminal: None,
+        }
+    }
+
+    /// Returns the staged `OrderSubmitted` event, when eligible evidence was committed.
+    #[must_use]
+    pub const fn submitted(&self) -> Option<DeepXFrameworkOrderEventStage> {
+        self.submitted
+    }
+
+    /// Returns the staged mutually exclusive terminal event, when finalized evidence was committed.
+    #[must_use]
+    pub const fn terminal(&self) -> Option<DeepXFrameworkOrderEventStage> {
+        self.terminal
+    }
+
+    pub(crate) fn stage_submitted(&mut self, stage: DeepXFrameworkOrderEventStage) -> bool {
+        if self.submitted.is_some() {
+            false
+        } else {
+            self.submitted = Some(stage);
+            true
+        }
+    }
+
+    pub(crate) fn stage_terminal(&mut self, stage: DeepXFrameworkOrderEventStage) -> bool {
+        if self.terminal.is_some() {
+            false
+        } else {
+            self.terminal = Some(stage);
+            true
+        }
+    }
+
+    pub(crate) fn acknowledge_submitted(&mut self, event_id: UUID4) -> Option<bool> {
+        let stage = self.submitted.as_mut()?;
+        (stage.event_id == event_id).then(|| stage.acknowledge())
+    }
+
+    pub(crate) fn acknowledge_terminal(&mut self, event_id: UUID4) -> Option<bool> {
+        let stage = self.terminal.as_mut()?;
+        (stage.event_id == event_id).then(|| stage.acknowledge())
+    }
+}
+
+/// Finalized chain boundary observed before a transaction nonce is reserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepXSubmissionScanCheckpoint {
+    finalized_block_number: u64,
+    finalized_block_hash: [u8; 32],
+}
+
+impl DeepXSubmissionScanCheckpoint {
+    /// Creates an immutable pre-submission finalized scan boundary.
+    #[must_use]
+    pub const fn new(finalized_block_number: u64, finalized_block_hash: [u8; 32]) -> Self {
+        Self {
+            finalized_block_number,
+            finalized_block_hash,
+        }
+    }
+
+    /// Returns the finalized block number observed before nonce reservation.
+    #[must_use]
+    pub const fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
+    }
+
+    /// Returns the finalized block hash observed before nonce reservation.
+    #[must_use]
+    pub const fn finalized_block_hash(&self) -> [u8; 32] {
+        self.finalized_block_hash
+    }
+}
 
 /// A reserved nonce in one of DeepX's distinct nonce domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,6 +1031,12 @@ pub struct DeepXTransactionRecord {
     version: u16,
     /// Immutable transaction identity.
     identity: DeepXTransactionIdentity,
+    /// Immutable framework command and event identity, when framework-owned.
+    framework_order_context: Option<DeepXFrameworkOrderContext>,
+    /// Framework events and their durable consumer acknowledgement state.
+    framework_order_outbox: Option<DeepXFrameworkOrderOutbox>,
+    /// Finalized chain boundary observed before nonce reservation, when available.
+    submission_scan_checkpoint: Option<DeepXSubmissionScanCheckpoint>,
     /// Complete signed bytes and deterministic hash, once signing succeeds.
     signed_extrinsic: Option<DeepXDurableSignedExtrinsic>,
     /// Evidence-driven transaction lifecycle.
@@ -707,6 +1048,10 @@ pub struct DeepXTransactionRecord {
 struct DeepXTransactionRecordWire {
     version: u16,
     identity: DeepXTransactionIdentity,
+    framework_order_context: Option<DeepXFrameworkOrderContext>,
+    #[serde(default)]
+    framework_order_outbox: Option<DeepXFrameworkOrderOutbox>,
+    submission_scan_checkpoint: Option<DeepXSubmissionScanCheckpoint>,
     signed_extrinsic: Option<DeepXDurableSignedExtrinsicWire>,
     lifecycle: DeepXTransactionLifecycleWire,
 }
@@ -766,6 +1111,9 @@ pub enum DeepXTransactionRecordError {
     /// The restored lifecycle fields are inconsistent with its state.
     #[error("inconsistent DeepX transaction lifecycle record")]
     InconsistentLifecycle,
+    /// Framework command or event identity conflicts with transaction identity.
+    #[error("inconsistent DeepX framework order context")]
+    InconsistentFrameworkContext,
     /// The signed extrinsic belongs to a different signer.
     #[error("DeepX signed extrinsic signer does not match its reservation")]
     SignerMismatch,
@@ -796,6 +1144,44 @@ impl DeepXTransactionRecord {
         Self {
             version: DEEPX_TRANSACTION_RECORD_VERSION,
             identity,
+            framework_order_context: None,
+            framework_order_outbox: None,
+            submission_scan_checkpoint: None,
+            signed_extrinsic: None,
+            lifecycle: DeepXTransactionLifecycle::created(),
+        }
+    }
+
+    /// Creates a record with its immutable pre-submission finalized scan boundary.
+    #[must_use]
+    pub const fn created_with_submission_scan_checkpoint(
+        identity: DeepXTransactionIdentity,
+        checkpoint: DeepXSubmissionScanCheckpoint,
+    ) -> Self {
+        Self {
+            version: DEEPX_TRANSACTION_RECORD_VERSION,
+            identity,
+            framework_order_context: None,
+            framework_order_outbox: None,
+            submission_scan_checkpoint: Some(checkpoint),
+            signed_extrinsic: None,
+            lifecycle: DeepXTransactionLifecycle::created(),
+        }
+    }
+
+    /// Creates a framework-owned record with immutable command and recovery identity.
+    #[must_use]
+    pub const fn created_with_framework_order_context(
+        identity: DeepXTransactionIdentity,
+        checkpoint: DeepXSubmissionScanCheckpoint,
+        framework_order_context: DeepXFrameworkOrderContext,
+    ) -> Self {
+        Self {
+            version: DEEPX_TRANSACTION_RECORD_VERSION,
+            identity,
+            framework_order_context: Some(framework_order_context),
+            framework_order_outbox: Some(DeepXFrameworkOrderOutbox::empty()),
+            submission_scan_checkpoint: Some(checkpoint),
             signed_extrinsic: None,
             lifecycle: DeepXTransactionLifecycle::created(),
         }
@@ -805,6 +1191,28 @@ impl DeepXTransactionRecord {
     #[must_use]
     pub const fn identity(&self) -> &DeepXTransactionIdentity {
         &self.identity
+    }
+
+    /// Returns immutable framework command and event identity, when framework-owned.
+    #[must_use]
+    pub const fn framework_order_context(&self) -> Option<DeepXFrameworkOrderContext> {
+        self.framework_order_context
+    }
+
+    /// Returns pending durable framework order-event staging state, when framework-owned.
+    #[must_use]
+    pub const fn framework_order_outbox(&self) -> Option<DeepXFrameworkOrderOutbox> {
+        self.framework_order_outbox
+    }
+
+    pub(crate) fn set_framework_order_outbox(&mut self, outbox: DeepXFrameworkOrderOutbox) {
+        self.framework_order_outbox = Some(outbox);
+    }
+
+    /// Returns the finalized chain boundary observed before nonce reservation.
+    #[must_use]
+    pub const fn submission_scan_checkpoint(&self) -> Option<DeepXSubmissionScanCheckpoint> {
+        self.submission_scan_checkpoint
     }
 
     /// Returns the complete durable signed extrinsic when available.
@@ -976,6 +1384,70 @@ impl DeepXTransactionRecord {
         ClientOrderId::new_checked(&self.identity.client_order_id)
             .map_err(|_| DeepXTransactionRecordError::InvalidClientOrderId)?;
 
+        if self.framework_order_context.is_some_and(|context| {
+            !matches!(
+                self.identity.operation(),
+                Some(DeepXTransactionOperation::PerpPlace { .. })
+            ) || !context.matches_identity(&self.identity)
+                || !matches!(
+                    self.identity.nonce(),
+                    DeepXNonceReservation::TimestampOrderId { .. }
+                )
+        }) {
+            return Err(DeepXTransactionRecordError::InconsistentFrameworkContext);
+        }
+        if self.framework_order_context.is_some() != self.framework_order_outbox.is_some() {
+            return Err(DeepXTransactionRecordError::InconsistentFrameworkContext);
+        }
+        if let (Some(context), Some(outbox)) =
+            (self.framework_order_context, self.framework_order_outbox)
+        {
+            if outbox.submitted.is_some_and(|stage| {
+                stage.event_id != context.submitted_event_id
+                    || stage.payload != DeepXFrameworkOrderEventPayload::Submitted
+                    || matches!(
+                        self.lifecycle.state(),
+                        DeepXTransactionState::Created | DeepXTransactionState::Signed
+                    )
+            }) {
+                return Err(DeepXTransactionRecordError::InconsistentFrameworkContext);
+            }
+            if let Some(stage) = outbox.terminal {
+                let expected_payload = if self.lifecycle.state() == DeepXTransactionState::Finalized
+                {
+                    self.lifecycle
+                        .inclusion()
+                        .map(|inclusion| match inclusion.outcome() {
+                            super::DeepXInclusionOutcome::Success => {
+                                let DeepXNonceReservation::TimestampOrderId { value } =
+                                    self.identity.nonce()
+                                else {
+                                    unreachable!("framework context requires timestamp nonce")
+                                };
+                                DeepXFrameworkOrderEventPayload::Accepted {
+                                    venue_order_id: value,
+                                }
+                            }
+                            super::DeepXInclusionOutcome::Failed => {
+                                DeepXFrameworkOrderEventPayload::Rejected
+                            }
+                        })
+                } else {
+                    None
+                };
+                if stage.event_id != context.terminal_event_id
+                    || outbox.submitted.is_none()
+                    || (stage.acknowledged
+                        && !outbox
+                            .submitted
+                            .is_some_and(|submitted| submitted.acknowledged))
+                    || expected_payload != Some(stage.payload)
+                {
+                    return Err(DeepXTransactionRecordError::InconsistentFrameworkContext);
+                }
+            }
+        }
+
         let consistent = match self.lifecycle.state() {
             DeepXTransactionState::Created => {
                 self.lifecycle.extrinsic_hash().is_none()
@@ -1035,6 +1507,22 @@ impl DeepXTransactionRecord {
             return Err(DeepXTransactionRecordError::InconsistentLifecycle);
         }
 
+        if matches!(
+            self.lifecycle.state(),
+            DeepXTransactionState::Submitting
+                | DeepXTransactionState::Accepted
+                | DeepXTransactionState::InBlockSuccess
+                | DeepXTransactionState::InBlockFailed
+                | DeepXTransactionState::Finalized
+                | DeepXTransactionState::NotIncluded
+        ) && matches!(
+            self.identity.operation(),
+            Some(DeepXTransactionOperation::PerpPlace { .. })
+        ) && self.submission_scan_checkpoint.is_none()
+        {
+            return Err(DeepXTransactionRecordError::InconsistentLifecycle);
+        }
+
         let signed_extrinsic_is_consistent = match &self.signed_extrinsic {
             Some(signed) => {
                 signed.has_valid_hash()
@@ -1068,6 +1556,9 @@ impl DeepXTransactionRecord {
         let record = Self {
             version: wire.version,
             identity: wire.identity,
+            framework_order_context: wire.framework_order_context,
+            framework_order_outbox: wire.framework_order_outbox,
+            submission_scan_checkpoint: wire.submission_scan_checkpoint,
             signed_extrinsic: wire
                 .signed_extrinsic
                 .map(|signed| DeepXDurableSignedExtrinsic {
@@ -1131,6 +1622,60 @@ mod tests {
                 transaction_version: 1,
                 signed_extensions: vec!["CheckNonce".to_string()],
             },
+        )
+    }
+
+    fn framework_context() -> DeepXFrameworkOrderContext {
+        DeepXFrameworkOrderContext::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            AccountId::from("DEEPX-001"),
+            UUID4::from_bytes([1; 16]),
+            UnixNanos::from(10),
+            UUID4::from_bytes([2; 16]),
+            UnixNanos::from(9),
+            Some(UUID4::from_bytes([3; 16])),
+            Some(UUID4::from_bytes([4; 16])),
+            UUID4::from_bytes([5; 16]),
+            UUID4::from_bytes([6; 16]),
+        )
+    }
+
+    fn framework_record() -> DeepXTransactionRecord {
+        let identity = DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            [7; 20],
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            DeepXDirectRuntimeIdentity {
+                genesis_hash: [1; 32],
+                metadata_sha256: [2; 32],
+                spec_version: 369,
+                transaction_version: 1,
+                signed_extensions: vec!["CheckNonce".to_string()],
+            },
+            crate::signing::DeepXPerpPlaceParams {
+                subaccount: [7; 20],
+                market_id: 3,
+                is_long: true,
+                size: 1,
+                price: 1,
+                order_type: crate::signing::DeepXPerpOrderType::Limit(
+                    crate::signing::DeepXTimeInForce::Gtc,
+                ),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: crate::signing::DeepXPostOnlyParam::None,
+            },
+        );
+        DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(185_969_410, [0x9f; 32]),
+            framework_context(),
         )
     }
 
@@ -1502,6 +2047,167 @@ mod tests {
     }
 
     #[rstest]
+    fn submission_scan_checkpoint_round_trips_exactly() {
+        let checkpoint = DeepXSubmissionScanCheckpoint::new(185_969_410, [0x9f; 32]);
+        let record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity(DeepXNonceReservation::TimestampOrderId { value: 42 }),
+            checkpoint,
+        );
+
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+
+        assert_eq!(restored.submission_scan_checkpoint(), Some(checkpoint));
+    }
+
+    #[rstest]
+    fn framework_order_context_round_trips_exactly() {
+        let record = framework_record();
+
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+
+        assert_eq!(
+            restored.framework_order_context(),
+            Some(framework_context())
+        );
+        assert_eq!(restored, record);
+    }
+
+    #[rstest]
+    #[case("client-order")]
+    #[case("instrument")]
+    #[case("event-id")]
+    fn framework_order_context_conflicts_fail_closed(#[case] corruption: &str) {
+        let mut value = serde_json::to_value(framework_record()).unwrap();
+        match corruption {
+            "client-order" => {
+                value["framework_order_context"]["client_order_id"] = Value::from("O-DIFFERENT");
+            }
+            "instrument" => {
+                value["framework_order_context"]["instrument_id"] =
+                    serde_json::to_value(InstrumentId::from("BTC-USDC-PERP.DEEPX")).unwrap();
+            }
+            "event-id" => {
+                value["framework_order_context"]["terminal_event_id"] =
+                    value["framework_order_context"]["submitted_event_id"].clone();
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(matches!(
+            DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DeepXTransactionRecordError::InconsistentFrameworkContext),
+        ));
+    }
+
+    #[rstest]
+    fn staged_framework_event_in_ineligible_state_fails_closed() {
+        let mut value = serde_json::to_value(framework_record()).unwrap();
+        value["framework_order_outbox"]["submitted"] =
+            serde_json::to_value(DeepXFrameworkOrderEventStage::new(
+                framework_context().submitted_event_id(),
+                UnixNanos::from(100),
+                UnixNanos::from(101),
+                false,
+                DeepXFrameworkOrderEventPayload::Submitted,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DeepXTransactionRecordError::InconsistentFrameworkContext),
+        ));
+    }
+
+    #[rstest]
+    fn generic_record_with_framework_outbox_fails_closed() {
+        let record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity(DeepXNonceReservation::TimestampOrderId { value: 42 }),
+            DeepXSubmissionScanCheckpoint::new(185_969_410, [0x9f; 32]),
+        );
+        let mut value = serde_json::to_value(record).unwrap();
+        value["framework_order_outbox"] =
+            serde_json::to_value(DeepXFrameworkOrderOutbox::empty()).unwrap();
+
+        assert!(matches!(
+            DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DeepXTransactionRecordError::InconsistentFrameworkContext),
+        ));
+    }
+
+    #[rstest]
+    fn version_six_record_without_framework_acknowledgements_is_rejected() {
+        let record =
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 42,
+            }));
+        let mut value = serde_json::to_value(record).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("framework_order_outbox");
+        value["version"] = Value::from(6);
+
+        assert!(matches!(
+            DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DeepXTransactionRecordError::UnsupportedVersion(6)),
+        ));
+    }
+
+    #[rstest]
+    fn terminal_acknowledgement_without_submitted_acknowledgement_is_rejected() {
+        let mut record = framework_record();
+        let bytes = vec![1, 2, 3];
+        let runtime = record.identity().runtime();
+        let signer = record.identity().signer();
+        let approved_runtime = ApprovedRuntimeIdentity {
+            environment: DeepXEnvironment::Testnet,
+            genesis_hash: runtime.genesis_hash,
+            metadata_sha256: runtime.metadata_sha256,
+            spec_version: runtime.spec_version,
+            transaction_version: runtime.transaction_version,
+            signed_extensions: runtime.signed_extensions.clone(),
+        };
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer,
+                nonce: 42,
+                runtime: approved_runtime,
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        let inclusion = super::super::DeepXInclusionEvidence::from_durable_parts(
+            [3; 32],
+            72,
+            4,
+            super::super::DeepXInclusionOutcome::Success,
+        );
+        record
+            .apply_observation(DeepXTransactionObservation::Included(inclusion))
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
+            .unwrap();
+        crate::transaction::stage_perp_place_framework_order_events(
+            &mut record,
+            UnixNanos::from(100),
+            UnixNanos::from(101),
+            true,
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(record).unwrap();
+        value["framework_order_outbox"]["terminal"]["acknowledged"] = Value::Bool(true);
+
+        assert!(matches!(
+            DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DeepXTransactionRecordError::InconsistentFrameworkContext),
+        ));
+    }
+
+    #[rstest]
     fn standalone_identity_rejects_invalid_client_order_id() {
         let identity = identity(DeepXNonceReservation::TimestampOrderId { value: 42 });
         let mut value = serde_json::to_value(identity).unwrap();
@@ -1676,7 +2382,7 @@ mod tests {
     fn cache_key_is_stable_ascii_and_client_order_scoped() {
         let key = DeepXTransactionRecord::cache_key(ClientOrderId::new("ORDER:1"));
 
-        assert_eq!(key, "deepx:transaction:v3:4f524445523a31");
+        assert_eq!(key, "deepx:transaction:v7:4f524445523a31");
         assert!(key.is_ascii());
     }
 

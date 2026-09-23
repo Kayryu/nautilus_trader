@@ -37,7 +37,7 @@ use config::ExecutionEngineConfig;
 use futures::future::join_all;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
-    cache::{Cache, PositionRef},
+    cache::{Cache, PositionRef, database::OrderEventPersistenceReceiver},
     clients::ExecutionClient,
     clock::Clock,
     enums::LogColor,
@@ -45,7 +45,8 @@ use nautilus_common::{
     log_info,
     logging::{CMD, EVT, RECV, SEND},
     messages::{
-        ExecutionReport,
+        ExecutionReport, OrderEventApplicationStatus, OrderEventConsumerReceipt,
+        OrderEventPersistenceStatus,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
             QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
@@ -103,6 +104,15 @@ const TIMER_SNAPSHOT_POSITIONS: &str = "ExecEngine_SNAPSHOT_POSITIONS";
 const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
+
+/// Immediate application result and optional durable persistence completion receiver.
+#[derive(Debug)]
+pub struct OrderEventProcessResult {
+    /// Consumer receipt populated with the knowledge available synchronously.
+    pub receipt: OrderEventConsumerReceipt,
+    /// Completion receiver for the corresponding cache database write.
+    pub persistence_rx: Option<OrderEventPersistenceReceiver>,
+}
 
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
@@ -1855,6 +1865,74 @@ impl ExecutionEngine {
     /// Processes an order event, updating internal state and routing as needed.
     pub fn process(&mut self, event: &OrderEventAny) {
         self.handle_event(event);
+    }
+
+    /// Processes an order event and reports whether canonical order history retained it.
+    ///
+    /// A supporting cache database returns a separate completion receiver because persistence is
+    /// asynchronous. The immediate receipt remains unconfirmed until that receiver completes.
+    #[must_use]
+    pub fn process_with_receipt(&mut self, event: &OrderEventAny) -> OrderEventProcessResult {
+        let event_id = event.id();
+        let prior = self.cached_order_event(event);
+        let application = if prior.as_ref() == Some(event) {
+            OrderEventApplicationStatus::AlreadyApplied
+        } else if prior.is_some() {
+            OrderEventApplicationStatus::Rejected
+        } else {
+            self.handle_event(event);
+            if self.cached_order_event(event).as_ref() == Some(event) {
+                OrderEventApplicationStatus::Applied
+            } else {
+                OrderEventApplicationStatus::Rejected
+            }
+        };
+        let mut persistence_rx = None;
+        let persistence = match application {
+            OrderEventApplicationStatus::Applied | OrderEventApplicationStatus::AlreadyApplied => {
+                if self.cache.borrow().has_backing() {
+                    match self.cache.borrow().persist_order_event_with_receipt(event) {
+                        Ok(receiver) => {
+                            persistence_rx = receiver;
+                            OrderEventPersistenceStatus::Unconfirmed
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to enqueue acknowledged order event {event_id} for persistence: {e}"
+                            );
+                            OrderEventPersistenceStatus::Failed
+                        }
+                    }
+                } else {
+                    OrderEventPersistenceStatus::NotConfigured
+                }
+            }
+            OrderEventApplicationStatus::Rejected | OrderEventApplicationStatus::Unconfirmed => {
+                OrderEventPersistenceStatus::NotApplicable
+            }
+        };
+
+        OrderEventProcessResult {
+            receipt: OrderEventConsumerReceipt {
+                event_id,
+                application,
+                persistence,
+            },
+            persistence_rx,
+        }
+    }
+
+    fn cached_order_event(&self, event: &OrderEventAny) -> Option<OrderEventAny> {
+        self.cache
+            .borrow()
+            .order(&event.client_order_id())
+            .and_then(|order| {
+                order
+                    .events()
+                    .into_iter()
+                    .find(|candidate| candidate.id() == event.id())
+                    .cloned()
+            })
     }
 
     /// Projects a reconciled fill onto its order without applying position or portfolio economics.

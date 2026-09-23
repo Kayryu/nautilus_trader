@@ -612,7 +612,7 @@ impl DatabaseQueries {
             .transpose()
             .map_err(|e| anyhow::anyhow!("Failed to serialize exec algorithm params: {e}"))?;
 
-        sqlx::query(r#"
+        let result = sqlx::query(r#"
             INSERT INTO "order_event" (
                 id, kind, client_order_id, order_type, order_side, trader_id, client_id, reason, strategy_id, instrument_id, trade_id, currency, quantity, time_in_force, liquidity_side,
                 post_only, reduce_only, quote_quantity, reconciliation, price, last_px, last_qty, trigger_price, trigger_type, limit_offset, trailing_offset,
@@ -626,13 +626,9 @@ impl DatabaseQueries {
             )
             ON CONFLICT (id)
             DO UPDATE
-            SET
-                kind = $2, client_order_id = $3, order_type = $4, order_side=$5, trader_id = $6, client_id = $7, reason = $8, strategy_id = $9, instrument_id = $10, trade_id = $11, currency = $12,
-                quantity = $13, time_in_force = $14, liquidity_side = $15, post_only = $16, reduce_only = $17, quote_quantity = $18, reconciliation = $19, price = $20, last_px = $21,
-                last_qty = $22, trigger_price = $23, trigger_type = $24, limit_offset = $25, trailing_offset = $26, trailing_offset_type = $27, expire_time = $28, display_qty = $29,
-                emulation_trigger = $30, trigger_instrument_id = $31, contingency_type = $32, order_list_id = $33, linked_order_ids = $34, parent_order_id = $35, exec_algorithm_id = $36,
-                exec_spawn_id = $37, venue_order_id = $38, account_id = $39, position_id = $40, commission = $41, ts_event = $42, ts_init = $43, activation_price = $44,
-                exec_algorithm_params = $45, tags = $46, updated_at = CURRENT_TIMESTAMP
+            SET updated_at = "order_event".updated_at
+            WHERE to_jsonb("order_event") - 'created_at' - 'updated_at'
+                = to_jsonb(EXCLUDED) - 'created_at' - 'updated_at'
 
         "#)
             .bind(order_event.id().to_string())
@@ -694,8 +690,13 @@ impl DatabaseQueries {
             .bind(order_event.tags().map(|x| x.iter().map(ToString::to_string).collect::<Vec<String>>()))
             .execute(&mut *transaction)
             .await
-            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to insert into order_event table: {e}"))?;
+        if result.rows_affected() != 1 {
+            anyhow::bail!(
+                "Order event ID {} conflicts with the persisted payload",
+                order_event.id()
+            );
+        }
         transaction
             .commit()
             .await

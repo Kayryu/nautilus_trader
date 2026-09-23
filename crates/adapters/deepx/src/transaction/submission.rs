@@ -258,6 +258,92 @@ impl DeepXSubmittedExtrinsic {
     }
 }
 
+/// A one-shot submission failure retained with its durable reconciliation context.
+#[derive(Debug, Error)]
+pub enum DeepXSubmissionAttemptFailure {
+    /// Local evidence proves the transport did not start transmission.
+    #[error("DeepX submission was not sent: {0}")]
+    NotSent(String),
+    /// The submission endpoint explicitly rejected the payload.
+    #[error("DeepX submission endpoint rejected the payload: {0}")]
+    VenueRejected(String),
+    /// Transmission may have started and requires reconciliation.
+    #[error("DeepX submission outcome is ambiguous: {0}")]
+    Ambiguous(String),
+    /// Claimed acceptance did not identify the exact permitted payload.
+    #[error(transparent)]
+    Hash(#[from] DeepXSubmissionError),
+}
+
+impl From<DeepXSubmissionFailure> for DeepXSubmissionAttemptFailure {
+    fn from(value: DeepXSubmissionFailure) -> Self {
+        match value {
+            DeepXSubmissionFailure::NotSent(reason) => Self::NotSent(reason),
+            DeepXSubmissionFailure::VenueRejected(reason) => Self::VenueRejected(reason),
+            DeepXSubmissionFailure::Ambiguous(reason) => Self::Ambiguous(reason),
+        }
+    }
+}
+
+/// Result of consuming one permit while preserving caller-owned reconciliation context.
+#[derive(Debug)]
+pub enum DeepXSubmissionAttemptOutcome<C> {
+    /// The transport returned the exact permitted extrinsic hash.
+    Accepted {
+        /// Durable context retained for the acceptance commit.
+        context: C,
+        /// Hash-verified node acceptance evidence.
+        submitted: DeepXSubmittedExtrinsic,
+    },
+    /// Acceptance was not proven and the context must remain available for reconciliation.
+    Unresolved {
+        /// Durable context retained after the permit was consumed.
+        context: C,
+        /// Delivery classification or hash-verification failure.
+        failure: DeepXSubmissionAttemptFailure,
+    },
+}
+
+/// Consumes one prepared permit through exactly one classified transport attempt.
+///
+/// This coordinator never retries. It preserves `context` in every outcome so consuming the permit
+/// cannot discard the durable evidence required to commit acceptance or reconcile ambiguity.
+///
+/// # Errors
+///
+/// Delivery and hash failures are returned inside
+/// [`DeepXSubmissionAttemptOutcome::Unresolved`] together with the original context.
+pub async fn submit_once_preserving_context<C, F, Fut>(
+    context: C,
+    permit: DeepXSubmissionPermit,
+    submit: F,
+) -> DeepXSubmissionAttemptOutcome<C>
+where
+    F: FnOnce(Vec<u8>, [u8; 32]) -> Fut,
+    Fut: Future<Output = Result<[u8; 32], DeepXSubmissionFailure>>,
+{
+    let (bytes, expected_hash) = permit.into_payload();
+    match submit(bytes.clone(), expected_hash).await {
+        Ok(node_hash) => match verify_submission_hash(&bytes, expected_hash, node_hash) {
+            Ok(()) => DeepXSubmissionAttemptOutcome::Accepted {
+                context,
+                submitted: DeepXSubmittedExtrinsic {
+                    node_hash,
+                    extrinsic_hash: expected_hash,
+                },
+            },
+            Err(error) => DeepXSubmissionAttemptOutcome::Unresolved {
+                context,
+                failure: error.into(),
+            },
+        },
+        Err(failure) => DeepXSubmissionAttemptOutcome::Unresolved {
+            context,
+            failure: failure.into(),
+        },
+    }
+}
+
 /// Consumes one durable submission permit and retries only explicitly ambiguous outcomes.
 ///
 /// Every attempt receives a fresh copy of the exact bytes and hash released by the same permit.
@@ -333,26 +419,65 @@ pub async fn submit_extrinsic_once(
     submission_url: &str,
     extrinsic: &SignedPalletExtrinsic,
 ) -> Result<DeepXSubmittedExtrinsic, DeepXSubmissionError> {
-    let client = BlockchainHttpRpcClient::new(submission_url.to_string(), None, None);
-    let encoded_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": SUBMIT_EXTRINSIC_METHOD,
-            "params": [format!("0x{}", hex::encode(extrinsic.bytes()))],
-        }))
-        .await
-        .map_err(|source| DeepXSubmissionError::Rpc {
-            method: SUBMIT_EXTRINSIC_METHOD,
-            source,
-        })?;
-    let node_hash = decode_node_hash(&encoded_hash)?;
+    let node_hash = submit_encoded_extrinsic_hash_once(submission_url, extrinsic.bytes()).await?;
     verify_submission_hash(extrinsic.bytes(), extrinsic.extrinsic_hash(), node_hash)?;
 
     Ok(DeepXSubmittedExtrinsic {
         node_hash,
         extrinsic_hash: extrinsic.extrinsic_hash(),
     })
+}
+
+/// Submits exact prevalidated direct-pallet bytes once with conservative delivery classification.
+///
+/// Empty bytes or a local Blake2 hash mismatch prove that transmission was not attempted. Once the
+/// RPC future starts, every transport, RPC response, decoding, or returned-hash failure is
+/// ambiguous and requires reconciliation. This function never retries.
+///
+/// # Errors
+///
+/// Returns `NotSent` only for local payload validation and `Ambiguous` for every failure after the
+/// `author_submitExtrinsic` request starts. It never returns `VenueRejected` because the shared RPC
+/// transport does not expose evidence sufficient to distinguish rejection from uncertain delivery.
+pub async fn submit_direct_pallet_once_classified(
+    submission_url: &str,
+    bytes: Vec<u8>,
+    expected_hash: [u8; 32],
+) -> Result<[u8; 32], DeepXSubmissionFailure> {
+    if bytes.is_empty() {
+        return Err(DeepXSubmissionFailure::not_sent(
+            "signed extrinsic payload is empty",
+        ));
+    }
+    if let Err(error) = verify_submission_hash(&bytes, expected_hash, expected_hash) {
+        return Err(DeepXSubmissionFailure::not_sent(error.to_string()));
+    }
+    let node_hash = submit_encoded_extrinsic_hash_once(submission_url, &bytes)
+        .await
+        .map_err(|error| DeepXSubmissionFailure::ambiguous(error.to_string()))?;
+    verify_submission_hash(&bytes, expected_hash, node_hash)
+        .map_err(|error| DeepXSubmissionFailure::ambiguous(error.to_string()))?;
+    Ok(node_hash)
+}
+
+async fn submit_encoded_extrinsic_hash_once(
+    submission_url: &str,
+    bytes: &[u8],
+) -> Result<[u8; 32], DeepXSubmissionError> {
+    let client = BlockchainHttpRpcClient::new(submission_url.to_string(), None, None);
+    let encoded_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": SUBMIT_EXTRINSIC_METHOD,
+            "params": [format!("0x{}", hex::encode(bytes))],
+        }))
+        .await
+        .map_err(|source| DeepXSubmissionError::Rpc {
+            method: SUBMIT_EXTRINSIC_METHOD,
+            source,
+        })?;
+    decode_node_hash(&encoded_hash)
 }
 
 fn decode_node_hash(encoded: &str) -> Result<[u8; 32], DeepXSubmissionError> {
@@ -373,7 +498,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         future::ready,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{Json, Router, routing::post};
@@ -447,8 +575,9 @@ mod tests {
     #[case(308)]
     #[tokio::test]
     async fn rest_post_uses_exact_body_once_without_read_failover(#[case] status: u16) {
-        use axum::http::StatusCode;
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::http::StatusCode;
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let expected =
@@ -557,6 +686,34 @@ mod tests {
         url
     }
 
+    async fn spawn_counted_submission_server(
+        response: Value,
+        calls: Arc<AtomicUsize>,
+        expected_bytes: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let response = response.clone();
+                let expected_bytes = expected_bytes.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(request["method"], SUBMIT_EXTRINSIC_METHOD);
+                    assert_eq!(
+                        request["params"],
+                        json!([format!("0x{}", hex::encode(expected_bytes))])
+                    );
+                    Json(response)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (url, server)
+    }
+
     fn ok_response(extrinsic: &SignedPalletExtrinsic) -> Value {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -570,6 +727,236 @@ mod tests {
             bytes: extrinsic.bytes().to_vec(),
             extrinsic_hash: extrinsic.extrinsic_hash(),
         }
+    }
+
+    #[tokio::test]
+    async fn one_shot_submission_acceptance_preserves_context_and_exact_payload() {
+        let extrinsic = signed_remark().unwrap();
+        let expected_bytes = extrinsic.bytes().to_vec();
+        let expected_hash = extrinsic.extrinsic_hash();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+
+        let outcome = submit_once_preserving_context(
+            "durable-context",
+            submission_permit(&extrinsic),
+            move |bytes, hash| {
+                observed.lock().unwrap().push((bytes, hash));
+                ready(Ok(expected_hash))
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DeepXSubmissionAttemptOutcome::Accepted { context, submitted }
+                if context == "durable-context"
+                    && submitted.node_hash() == expected_hash
+                    && submitted.extrinsic_hash() == expected_hash
+        ));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(expected_bytes, expected_hash)]
+        );
+    }
+
+    #[rstest]
+    #[case(DeepXSubmissionFailure::not_sent("not sent"), 0)]
+    #[case(DeepXSubmissionFailure::venue_rejected("rejected"), 1)]
+    #[case(DeepXSubmissionFailure::ambiguous("unknown"), 2)]
+    #[tokio::test]
+    async fn one_shot_submission_failure_preserves_context_without_retry(
+        #[case] delivery: DeepXSubmissionFailure,
+        #[case] expected: u8,
+    ) {
+        let extrinsic = signed_remark().unwrap();
+        let calls = Arc::new(Mutex::new(0_u32));
+        let observed = Arc::clone(&calls);
+
+        let outcome = submit_once_preserving_context(
+            "durable-context",
+            submission_permit(&extrinsic),
+            move |_, _| {
+                *observed.lock().unwrap() += 1;
+                ready(Err(delivery))
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(matches!(
+            (&outcome, expected),
+            (
+                DeepXSubmissionAttemptOutcome::Unresolved {
+                    context: "durable-context",
+                    failure: DeepXSubmissionAttemptFailure::NotSent(_),
+                },
+                0,
+            ) | (
+                DeepXSubmissionAttemptOutcome::Unresolved {
+                    context: "durable-context",
+                    failure: DeepXSubmissionAttemptFailure::VenueRejected(_),
+                },
+                1,
+            ) | (
+                DeepXSubmissionAttemptOutcome::Unresolved {
+                    context: "durable-context",
+                    failure: DeepXSubmissionAttemptFailure::Ambiguous(_),
+                },
+                2,
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_shot_submission_hash_mismatch_preserves_context_without_retry() {
+        let extrinsic = signed_remark().unwrap();
+        let calls = Arc::new(Mutex::new(0_u32));
+        let observed = Arc::clone(&calls);
+        let wrong_hash = BlakeTwo256.hash(b"different accepted extrinsic").0;
+
+        let outcome = submit_once_preserving_context(
+            "durable-context",
+            submission_permit(&extrinsic),
+            move |_, _| {
+                *observed.lock().unwrap() += 1;
+                ready(Ok(wrong_hash))
+            },
+        )
+        .await;
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(matches!(
+            outcome,
+            DeepXSubmissionAttemptOutcome::Unresolved {
+                context: "durable-context",
+                failure: DeepXSubmissionAttemptFailure::Hash(
+                    DeepXSubmissionError::HashMismatch { .. }
+                ),
+            }
+        ));
+    }
+
+    #[rstest]
+    #[case(Vec::new(), BlakeTwo256.hash(b"empty").0)]
+    #[case(b"signed payload".to_vec(), BlakeTwo256.hash(b"different payload").0)]
+    #[tokio::test]
+    async fn classified_direct_submission_rejects_local_payload_without_request(
+        #[case] bytes: Vec<u8>,
+        #[case] expected_hash: [u8; 32],
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (url, server) = spawn_counted_submission_server(
+            json!({"jsonrpc": "2.0", "id": 1, "result": "unreachable"}),
+            Arc::clone(&calls),
+            bytes.clone(),
+        )
+        .await;
+
+        let failure = submit_direct_pallet_once_classified(&url, bytes, expected_hash)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure, DeepXSubmissionFailure::NotSent(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn classified_direct_submission_accepts_exact_hash_once() {
+        let extrinsic = signed_remark().unwrap();
+        let bytes = extrinsic.bytes().to_vec();
+        let expected_hash = extrinsic.extrinsic_hash();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (url, server) = spawn_counted_submission_server(
+            ok_response(&extrinsic),
+            Arc::clone(&calls),
+            bytes.clone(),
+        )
+        .await;
+
+        let node_hash = submit_direct_pallet_once_classified(&url, bytes, expected_hash)
+            .await
+            .unwrap();
+
+        assert_eq!(node_hash, expected_hash);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": 1010, "message": "Invalid Transaction"},
+    }))]
+    #[case(json!({"jsonrpc": "2.0", "id": 1}))]
+    #[case(json!({"jsonrpc": "2.0", "id": 1, "result": 42}))]
+    #[case(json!({"jsonrpc": "2.0", "id": 1, "result": "0x00"}))]
+    #[tokio::test]
+    async fn classified_direct_submission_treats_rpc_failures_as_ambiguous(
+        #[case] response: Value,
+    ) {
+        let extrinsic = signed_remark().unwrap();
+        let bytes = extrinsic.bytes().to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (url, server) =
+            spawn_counted_submission_server(response, Arc::clone(&calls), bytes.clone()).await;
+
+        let failure = submit_direct_pallet_once_classified(&url, bytes, extrinsic.extrinsic_hash())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure, DeepXSubmissionFailure::Ambiguous(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn classified_direct_submission_treats_mismatched_node_hash_as_ambiguous() {
+        let extrinsic = signed_remark().unwrap();
+        let bytes = extrinsic.bytes().to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": format!(
+                "0x{}",
+                hex::encode(BlakeTwo256.hash(b"different extrinsic").0)
+            ),
+        });
+        let (url, server) =
+            spawn_counted_submission_server(response, Arc::clone(&calls), bytes.clone()).await;
+
+        let failure = submit_direct_pallet_once_classified(&url, bytes, extrinsic.extrinsic_hash())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure, DeepXSubmissionFailure::Ambiguous(_)));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn classified_direct_submission_treats_transport_failure_as_ambiguous() {
+        let extrinsic = signed_remark().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        });
+
+        let failure = submit_direct_pallet_once_classified(
+            &url,
+            extrinsic.bytes().to_vec(),
+            extrinsic.extrinsic_hash(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(failure, DeepXSubmissionFailure::Ambiguous(_)));
+        server.await.unwrap();
     }
 
     #[tokio::test]

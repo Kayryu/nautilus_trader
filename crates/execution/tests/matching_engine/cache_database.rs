@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use ahash::AHashMap;
 use bytes::Bytes;
 use nautilus_common::{
-    cache::database::{CacheDatabaseAdapter, CacheMap},
+    cache::database::{CacheDatabaseAdapter, CacheMap, OrderEventPersistenceReceiver},
     signal::Signal,
 };
 use nautilus_core::UnixNanos;
@@ -47,6 +47,9 @@ struct FailNthAddOrderState {
     add_order_calls: usize,
     order_snapshots: Vec<OrderSnapshot>,
     position_snapshots: Vec<PositionSnapshot>,
+    order_persistence_receipt: Option<Result<(), String>>,
+    drop_order_persistence_receipt: bool,
+    order_persistence_requests: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +78,30 @@ impl FailNthAddOrderDatabaseControl {
     )]
     pub(super) fn position_snapshots(&self) -> Vec<PositionSnapshot> {
         self.state.lock().unwrap().position_snapshots.clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by the exec_engine test target sharing this module"
+    )]
+    pub(super) fn set_order_persistence_receipt(&self, result: Option<Result<(), String>>) {
+        self.state.lock().unwrap().order_persistence_receipt = result;
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by the exec_engine test target sharing this module"
+    )]
+    pub(super) fn set_drop_order_persistence_receipt(&self, drop_receipt: bool) {
+        self.state.lock().unwrap().drop_order_persistence_receipt = drop_receipt;
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by the exec_engine test target sharing this module"
+    )]
+    pub(super) fn order_persistence_requests(&self) -> usize {
+        self.state.lock().unwrap().order_persistence_requests
     }
 }
 
@@ -362,6 +389,26 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
 
     fn update_order(&self, _order_event: &OrderEventAny) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn persist_order_event_with_receipt(
+        &self,
+        _order_event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderEventPersistenceReceiver>> {
+        let mut state = self.control.state.lock().unwrap();
+        state.order_persistence_requests += 1;
+        let Some(result) = state.order_persistence_receipt.clone() else {
+            return Ok(None);
+        };
+        let drop_receipt = state.drop_order_persistence_receipt;
+        drop(state);
+
+        let (receipt_tx, receipt_rx) = futures::channel::oneshot::channel();
+        if !drop_receipt {
+            let result = result.map_err(anyhow::Error::msg);
+            let _ = receipt_tx.send(result);
+        }
+        Ok(Some(receipt_rx))
     }
 
     fn update_position(&self, _position: &Position) -> anyhow::Result<()> {

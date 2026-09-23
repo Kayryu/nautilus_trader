@@ -49,15 +49,71 @@ is recorded without requiring a placement event.
 `collect_finalized_perp_place_recovery_scan` uses the existing bounded canonical block/hash and
 extrinsic-index scanner, reads events at the exact observed block, and applies that verifier.
 `DeepXDurableRecoveryObserver::PerpPlace` adds canonical reconstruction of retained signed bytes
-before recovery RPC and uses the hash/checkpoint retained in the acknowledged record. The
-execution startup reconciliation path selects this observer for not-included perpetual placement
-records. Unresolved or conflicting evidence continues to block startup, never authorizing replay,
-replacement nonce allocation, order success, or connected readiness.
+before recovery RPC. Current version 7 records also retain the finalized block number and hash
+observed before nonce reservation. Execution startup uses that immutable checkpoint to scan restored
+`submitting` and `accepted` placements and commits a proven finalized inclusion in separate
+in-block and finalized compare-and-set steps. It selects the explicit observer for subsequent
+not-included scans. Unresolved or conflicting evidence continues to block startup, never
+authorizing replay, replacement nonce allocation, order success, or connected readiness.
 
-These tests use synthetic metadata-encoded events and mock canonical RPC, including both captured
-approved runtime versions. They prove local binding and recovery invariants, not successful live
-placement, current signer/subaccount authorization, private-event decoding, or live runtime event
-conformance. No real transactions were submitted to obtain this coverage.
+On the testnet runtime, standard `System.Events` can be absent. The recovery reader then decodes
+`System.Threads(block_number)` as the inclusive last thread index and requires every
+`System.EventsMap(block_number, thread)` batch from zero through that index. It validates each
+compact event count and reconstructs one complete SCALE event vector; missing or malformed thread
+state or any missing batch fails closed. Captured spec369 block `185969410` contains four batches
+with 58 total events. Its extrinsic index 8 proves both successful dispatch and the exact Limit GTC
+placement for order `1789445053841`; the fixture records the finalized block hash, storage keys,
+batch counts, runtime identity, and REST cross-reference.
+
+The historical fixture proves runtime event conformance for one existing public transaction.
+Broader malformed, conflicting and boundary coverage still uses synthetic metadata-encoded events
+and mock canonical RPC across both approved runtime versions. This does not prove current
+signer/subaccount authorization, private-event decoding, or framework lifecycle coordination. No
+transaction was submitted to obtain this coverage.
+
+`classify_perp_place_framework_order_events` derives a pure, non-emitting framework eligibility
+decision from durable placement state. Transmission must have crossed the durable `submitting`
+boundary before `OrderSubmitted` is eligible. Pool acceptance and non-final inclusion remain
+non-terminal. Only finalized matching placement evidence is eligible for `OrderAccepted`, using
+the verified timestamp nonce as venue order ID, while finalized authoritative failure is eligible
+for `OrderRejected`. Not-included evidence is not rejection, and `ActionRequired` fails closed
+because the lifecycle no longer proves its preceding submission state. This decision is not a
+delivery receipt; durable staging and crash-safe delivery acknowledgement remain prerequisites for
+startup emission. Framework submission stays disabled.
+
+Version 5 added immutable framework context only to framework-owned perpetual placements. The
+initial durable reservation retains trader, strategy, instrument, client-order, account, command,
+initialized-order, correlation and causation identities, both initialization timestamps, and
+distinct preallocated IDs for the future submitted and mutually exclusive terminal event. Scope
+and event-ID conflicts fail before nonce allocation. Generic opt-in transaction records have no
+framework event authority. Version 6 added a pending-only durable outbox. Version 7 records exact
+consumer acknowledgement for every staged event. Revision-checked CAS staging records every
+currently eligible event with its stable ID and first `ts_event`/`ts_init`; repeated staging
+preserves those timestamps, terminal payloads must match finalized evidence, and the entry retains
+its reconciliation origin. A pure materializer reconstructs only pending Nautilus events in
+Submitted-before-terminal order with exact durable fields and command causation. It does not send
+or mutate them. Execution ingress now offers a one-shot consumer receipt only after the
+exact event is present in canonical order history. Exact replay returns `AlreadyApplied`; missing
+orders, invalid transitions, event-ID payload conflicts, and routing paths that cannot observe the
+engine remain rejected or unconfirmed. Channel admission never completes this receipt. With no
+cache backing it proves in-memory application only. PostgreSQL and Redis cache backings complete a
+separate receipt only after their database worker finishes the idempotent event write. PostgreSQL
+rejects an existing event ID whose complete stored payload differs. Redis avoids duplicate append
+on exact replay and confirms only after order replay and index updates finish. Write failure,
+payload conflict, or a dropped worker returns `Failed`; a backing without receipt support stays
+`Unconfirmed`. Only an exact `Applied` or `AlreadyApplied` receipt paired with `Persisted` can be
+committed through the signer lease and revision-checked CAS. The commit marks that exact event
+acknowledged, repeated acknowledgement is idempotent, and a terminal event cannot advance first.
+The receipt alone never mutates the outbox, and every other outcome remains pending. After durable
+transaction reconciliation proves every record complete, the startup coordinator reloads the
+latest revisions, stages eligible framework events, emits only pending entries in transition order,
+waits up to 30 seconds for each final receipt, and commits each acknowledgement before proceeding.
+Dispatch failure, timeout, sender loss, an unconfirmed receipt, or uncertain CAS blocks startup and
+retains pending state. A crash after consumption but before acknowledgement commit replays the same
+stable ID; `AlreadyApplied` plus a fresh durable database receipt closes that window.
+PostgreSQL restoration rejects version 6 and older records explicitly; there is no migration or
+replay of their signed bytes. This coordinator emits recovered order events only and never
+transmits a transaction. Framework `submit_order` remains fail-closed.
 
 ## Opt-in durable REST submission
 
@@ -1085,16 +1141,22 @@ implemented and covered by unit tests:
   a durable write. Restored `not-included` records resume a bounded finalized scan from their exact
   durable checkpoint. An unchanged checkpoint remains unresolved without a write, while later
   submission-pool presence conflicts with the prior absence evidence and is durably committed as
-  operator action. Finding the exact extrinsic still fails closed because authoritative dispatch
-  and business-event evidence is not yet available. Startup advances only when every acknowledged
+  operator action. For supported operations, an exact extrinsic found by the bounded scanner is
+  decoded from complete standard or threaded system event storage; successful dispatch still
+  requires the exact expected business event. Startup advances only when every acknowledged
   record is finalized with no remaining recovery, submission decision, reconciliation, or operator
   action. An empty complete record set is valid; endpoint or capability mismatch, signer mismatch,
   stale lease, acknowledgement mismatch, and any unresolved record fail without advancing. This
-  includes restored `submitting` and `accepted` records: exact presence in the Submission endpoint's
-  valid pending pool durably records acceptance, while absence preserves the unresolved record
-  because one non-atomic pool snapshot cannot prove non-inclusion. This proves only durable
-  transaction recovery readiness for that signer, not protocol-level account or order
-  reconciliation. Cache borrow contention fails with a typed error.
+  includes restored `submitting` and `accepted` records. Perpetual placements first verify their
+  exact retained call and scan every finalized block after their durable pre-submission checkpoint;
+  exact event evidence advances through in-block and finalized commits. Exact presence in the
+  Submission endpoint's valid pending pool durably records acceptance, while absence preserves the
+  unresolved record because one non-atomic pool snapshot cannot prove non-inclusion. This proves
+  only durable transaction recovery readiness for that signer, not protocol-level account or
+  order reconciliation. Once all records are complete, the coordinator stages eligible framework
+  outbox entries and requires exact canonical application plus durable cache persistence before
+  committing each acknowledgement. Any dispatch, receipt, persistence, ordering, or CAS failure
+  prevents mass reconciliation from advancing. Cache borrow contention fails with a typed error.
   Disconnect resets the
   complete gate, current account-subscription proof, and event identity.
 - A protocol-neutral order-context registry which captures complete shared `OrderContext` values,
@@ -1287,11 +1349,67 @@ integration.
   failures leave the change latched. It atomically applies only a matching fixture-approved
   snapshot after all old permits are released. It does not poll, retry automatically, approve
   unknown fixtures, automatically resume signing after a failed refresh, or weaken permit
-  quiescence. No live
-  runtime watcher, order-call model, golden signing vector, configured chain time source, or live
-  recovery event decoder exists. A one-shot submission primitive and durable transaction tracker
-  exist behind fail-closed preparation and signer-lease boundaries, but no execution command path
-  can invoke them. A read-only RPC
+  quiescence. The execution client's retained snapshot service can perform a one-shot finalized
+  chain-time observation: it validates and applies the runtime at the exact Watch checkpoint before
+  strictly decoding that block's `Timestamp.Now` storage as a non-zero SCALE `u64`. It performs no
+  nonce allocation, signing, persistence mutation, or submission. A separate client-owned
+  perpetual placement reservation boundary combines that evidence with the retained signer lease,
+  allocator, snapshot permit, and PostgreSQL store. It rejects account/subaccount,
+  instrument/market, order-side/direction, and runtime mismatches, holds the permit through the
+  durable create, and releases only an exactly acknowledged `created` record. It performs no
+  signing or submission. A second client-owned offline boundary accepts that acknowledged record,
+  revalidates its full account, market, direction, and runtime scope, reconstructs the call and
+  timestamp nonce from the durable identity, and releases signed bytes only after the exact
+  `signed` record commits by CAS. It creates no transmission permit and performs no submission.
+  A third client-owned boundary revalidates that signed record and its canonical perpetual call,
+  commits the `submitting` transition, and only then releases a single-use payload permit. It does
+  not consume the permit, perform network I/O, or grant retry or replay authority. The permit can
+  be separated from its exact durable submitting context, preserving reconciliation authority after
+  consumption. A client-owned acceptance boundary commits `accepted` only when opaque hash-verified
+  submission evidence matches that context; it also performs no network I/O. A transport-neutral
+  client coordinator consumes the permit exactly once while retaining both signer-lease and runtime
+  permits. It selects no endpoint, performs no retry, and returns the durable context for accepted,
+  not-sent, rejected, ambiguous, and hash-mismatch outcomes.
+  The conservative DirectPallet JSON-RPC transport returns `not-sent` only when local preflight
+  rejects empty bytes or a Blake2-256 mismatch before a request. Once `author_submitExtrinsic`
+  starts, transport errors, JSON-RPC errors, malformed responses, and returned-hash mismatches are
+  all ambiguous because the shared RPC client cannot prove rejection or non-delivery. It performs
+  exactly one attempt. Runtime validation retains the exact endpoint and capability evidence; an
+  opt-in client-owned method can submit only after full startup through that retained Submission
+  endpoint while holding the signer lease and runtime permit. Reset, stop, and disconnect erase the
+  evidence. The method remains disconnected from framework order commands.
+  A separate pure order-mapping boundary accepts only simple perpetual Limit GTC and Limit IOC
+  framework orders. It verifies command/event identity, configured subaccount, immutable market
+  identity, minimum quantity/notional, step and tick; converts quantity at the market
+  `baseDecimal` scale and price at the chain-defined `1e6` scale; and maps direction, reduce-only,
+  and supported post-only behavior exactly. Market, Stop, FOK, IOC+post-only, quote quantity,
+  advanced fields, inexact values, and out-of-range market IDs fail before nonce allocation,
+  persistence, signing, or network access. An explicit client-owned preparation workflow composes
+  this mapping with complete connected startup, the exact retained RPC evidence, immutable order
+  context, finalized chain time, durable timestamp reservation, offline signing, and the
+  CAS-committed `submitting` transition. Mapping and startup failures occur before context mutation
+  or nonce allocation. It performs no transmission or framework event emission, and framework
+  `submit_order` remains fail-closed.
+  A separate pure REST-evidence verifier binds a typed perpetual order record to one durable
+  placement. It requires exact agreement across the timestamp nonce/order ID, subaccount,
+  immutable instrument/market indexes, direction, runtime-scaled size and price, supported Limit
+  call, optional points, flags, durable signed/lifecycle hash, REST `EXTRINSIC_HASH`, and nonzero
+  reported height. The REST schema omits time in force, so GTC versus IOC remains proven only by
+  the retained durable call. This is mutable backend/indexer evidence: the reported height is not
+  promoted to canonical inclusion, and the verifier proves no dispatch result, business event, or
+  finality. It cannot emit a framework order event or enable submission.
+  An independent Watch observer waits for the reported height to become finalized, obtains that
+  height's canonical block, and locates the exact durable extrinsic by recomputed Blake2-256 hash.
+  It returns `Pending` before finality and fails if the finalized block omits or duplicates the
+  target. A pure combiner accepts the REST order binding and finalized location only when their
+  transaction hashes and block heights agree. This establishes finalized transaction membership
+  corroborated by mutable REST state, not runtime dispatch or an authoritative business event. The
+  result is intentionally not convertible to `DeepXInclusionEvidence`, cannot mutate the durable
+  lifecycle, and cannot emit `OrderAccepted`.
+  No live framework command coordinator, complete order-call model, or complete golden signing
+  vectors exist. A one-shot submission primitive, durable transaction tracker, and read-only
+  finalized recovery event decoder exist behind fail-closed preparation and signer-lease
+  boundaries, but no execution command path can invoke them. A read-only RPC
   identity collector concurrently queries every configured role endpoint
   for its genesis hash and releases only a complete validated endpoint set. An independent
   read-only capability probe can then require a caller-supplied non-empty method set for one role
@@ -1336,6 +1454,31 @@ integration.
   startup epoch is present in the matching cached account history. This rejects stale account
   entries from a previous startup epoch, but it does not prove the protocol-dependent semantic
   completeness of that account state.
+  The runtime startup step has a read-only production coordinator which validates chain identity
+  and advertised methods for all three configured RPC roles, then bootstraps and atomically refreshes
+  a fixture-approved finalized snapshot from the validated Watch endpoint. It retains evidence only
+  after the complete sequence succeeds. This step does not initialize durable transaction state,
+  connect the account stream, authorize signing, or enable transaction submission.
+  The next startup step can independently derive the configured signer wallet, retrieve its REST
+  subaccount directory and the configured subaccount profile, and retain ownership evidence only
+  when both observations bind the same active relationship. Arbitrary query wallets cannot replace
+  the signer-derived identity. The proof is not freshness, stream-authentication, or transaction
+  authority evidence.
+  The execution client can next own the exact acknowledged `user_balances` connection. Foreign
+  acknowledgements fail without retaining a socket or advancing startup. Async disconnect performs
+  a bounded close handshake, while synchronous reset revokes the proof and drops the task-free
+  transport. It can read a confirmed balance frame using only that retained proof. A bounded
+  receive timeout preserves the connection for retry, while a closed, malformed, or foreign stream
+  revokes both the connection and proof. A separate client-owned initialization boundary accepts a
+  caller-provided `AccountState` and atomically revalidates the retained connection, frame
+  subscription, framework account identity, and event dispatch. It does not infer free/locked
+  balances or margins from the balance payload; the caller must independently establish those
+  semantics.
+  Production mass reconciliation and final account registration then consume only this
+  client-owned connection and the startup evidence already retained by the execution client. Mass
+  reconciliation uses the retained validated RPC roles and durable PostgreSQL runtime; registration
+  revalidates the same subscription before checking the current-epoch account event in cache. A
+  missing or stale owned connection revokes its proof and cannot advance either gate.
   Bounded trade-ID replay state supports reserve, commit, and failure release for an already
   validated venue `TradeId`; committed IDs survive reconnect startup resets until FIFO eviction.
   Validated fill reports are merged across bounded pagination overlap only when the
@@ -1348,9 +1491,13 @@ integration.
   Current testnet evidence across buyer and seller taker trades and maker rebates shows REST `fee`
   as a signed account-balance delta. The conversion negates it into Nautilus commission, resolves
   an empty `feeAsset` from the market quote currency, and rejects fee assets or fee signs that
-  conflict with startup market metadata. The chain implementation independently names the market
-  quote asset for both maker and taker fees. These observations do not prove a block-pinned history
-  snapshot, completeness under concurrent writes, or private-stream reconciliation.
+  conflict with startup market metadata. The execution commission fallback uses the same immutable
+  fee rates only for an exact linear perpetual instrument match. Quantity and price must be
+  positive exact increment multiples, liquidity must be maker or taker, and the calculated
+  `Decimal` must fit the quote currency without rounding. Maker rebates remain negative commission
+  values. The chain implementation independently names the market quote asset for both maker and
+  taker fees. These observations do not prove a block-pinned history snapshot, completeness under
+  concurrent writes, or private-stream reconciliation.
   Already validated order status reports have the same exact-overlap boundary keyed by
   `VenueOrderId`, with unique non-empty `ClientOrderId` ownership. It compares all venue-derived
   fields, so lifecycle progression, complementary partial fields, and competing source snapshots
@@ -1367,11 +1514,12 @@ integration.
   in-block finality and reorganization evidence, resume an exact not-included checkpoint, and
   observe submitting or accepted records against the Submission endpoint's valid pending pool.
   Exact pool presence durably records acceptance; pool absence remains unresolved without a write.
+  Complete framework-owned placements then replay their durable outbox through acknowledged
+  execution ingress and commit exact application-and-persistence receipts before startup advances.
   Pending-pool absence is no longer the active implementation milestone. Phase E work should now
   replace the synthetic private-session gate with proven account-subscription ownership, implement
-  order decoding, remaining bulk report orchestration, network startup coordination, one
-  fixture-proven order command, and authoritative event emission. None of those operational
-  mutation surfaces exists yet.
+  order decoding, remaining bulk report orchestration, network startup coordination, and one
+  fixture-proven order command. No transaction command mutation surface exists yet.
 - **Phase F - Partial:** Read-only wallet quota summary, typed delegate directories, and selected
   offline subaccount/delegate signing primitives exist. Typed quota history, management services,
   authorization conformance, and all quota/delegate/subaccount mutations remain disabled.
@@ -2140,9 +2288,13 @@ event observations must carry the same block extrinsic index. Successful dispatc
 authoritative expected business event is rejected, as is a failed dispatch paired with any
 business event. Only successful dispatch plus expected business success produces
 `in-block-success`; expected business failure or dispatch failure produces `in-block-failed`.
-Version 3 durable records retain their existing collapsed inclusion shape and are restored only
-through the internal validated record codec. No RPC event decoder or business-event schema is yet
-connected to this boundary, so live inclusion classification remains disabled.
+Version 4 durable records added the immutable pre-submission finalized checkpoint used by
+perpetual placement recovery. Version 5 added immutable framework command and future event identity
+for framework-owned placements. Version 6 added pending-only durable event staging with stable
+timestamps. Version 7 adds exact consumer acknowledgement for each staged event. PostgreSQL
+restoration scans the complete DeepX transaction key family so a version 6
+or older or unknown-version record fails startup explicitly instead of being hidden by the new
+namespace. There is no automatic migration or replay of legacy signed bytes.
 
 A read-only network observation boundary now queries only chain-identity-validated endpoints. It
 fetches a canonical block hash and body from the Watch endpoint, verifies the returned header
@@ -2250,8 +2402,11 @@ startup rejects evidence collected from a different endpoint set. These names ar
 implied by the current planned flows; they do not prove semantics or enable any operational client.
 
 Direct-pallet transaction reservations have a versioned, strict durable record format. Version 3
-adds retained reorganization evidence and uses a distinct cache-key namespace so older record
-shapes cannot be silently interpreted as current. A record records the client order ID, signer,
+added retained reorganization evidence, version 4 added the pre-submission finalized checkpoint,
+version 5 added framework identity for framework-owned placements, version 6 added pending-only
+framework event staging, and version 7 adds exact consumer acknowledgement. Each version uses a
+distinct cache-key namespace so older record shapes cannot be silently interpreted as current. A record
+records the client order ID, signer,
 instrument, side, nonce domain, and approved runtime identity before signing. The offline signed
 result carries the runtime identity actually used for encoding,
 and the record accepts only a matching signer, timestamp nonce, runtime, and Blake2-256 hash of the
@@ -2320,9 +2475,34 @@ creates the immutable identity, and returns the record only after `create_commit
 that record's exact encoding. It performs no signing or submission. The execution client now
 retains the configured store, signer lease, allocator, and verified durable snapshot for its
 configured signing key using the configured non-zero clock-drift limit, which defaults to five
-seconds. No client method yet combines that runtime with an authoritative finalized chain-time
-reader, so it does not allocate a new nonce, enable sequential account nonces, sign, or submit a
-transaction.
+seconds. It also retains the fixture-approved runtime snapshot service and can use it to observe
+chain time without accepting a caller-supplied snapshot or time value. That operation first
+validates and applies runtime version and metadata from one finalized Watch checkpoint, then reads
+`Timestamp.Now` from the exact same block hash and accepts only one non-zero SCALE `u64` Unix
+millisecond value. Runtime change evidence is latched before any later timestamp-read failure. The
+operation does not allocate a new nonce, enable sequential account nonces, sign, persist a
+transaction, or submit it. A separate client-owned perpetual placement reservation operation
+combines a fresh observation with the retained signer lease, timestamp allocator, snapshot permit,
+and PostgreSQL store. It validates the retained ownership proof against the signer and requested
+subaccount, binds the instrument to the immutable market catalog, holds the matching runtime permit
+through `create_committed`, and requires Nautilus Buy/Sell to match the runtime's `is_long`
+direction. It returns only the exact acknowledged `created` record. This burns a timestamp nonce on
+any failed or ambiguous create as required, but performs no signing or submission and is not called
+by an execution command. A separate client-owned offline signing operation accepts only the
+acknowledged reservation, revalidates its signer, subaccount, instrument, market, direction, and
+retained runtime, and reconstructs every pallet argument and the timestamp nonce from the durable
+identity. It returns signed bytes only after the exact `signed` record commits through
+revision-checked CAS. No transmission permit is created, no network submission occurs, and no
+execution command invokes it. A third client-owned operation revalidates the durable signed record
+and canonical call, commits the exact `submitting` transition, and only then releases a single-use
+transmission permit. It does not consume the permit, perform network I/O, authorize retry or replay,
+or connect this path to an execution command. Splitting the preparation retains the exact durable
+submitting context separately from the single-use permit. A client-owned acceptance operation can
+then commit `accepted` only from hash-verified submission evidence matching that context, without
+performing submission or any other network I/O. A transport-neutral client coordinator can consume
+the permit through exactly one caller-classified attempt while holding the signer lease and runtime
+permit. It does not select a network endpoint or retry, and preserves the durable context across all
+accepted and unresolved outcomes.
 
 The persistence contract is asynchronous so the PostgreSQL implementation can hold a
 transaction-scoped signer fence and commit record changes without blocking the runtime. Signing

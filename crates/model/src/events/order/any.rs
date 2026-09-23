@@ -15,7 +15,7 @@
 
 use std::fmt::Display;
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
@@ -57,6 +57,30 @@ pub enum OrderEventAny {
 }
 
 impl OrderEventAny {
+    /// Returns the event ID.
+    #[must_use]
+    pub fn id(&self) -> UUID4 {
+        match self {
+            Self::Initialized(event) => event.event_id,
+            Self::Denied(event) => event.event_id,
+            Self::Emulated(event) => event.event_id,
+            Self::Released(event) => event.event_id,
+            Self::Submitted(event) => event.event_id,
+            Self::Accepted(event) => event.event_id,
+            Self::Rejected(event) => event.event_id,
+            Self::Canceled(event) => event.event_id,
+            Self::Expired(event) => event.event_id,
+            Self::Triggered(event) => event.event_id,
+            Self::PendingUpdate(event) => event.event_id,
+            Self::PendingCancel(event) => event.event_id,
+            Self::ModifyRejected(event) => event.event_id,
+            Self::CancelRejected(event) => event.event_id,
+            Self::Updated(event) => event.event_id,
+            Self::Filled(event) => event.event_id,
+            Self::FillVoided(event) => event.event_id,
+        }
+    }
+
     #[must_use]
     pub fn into_boxed(self) -> Box<dyn OrderEvent> {
         match self {

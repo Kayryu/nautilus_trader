@@ -26,12 +26,13 @@ use super::{
     DeepXCommittedTransactionRecord, DeepXRestoredTransactionRecord, DeepXSignerLease,
     DeepXTransactionPersistenceError, DeepXTransactionRevision, DeepXTransactionStore,
 };
-use crate::transaction::{DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DeepXTransactionRecord};
+use crate::transaction::DeepXTransactionRecord;
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"DXTX";
 const ENVELOPE_VERSION: u8 = 1;
 const ENVELOPE_HEADER_LEN: usize = ENVELOPE_MAGIC.len() + 1 + size_of::<u64>();
 const ADVISORY_LOCK_DOMAIN: &[u8] = b"nautilus:deepx:signer-lease:v1";
+const TRANSACTION_CACHE_KEY_FAMILY_PREFIX: &str = "deepx:transaction:v";
 
 /// PostgreSQL-backed DeepX transaction store using the Nautilus `general` cache table.
 #[derive(Clone, Debug)]
@@ -163,7 +164,7 @@ impl DeepXTransactionStore for DeepXPostgresTransactionStore {
         let rows = sqlx::query(
             "SELECT id, value FROM general WHERE left(id, length($1)) = $1 ORDER BY id",
         )
-        .bind(DEEPX_TRANSACTION_CACHE_KEY_PREFIX)
+        .bind(TRANSACTION_CACHE_KEY_FAMILY_PREFIX)
         .fetch_all(&mut *connection)
         .await
         .map_err(before_commit("load DeepX transaction records"))?;

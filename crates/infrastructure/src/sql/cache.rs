@@ -20,7 +20,9 @@ use bytes::Bytes;
 use nautilus_common::{
     cache::{
         CacheConfig,
-        database::{CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap},
+        database::{
+            CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, OrderEventPersistenceReceiver,
+        },
     },
     live::get_runtime,
     logging::{log_task_awaiting, log_task_started, log_task_stopped},
@@ -187,7 +189,7 @@ pub struct PostgresCacheDatabase {
     clippy::large_enum_variant,
     reason = "variant sizes vary with feature unification; allow stays silent when the lint does not fire"
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum DatabaseQuery {
     Close,
     Add(String, Vec<u8>),
@@ -203,7 +205,10 @@ pub enum DatabaseQuery {
     AddQuote(QuoteTick),
     AddTrade(TradeTick),
     AddBar(Bar),
-    UpdateOrder(OrderEventAny),
+    UpdateOrder(
+        OrderEventAny,
+        Option<futures::channel::oneshot::Sender<anyhow::Result<()>>>,
+    ),
     UpdatePosition(OrderFilled),
     IndexOrderPosition(ClientOrderId, PositionId),
     IndexOrderClients(Vec<(ClientOrderId, ClientId)>),
@@ -1188,10 +1193,24 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn update_order(&self, event: &OrderEventAny) -> anyhow::Result<()> {
-        let query = DatabaseQuery::UpdateOrder(event.clone());
+        let query = DatabaseQuery::UpdateOrder(event.clone(), None);
         self.tx.send(query).map_err(|e| {
             anyhow::anyhow!("Failed to send query update_order to database message handler: {e}")
         })
+    }
+
+    fn persist_order_event_with_receipt(
+        &self,
+        event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderEventPersistenceReceiver>> {
+        let (receipt_tx, receipt_rx) = futures::channel::oneshot::channel();
+        let query = DatabaseQuery::UpdateOrder(event.clone(), Some(receipt_tx));
+        self.tx.send(query).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to send acknowledged update_order query to database message handler: {e}"
+            )
+        })?;
+        Ok(Some(receipt_rx))
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
@@ -1252,6 +1271,7 @@ fn position_last_event(position: &Position) -> anyhow::Result<OrderFilled> {
 )]
 async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
     for cmd in buffer.drain(..) {
+        let mut receipt_tx = None;
         let result: anyhow::Result<()> = match cmd {
             DatabaseQuery::Close => Ok(()),
             DatabaseQuery::Add(key, value) => DatabaseQueries::add(pool, key, value).await,
@@ -1360,7 +1380,8 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             DatabaseQuery::AddQuote(quote) => DatabaseQueries::add_quote(pool, &quote).await,
             DatabaseQuery::AddTrade(trade) => DatabaseQueries::add_trade(pool, &trade).await,
             DatabaseQuery::AddBar(bar) => DatabaseQueries::add_bar(pool, &bar).await,
-            DatabaseQuery::UpdateOrder(event) => {
+            DatabaseQuery::UpdateOrder(event, tx) => {
+                receipt_tx = tx;
                 DatabaseQueries::add_order_event(pool, event.into_boxed(), None).await
             }
             DatabaseQuery::UpdatePosition(event) => {
@@ -1374,8 +1395,11 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             }
         };
 
-        if let Err(e) = result {
+        if let Err(e) = &result {
             log::error!("Error on query: {e:?}");
+        }
+        if let Some(receipt_tx) = receipt_tx {
+            let _ = receipt_tx.send(result);
         }
     }
 }

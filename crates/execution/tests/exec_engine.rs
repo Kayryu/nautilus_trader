@@ -31,12 +31,13 @@ use std::{
 
 use ahash::AHashSet;
 use cache_database::{FailNthAddOrderDatabase, FailNthAddOrderDatabaseControl};
+use futures::FutureExt;
 use nautilus_common::{
     cache::{Cache, CacheSnapshotRef},
     clients::ExecutionClient,
     clock::{self, Clock, TestClock},
     messages::{
-        ExecutionReport,
+        ExecutionReport, OrderEventApplicationStatus, OrderEventPersistenceStatus,
         execution::{
             BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount,
             SubmitOrder, SubmitOrderList, TradingCommand,
@@ -1045,6 +1046,247 @@ fn test_counters_increment_and_reset(mut execution_engine: ExecutionEngine) {
     assert_eq!(execution_engine.command_count(), 0);
     assert_eq!(execution_engine.event_count(), 0);
     assert_eq!(execution_engine.report_count(), 0);
+}
+
+#[rstest]
+fn test_order_event_receipt_requires_canonical_history(mut execution_engine: ExecutionEngine) {
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+
+    let applied = execution_engine.process_with_receipt(&event).receipt;
+    assert_eq!(applied.event_id, event.id());
+    assert_eq!(applied.application, OrderEventApplicationStatus::Applied);
+    assert_eq!(
+        applied.persistence,
+        OrderEventPersistenceStatus::NotConfigured
+    );
+
+    let repeated = execution_engine.process_with_receipt(&event).receipt;
+    assert_eq!(
+        repeated.application,
+        OrderEventApplicationStatus::AlreadyApplied
+    );
+    assert_eq!(
+        repeated.persistence,
+        OrderEventPersistenceStatus::NotConfigured
+    );
+
+    let missing_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    let missing = TestOrderEventStubs::submitted(&missing_order, AccountId::test_default());
+    let rejected = execution_engine.process_with_receipt(&missing).receipt;
+    assert_eq!(rejected.application, OrderEventApplicationStatus::Rejected);
+    assert_eq!(
+        rejected.persistence,
+        OrderEventPersistenceStatus::NotApplicable
+    );
+}
+
+#[rstest]
+fn test_order_event_receipt_rejects_event_id_conflict(mut execution_engine: ExecutionEngine) {
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+    assert_eq!(
+        execution_engine
+            .process_with_receipt(&event)
+            .receipt
+            .application,
+        OrderEventApplicationStatus::Applied
+    );
+    let mut conflicting = event.clone();
+    let OrderEventAny::Submitted(submitted) = &mut conflicting else {
+        unreachable!();
+    };
+    submitted.ts_event = UnixNanos::from(1);
+
+    let receipt = execution_engine.process_with_receipt(&conflicting).receipt;
+    assert_eq!(receipt.event_id, event.id());
+    assert_eq!(receipt.application, OrderEventApplicationStatus::Rejected);
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .event_count(),
+        2
+    );
+}
+
+#[rstest]
+fn test_order_event_receipt_never_confirms_async_cache_backing() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let (database, _) = FailNthAddOrderDatabase::create();
+    cache.borrow_mut().set_database(Box::new(database));
+    let mut engine = ExecutionEngine::new(clock, cache, None);
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+
+    let receipt = engine.process_with_receipt(&event).receipt;
+
+    assert_eq!(receipt.application, OrderEventApplicationStatus::Applied);
+    assert_eq!(
+        receipt.persistence,
+        OrderEventPersistenceStatus::Unconfirmed
+    );
+}
+
+#[rstest]
+fn test_order_event_persistence_receipt_completes_only_from_database_result() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let (database, control) = FailNthAddOrderDatabase::create();
+    control.set_order_persistence_receipt(Some(Ok(())));
+    cache.borrow_mut().set_database(Box::new(database));
+    let mut engine = ExecutionEngine::new(clock, cache, None);
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+
+    let applied = engine.process_with_receipt(&event);
+    assert_eq!(
+        applied.receipt.application,
+        OrderEventApplicationStatus::Applied
+    );
+    assert_eq!(
+        applied.receipt.persistence,
+        OrderEventPersistenceStatus::Unconfirmed
+    );
+    assert!(
+        applied
+            .persistence_rx
+            .unwrap()
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
+
+    let replayed = engine.process_with_receipt(&event);
+    assert_eq!(
+        replayed.receipt.application,
+        OrderEventApplicationStatus::AlreadyApplied
+    );
+    assert!(
+        replayed
+            .persistence_rx
+            .unwrap()
+            .now_or_never()
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(control.order_persistence_requests(), 2);
+}
+
+#[rstest]
+fn test_order_event_persistence_receipt_reports_database_failure() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let (database, control) = FailNthAddOrderDatabase::create();
+    control.set_order_persistence_receipt(Some(Err("database write failed".to_string())));
+    cache.borrow_mut().set_database(Box::new(database));
+    let mut engine = ExecutionEngine::new(clock, cache, None);
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+
+    let result = engine.process_with_receipt(&event);
+    let persistence = result
+        .persistence_rx
+        .unwrap()
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        result.receipt.application,
+        OrderEventApplicationStatus::Applied
+    );
+    assert_eq!(
+        result.receipt.persistence,
+        OrderEventPersistenceStatus::Unconfirmed
+    );
+    assert_eq!(
+        persistence.unwrap_err().to_string(),
+        "database write failed"
+    );
+}
+
+#[rstest]
+fn test_order_event_persistence_receipt_fails_closed_when_sender_drops() {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(audusd_sim().id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let (database, control) = FailNthAddOrderDatabase::create();
+    control.set_order_persistence_receipt(Some(Ok(())));
+    control.set_drop_order_persistence_receipt(true);
+    cache.borrow_mut().set_database(Box::new(database));
+    let mut engine = ExecutionEngine::new(clock, cache, None);
+    let event = TestOrderEventStubs::submitted(&order, AccountId::test_default());
+
+    let result = engine.process_with_receipt(&event);
+
+    assert!(
+        result
+            .persistence_rx
+            .unwrap()
+            .now_or_never()
+            .unwrap()
+            .is_err()
+    );
 }
 
 #[rstest]

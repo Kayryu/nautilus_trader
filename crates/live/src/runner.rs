@@ -67,8 +67,9 @@ use nautilus_common::{
         replace_system_event_sender,
     },
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent, data::DataCommand,
-        execution::TradingCommand,
+        DataEvent, ExecutionEvent, ExecutionReport, OrderEventApplicationStatus,
+        OrderEventConsumerReceipt, OrderEventPersistenceStatus, SystemCommand, SystemEvent,
+        data::DataCommand, execution::TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     runner::{
@@ -472,6 +473,16 @@ impl AsyncRunner {
         match event {
             ExecutionEvent::Order(order_event) => {
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
+            }
+            ExecutionEvent::AcknowledgedOrder(envelope) => {
+                let (order_event, receipt_tx) = envelope.into_parts();
+                let event_id = order_event.id();
+                msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
+                let _ = receipt_tx.send(OrderEventConsumerReceipt {
+                    event_id,
+                    application: OrderEventApplicationStatus::Unconfirmed,
+                    persistence: OrderEventPersistenceStatus::NotApplicable,
+                });
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in batch {
@@ -1456,6 +1467,31 @@ mod tests {
             }
             _ => panic!("Expected OrderSubmitted event"),
         }
+    }
+
+    #[rstest]
+    fn test_generic_runner_never_confirms_acknowledged_order_application() {
+        let event = OrderEventAny::Submitted(
+            OrderSubmittedSpec::builder()
+                .client_order_id(ClientOrderId::from("O-ACK-001"))
+                .build(),
+        );
+        let event_id = event.id();
+        let (envelope, mut receipt_rx) =
+            nautilus_common::messages::AcknowledgedOrderEvent::with_receipt_channel(event);
+
+        AsyncRunner::handle_exec_event(ExecutionEvent::AcknowledgedOrder(envelope));
+
+        let receipt = receipt_rx.try_recv().unwrap().unwrap();
+        assert_eq!(receipt.event_id, event_id);
+        assert_eq!(
+            receipt.application,
+            OrderEventApplicationStatus::Unconfirmed
+        );
+        assert_eq!(
+            receipt.persistence,
+            OrderEventPersistenceStatus::NotApplicable
+        );
     }
 
     #[tokio::test]

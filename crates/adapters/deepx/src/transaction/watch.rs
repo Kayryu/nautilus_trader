@@ -16,14 +16,14 @@
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
-#[cfg(test)]
-use parity_scale_codec::Encode;
-use parity_scale_codec::{Compact, Decode};
+use parity_scale_codec::{Compact, Decode, Encode};
 use serde::Deserialize;
 use serde_json::json;
-use subxt_core::config::{Hasher, substrate::BlakeTwo256};
-use subxt_core::events::{Events, Phase};
-use subxt_core::ext::scale_value::{Composite, Value as ScaleValue, ValueDef};
+use subxt_core::{
+    config::{Hasher, substrate::BlakeTwo256},
+    events::{Events, Phase},
+    ext::scale_value::{Composite, Value as ScaleValue, ValueDef},
+};
 use thiserror::Error;
 
 use super::{
@@ -1157,11 +1157,14 @@ pub enum DeepXTransactionWatchError {
         /// Index of the exact target extrinsic in the block.
         extrinsic_index: u32,
     },
-    /// The exact finalized block did not expose `System.Events` storage.
-    #[error("DeepX System.Events storage was unavailable at finalized block {0}")]
+    /// A finalized canonical block did not contain the exact target extrinsic.
+    #[error("DeepX finalized block {0} does not contain the target extrinsic")]
+    FinalizedExtrinsicUnavailable(u64),
+    /// The exact finalized block did not expose complete system event storage.
+    #[error("DeepX system event storage was unavailable at finalized block {0}")]
     EventStorageUnavailable(u64),
-    /// The exact finalized block returned malformed `System.Events` storage.
-    #[error("DeepX System.Events storage at finalized block {0} was not prefixed hexadecimal")]
+    /// The exact finalized block returned malformed system event storage.
+    #[error("DeepX system event storage at finalized block {0} was malformed")]
     InvalidEventStorage(u64),
     /// Runtime event evidence did not prove the durable perpetual cancellation.
     #[error(transparent)]
@@ -1222,6 +1225,52 @@ pub enum DeepXFinalityObservation {
     Pending(DeepXFinalizedRecoveryCheckpoint),
     /// The exact recorded inclusion remains canonical at a finalized height.
     Finalized(DeepXInclusionEvidence),
+}
+
+/// Exact location of one extrinsic in a finalized canonical block.
+///
+/// This proves transaction membership and finality, but not dispatch or business outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedTransactionLocation {
+    extrinsic_hash: [u8; 32],
+    block_number: u64,
+    block_hash: [u8; 32],
+    extrinsic_index: u32,
+}
+
+impl DeepXFinalizedTransactionLocation {
+    /// Returns the exact extrinsic hash located in the finalized block.
+    #[must_use]
+    pub const fn extrinsic_hash(&self) -> [u8; 32] {
+        self.extrinsic_hash
+    }
+
+    /// Returns the finalized block number containing the extrinsic.
+    #[must_use]
+    pub const fn block_number(&self) -> u64 {
+        self.block_number
+    }
+
+    /// Returns the finalized canonical block hash.
+    #[must_use]
+    pub const fn block_hash(&self) -> [u8; 32] {
+        self.block_hash
+    }
+
+    /// Returns the unique extrinsic index in the finalized block.
+    #[must_use]
+    pub const fn extrinsic_index(&self) -> u32 {
+        self.extrinsic_index
+    }
+}
+
+/// Finalized-location observation for an exact transaction and reported block height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXFinalizedTransactionLocationObservation {
+    /// The finalized head has not reached the requested block height.
+    Pending(DeepXFinalizedRecoveryCheckpoint),
+    /// The exact target extrinsic was found uniquely in the finalized canonical block.
+    Finalized(DeepXFinalizedTransactionLocation),
 }
 
 impl DeepXCanonicalBlockObservation {
@@ -1356,6 +1405,57 @@ pub async fn observe_finality(
             DeepXTransactionWatchError::FinalityEvidenceConflict(recorded_inclusion.block_number()),
         ),
     }
+}
+
+/// Locates an exact extrinsic at a requested height after that height becomes finalized.
+///
+/// This read-only boundary verifies the Watch endpoint capabilities, observes its finalized head,
+/// and recomputes every extrinsic hash in the canonical block at the requested height. It does not
+/// inspect events or infer dispatch or business success.
+///
+/// # Errors
+///
+/// Returns an error for mismatched capabilities, malformed chain data, duplicate target
+/// extrinsics, or a finalized canonical block which does not contain the exact target.
+pub async fn observe_finalized_transaction_location(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    target_extrinsic_hash: [u8; 32],
+    block_number: u64,
+) -> Result<DeepXFinalizedTransactionLocationObservation, DeepXTransactionWatchError> {
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != watch_url
+        || DEEPX_WATCH_RPC_METHODS
+            .iter()
+            .any(|method| !watch_capabilities.methods().contains(*method))
+    {
+        return Err(DeepXTransactionWatchError::CapabilitiesMismatch(
+            DeepXRpcRole::Watch,
+        ));
+    }
+
+    let checkpoint = observe_finalized_checkpoint_at(watch_url).await?;
+    if checkpoint.block_number() < block_number {
+        return Ok(DeepXFinalizedTransactionLocationObservation::Pending(
+            checkpoint,
+        ));
+    }
+
+    let observation =
+        observe_canonical_block_at(watch_url, block_number, target_extrinsic_hash).await?;
+    let extrinsic_index = observation.extrinsic_index().ok_or(
+        DeepXTransactionWatchError::FinalizedExtrinsicUnavailable(block_number),
+    )?;
+    Ok(DeepXFinalizedTransactionLocationObservation::Finalized(
+        DeepXFinalizedTransactionLocation {
+            extrinsic_hash: target_extrinsic_hash,
+            block_number,
+            block_hash: observation.block_hash(),
+            extrinsic_index,
+        },
+    ))
 }
 
 /// Exact transaction-membership observation from the submission node pool.
@@ -2020,21 +2120,60 @@ async fn fetch_system_events(
     block_number: u64,
 ) -> Result<Vec<u8>, DeepXTransactionWatchError> {
     let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
-    let encoded: Option<String> = client
-        .execute_rpc_call(json!({
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let encoded = fetch_storage_value(&client, SYSTEM_EVENTS_STORAGE_KEY, &block_hash).await?;
+    if let Some(encoded) = encoded {
+        return decode_event_storage_value(&encoded, block_number);
+    }
+
+    let threads_key = system_threads_storage_key(block_number);
+    let encoded_threads = fetch_storage_value(&client, &threads_key, &block_hash)
+        .await?
+        .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
+            block_number,
+        ))?;
+    let threads = decode_event_storage_value(&encoded_threads, block_number)?;
+    let [last_thread] = threads.as_slice() else {
+        return Err(DeepXTransactionWatchError::InvalidEventStorage(
+            block_number,
+        ));
+    };
+    let mut batches = Vec::with_capacity(usize::from(*last_thread) + 1);
+    for thread in 0..=*last_thread {
+        let key = system_events_map_storage_key(block_number, thread);
+        let encoded = fetch_storage_value(&client, &key, &block_hash)
+            .await?
+            .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
+                block_number,
+            ))?;
+        batches.push(decode_event_storage_value(&encoded, block_number)?);
+    }
+    combine_events_map_batches(&batches, block_number)
+}
+
+async fn fetch_storage_value(
+    client: &BlockchainHttpRpcClient,
+    storage_key: &str,
+    block_hash: &str,
+) -> Result<Option<String>, DeepXTransactionWatchError> {
+    client
+        .execute_optional_rpc_call(json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "state_getStorage",
-            "params": [SYSTEM_EVENTS_STORAGE_KEY, format!("0x{}", hex::encode(block_hash))],
+            "params": [storage_key, block_hash],
         }))
         .await
         .map_err(|source| DeepXTransactionWatchError::Rpc {
             method: "state_getStorage",
             source,
-        })?;
-    let encoded = encoded.ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
-        block_number,
-    ))?;
+        })
+}
+
+fn decode_event_storage_value(
+    encoded: &str,
+    block_number: u64,
+) -> Result<Vec<u8>, DeepXTransactionWatchError> {
     let value =
         encoded
             .strip_prefix("0x")
@@ -2049,14 +2188,10 @@ async fn fetch_system_events(
     hex::decode(value).map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))
 }
 
-#[cfg(test)]
 const SYSTEM_THREADS_STORAGE_KEY_PREFIX: &str = "System";
-#[cfg(test)]
 const SYSTEM_THREADS_STORAGE_ITEM: &str = "Threads";
-#[cfg(test)]
 const SYSTEM_EVENTS_MAP_STORAGE_ITEM: &str = "EventsMap";
 
-#[cfg(test)]
 fn system_map_storage_key(prefix: &str, item: &str, key: &[u8]) -> String {
     let mut encoded = Vec::with_capacity(32 + 16);
     encoded.extend_from_slice(&sp_crypto_hashing::twox_128(prefix.as_bytes()));
@@ -2065,7 +2200,6 @@ fn system_map_storage_key(prefix: &str, item: &str, key: &[u8]) -> String {
     format!("0x{}", hex::encode(encoded))
 }
 
-#[cfg(test)]
 fn system_threads_storage_key(block_number: u64) -> String {
     system_map_storage_key(
         SYSTEM_THREADS_STORAGE_KEY_PREFIX,
@@ -2074,7 +2208,6 @@ fn system_threads_storage_key(block_number: u64) -> String {
     )
 }
 
-#[cfg(test)]
 fn system_events_map_storage_key(block_number: u64, thread: u8) -> String {
     let block_key = sp_crypto_hashing::blake2_128(&block_number.to_le_bytes());
     let thread_key = sp_crypto_hashing::blake2_128(&[thread]);
@@ -2090,7 +2223,6 @@ fn system_events_map_storage_key(block_number: u64, thread: u8) -> String {
     format!("0x{}", hex::encode(encoded))
 }
 
-#[cfg(test)]
 fn combine_events_map_batches(
     batches: &[Vec<u8>],
     block_number: u64,
@@ -2115,15 +2247,15 @@ fn combine_events_map_batches(
     }
     let count = batches
         .iter()
-        .try_fold(0usize, |total, batch| {
+        .try_fold(0u32, |total, batch| {
             let mut input = batch.as_slice();
-            let count = Compact::<u32>::decode(&mut input).ok()?.0 as usize;
-            Some(total.checked_add(count)?)
+            let count = Compact::<u32>::decode(&mut input).ok()?.0;
+            total.checked_add(count)
         })
         .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
             block_number,
         ))?;
-    let mut combined = Compact(count as u32).encode();
+    let mut combined = Compact(count).encode();
     combined.extend_from_slice(&records);
     Ok(combined)
 }
@@ -2253,17 +2385,43 @@ mod tests {
 
     use super::*;
 
-    #[test]
+    #[rstest]
     fn events_map_storage_keys_use_substrate_hashers() {
+        let snapshot = runtime_snapshot();
         let threads = system_threads_storage_key(42);
         let events = system_events_map_storage_key(42, 3);
-        assert_eq!(threads.len(), 82);
-        assert_eq!(events.len(), 130);
+        let threads_address =
+            subxt_core::storage::address::dynamic("System", "Threads", vec![ScaleValue::u128(42)]);
+        let events_address = subxt_core::storage::address::dynamic(
+            "System",
+            "EventsMap",
+            vec![ScaleValue::u128(42), ScaleValue::u128(3)],
+        );
+        assert_eq!(
+            threads,
+            format!(
+                "0x{}",
+                hex::encode(
+                    subxt_core::storage::get_address_bytes(&threads_address, snapshot.metadata(),)
+                        .unwrap(),
+                ),
+            ),
+        );
+        assert_eq!(
+            events,
+            format!(
+                "0x{}",
+                hex::encode(
+                    subxt_core::storage::get_address_bytes(&events_address, snapshot.metadata(),)
+                        .unwrap(),
+                ),
+            ),
+        );
         assert_ne!(events, system_events_map_storage_key(42, 4));
         assert_ne!(events, system_events_map_storage_key(43, 3));
     }
 
-    #[test]
+    #[rstest]
     fn events_map_batches_combine_compact_counts() {
         let mut first = Compact(1_u32).encode();
         first.push(10);
@@ -2276,12 +2434,17 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn events_map_batches_reject_nonempty_zero_count() {
         let mut batch = Compact(0_u32).encode();
         batch.push(1);
         assert!(combine_events_map_batches(&[batch], 42).is_err());
     }
+    use nautilus_model::{
+        enums::OrderSide,
+        identifiers::{ClientOrderId, InstrumentId},
+    };
+
     use crate::{
         common::{
             DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, consts::DEEPX_TESTNET_GENESIS_HASH,
@@ -2293,10 +2456,6 @@ mod tests {
             DeepXDirectRuntimeIdentity, DeepXInclusionOutcome, DeepXNonceReservation,
             DeepXRecoveryDecision,
         },
-    };
-    use nautilus_model::{
-        enums::OrderSide,
-        identifiers::{ClientOrderId, InstrumentId},
     };
 
     #[derive(Clone)]
@@ -4003,7 +4162,7 @@ mod tests {
         finalized_hash: Option<String>,
         block_extrinsics: Arc<BTreeMap<u64, Vec<String>>>,
         pool_extrinsics: Arc<[String]>,
-        event_storage: Arc<BTreeMap<u64, String>>,
+        event_storage: Arc<BTreeMap<(u64, String), String>>,
         post_checkpoint_requests: Arc<AtomicUsize>,
     }
 
@@ -4063,9 +4222,9 @@ mod tests {
                 })
             }
             "state_getStorage" => {
-                assert_eq!(request["params"][0], SYSTEM_EVENTS_STORAGE_KEY);
+                let key = request["params"][0].as_str().unwrap();
                 let number = decode_mock_block_hash(request["params"][1].as_str().unwrap());
-                json!(state.event_storage.get(&number))
+                json!(state.event_storage.get(&(number, key.to_string())))
             }
             "author_pendingExtrinsics" => json!(state.pool_extrinsics.as_ref()),
             method => panic!("unexpected method {method}"),
@@ -4107,6 +4266,33 @@ mod tests {
         block_extrinsics: BTreeMap<u64, Vec<String>>,
         pool_extrinsics: Vec<String>,
         event_storage: BTreeMap<u64, String>,
+    ) -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+        Arc<AtomicUsize>,
+    ) {
+        let event_storage = event_storage
+            .into_iter()
+            .map(|(block_number, value)| {
+                ((block_number, SYSTEM_EVENTS_STORAGE_KEY.to_string()), value)
+            })
+            .collect();
+        recovery_endpoints_with_storage(
+            finalized_block,
+            finalized_hash,
+            block_extrinsics,
+            pool_extrinsics,
+            event_storage,
+        )
+        .await
+    }
+
+    async fn recovery_endpoints_with_storage(
+        finalized_block: u64,
+        finalized_hash: Option<String>,
+        block_extrinsics: BTreeMap<u64, Vec<String>>,
+        pool_extrinsics: Vec<String>,
+        event_storage: BTreeMap<(u64, String), String>,
     ) -> (
         DeepXValidatedRpcEndpoints,
         DeepXValidatedRpcMethodCapabilities,
@@ -4155,7 +4341,7 @@ mod tests {
         (endpoints, capabilities, post_checkpoint_requests)
     }
 
-    #[test]
+    #[rstest]
     fn finalized_event_storage_metadata_layout() {
         let snapshot = runtime_snapshot();
         let system = snapshot.metadata().pallet_by_name("System").unwrap();
@@ -4176,6 +4362,64 @@ mod tests {
         assert_eq!(batches.default_bytes(), &[0]);
     }
 
+    #[rstest]
+    fn finalized_event_fixture_proves_known_perpetual_placement() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-185969410/system_events.json",
+        )))
+        .unwrap();
+        let block_hash = hex::decode_array(
+            fixture["block_hash"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let event_bytes =
+            hex::decode(fixture["result"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let snapshot = runtime_snapshot_for_spec(369);
+        let identity = DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new("O-DEEPX-CAPTURED-1789445053841"),
+            [0; 20],
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: 1_789_445_053_841,
+            },
+            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
+            crate::signing::DeepXPerpPlaceParams {
+                subaccount: hex::decode_array("4ded31cb63949b52f9dfc9bcfade4eab7017eadc").unwrap(),
+                market_id: 3,
+                is_long: true,
+                size: 300_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: crate::signing::DeepXPerpOrderType::Limit(
+                    crate::signing::DeepXTimeInForce::Gtc,
+                ),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: crate::signing::DeepXPostOnlyParam::None,
+            },
+        );
+
+        let evidence = verify_perp_place_inclusion_events(
+            &snapshot,
+            &identity,
+            block_hash,
+            fixture["block_number"].as_u64().unwrap(),
+            u32::try_from(fixture["extrinsic_index"].as_u64().unwrap()).unwrap(),
+            &event_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.block_hash(), block_hash);
+        assert_eq!(evidence.block_number(), 185_969_410);
+        assert_eq!(evidence.extrinsic_index(), 8);
+        assert_eq!(evidence.outcome(), DeepXInclusionOutcome::Success);
+    }
+
     #[tokio::test]
     async fn finalized_event_storage_rejects_missing_and_malformed_values() {
         for encoded in [None, Some("00"), Some("0x"), Some("0xgg"), Some("0x0")] {
@@ -4190,10 +4434,7 @@ mod tests {
             match encoded {
                 None => assert!(matches!(
                     result,
-                    Err(DeepXTransactionWatchError::Rpc {
-                        method: "state_getStorage",
-                        ..
-                    })
+                    Err(DeepXTransactionWatchError::EventStorageUnavailable(41))
                 )),
                 Some(_) => assert!(matches!(
                     result,
@@ -4213,6 +4454,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, vec![0, 171, 255]);
+    }
+
+    #[tokio::test]
+    async fn finalized_event_storage_combines_every_thread_through_inclusive_last_index() {
+        let block_number = 41;
+        let mut first = Compact(1u32).encode();
+        first.push(0xaa);
+        let mut second = Compact(2u32).encode();
+        second.extend_from_slice(&[0xbb, 0xcc]);
+        let third = Compact(0u32).encode();
+        let storage = BTreeMap::from([
+            (
+                (block_number, system_threads_storage_key(block_number)),
+                "0x02".to_string(),
+            ),
+            (
+                (block_number, system_events_map_storage_key(block_number, 0)),
+                format!("0x{}", hex::encode(&first)),
+            ),
+            (
+                (block_number, system_events_map_storage_key(block_number, 1)),
+                format!("0x{}", hex::encode(&second)),
+            ),
+            (
+                (block_number, system_events_map_storage_key(block_number, 2)),
+                format!("0x{}", hex::encode(&third)),
+            ),
+        ]);
+        let (endpoints, _, _) =
+            recovery_endpoints_with_storage(42, None, BTreeMap::new(), vec![], storage).await;
+        let hash = hex::decode_array(block_hash(block_number).trim_start_matches("0x")).unwrap();
+
+        let bytes = fetch_system_events(
+            endpoints.url_for(DeepXRpcRole::Recovery),
+            hash,
+            block_number,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = Compact(3u32).encode();
+        expected.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn finalized_event_storage_rejects_missing_thread_batch() {
+        let block_number = 41;
+        let storage = BTreeMap::from([
+            (
+                (block_number, system_threads_storage_key(block_number)),
+                "0x01".to_string(),
+            ),
+            (
+                (block_number, system_events_map_storage_key(block_number, 0)),
+                "0x00".to_string(),
+            ),
+        ]);
+        let (endpoints, _, _) =
+            recovery_endpoints_with_storage(42, None, BTreeMap::new(), vec![], storage).await;
+        let hash = hex::decode_array(block_hash(block_number).trim_start_matches("0x")).unwrap();
+
+        let result = fetch_system_events(
+            endpoints.url_for(DeepXRpcRole::Recovery),
+            hash,
+            block_number,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DeepXTransactionWatchError::EventStorageUnavailable(41)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalized_event_storage_rejects_malformed_last_thread() {
+        let block_number = 41;
+        for encoded in ["0x", "0x0001", "0xgg"] {
+            let storage = BTreeMap::from([(
+                (block_number, system_threads_storage_key(block_number)),
+                encoded.to_string(),
+            )]);
+            let (endpoints, _, _) =
+                recovery_endpoints_with_storage(42, None, BTreeMap::new(), vec![], storage).await;
+            let hash =
+                hex::decode_array(block_hash(block_number).trim_start_matches("0x")).unwrap();
+
+            let result = fetch_system_events(
+                endpoints.url_for(DeepXRpcRole::Recovery),
+                hash,
+                block_number,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(DeepXTransactionWatchError::InvalidEventStorage(41)),
+            ));
+        }
     }
 
     async fn spawn_recovery_rpc(
@@ -4318,6 +4659,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(observation.extrinsic_index(), None);
+    }
+
+    #[tokio::test]
+    async fn finalized_transaction_location_waits_then_binds_exact_membership() {
+        let target = extrinsic(&[1, 2, 3, 4]);
+        let target_hash = BlakeTwo256.hash(&target).0;
+        let blocks = BTreeMap::from([(
+            41,
+            vec![
+                format!("0x{}", hex::encode(extrinsic(&[5, 6]))),
+                format!("0x{}", hex::encode(&target)),
+            ],
+        )]);
+        let (pending_endpoints, pending_capabilities, _) =
+            recovery_endpoints(40, None, blocks.clone(), vec![]).await;
+
+        let pending = observe_finalized_transaction_location(
+            &pending_endpoints,
+            &pending_capabilities,
+            target_hash,
+            41,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            pending,
+            DeepXFinalizedTransactionLocationObservation::Pending(checkpoint)
+                if checkpoint.block_number() == 40
+        ));
+
+        let (endpoints, capabilities, _) = recovery_endpoints(42, None, blocks, vec![]).await;
+        let finalized =
+            observe_finalized_transaction_location(&endpoints, &capabilities, target_hash, 41)
+                .await
+                .unwrap();
+        let DeepXFinalizedTransactionLocationObservation::Finalized(location) = finalized else {
+            panic!("expected finalized transaction location");
+        };
+
+        assert_eq!(location.extrinsic_hash(), target_hash);
+        assert_eq!(location.block_number(), 41);
+        assert_eq!(
+            location.block_hash(),
+            hex::decode_array(block_hash(41).trim_start_matches("0x")).unwrap(),
+        );
+        assert_eq!(location.extrinsic_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn finalized_transaction_location_rejects_absent_target() {
+        let blocks = BTreeMap::from([(
+            41,
+            vec![format!("0x{}", hex::encode(extrinsic(&[1, 2, 3])))],
+        )]);
+        let (endpoints, capabilities, _) = recovery_endpoints(42, None, blocks, vec![]).await;
+
+        let result =
+            observe_finalized_transaction_location(&endpoints, &capabilities, [9; 32], 41).await;
+
+        assert!(matches!(
+            result,
+            Err(DeepXTransactionWatchError::FinalizedExtrinsicUnavailable(
+                41
+            )),
+        ));
     }
 
     #[tokio::test]

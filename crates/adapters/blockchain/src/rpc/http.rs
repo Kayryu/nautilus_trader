@@ -143,6 +143,47 @@ impl BlockchainHttpRpcClient {
         self.execute_rpc_call_with_timeout(rpc_request, None).await
     }
 
+    /// Executes a JSON-RPC call whose successful result may legitimately be `null`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP RPC request fails, the response cannot be parsed, or the
+    /// response contains a JSON-RPC error.
+    pub async fn execute_optional_rpc_call<T: DeserializeOwned>(
+        &self,
+        rpc_request: serde_json::Value,
+    ) -> anyhow::Result<Option<T>> {
+        let bytes = self
+            .send_rpc_request(rpc_request, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to execute RPC request: {e}"))?;
+        let raw = serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to parse RPC response: {e}"))?;
+        let has_result = raw
+            .as_object()
+            .is_some_and(|response| response.contains_key("result"));
+        let parsed =
+            serde_json::from_slice::<RpcNodeHttpResponse<T>>(bytes.as_ref()).map_err(|e| {
+                let raw_response = String::from_utf8_lossy(bytes.as_ref());
+                let preview = rpc_response_preview(&raw_response);
+                anyhow::anyhow!("Failed to parse RPC response: {e}\nRaw response: {preview}")
+            })?;
+
+        if parsed.jsonrpc.is_none()
+            && let (Some(code), Some(message)) = (parsed.code, parsed.message)
+        {
+            anyhow::bail!("RPC provider error {code}: {message}");
+        }
+
+        if let Some(error) = parsed.error {
+            anyhow::bail!("RPC error {}: {}", error.code, error.message);
+        }
+
+        anyhow::ensure!(has_result, "Response missing both result and error fields");
+
+        Ok(parsed.result)
+    }
+
     /// Executes an Ethereum JSON-RPC call with an optional per-request timeout and deserializes
     /// the response into the specified type T.
     ///
@@ -1596,6 +1637,75 @@ pub(crate) mod tests {
         assert!(!debug.contains(PATH_SECRET));
         assert!(!debug.contains(QUERY_SECRET));
         assert!(!debug.contains(&http_rpc_url));
+    }
+
+    #[tokio::test]
+    async fn optional_rpc_call_accepts_null_result() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null,
+        })
+        .to_string();
+        let (client, _) =
+            client_for(MockRpcState::default().with_response("state_getStorage", &response)).await;
+
+        let result: Option<String> = client
+            .execute_optional_rpc_call(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "state_getStorage",
+                "params": ["0x00"],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn optional_rpc_call_rejects_rpc_error() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32601, "message": "method not found"},
+        })
+        .to_string();
+        let (client, _) =
+            client_for(MockRpcState::default().with_response("state_getStorage", &response)).await;
+
+        let result = client
+            .execute_optional_rpc_call::<String>(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "state_getStorage",
+                "params": ["0x00"],
+            }))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn optional_rpc_call_rejects_missing_result_and_error() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+        })
+        .to_string();
+        let (client, _) =
+            client_for(MockRpcState::default().with_response("state_getStorage", &response)).await;
+
+        let result = client
+            .execute_optional_rpc_call::<String>(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "state_getStorage",
+                "params": ["0x00"],
+            }))
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

@@ -19,6 +19,8 @@ mod postgres;
 
 use std::fmt::{self, Debug};
 
+use nautilus_common::messages::OrderEventConsumerReceipt;
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::OrderSide,
     identifiers::{ClientOrderId, InstrumentId},
@@ -29,12 +31,15 @@ use thiserror::Error;
 
 use super::{
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalityObservation,
-    DeepXFinalizedRecoveryCollection, DeepXNonceReservation, DeepXRecoveryDecision,
-    DeepXReorganizationDecision, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
-    DeepXTimestampNonceError, DeepXTransactionIdentity, DeepXTransactionObservation,
-    DeepXTransactionRecord, DeepXTransactionRecordError, DeepXTransactionState,
-    DeepXTransactionWatchError, collect_finalized_recovery_scan_with_event_evidence,
-    observe_finality, observe_reorganization, observe_submission_pool,
+    DeepXFinalizedRecoveryCollection, DeepXFrameworkOrderContext,
+    DeepXFrameworkOrderEventAcknowledgementError, DeepXFrameworkOrderEventStagingError,
+    DeepXNonceReservation, DeepXRecoveryDecision, DeepXReorganizationDecision,
+    DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
+    DeepXTransactionIdentity, DeepXTransactionObservation, DeepXTransactionRecord,
+    DeepXTransactionRecordError, DeepXTransactionState, DeepXTransactionWatchError,
+    acknowledge_perp_place_framework_order_event,
+    collect_finalized_recovery_scan_with_event_evidence, observe_finality, observe_reorganization,
+    observe_submission_pool, stage_perp_place_framework_order_events,
 };
 use crate::{
     common::DeepXPrivateKey,
@@ -338,6 +343,9 @@ where
 /// Failure while reserving and durably committing a timestamp transaction identity.
 #[derive(Debug, Error)]
 pub enum DeepXReservationPreparationError {
+    /// Framework recovery identity is internally inconsistent.
+    #[error(transparent)]
+    Record(#[from] DeepXTransactionRecordError),
     /// Timestamp nonce allocation could not be proven safe.
     #[error(transparent)]
     TimestampNonce(#[from] DeepXTimestampNonceError),
@@ -431,7 +439,84 @@ pub async fn prepare_perp_place_reservation<S>(
     instrument_id: InstrumentId,
     order_side: OrderSide,
     runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
     params: crate::signing::DeepXPerpPlaceParams,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    prepare_perp_place_reservation_inner(
+        store,
+        lease,
+        allocator,
+        local_time_ms,
+        chain_time_ms,
+        client_order_id,
+        instrument_id,
+        order_side,
+        runtime,
+        submission_scan_checkpoint,
+        params,
+        None,
+    )
+    .await
+}
+
+/// Allocates a perpetual placement reservation with immutable framework recovery identity.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, timestamp allocation, framework identity, durable create,
+/// or the exact Created acknowledgement cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_framework_perp_place_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: crate::signing::DeepXPerpPlaceParams,
+    framework_order_context: DeepXFrameworkOrderContext,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    prepare_perp_place_reservation_inner(
+        store,
+        lease,
+        allocator,
+        local_time_ms,
+        chain_time_ms,
+        client_order_id,
+        instrument_id,
+        order_side,
+        runtime,
+        submission_scan_checkpoint,
+        params,
+        Some(framework_order_context),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_perp_place_reservation_inner<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: crate::signing::DeepXPerpPlaceParams,
+    framework_order_context: Option<DeepXFrameworkOrderContext>,
 ) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
 where
     S: DeepXTransactionStore,
@@ -439,9 +524,16 @@ where
     if lease.signer() != allocator.signer() {
         return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
     }
+    if framework_order_context.is_some_and(|context| {
+        context.client_order_id() != client_order_id
+            || context.instrument_id() != instrument_id
+            || !context.has_distinct_event_identity()
+    }) {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
     store.verify_signer_lease(lease).await?;
     let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
-    let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_place(
+    let identity = DeepXTransactionIdentity::new_perp_place(
         client_order_id,
         allocator.signer(),
         instrument_id,
@@ -449,7 +541,18 @@ where
         nonce,
         runtime,
         params,
-    ));
+    );
+    let record = match framework_order_context {
+        Some(context) => DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            submission_scan_checkpoint,
+            context,
+        ),
+        None => DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity,
+            submission_scan_checkpoint,
+        ),
+    };
     let committed = store.create_committed(lease, &record).await?;
     committed.verify(&record)?;
     Ok(DeepXPreparedReservation { record, committed })
@@ -1898,6 +2001,21 @@ impl DeepXPreparedSubmission {
     pub fn into_permit(self) -> DeepXSubmissionPermit {
         self.permit
     }
+
+    /// Consumes the preparation into its durable submitting context and transmission permit.
+    ///
+    /// Keeping the context separately allows a one-shot transport coordinator to commit verified
+    /// acceptance or retain exact reconciliation evidence after the permit is consumed.
+    #[must_use]
+    pub fn into_parts(self) -> (DeepXRestoredTransactionRecord, DeepXSubmissionPermit) {
+        (
+            DeepXRestoredTransactionRecord {
+                record: self.record,
+                committed: self.committed,
+            },
+            self.permit,
+        )
+    }
 }
 
 /// Atomically prepares a durably signed record for its first transmission.
@@ -2089,7 +2207,10 @@ pub enum DeepXFinalizedRecoveryCommitError {
     /// The durable record has no signed extrinsic hash to bind to the finalized scan.
     #[error("DeepX finalized recovery requires durable signed bytes")]
     MissingSignedExtrinsic,
-    /// Only a prior complete not-included checkpoint can authorize this recovery scan.
+    /// The transaction has no durable finalized boundary from before submission.
+    #[error("DeepX finalized recovery requires a durable pre-submission checkpoint")]
+    MissingSubmissionScanCheckpoint,
+    /// The lifecycle state cannot be advanced through finalized checkpoint recovery.
     #[error("DeepX transaction state {0:?} is not eligible for finalized checkpoint recovery")]
     IneligibleState(DeepXTransactionState),
     /// The not-included lifecycle state did not retain its required checkpoint evidence.
@@ -2114,6 +2235,124 @@ pub enum DeepXFinalizedRecoveryCommitError {
 pub struct DeepXCommittedObservation {
     record: DeepXTransactionRecord,
     committed: DeepXCommittedTransactionRecord,
+}
+
+/// Failure while staging eligible framework order events durably.
+#[derive(Debug, Error)]
+pub enum DeepXFrameworkOrderOutboxCommitError {
+    /// Event eligibility or staged record invariants could not be proven.
+    #[error(transparent)]
+    Staging(#[from] DeepXFrameworkOrderEventStagingError),
+    /// The consumer receipt did not prove exact durable application.
+    #[error(transparent)]
+    Acknowledgement(#[from] DeepXFrameworkOrderEventAcknowledgementError),
+    /// Persistence or signer ownership could not be proven.
+    #[error(transparent)]
+    Persistence(#[from] DeepXTransactionPersistenceError),
+}
+
+/// Result of durably staging every currently eligible framework order event.
+#[derive(Debug)]
+pub struct DeepXCommittedFrameworkOrderOutbox {
+    record: DeepXTransactionRecord,
+    committed: DeepXCommittedTransactionRecord,
+}
+
+impl DeepXCommittedFrameworkOrderOutbox {
+    /// Returns the transaction record containing the committed staged outbox.
+    #[must_use]
+    pub const fn record(&self) -> &DeepXTransactionRecord {
+        &self.record
+    }
+
+    /// Returns acknowledgement of the exact staged transaction record.
+    #[must_use]
+    pub const fn committed(&self) -> &DeepXCommittedTransactionRecord {
+        &self.committed
+    }
+}
+
+/// Stages every currently eligible framework order event through revision-checked CAS.
+///
+/// Existing entries and their timestamps remain unchanged. The returned entries are pending only;
+/// this function performs no channel send and creates no delivery acknowledgement.
+///
+/// # Errors
+///
+/// Returns an error without releasing staged output if signer ownership, the prior durable
+/// acknowledgement, event eligibility, record invariants, or the CAS outcome cannot be proven.
+pub async fn commit_framework_order_event_staging<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_record: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    reconciliation: bool,
+) -> Result<DeepXCommittedFrameworkOrderOutbox, DeepXFrameworkOrderOutboxCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_record.verify(record)?;
+
+    let mut candidate = record.clone();
+    let changed =
+        stage_perp_place_framework_order_events(&mut candidate, ts_event, ts_init, reconciliation)?;
+    let committed = if changed {
+        let committed = store
+            .compare_and_set_committed(lease, committed_record, &candidate)
+            .await?;
+        committed.verify(&candidate)?;
+        committed
+    } else {
+        committed_record.clone()
+    };
+    Ok(DeepXCommittedFrameworkOrderOutbox {
+        record: candidate,
+        committed,
+    })
+}
+
+/// Commits one exact framework order-event consumer acknowledgement through revision-checked CAS.
+///
+/// An identical repeated acknowledgement returns the existing revision. A terminal receipt cannot
+/// advance before its submitted predecessor is durably acknowledged.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, prior record acknowledgement, consumer application,
+/// durable cache persistence, event identity, ordering, record invariants, or CAS cannot be proven.
+pub async fn commit_framework_order_event_acknowledgement<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_record: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    receipt: OrderEventConsumerReceipt,
+) -> Result<DeepXCommittedFrameworkOrderOutbox, DeepXFrameworkOrderOutboxCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_record.verify(record)?;
+
+    let mut candidate = record.clone();
+    let changed = acknowledge_perp_place_framework_order_event(&mut candidate, receipt)?;
+    let committed = if changed {
+        let committed = store
+            .compare_and_set_committed(lease, committed_record, &candidate)
+            .await?;
+        committed.verify(&candidate)?;
+        committed
+    } else {
+        committed_record.clone()
+    };
+    Ok(DeepXCommittedFrameworkOrderOutbox {
+        record: candidate,
+        committed,
+    })
 }
 
 impl DeepXCommittedObservation {
@@ -2418,6 +2657,104 @@ where
     }
 }
 
+/// Reconciles a submitted perpetual placement from its pre-submission finalized checkpoint.
+///
+/// Exact durable bytes and call arguments are verified before any network access. A canonical
+/// finalized inclusion is committed in two revision-checked steps so a crash cannot skip the
+/// durable in-block boundary. Pending-pool absence preserves the unresolved lifecycle because a
+/// non-atomic pool snapshot cannot authorize replay or replacement.
+///
+/// # Errors
+///
+/// Returns an error before network access unless the record is submitting or accepted, retains
+/// signed bytes and a pre-submission checkpoint, matches the approved runtime snapshot, and its
+/// exact signed call passes verification. RPC conflicts and commit failures remain fail-closed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery binds endpoint, durable store, snapshot, and verifier evidence"
+)]
+pub async fn reconcile_submitted_perp_place_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+    verifier: &DeepXPerpPlaceCallVerifier,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
+    let signed_extrinsic = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?;
+    let checkpoint = record
+        .submission_scan_checkpoint()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSubmissionScanCheckpoint)?;
+    verifier.verify(record.identity(), signed_extrinsic)?;
+
+    let collection = super::collect_finalized_perp_place_recovery_scan(
+        endpoints,
+        capabilities,
+        snapshot,
+        record.identity(),
+        checkpoint.finalized_block_number(),
+        checkpoint.finalized_block_hash(),
+        max_blocks_per_range,
+        signed_extrinsic.extrinsic_hash(),
+    )
+    .await
+    .map_err(|e| *e)?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            match observe_submission_pool(endpoints, signed_extrinsic.extrinsic_hash()).await? {
+                super::DeepXPoolObservation::Present => DeepXRecoveryDecision::PoolAccepted,
+                super::DeepXPoolObservation::Absent => {
+                    return Ok(DeepXCommittedObservation {
+                        record: record.clone(),
+                        committed: restored.committed().clone(),
+                    });
+                }
+            }
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::ActionRequired => {
+                return Ok(DeepXCommittedObservation {
+                    record: record.clone(),
+                    committed: restored.committed().clone(),
+                });
+            }
+            decision => decision,
+        },
+    };
+    let committed =
+        commit_recovery_decision(store, lease, restored.committed(), record, decision).await?;
+    if !matches!(decision, DeepXRecoveryDecision::FinalizedInclusion(_)) {
+        return Ok(committed);
+    }
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        committed.committed(),
+        committed.record(),
+        decision,
+    )
+    .await?)
+}
+
 /// Reconciles one acknowledged not-included record from its exact finalized checkpoint.
 ///
 /// All authority-bearing inputs are derived from `restored`. An up-to-date checkpoint preserves
@@ -2650,9 +2987,11 @@ mod tests {
     };
 
     use axum::{Json, Router, extract::State, routing::post};
+    use nautilus_common::messages::{OrderEventApplicationStatus, OrderEventPersistenceStatus};
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         enums::OrderSide,
-        identifiers::{ClientOrderId, InstrumentId},
+        identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     };
     use rstest::rstest;
     use serde_json::{Value as JsonValue, json};
@@ -2671,8 +3010,8 @@ mod tests {
         transaction::{
             DeepXAbsenceEvidence, DeepXAutomaticReplayDecision, DeepXDirectRuntimeIdentity,
             DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation,
-            DeepXSubmissionPermit, DeepXTransactionIdentity, DeepXTransactionObservation,
-            submit_with_bounded_ambiguity_retry,
+            DeepXSubmissionPermit, DeepXSubmissionScanCheckpoint, DeepXTransactionIdentity,
+            DeepXTransactionObservation, submit_with_bounded_ambiguity_retry,
         },
     };
 
@@ -2755,6 +3094,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FinalizedRecoveryRpcState {
         finalized_block: u64,
+        pending_extrinsics: Vec<String>,
     }
 
     async fn finalized_recovery_rpc(
@@ -2800,7 +3140,7 @@ mod tests {
                     },
                 })
             }
-            "author_pendingExtrinsics" => json!([]),
+            "author_pendingExtrinsics" => json!(state.pending_extrinsics),
             method => panic!("unexpected method {method}"),
         };
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
@@ -2812,6 +3152,16 @@ mod tests {
         DeepXValidatedRpcEndpoints,
         DeepXValidatedRpcMethodCapabilities,
     ) {
+        finalized_recovery_endpoints_with_pool(finalized_block, Vec::new()).await
+    }
+
+    async fn finalized_recovery_endpoints_with_pool(
+        finalized_block: u64,
+        pending_extrinsics: Vec<String>,
+    ) -> (
+        DeepXValidatedRpcEndpoints,
+        DeepXValidatedRpcMethodCapabilities,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2819,7 +3169,10 @@ mod tests {
                 listener,
                 Router::new()
                     .route("/", post(finalized_recovery_rpc))
-                    .with_state(FinalizedRecoveryRpcState { finalized_block }),
+                    .with_state(FinalizedRecoveryRpcState {
+                        finalized_block,
+                        pending_extrinsics,
+                    }),
             )
             .await
             .unwrap();
@@ -4048,11 +4401,16 @@ mod tests {
             InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
             OrderSide::Buy,
             remark_runtime(),
+            DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
             params,
         )
         .await
         .unwrap();
         assert_eq!(created.committed().revision().value(), 1);
+        assert_eq!(
+            created.record().submission_scan_checkpoint(),
+            Some(DeepXSubmissionScanCheckpoint::new(40, [40; 32])),
+        );
         let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
         let signed = prepare_signed_perp_place_transaction(
             &store,
@@ -4080,7 +4438,13 @@ mod tests {
             DeepXTransactionState::Submitting
         );
         assert_eq!(submitting.committed().revision().value(), 3);
-        let (bytes, hash) = submitting.into_permit().into_payload();
+        let (submitting_context, permit) = submitting.into_parts();
+        assert_eq!(
+            submitting_context.record().lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+        assert_eq!(submitting_context.committed().revision().value(), 3);
+        let (bytes, hash) = permit.into_payload();
         let durable = signed.record().signed_extrinsic().unwrap();
         assert_eq!(bytes, durable.bytes());
         assert_eq!(hash, durable.extrinsic_hash());
@@ -4139,7 +4503,13 @@ mod tests {
     #[tokio::test]
     async fn direct_dispatch_prepares_restores_and_binds_submission(#[case] operation: u8) {
         let baseline = direct_operation_fixture(operation);
-        let created = DeepXTransactionRecord::created(baseline.identity().clone());
+        let created = match baseline.submission_scan_checkpoint() {
+            Some(checkpoint) => DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+                baseline.identity().clone(),
+                checkpoint,
+            ),
+            None => DeepXTransactionRecord::created(baseline.identity().clone()),
+        };
         let store = TestStore::empty();
         let lease = store
             .acquire_signer_lease(created.identity().signer())
@@ -4202,6 +4572,97 @@ mod tests {
         assert_eq!(store.current_revision(), 3);
     }
 
+    #[tokio::test]
+    async fn framework_perp_place_reservation_persists_exact_context() {
+        let store = TestStore::empty();
+        let signer = derive_signer_account_id(&remark_key()).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+        let allocator = DeepXTimestampNonceAllocator::from_records(signer, [], 10);
+        let params = perp_place_params(perp_place_fixture(1, None).identity()).unwrap();
+        let context = DeepXFrameworkOrderContext::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            AccountId::from("DEEPX-001"),
+            UUID4::from_bytes([1; 16]),
+            UnixNanos::from(10),
+            UUID4::from_bytes([2; 16]),
+            UnixNanos::from(9),
+            Some(UUID4::from_bytes([3; 16])),
+            Some(UUID4::from_bytes([4; 16])),
+            UUID4::from_bytes([5; 16]),
+            UUID4::from_bytes([6; 16]),
+        );
+
+        let created = prepare_framework_perp_place_reservation(
+            &store,
+            &lease,
+            &allocator,
+            1_725_000_000_125,
+            1_725_000_000_125,
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            OrderSide::Buy,
+            remark_runtime(),
+            DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+            params,
+            context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.record().framework_order_context(), Some(context));
+        assert_eq!(created.committed().revision().value(), 1);
+    }
+
+    #[tokio::test]
+    async fn framework_context_mismatch_fails_before_nonce_allocation() {
+        let store = TestStore::empty();
+        let signer = derive_signer_account_id(&remark_key()).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+        let allocator = DeepXTimestampNonceAllocator::from_records(signer, [], 10);
+        let params = perp_place_params(perp_place_fixture(1, None).identity()).unwrap();
+        let context = DeepXFrameworkOrderContext::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            ClientOrderId::from("O-DIFFERENT"),
+            AccountId::from("DEEPX-001"),
+            UUID4::from_bytes([1; 16]),
+            UnixNanos::from(10),
+            UUID4::from_bytes([2; 16]),
+            UnixNanos::from(9),
+            None,
+            None,
+            UUID4::from_bytes([5; 16]),
+            UUID4::from_bytes([6; 16]),
+        );
+
+        assert!(matches!(
+            prepare_framework_perp_place_reservation(
+                &store,
+                &lease,
+                &allocator,
+                1_725_000_000_125,
+                1_725_000_000_125,
+                ClientOrderId::from("O-19700101-000000-001-001-1"),
+                InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+                OrderSide::Buy,
+                remark_runtime(),
+                DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+                params,
+                context,
+            )
+            .await,
+            Err(DeepXReservationPreparationError::Record(
+                DeepXTransactionRecordError::InconsistentFrameworkContext,
+            )),
+        ));
+        assert_eq!(allocator.last_reserved(), None);
+        assert_eq!(store.current_revision(), 0);
+    }
+
     #[rstest]
     #[case(0, "Perp", "PlaceOrder")]
     #[case(1, "Perp", "ClosePosition")]
@@ -4221,7 +4682,13 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use nautilus_core::hex;
         let baseline = direct_operation_fixture(operation);
-        let created = DeepXTransactionRecord::created(baseline.identity().clone());
+        let created = match baseline.submission_scan_checkpoint() {
+            Some(checkpoint) => DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+                baseline.identity().clone(),
+                checkpoint,
+            ),
+            None => DeepXTransactionRecord::created(baseline.identity().clone()),
+        };
         let store = TestStore::empty();
         let lease = store
             .acquire_signer_lease(created.identity().signer())
@@ -4299,17 +4766,19 @@ mod tests {
     #[case(8)]
     #[tokio::test]
     async fn rest_acceptance_and_pending_status_poll_never_claim_finality(#[case] operation: u8) {
-        use crate::transaction::{
-            DeepXRestStatusPollPolicy, DeepXRestStatusPollTermination, DeepXTransactionOperation,
-            poll_rest_transaction_status, submit_rest_transaction_once,
-        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         use axum::{
             Json, Router,
             extract::Query,
             routing::{get, post},
         };
         use nautilus_core::hex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::transaction::{
+            DeepXRestStatusPollPolicy, DeepXRestStatusPollTermination, DeepXTransactionOperation,
+            poll_rest_transaction_status, submit_rest_transaction_once,
+        };
 
         let record = direct_operation_fixture(operation);
         let hash = record.signed_extrinsic().unwrap().extrinsic_hash();
@@ -4845,6 +5314,7 @@ mod tests {
                 InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
                 OrderSide::Buy,
                 remark_runtime(),
+                DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
                 params,
             )
             .await,
@@ -4891,9 +5361,438 @@ mod tests {
             u64::MAX,
         )
         .unwrap();
-        let mut record = DeepXTransactionRecord::created(identity);
+        let mut record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+        );
         record.record_signed(&signed).unwrap();
         record
+    }
+
+    fn framework_submitting_record() -> DeepXTransactionRecord {
+        let params = crate::signing::DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 3,
+            is_long: true,
+            size: 1,
+            price: 100,
+            order_type: crate::signing::DeepXPerpOrderType::Limit(
+                crate::signing::DeepXTimeInForce::Gtc,
+            ),
+            take_profit: None,
+            stop_loss: None,
+            reduce_only: false,
+            post_only: crate::signing::DeepXPostOnlyParam::None,
+        };
+        let client_order_id = ClientOrderId::new("O-19700101-000000-001-001-1");
+        let instrument_id = InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap();
+        let identity = DeepXTransactionIdentity::new_perp_place(
+            client_order_id,
+            derive_signer_account_id(&remark_key()).unwrap(),
+            instrument_id,
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: u64::MAX },
+            remark_runtime(),
+            params,
+        );
+        let context = DeepXFrameworkOrderContext::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-DEEPX-001"),
+            instrument_id,
+            client_order_id,
+            AccountId::from("DEEPX-001"),
+            UUID4::from_bytes([1; 16]),
+            UnixNanos::from(10),
+            UUID4::from_bytes([2; 16]),
+            UnixNanos::from(9),
+            None,
+            None,
+            UUID4::from_bytes([3; 16]),
+            UUID4::from_bytes([4; 16]),
+        );
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let signed = crate::signing::sign_perp_place_order(
+            &service.acquire().unwrap(),
+            &remark_key(),
+            params,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut record = DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+            context,
+        );
+        record.record_signed(&signed).unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+    }
+
+    fn framework_finalized_staged_record() -> DeepXTransactionRecord {
+        let mut record = framework_submitting_record();
+        let inclusion = DeepXInclusionEvidence::from_durable_parts(
+            [5; 32],
+            41,
+            2,
+            DeepXInclusionOutcome::Success,
+        );
+        record
+            .apply_observation(DeepXTransactionObservation::Included(inclusion))
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
+            .unwrap();
+        stage_perp_place_framework_order_events(
+            &mut record,
+            UnixNanos::from(100),
+            UnixNanos::from(101),
+            true,
+        )
+        .unwrap();
+        record
+    }
+
+    fn framework_receipt(
+        event_id: UUID4,
+        application: OrderEventApplicationStatus,
+        persistence: OrderEventPersistenceStatus,
+    ) -> OrderEventConsumerReceipt {
+        OrderEventConsumerReceipt {
+            event_id,
+            application,
+            persistence,
+        }
+    }
+
+    #[tokio::test]
+    async fn framework_order_event_staging_commits_once_and_retains_timestamps() {
+        let record = framework_submitting_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+
+        let staged = commit_framework_order_event_staging(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            UnixNanos::from(100),
+            UnixNanos::from(101),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.committed().revision().value(), 4);
+        let submitted = staged
+            .record()
+            .framework_order_outbox()
+            .unwrap()
+            .submitted()
+            .unwrap();
+        assert_eq!(submitted.ts_event(), UnixNanos::from(100));
+        assert_eq!(submitted.ts_init(), UnixNanos::from(101));
+        assert!(submitted.reconciliation());
+
+        let repeated = commit_framework_order_event_staging(
+            &store,
+            &lease,
+            staged.committed(),
+            staged.record(),
+            UnixNanos::from(200),
+            UnixNanos::from(201),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated.committed().revision().value(), 4);
+        assert_eq!(repeated.record(), staged.record());
+        assert!(
+            repeated
+                .record()
+                .framework_order_outbox()
+                .unwrap()
+                .submitted()
+                .unwrap()
+                .reconciliation()
+        );
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn framework_submitted_acknowledgement_commits_once_and_round_trips() {
+        let record = framework_finalized_staged_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let receipt = framework_receipt(
+            record
+                .framework_order_context()
+                .unwrap()
+                .submitted_event_id(),
+            OrderEventApplicationStatus::Applied,
+            OrderEventPersistenceStatus::Persisted,
+        );
+
+        let acknowledged = commit_framework_order_event_acknowledgement(
+            &store, &lease, &committed, &record, receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(acknowledged.committed().revision().value(), 4);
+        assert!(
+            acknowledged
+                .record()
+                .framework_order_outbox()
+                .unwrap()
+                .submitted()
+                .unwrap()
+                .is_acknowledged()
+        );
+
+        let repeated = commit_framework_order_event_acknowledgement(
+            &store,
+            &lease,
+            acknowledged.committed(),
+            acknowledged.record(),
+            receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated.committed().revision().value(), 4);
+        assert_eq!(repeated.record(), acknowledged.record());
+        assert_eq!(store.current_revision(), 4);
+
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        let [restored] = restored.as_slice() else {
+            panic!("expected one restored framework record")
+        };
+        assert_eq!(restored.record(), acknowledged.record());
+        assert_eq!(restored.committed(), acknowledged.committed());
+    }
+
+    #[rstest]
+    #[case(
+        UUID4::from_bytes([3; 16]),
+        OrderEventApplicationStatus::Rejected,
+        OrderEventPersistenceStatus::Persisted
+    )]
+    #[case(
+        UUID4::from_bytes([3; 16]),
+        OrderEventApplicationStatus::Applied,
+        OrderEventPersistenceStatus::Failed
+    )]
+    #[case(
+        UUID4::from_bytes([9; 16]),
+        OrderEventApplicationStatus::Applied,
+        OrderEventPersistenceStatus::Persisted
+    )]
+    #[tokio::test]
+    async fn unconfirmed_or_unknown_framework_receipt_does_not_commit(
+        #[case] event_id: UUID4,
+        #[case] application: OrderEventApplicationStatus,
+        #[case] persistence: OrderEventPersistenceStatus,
+    ) {
+        let record = framework_finalized_staged_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+
+        assert!(
+            commit_framework_order_event_acknowledgement(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                framework_receipt(event_id, application, persistence),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.current_revision(), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_framework_acknowledgement_requires_committed_submission() {
+        let record = framework_finalized_staged_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let context = record.framework_order_context().unwrap();
+
+        assert!(
+            commit_framework_order_event_acknowledgement(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                framework_receipt(
+                    context.terminal_event_id(),
+                    OrderEventApplicationStatus::Applied,
+                    OrderEventPersistenceStatus::Persisted,
+                ),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(store.current_revision(), 3);
+
+        let submitted = commit_framework_order_event_acknowledgement(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            framework_receipt(
+                context.submitted_event_id(),
+                OrderEventApplicationStatus::Applied,
+                OrderEventPersistenceStatus::Persisted,
+            ),
+        )
+        .await
+        .unwrap();
+        let terminal = commit_framework_order_event_acknowledgement(
+            &store,
+            &lease,
+            submitted.committed(),
+            submitted.record(),
+            framework_receipt(
+                context.terminal_event_id(),
+                OrderEventApplicationStatus::AlreadyApplied,
+                OrderEventPersistenceStatus::Persisted,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(terminal.committed().revision().value(), 5);
+        assert!(
+            terminal
+                .record()
+                .framework_order_outbox()
+                .unwrap()
+                .terminal()
+                .unwrap()
+                .is_acknowledged()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_framework_acknowledgement_revision_does_not_commit() {
+        let record = framework_finalized_staged_record();
+        let store = TestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let stale = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            commit_framework_order_event_acknowledgement(
+                &store,
+                &lease,
+                &stale,
+                &record,
+                framework_receipt(
+                    record
+                        .framework_order_context()
+                        .unwrap()
+                        .submitted_event_id(),
+                    OrderEventApplicationStatus::Applied,
+                    OrderEventPersistenceStatus::Persisted,
+                ),
+            )
+            .await,
+            Err(DeepXFrameworkOrderOutboxCommitError::Persistence(
+                DeepXTransactionPersistenceError::RevisionConflict
+            )),
+        ));
+        assert_eq!(store.current_revision(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_framework_acknowledgement_commit_never_releases_record() {
+        let record = framework_finalized_staged_record();
+        let store = TestStore {
+            revision: Mutex::new(3),
+            encoded_record: Mutex::new(record.encode().unwrap()),
+            active_generation: 4,
+            create_outcome_unknown: false,
+            commit_outcome_unknown: true,
+            signed_commit_fault: 0,
+        };
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            commit_framework_order_event_acknowledgement(
+                &store,
+                &lease,
+                &committed,
+                &record,
+                framework_receipt(
+                    record
+                        .framework_order_context()
+                        .unwrap()
+                        .submitted_event_id(),
+                    OrderEventApplicationStatus::Applied,
+                    OrderEventPersistenceStatus::Persisted,
+                ),
+            )
+            .await,
+            Err(DeepXFrameworkOrderOutboxCommitError::Persistence(
+                DeepXTransactionPersistenceError::CommitOutcomeUnknown(_)
+            )),
+        ));
+        assert_eq!(store.current_revision(), 4);
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        assert!(
+            restored[0]
+                .record()
+                .framework_order_outbox()
+                .unwrap()
+                .submitted()
+                .unwrap()
+                .is_acknowledged()
+        );
     }
 
     #[rstest]
@@ -4903,7 +5802,8 @@ mod tests {
     #[tokio::test]
     async fn perp_place_preparation_round_trip(#[case] size: u128, #[case] point: Option<u128>) {
         let expected = perp_place_fixture(size, point);
-        let restored = DeepXTransactionRecord::decode(&expected.encode().unwrap()).unwrap();
+        let encoded = expected.encode().unwrap();
+        let restored = DeepXTransactionRecord::decode(&encoded).unwrap();
         assert_eq!(restored, expected);
         let verifier = DeepXPerpPlaceCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
         verifier
@@ -4915,7 +5815,10 @@ mod tests {
                 .is_err()
         );
         assert!(format!("{verifier:?}").contains("<redacted>"));
-        let record = DeepXTransactionRecord::created(expected.identity().clone());
+        let record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            expected.identity().clone(),
+            expected.submission_scan_checkpoint().unwrap(),
+        );
         let store = TestStore::new(3, &record);
         let lease = store
             .acquire_signer_lease(record.identity().signer())
@@ -4940,6 +5843,28 @@ mod tests {
         assert_eq!(prepared.record(), &expected);
         assert!(prepared.committed().matches(&expected));
         assert_eq!(store.current_revision(), 4);
+    }
+
+    #[rstest]
+    fn perp_place_without_scan_checkpoint_cannot_start_submission() {
+        let baseline = perp_place_fixture(u128::MAX, None);
+        let durable = baseline.signed_extrinsic().unwrap();
+        let mut record = DeepXTransactionRecord::created(baseline.identity().clone());
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                bytes: durable.bytes().to_vec(),
+                extrinsic_hash: durable.extrinsic_hash(),
+                signer: record.identity().signer(),
+                nonce: u64::MAX,
+                runtime: remark_snapshot().identity().clone(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            record.apply_observation(DeepXTransactionObservation::SubmissionStarted),
+            Err(DeepXTransactionRecordError::InconsistentLifecycle),
+        ));
+        assert_eq!(record.lifecycle().state(), DeepXTransactionState::Signed);
     }
 
     #[rstest]
@@ -7059,6 +7984,73 @@ mod tests {
         assert_eq!(store.current_revision(), 2);
     }
 
+    #[rstest]
+    #[case::pool_absent(false, DeepXTransactionState::Submitting, 3)]
+    #[case::pool_present(true, DeepXTransactionState::Accepted, 4)]
+    #[tokio::test]
+    async fn submitted_perp_place_recovery_uses_pre_submission_checkpoint(
+        #[case] pool_present: bool,
+        #[case] expected_state: DeepXTransactionState,
+        #[case] expected_revision: u64,
+    ) {
+        let baseline = perp_place_fixture(u128::MAX, None);
+        let durable = baseline.signed_extrinsic().unwrap();
+        let mut checkpoint_hash = [0; 32];
+        checkpoint_hash[24..].copy_from_slice(&40_u64.to_be_bytes());
+        let mut record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            baseline.identity().clone(),
+            DeepXSubmissionScanCheckpoint::new(40, checkpoint_hash),
+        );
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                bytes: durable.bytes().to_vec(),
+                extrinsic_hash: durable.extrinsic_hash(),
+                signer: record.identity().signer(),
+                nonce: u64::MAX,
+                runtime: remark_snapshot().identity().clone(),
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        let pending_extrinsics = pool_present
+            .then(|| format!("0x{}", nautilus_core::hex::encode(durable.bytes())))
+            .into_iter()
+            .collect();
+        let (endpoints, capabilities) =
+            finalized_recovery_endpoints_with_pool(40, pending_extrinsics).await;
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let restored = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let snapshot = remark_snapshot();
+        let verifier = DeepXPerpPlaceCallVerifier::new(snapshot.clone(), remark_key()).unwrap();
+
+        let result = reconcile_submitted_perp_place_checkpoint(
+            &endpoints,
+            &capabilities,
+            &snapshot,
+            &store,
+            &lease,
+            &restored,
+            10,
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.record().lifecycle().state(), expected_state);
+        assert_eq!(result.committed().revision().value(), expected_revision);
+        assert_eq!(store.current_revision(), expected_revision);
+    }
+
     #[tokio::test]
     async fn reorganization_is_committed_once_and_requires_fresh_reconciliation() {
         let mut record = submitting_record();
@@ -7593,7 +8585,15 @@ mod tests {
             };
             signed.bytes[30] ^= 1;
             signed.extrinsic_hash = BlakeTwo256.hash(&signed.bytes).0;
-            record = DeepXTransactionRecord::created(record.identity().clone());
+            record = match record.submission_scan_checkpoint() {
+                Some(checkpoint) => {
+                    DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+                        record.identity().clone(),
+                        checkpoint,
+                    )
+                }
+                None => DeepXTransactionRecord::created(record.identity().clone()),
+            };
             record.record_signed(&signed).unwrap();
         }
         record

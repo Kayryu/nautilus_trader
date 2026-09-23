@@ -1,0 +1,55 @@
+{
+  "captured_at": "2026-09-20T04:53:49Z",
+  "deployment": "testnet",
+  "endpoint_role": "finalized_event_storage",
+  "rpc_url": "https://rpc-testnet.deepx.fi",
+  "block_hash": "0x9f7e1dea11e303be23585b051820a5e7ceee49713764f8a2f35b5ffb5d04eb8d",
+  "block_number": 185969410,
+  "extrinsic_hash": "0x6ec8cb0021bec82fd60a9c21d30dd2c1ac6d64094926a012a44defbd7cd6144d",
+  "extrinsic_index": 8,
+  "storage": {
+    "standard_events_result": null,
+    "threads_key": "0x26aa394eea5630e07c48ae0c9558cef79cb5c9f400ab41399c6b8b51f8d1881902ab150b00000000",
+    "threads_result": "0x03",
+    "events_map_keys": [
+      "0x26aa394eea5630e07c48ae0c9558cef731d080e4d67db2640c561142dcdc20654b26d5860e48f8f72f3fb26378b7c7127025e075d5e2f6cde3cc051a31f07660",
+      "0x26aa394eea5630e07c48ae0c9558cef731d080e4d67db2640c561142dcdc20654b26d5860e48f8f72f3fb26378b7c7124a9e6f9b8d43f6ad008f8c291929dee2",
+      "0x26aa394eea5630e07c48ae0c9558cef731d080e4d67db2640c561142dcdc20654b26d5860e48f8f72f3fb26378b7c712e46963f29e4adcdd46170b8ac19aa291",
+      "0x26aa394eea5630e07c48ae0c9558cef731d080e4d67db2640c561142dcdc20654b26d5860e48f8f72f3fb26378b7c71271b186b851e866e71be237342976049a"
+    ],
+    "batch_event_counts": [
+      32,
+      12,
+      12,
+      2
+    ],
+    "combined_event_count": 58
+  },
+  "fixture": {
+    "payload_path": "system_events.json",
+    "payload_bytes": 11373,
+    "payload_sha256": "d315054ffb3be8c1449fd070351f04614abab6e2f8aad5556df93ce9c6e94f0d"
+  },
+  "runtime_identity": {
+    "genesis_hash": "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+    "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+    "source_manifest": "../genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json",
+    "spec_version": 369,
+    "transaction_version": 1
+  },
+  "order_evidence": {
+    "order_id": "1789445053841",
+    "source_fixture": "../../../http/testnet/perp_history_orders_account_market_3.json"
+  },
+  "derivation": [
+    "System.Events was absent at the exact block hash.",
+    "System.Threads(block_number) returned the inclusive last thread index 3.",
+    "System.EventsMap(block_number, thread) was read for every thread from 0 through 3.",
+    "Each batch Compact<u32> count was removed, counts were checked and summed, and one Compact<u32> count was prepended to the concatenated EventRecord bytes."
+  ],
+  "limitations": [
+    "The fixture proves event bytes at one finalized historical block only.",
+    "The REST order record is separate mutable backend evidence and is not used as finality evidence.",
+    "The fixture contains no credentials and was captured through read-only RPC methods."
+  ]
+}

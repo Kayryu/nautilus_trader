@@ -44,7 +44,7 @@ use ahash::{AHashMap, AHashSet};
 use bounded::BoundedVecDeque;
 use bytes::Bytes;
 pub use config::CacheConfig; // Re-export
-use database::{CacheDatabaseAdapter, CacheMap};
+use database::{CacheDatabaseAdapter, CacheMap, OrderEventPersistenceReceiver};
 pub use error::{
     ACCOUNT_NOT_FOUND, AccountLookupError, CURRENCY_NOT_FOUND, CurrencyLookupError,
     INSTRUMENT_NOT_FOUND, InstrumentLookupError, ORDER_BOOK_NOT_FOUND, ORDER_LIST_NOT_FOUND,
@@ -2757,6 +2757,26 @@ impl Cache {
     #[must_use]
     pub const fn has_backing(&self) -> bool {
         self.database.is_some()
+    }
+
+    /// Idempotently persists an order event and returns a durable completion receiver when the
+    /// configured database supports acknowledgements.
+    ///
+    /// Returns `None` when the cache has no backing database or its adapter cannot confirm durable
+    /// order-event writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if preparing or enqueueing the acknowledged write fails.
+    pub fn persist_order_event_with_receipt(
+        &self,
+        event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderEventPersistenceReceiver>> {
+        let Some(database) = &self.database else {
+            return Ok(None);
+        };
+
+        database.persist_order_event_with_receipt(event)
     }
 
     /// Loads persisted actor state.

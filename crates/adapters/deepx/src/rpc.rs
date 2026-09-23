@@ -15,7 +15,10 @@
 
 //! Read-only DeepX Substrate RPC identity collection.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fmt::{Debug, Formatter},
+};
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
@@ -78,11 +81,21 @@ struct ObservedRpcMethods {
 }
 
 /// Evidence that one identity-validated endpoint advertised every requested RPC method.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeepXRpcMethodCapabilities {
     role: DeepXRpcRole,
     endpoint_url: String,
     methods: BTreeSet<String>,
+}
+
+impl Debug for DeepXRpcMethodCapabilities {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(DeepXRpcMethodCapabilities))
+            .field("role", &self.role)
+            .field("endpoint_url", &"<redacted>")
+            .field("methods", &self.methods)
+            .finish()
+    }
 }
 
 impl DeepXRpcMethodCapabilities {
@@ -551,6 +564,28 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     observe_approved_finalized_runtime_snapshot_at(&config.environment, url, |_, _, _| Ok(())).await
 }
 
+/// Collects an approved runtime snapshot from the chain-identity-validated Watch endpoint.
+///
+/// This bootstrap observation initializes a snapshot service before its first atomic refresh. The
+/// endpoint set must already have passed complete role identity validation; this function does not
+/// probe method capabilities, install the snapshot, or authorize signing.
+///
+/// # Errors
+///
+/// Returns an error for request or response failure, malformed hashes or metadata, or a runtime
+/// snapshot which differs from the approved testnet fixture identity.
+pub(crate) async fn observe_approved_finalized_runtime_snapshot_for_endpoints(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
+    observe_approved_finalized_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+        |_, _, _| Ok(()),
+    )
+    .await
+}
+
 /// Observes and atomically applies an approved finalized runtime snapshot.
 ///
 /// The observation uses only the chain-identity-validated Watch endpoint. Changed runtime versions
@@ -830,6 +865,19 @@ mod tests {
     );
     const FINALIZED_HASH: &str =
         "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+
+    #[rstest::rstest]
+    fn rpc_capability_debug_redacts_endpoint_url() {
+        let secret_url = "https://rpc.example.test/path?token=secret";
+        let endpoints = validated_endpoints(secret_url);
+        let capabilities = validated_capabilities(&endpoints);
+        let debug = format!("{capabilities:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(secret_url));
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("author_submitExtrinsic"));
+    }
 
     #[tokio::test]
     async fn observes_and_validates_all_rpc_role_identities() {

@@ -42,6 +42,17 @@ use ustr::Ustr;
 use super::config::CacheConfig;
 use crate::signal::Signal;
 
+/// One-shot receiver completed after an order event is durably persisted.
+pub type OrderEventPersistenceReceiver = futures::channel::oneshot::Receiver<anyhow::Result<()>>;
+
+/// Creates a one-shot channel for durable order-event persistence completion.
+pub fn order_event_persistence_channel() -> (
+    futures::channel::oneshot::Sender<anyhow::Result<()>>,
+    OrderEventPersistenceReceiver,
+) {
+    futures::channel::oneshot::channel()
+}
+
 #[derive(Debug, Default)]
 pub struct CacheMap {
     pub currencies: AHashMap<Ustr, Currency>,
@@ -540,6 +551,22 @@ pub trait CacheDatabaseAdapter {
     ///
     /// Returns an error if updating an order fails.
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()>;
+
+    /// Idempotently persists an order event and returns a durable completion receiver when
+    /// supported.
+    ///
+    /// The default implementation reports that persistence acknowledgement is unsupported. It
+    /// does not enqueue another write because the ordinary cache update path has already done so.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if preparing or enqueueing the acknowledged write fails.
+    fn persist_order_event_with_receipt(
+        &self,
+        _order_event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderEventPersistenceReceiver>> {
+        Ok(None)
+    }
 
     /// Updates a position in the cache.
     ///

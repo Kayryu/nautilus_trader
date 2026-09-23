@@ -90,7 +90,8 @@ use nautilus_common::{
     live::dst,
     log_info,
     messages::{
-        DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent,
+        DataEvent, ExecutionEvent, ExecutionReport, OrderEventPersistenceStatus, SystemCommand,
+        SystemEvent,
         data::DataCommand,
         execution::{
             GenerateFillReports, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -2016,6 +2017,26 @@ impl LiveNode {
     /// so a fill the execution engine rejects (unknown order, invalid
     /// transition) is never marked and its later `Fill` report stays eligible.
     fn dispatch_exec_event_and_commit_fill(&mut self, evt: ExecutionEvent) {
+        if let ExecutionEvent::AcknowledgedOrder(envelope) = evt {
+            let (event, receipt_tx) = envelope.into_parts();
+            let result = self
+                .kernel
+                .exec_engine
+                .borrow_mut()
+                .process_with_receipt(&event);
+            if let Some(persistence_rx) = result.persistence_rx {
+                let mut receipt = result.receipt;
+
+                dst::task::spawn(async move {
+                    receipt = resolve_order_event_persistence(receipt, persistence_rx).await;
+                    let _ = receipt_tx.send(receipt);
+                });
+            } else {
+                let _ = receipt_tx.send(result.receipt);
+            }
+            return;
+        }
+
         let recent_fill_candidate = match &evt {
             ExecutionEvent::Order(OrderEventAny::Filled(fill)) => Some(fill.clone()),
             _ => None,
@@ -2393,6 +2414,10 @@ impl LiveNode {
             ExecutionEvent::Order(order_evt) => {
                 self.exec_manager.observe_order_event(order_evt);
                 close_ids.push(order_evt.client_order_id());
+            }
+            ExecutionEvent::AcknowledgedOrder(envelope) => {
+                self.exec_manager.observe_order_event(envelope.event());
+                close_ids.push(envelope.event().client_order_id());
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in &batch.events {
@@ -3226,6 +3251,30 @@ impl LiveNode {
     }
 }
 
+async fn resolve_order_event_persistence(
+    mut receipt: nautilus_common::messages::OrderEventConsumerReceipt,
+    persistence_rx: nautilus_common::cache::database::OrderEventPersistenceReceiver,
+) -> nautilus_common::messages::OrderEventConsumerReceipt {
+    receipt.persistence = match persistence_rx.await {
+        Ok(Ok(())) => OrderEventPersistenceStatus::Persisted,
+        Ok(Err(e)) => {
+            log::error!(
+                "Failed to persist acknowledged order event {}: {e}",
+                receipt.event_id
+            );
+            OrderEventPersistenceStatus::Failed
+        }
+        Err(e) => {
+            log::error!(
+                "Persistence acknowledgement dropped for order event {}: {e}",
+                receipt.event_id
+            );
+            OrderEventPersistenceStatus::Failed
+        }
+    };
+    receipt
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SocketReconnectDispatchOutcome {
     Accepted,
@@ -3697,6 +3746,9 @@ fn flush_all_pending(
             ExecutionEvent::Order(order_evt) => {
                 pending.order_evts.push(order_evt);
             }
+            ExecutionEvent::AcknowledgedOrder(envelope) => {
+                pending.ack_order_evts.push(envelope);
+            }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in batch {
                     pending.order_evts.push(OrderEventAny::Submitted(submitted));
@@ -3773,6 +3825,9 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                     ExecutionEvent::Order(order_evt) => {
                         pending.order_evts.push(order_evt);
                     }
+                    ExecutionEvent::AcknowledgedOrder(envelope) => {
+                        pending.ack_order_evts.push(envelope);
+                    }
                     ExecutionEvent::OrderSubmittedBatch(batch) => {
                         for submitted in batch {
                             pending.order_evts.push(OrderEventAny::Submitted(submitted));
@@ -3811,6 +3866,7 @@ struct PendingEvents {
     data_cmds: Vec<DataCommand>,
     exec_reports: Vec<ExecutionReport>,
     order_evts: Vec<OrderEventAny>,
+    ack_order_evts: Vec<nautilus_common::messages::AcknowledgedOrderEvent>,
     exec_cmds: Vec<TradingCommandMessage>,
 }
 
@@ -3822,6 +3878,7 @@ impl PendingEvents {
             && self.data_cmds.is_empty()
             && self.exec_reports.is_empty()
             && self.order_evts.is_empty()
+            && self.ack_order_evts.is_empty()
             && self.exec_cmds.is_empty()
     }
 
@@ -3857,16 +3914,19 @@ impl PendingEvents {
             + self.data_cmds.len()
             + self.exec_reports.len()
             + self.order_evts.len()
+            + self.ack_order_evts.len()
             + self.exec_cmds.len();
 
         if total > 0 {
             log::debug!(
                 "Processing {total} events/commands queued during startup \
-                 (data_evts={}, data_cmds={}, exec_reports={}, order_evts={}, exec_cmds={})",
+                 (data_evts={}, data_cmds={}, exec_reports={}, order_evts={}, \
+                 ack_order_evts={}, exec_cmds={})",
                 self.data_evts.len(),
                 self.data_cmds.len(),
                 self.exec_reports.len(),
                 self.order_evts.len(),
+                self.ack_order_evts.len(),
                 self.exec_cmds.len()
             );
         }
@@ -3885,6 +3945,10 @@ impl PendingEvents {
 
         for evt in self.order_evts.drain(..) {
             AsyncRunner::handle_exec_event(ExecutionEvent::Order(evt));
+        }
+
+        for envelope in self.ack_order_evts.drain(..) {
+            AsyncRunner::handle_exec_event(ExecutionEvent::AcknowledgedOrder(envelope));
         }
 
         for cmd in self.exec_cmds.drain(..) {
@@ -4762,6 +4826,78 @@ mod tests {
             ),
             (false, false, true),
         );
+    }
+
+    #[rstest]
+    fn test_acknowledged_order_event_receipts_follow_canonical_history() {
+        let mut node = LiveNode::build("OrderReceiptNode".to_string(), None).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), true)
+            .unwrap();
+        let event = TestOrderEventStubs::submitted(&order, AccountId::from("BINANCE-001"));
+
+        let (envelope, mut receipt_rx) =
+            nautilus_common::messages::AcknowledgedOrderEvent::with_receipt_channel(event.clone());
+        node.process_exec_event(ExecutionEvent::AcknowledgedOrder(envelope));
+        let receipt = receipt_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            receipt.application,
+            nautilus_common::messages::OrderEventApplicationStatus::Applied
+        );
+        assert_eq!(
+            receipt.persistence,
+            nautilus_common::messages::OrderEventPersistenceStatus::NotConfigured
+        );
+
+        let (envelope, mut receipt_rx) =
+            nautilus_common::messages::AcknowledgedOrderEvent::with_receipt_channel(event);
+        node.process_exec_event(ExecutionEvent::AcknowledgedOrder(envelope));
+        let receipt = receipt_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            receipt.application,
+            nautilus_common::messages::OrderEventApplicationStatus::AlreadyApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_event_persistence_resolution_reports_success() {
+        let event_id = UUID4::new();
+        let receipt = nautilus_common::messages::OrderEventConsumerReceipt {
+            event_id,
+            application: nautilus_common::messages::OrderEventApplicationStatus::Applied,
+            persistence: OrderEventPersistenceStatus::Unconfirmed,
+        };
+        let (persistence_tx, persistence_rx) =
+            nautilus_common::cache::database::order_event_persistence_channel();
+        persistence_tx.send(Ok(())).unwrap();
+
+        let receipt = resolve_order_event_persistence(receipt, persistence_rx).await;
+
+        assert_eq!(receipt.event_id, event_id);
+        assert_eq!(receipt.persistence, OrderEventPersistenceStatus::Persisted);
+    }
+
+    #[tokio::test]
+    async fn test_order_event_persistence_resolution_fails_closed() {
+        let receipt = nautilus_common::messages::OrderEventConsumerReceipt {
+            event_id: UUID4::new(),
+            application: nautilus_common::messages::OrderEventApplicationStatus::Applied,
+            persistence: OrderEventPersistenceStatus::Unconfirmed,
+        };
+        let (persistence_tx, persistence_rx) =
+            nautilus_common::cache::database::order_event_persistence_channel();
+        drop(persistence_tx);
+
+        let receipt = resolve_order_event_persistence(receipt, persistence_rx).await;
+
+        assert_eq!(receipt.persistence, OrderEventPersistenceStatus::Failed);
     }
 
     #[rstest]
@@ -8479,6 +8615,9 @@ mod tests {
                 }
                 ExecutionEvent::Order(order_evt) => {
                     pending.order_evts.push(order_evt);
+                }
+                ExecutionEvent::AcknowledgedOrder(envelope) => {
+                    pending.ack_order_evts.push(envelope);
                 }
                 ExecutionEvent::OrderSubmittedBatch(batch) => {
                     for submitted in batch {

@@ -34,7 +34,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use nautilus_common::{
     factories::OrderEventFactory,
-    messages::{ExecutionEvent, ExecutionReport},
+    messages::{
+        AcknowledgedOrderEvent, ExecutionEvent, ExecutionReport, OrderEventConsumerReceiptReceiver,
+    },
 };
 use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
@@ -434,6 +436,29 @@ impl ExecutionEventEmitter {
             .map_err(|e| anyhow::anyhow!("Failed to send order event: {e}"))
     }
 
+    /// Emits an order event and returns a one-shot execution-consumer receipt.
+    ///
+    /// The receipt distinguishes canonical engine application from asynchronous cache database
+    /// persistence. Channel admission alone never produces a successful application receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sender is uninitialized or its receiver is closed.
+    pub fn try_send_order_event_with_receipt(
+        &self,
+        event: OrderEventAny,
+    ) -> anyhow::Result<OrderEventConsumerReceiptReceiver> {
+        let sender = self.sender.load();
+        let sender = sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot send order event: sender not initialized"))?;
+        let (envelope, receipt_rx) = AcknowledgedOrderEvent::with_receipt_channel(event);
+        sender
+            .send(ExecutionEvent::AcknowledgedOrder(envelope))
+            .map_err(|e| anyhow::anyhow!("Failed to send acknowledged order event: {e}"))?;
+        Ok(receipt_rx)
+    }
+
     /// Emits a batch of order submitted events as a single channel message.
     pub fn send_order_submitted_batch(&self, batch: OrderSubmittedBatch) {
         let sender = self.sender.load();
@@ -595,6 +620,25 @@ mod tests {
             rx_b.try_recv(),
             Ok(ExecutionEvent::Order(OrderEventAny::Submitted(_)))
         ));
+    }
+
+    #[rstest]
+    fn test_receipt_send_only_admits_event_to_channel() {
+        let mut emitter = create_emitter();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        let event = create_order_event();
+        let event_id = event.id();
+
+        let mut receipt_rx = emitter.try_send_order_event_with_receipt(event).unwrap();
+
+        assert!(matches!(receipt_rx.try_recv(), Ok(None)));
+        let ExecutionEvent::AcknowledgedOrder(envelope) = rx.try_recv().unwrap() else {
+            panic!("expected acknowledged order event")
+        };
+        assert_eq!(envelope.event().id(), event_id);
+        drop(envelope);
+        assert!(receipt_rx.try_recv().is_err());
     }
 
     #[rstest]

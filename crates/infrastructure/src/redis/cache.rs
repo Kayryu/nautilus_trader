@@ -48,7 +48,9 @@ use bytes::Bytes;
 use nautilus_common::{
     cache::{
         CacheConfig,
-        database::{CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap},
+        database::{
+            CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap, OrderEventPersistenceReceiver,
+        },
     },
     enums::SerializationEncoding,
     live::get_runtime,
@@ -246,7 +248,7 @@ impl RedisConnectionConfig for RedisCacheConfig {
 }
 
 /// A type of database operation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum DatabaseOperation {
     Insert,
     Update,
@@ -258,7 +260,7 @@ pub enum DatabaseOperation {
 }
 
 /// Represents a database command to be performed which may be executed in a task.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DatabaseCommand {
     /// The database operation type.
     pub op_type: DatabaseOperation,
@@ -266,6 +268,8 @@ pub struct DatabaseCommand {
     pub key: Option<String>,
     /// The data payload for the operation.
     pub payload: Option<Vec<Bytes>>,
+    /// Completion channel for an acknowledged order-event write.
+    pub order_receipt_tx: Option<futures::channel::oneshot::Sender<anyhow::Result<()>>>,
 }
 
 impl DatabaseCommand {
@@ -276,6 +280,22 @@ impl DatabaseCommand {
             op_type,
             key: Some(key),
             payload,
+            order_receipt_tx: None,
+        }
+    }
+
+    /// Creates an acknowledged order-event update command.
+    #[must_use]
+    pub fn update_order_with_receipt(
+        key: String,
+        payload: Vec<Bytes>,
+        order_receipt_tx: futures::channel::oneshot::Sender<anyhow::Result<()>>,
+    ) -> Self {
+        Self {
+            op_type: DatabaseOperation::UpdateOrder,
+            key: Some(key),
+            payload: Some(payload),
+            order_receipt_tx: Some(order_receipt_tx),
         }
     }
 
@@ -286,6 +306,7 @@ impl DatabaseCommand {
             op_type: DatabaseOperation::Close,
             key: None,
             payload: None,
+            order_receipt_tx: None,
         }
     }
 }
@@ -415,6 +436,7 @@ impl RedisCacheDatabase {
             op_type: DatabaseOperation::Flush(reply_tx),
             key: None,
             payload: None,
+            order_receipt_tx: None,
         };
         self.tx
             .send(cmd)
@@ -783,23 +805,32 @@ async fn drain_buffer(
     let mut has_pending_ops = false;
 
     for msg in buffer.drain(..) {
-        let Some(key) = msg.key else {
-            log::error!("Null key found for message: {msg:?}");
+        let DatabaseCommand {
+            op_type,
+            key,
+            payload,
+            order_receipt_tx,
+        } = msg;
+        let Some(key) = key else {
+            let e = anyhow::anyhow!("Null key found for database operation: {op_type:?}");
+            log::error!("{e}");
+            send_order_persistence_result(order_receipt_tx, Err(e));
             continue;
         };
         let collection = match get_collection_key(&key) {
             Ok(collection) => collection,
             Err(e) => {
                 log::error!("{e}");
-                continue; // Continue to next message
+                send_order_persistence_result(order_receipt_tx, Err(e));
+                continue;
             }
         };
 
         let key = format!("{trader_key}{REDIS_DELIMITER}{key}");
 
-        match msg.op_type {
+        match op_type {
             DatabaseOperation::Insert => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = payload {
                     log::debug!("Processing INSERT for collection: {collection}, key: {key}");
                     if let Err(e) = insert(&mut pipe, collection, &key, &payload) {
                         log::error!("{e}");
@@ -811,7 +842,7 @@ async fn drain_buffer(
                 }
             }
             DatabaseOperation::Update => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = payload {
                     log::debug!("Processing UPDATE for collection: {collection}, key: {key}");
                     if let Err(e) = update(&mut pipe, collection, &key, &payload) {
                         log::error!("{e}");
@@ -825,19 +856,19 @@ async fn drain_buffer(
             DatabaseOperation::UpdateOrder => {
                 flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
 
-                if let Some(payload) = msg.payload {
+                let result = if let Some(payload) = payload {
                     log::debug!("Processing UPDATE_ORDER for key: {key}");
-                    if let Err(e) =
-                        update_order_event_log(conn, trader_key, encoding, &key, &payload).await
-                    {
-                        log::error!("{e}");
-                    }
+                    update_order_event_log(conn, trader_key, encoding, &key, &payload).await
                 } else {
-                    log::error!("Null `payload` for `update_order`");
+                    Err(anyhow::anyhow!("Null `payload` for `update_order`"))
+                };
+                if let Err(e) = &result {
+                    log::error!("{e}");
                 }
+                send_order_persistence_result(order_receipt_tx, result);
             }
             DatabaseOperation::ReplaceList => {
-                if let Some(payload) = msg.payload {
+                if let Some(payload) = payload {
                     log::debug!("Processing REPLACE_LIST for key: {key}");
                     if let Err(e) = replace_list_operation(&mut pipe, collection, &key, &payload) {
                         log::error!("{e}");
@@ -853,10 +884,10 @@ async fn drain_buffer(
                     "Processing DELETE for collection: {}, key: {}, payload: {:?}",
                     collection,
                     key,
-                    msg.payload.as_ref().map(std::vec::Vec::len)
+                    payload.as_ref().map(std::vec::Vec::len)
                 );
                 // `payload` can be `None` for a delete operation
-                if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
+                if let Err(e) = delete(&mut pipe, collection, &key, payload) {
                     log::error!("{e}");
                 } else {
                     has_pending_ops = true;
@@ -868,6 +899,15 @@ async fn drain_buffer(
     }
 
     flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
+}
+
+fn send_order_persistence_result(
+    receipt_tx: Option<futures::channel::oneshot::Sender<anyhow::Result<()>>>,
+    result: anyhow::Result<()>,
+) {
+    if let Some(receipt_tx) = receipt_tx {
+        let _ = receipt_tx.send(result);
+    }
 }
 
 async fn flush_pending_pipeline(
@@ -899,41 +939,54 @@ async fn update_order_event_log(
 
     let result: Vec<Bytes> = conn.lrange(key, 0, -1).await?;
     if result.is_empty() {
-        log::warn!("Cannot update order in Redis, no existing state at {key}");
-        return Ok(());
+        anyhow::bail!("Cannot update order in Redis, no existing state at {key}");
     }
-
-    let mut append_pipe = redis::pipe();
-    append_pipe.atomic();
-    update_list(&mut append_pipe, key, value[0].as_ref());
-    append_pipe.query_async::<()>(conn).await?;
 
     let mut events: Vec<OrderEventAny> = result
         .iter()
         .map(|payload| DatabaseQueries::deserialize_payload(encoding, payload))
         .collect::<anyhow::Result<_>>()
-        .with_context(|| {
-            format!(
-                "Order event append succeeded for {key}, but index replay failed decoding history"
-            )
-        })?;
+        .with_context(|| format!("Order event persistence failed decoding history at {key}"))?;
     let event: OrderEventAny = DatabaseQueries::deserialize_payload(encoding, value[0].as_ref())
-        .with_context(|| {
-            format!(
-                "Order event append succeeded for {key}, but index replay failed decoding appended event"
-            )
-        })?;
-    events.push(event);
-    let order = OrderAny::from_events(events).with_context(|| {
-        format!("Order event append succeeded for {key}, but index replay failed rebuilding order")
-    })?;
+        .with_context(|| format!("Order event persistence failed decoding new event for {key}"))?;
+    if merge_order_event_history(&mut events, event, key)? {
+        let mut append_pipe = redis::pipe();
+        append_pipe.atomic();
+        update_list(&mut append_pipe, key, value[0].as_ref());
+        append_pipe.query_async::<()>(conn).await?;
+    }
+
+    let order = OrderAny::from_events(events)
+        .with_context(|| format!("Order event persistence failed rebuilding order at {key}"))?;
 
     let mut pipe = redis::pipe();
     pipe.atomic();
     update_order_indexes(&mut pipe, trader_key, &order);
-    pipe.query_async::<()>(conn).await?;
+    pipe.query_async::<()>(conn)
+        .await
+        .with_context(|| format!("Order event persisted at {key}, but index update failed"))?;
 
     Ok(())
+}
+
+fn merge_order_event_history(
+    events: &mut Vec<OrderEventAny>,
+    event: OrderEventAny,
+    key: &str,
+) -> anyhow::Result<bool> {
+    match events.iter().find(|candidate| candidate.id() == event.id()) {
+        Some(existing) if existing != &event => {
+            anyhow::bail!(
+                "Order event ID {} conflicts with persisted payload at {key}",
+                event.id()
+            );
+        }
+        Some(_) => Ok(false),
+        None => {
+            events.push(event);
+            Ok(true)
+        }
+    }
 }
 
 fn insert(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
@@ -1848,6 +1901,23 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
     }
 
+    fn persist_order_event_with_receipt(
+        &self,
+        order_event: &OrderEventAny,
+    ) -> anyhow::Result<Option<OrderEventPersistenceReceiver>> {
+        let client_order_id = order_event.client_order_id();
+        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
+        let payload = DatabaseQueries::serialize_payload(self.encoding(), order_event)?;
+        let (receipt_tx, receipt_rx) = futures::channel::oneshot::channel();
+        let op =
+            DatabaseCommand::update_order_with_receipt(key, vec![Bytes::from(payload)], receipt_tx);
+        self.database
+            .tx
+            .send(op)
+            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))?;
+        Ok(Some(receipt_rx))
+    }
+
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
         let position_id = position.id;
         if position.fill_voids.is_empty() {
@@ -1912,6 +1982,12 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::{
+        enums::{OrderSide, OrderType},
+        identifiers::{AccountId, InstrumentId},
+        orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
+        types::Quantity,
+    };
     use rstest::rstest;
 
     use super::*;
@@ -1940,5 +2016,29 @@ mod tests {
     fn test_get_collection_key_invalid() {
         let key = "no_delimiter";
         assert!(get_collection_key(key).is_err());
+    }
+
+    #[rstest]
+    fn test_merge_order_event_history_is_idempotent_and_rejects_conflicts() {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        let event = TestOrderEventStubs::submitted(&order, AccountId::new("SIM-001"));
+        let mut events = vec![OrderEventAny::Initialized(order.init_event().clone())];
+
+        assert!(merge_order_event_history(&mut events, event.clone(), "orders:test").unwrap());
+        assert!(!merge_order_event_history(&mut events, event.clone(), "orders:test").unwrap());
+        assert_eq!(events.len(), 2);
+
+        let mut conflicting = event;
+        let OrderEventAny::Submitted(submitted) = &mut conflicting else {
+            unreachable!();
+        };
+        submitted.ts_event = UnixNanos::from(1);
+        let e = merge_order_event_history(&mut events, conflicting, "orders:test").unwrap_err();
+        assert!(e.to_string().contains("conflicts with persisted payload"));
+        assert_eq!(events.len(), 2);
     }
 }
