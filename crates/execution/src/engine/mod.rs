@@ -138,6 +138,27 @@ pub struct ExecutionEngine {
     snapshot_anchorer: Option<SnapshotAnchorer>,
 }
 
+struct DetachedExecutionClients<'a> {
+    engine: &'a Rc<RefCell<ExecutionEngine>>,
+    clients: Option<IndexMap<ClientId, ExecutionClientAdapter>>,
+}
+
+impl DetachedExecutionClients<'_> {
+    fn restore(&mut self) {
+        if let Some(clients) = self.clients.take() {
+            let mut engine = self.engine.borrow_mut();
+            debug_assert!(engine.clients.is_empty());
+            engine.clients = clients;
+        }
+    }
+}
+
+impl Drop for DetachedExecutionClients<'_> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 impl Debug for ExecutionEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ExecutionEngine))
@@ -698,6 +719,32 @@ impl ExecutionEngine {
         for error in results.into_iter().filter_map(Result::err) {
             log::error!("Failed to connect execution client: {error:#}");
         }
+    }
+
+    /// Connects all registered clients without holding an execution-engine borrow while awaiting.
+    ///
+    /// Clients are restored to the engine if this future completes, is canceled, or is dropped.
+    /// This permits startup order-event receipts to be processed by the engine while a client is
+    /// still completing its connection workflow.
+    pub async fn connect_detached(engine: &Rc<RefCell<Self>>) {
+        let clients = std::mem::take(&mut engine.borrow_mut().clients);
+        let mut detached = DetachedExecutionClients {
+            engine,
+            clients: Some(clients),
+        };
+        let futures: Vec<_> = detached
+            .clients
+            .as_mut()
+            .into_iter()
+            .flat_map(|clients| clients.values_mut())
+            .map(ExecutionClientAdapter::connect)
+            .collect();
+        let results = join_all(futures).await;
+
+        for error in results.into_iter().filter_map(Result::err) {
+            log::error!("Failed to connect execution client: {error:#}");
+        }
+        detached.restore();
     }
 
     /// Disconnects all registered execution clients concurrently.

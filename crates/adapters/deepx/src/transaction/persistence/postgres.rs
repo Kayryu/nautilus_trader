@@ -180,12 +180,13 @@ impl DeepXTransactionStore for DeepXPostgresTransactionStore {
             let record = DeepXTransactionRecord::decode(encoded_record).map_err(|error| {
                 DeepXTransactionPersistenceError::BeforeCommit(error.to_string())
             })?;
-            if cache_key != record.cache_key_for_record() {
+            if !record.accepts_cache_key(&cache_key) {
                 return Err(DeepXTransactionPersistenceError::AcknowledgementMismatch);
             }
             if record.identity().signer() == lease.signer {
-                let committed =
-                    DeepXCommittedTransactionRecord::acknowledge_committed(&record, revision)?;
+                let committed = DeepXCommittedTransactionRecord::acknowledge_committed_at_key(
+                    &record, cache_key, revision,
+                )?;
                 restored.push(DeepXRestoredTransactionRecord::new(record, committed)?);
             }
         }

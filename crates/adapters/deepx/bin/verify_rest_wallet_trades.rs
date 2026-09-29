@@ -63,10 +63,16 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(!groups.is_empty(), "wallet trade snapshot is empty");
 
     let markets = groups.len();
-    let subaccounts = groups
+    let subaccount_groups = groups
         .iter()
         .map(|group| group.subaccounts.len())
         .sum::<usize>();
+    let subaccounts = groups
+        .iter()
+        .flat_map(|group| &group.subaccounts)
+        .map(|group| group.subaccount.to_ascii_lowercase())
+        .collect::<HashSet<_>>()
+        .len();
     let trades = groups
         .iter()
         .flat_map(|group| &group.subaccounts)
@@ -88,13 +94,14 @@ async fn main() -> anyhow::Result<()> {
     println!(
         concat!(
             "DeepX wallet trades verified wallet={} market={} markets={} ",
-            "subaccounts={} trades={} zero_size={} continuation_groups={} ",
+            "subaccounts={} subaccount_groups={} trades={} zero_size={} continuation_groups={} ",
             "distinct_cursors={} page_size={}"
         ),
         wallet,
         market_id.map_or_else(|| "all".to_string(), |value| value.to_string()),
         markets,
         subaccounts,
+        subaccount_groups,
         trades,
         zero_size,
         groups

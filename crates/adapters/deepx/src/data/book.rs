@@ -28,9 +28,11 @@ use nautilus_model::{
 
 use crate::{
     config::DeepXNetworkConfig,
+    http::{DeepXSpotMarket, DeepXSpotOrderBook},
     websocket::{
         DeepXWsError,
         book::{DeepXWsBookSnapshot, DeepXWsBookStream},
+        orderbook_rpc::DeepXOrderbookRpcSnapshot,
         public::{DeepXWsPublicConnection, DeepXWsPublicFrame},
     },
 };
@@ -98,6 +100,297 @@ pub(super) async fn request_book_snapshot(
     .await;
     let close = connection.close().await;
     result.and_then(|book| close.map(|()| book))
+}
+
+pub(super) fn parse_spot_order_book(
+    snapshot: &DeepXSpotOrderBook,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    depth: NonZeroUsize,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBook> {
+    anyhow::ensure!(
+        snapshot.pair_name == market.name,
+        "DeepX Spot book name does not match instrument metadata"
+    );
+    let expected_pair = nautilus_core::hex::decode_array::<32>(
+        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
+    )?;
+    let observed_pair = nautilus_core::hex::decode_array::<32>(
+        snapshot.pair.strip_prefix("0x").unwrap_or(&snapshot.pair),
+    )?;
+    anyhow::ensure!(
+        expected_pair == observed_pair,
+        "DeepX Spot book pair does not match instrument metadata"
+    );
+    anyhow::ensure!(
+        snapshot.last_update_id > 0,
+        "DeepX Spot book sequence must be nonzero"
+    );
+    let ts_event = UnixNanos::from(
+        snapshot
+            .engine_time
+            .checked_mul(1_000_000)
+            .ok_or_else(|| anyhow::anyhow!("DeepX Spot book timestamp overflows UnixNanos"))?,
+    );
+    let mut deltas = vec![OrderBookDelta::clear(
+        instrument.id(),
+        snapshot.last_update_id,
+        ts_event,
+        ts_init,
+    )];
+    for (side, levels) in [
+        (OrderSide::Buy, &snapshot.order_buy_list),
+        (OrderSide::Sell, &snapshot.order_sell_list),
+    ] {
+        for level in levels.iter().take(depth.get()) {
+            let price = Price::from_decimal_dp(level.price, instrument.price_precision())?;
+            let size = Quantity::from_decimal_dp(level.qty, instrument.size_precision())?;
+            anyhow::ensure!(
+                price.as_decimal() == level.price
+                    && size.as_decimal() == level.qty
+                    && price.as_decimal() % instrument.price_increment().as_decimal()
+                        == rust_decimal::Decimal::ZERO
+                    && size.as_decimal() % instrument.size_increment().as_decimal()
+                        == rust_decimal::Decimal::ZERO,
+                "DeepX Spot book level is not exactly representable on the instrument grid"
+            );
+            deltas.push(OrderBookDelta::new_checked(
+                instrument.id(),
+                BookAction::Add,
+                BookOrder::new(side, price, size, 0),
+                RecordFlag::F_SNAPSHOT as u8,
+                snapshot.last_update_id,
+                ts_event,
+                ts_init,
+            )?);
+        }
+    }
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
+    }
+    let deltas = OrderBookDeltas::new_checked(instrument.id(), deltas)?;
+    let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
+    book.apply_deltas(&deltas)?;
+    Ok(book)
+}
+
+pub(super) fn parse_spot_order_book_quote_tick(
+    snapshot: &DeepXSpotOrderBook,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let book = parse_spot_order_book(
+        snapshot,
+        market,
+        instrument,
+        NonZeroUsize::new(1).expect("nonzero quote depth"),
+        ts_init,
+    )?;
+    let ts_event = UnixNanos::from(
+        snapshot
+            .engine_time
+            .checked_mul(1_000_000)
+            .ok_or_else(|| anyhow::anyhow!("DeepX Spot book timestamp overflows UnixNanos"))?,
+    );
+    quote_tick_from_book(&book, instrument, ts_event, ts_init)
+}
+
+pub(super) fn quote_tick_from_book(
+    book: &OrderBook,
+    instrument: &InstrumentAny,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let (Some(bid_price), Some(bid_size), Some(ask_price), Some(ask_size)) = (
+        book.best_bid_price(),
+        book.best_bid_size(),
+        book.best_ask_price(),
+        book.best_ask_size(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(QuoteTick::new_checked(
+        instrument.id(),
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_event,
+        ts_init,
+    )?))
+}
+
+pub(super) fn parse_spot_rpc_book_deltas(
+    snapshot: &DeepXOrderbookRpcSnapshot,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    depth: NonZeroUsize,
+    sequence: u64,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
+    anyhow::ensure!(sequence > 0, "DeepX Spot book sequence must be nonzero");
+    let book = spot_rpc_pair(snapshot, market)?;
+    let ts_event = ts_init;
+    let mut deltas = vec![OrderBookDelta::clear(
+        instrument.id(),
+        sequence,
+        ts_event,
+        ts_init,
+    )];
+    for (side, levels) in [(OrderSide::Buy, &book.bids), (OrderSide::Sell, &book.asks)] {
+        for level in levels.iter().take(depth.get()) {
+            let (price, size) = parse_spot_rpc_level(level, market, instrument)?;
+            deltas.push(OrderBookDelta::new_checked(
+                instrument.id(),
+                BookAction::Add,
+                BookOrder::new(side, price, size, 0),
+                RecordFlag::F_SNAPSHOT as u8,
+                sequence,
+                ts_event,
+                ts_init,
+            )?);
+        }
+    }
+    if let Some(last) = deltas.last_mut() {
+        last.flags |= RecordFlag::F_LAST as u8;
+    }
+    OrderBookDeltas::new_checked(instrument.id(), deltas).map_err(Into::into)
+}
+
+pub(super) fn parse_spot_rpc_book_depth10(
+    snapshot: &DeepXOrderbookRpcSnapshot,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    sequence: u64,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDepth10> {
+    anyhow::ensure!(sequence > 0, "DeepX Spot book sequence must be nonzero");
+    let book = spot_rpc_pair(snapshot, market)?;
+    let mut bids = [BookOrder::default(); DEPTH10_LEN];
+    let mut asks = [BookOrder::default(); DEPTH10_LEN];
+    let mut bid_counts = [0; DEPTH10_LEN];
+    let mut ask_counts = [0; DEPTH10_LEN];
+    for (index, level) in book.bids.iter().take(DEPTH10_LEN).enumerate() {
+        let (price, size) = parse_spot_rpc_level(level, market, instrument)?;
+        bids[index] = BookOrder::new(OrderSide::Buy, price, size, 0);
+        bid_counts[index] = level.order_count;
+    }
+    for (index, level) in book.asks.iter().take(DEPTH10_LEN).enumerate() {
+        let (price, size) = parse_spot_rpc_level(level, market, instrument)?;
+        asks[index] = BookOrder::new(OrderSide::Sell, price, size, 0);
+        ask_counts[index] = level.order_count;
+    }
+    for bid in bids.iter_mut().skip(book.bids.len().min(DEPTH10_LEN)) {
+        *bid = BookOrder::new(
+            OrderSide::Buy,
+            Price::zero(instrument.price_precision()),
+            Quantity::zero(instrument.size_precision()),
+            0,
+        );
+    }
+    for ask in asks.iter_mut().skip(book.asks.len().min(DEPTH10_LEN)) {
+        *ask = BookOrder::new(
+            OrderSide::Sell,
+            Price::zero(instrument.price_precision()),
+            Quantity::zero(instrument.size_precision()),
+            0,
+        );
+    }
+    Ok(OrderBookDepth10::new(
+        instrument.id(),
+        bids,
+        asks,
+        bid_counts,
+        ask_counts,
+        RecordFlag::F_SNAPSHOT as u8,
+        sequence,
+        ts_init,
+        ts_init,
+    ))
+}
+
+pub(super) fn parse_spot_rpc_quote_tick(
+    snapshot: &DeepXOrderbookRpcSnapshot,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let book = spot_rpc_pair(snapshot, market)?;
+    let (Some(bid), Some(ask)) = (book.bids.first(), book.asks.first()) else {
+        return Ok(None);
+    };
+    let (bid_price, bid_size) = parse_spot_rpc_level(bid, market, instrument)?;
+    let (ask_price, ask_size) = parse_spot_rpc_level(ask, market, instrument)?;
+    Ok(Some(QuoteTick::new_checked(
+        instrument.id(),
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        ts_init,
+        ts_init,
+    )?))
+}
+
+fn spot_rpc_pair<'a>(
+    snapshot: &'a DeepXOrderbookRpcSnapshot,
+    market: &DeepXSpotMarket,
+) -> anyhow::Result<&'a crate::websocket::orderbook_rpc::DeepXOrderbookRpcSide> {
+    let expected_pair = nautilus_core::hex::decode_array::<32>(
+        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
+    )?;
+    let mut pair_book = None;
+    for (pair, book) in &snapshot.spot {
+        let observed_pair =
+            nautilus_core::hex::decode_array::<32>(pair.strip_prefix("0x").unwrap_or(pair))?;
+        anyhow::ensure!(
+            observed_pair == expected_pair,
+            "DeepX Spot RPC snapshot contains an unexpected pair"
+        );
+        anyhow::ensure!(
+            pair_book.replace(book).is_none(),
+            "duplicate DeepX Spot pair book"
+        );
+    }
+    pair_book.ok_or_else(|| anyhow::anyhow!("DeepX Spot RPC snapshot is missing pair"))
+}
+
+fn parse_spot_rpc_level(
+    level: &crate::websocket::orderbook_rpc::DeepXOrderbookRpcLevel,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+) -> anyhow::Result<(Price, Quantity)> {
+    let raw_price = rpc_atomic_decimal(&level.price, 6)?;
+    let raw_size = rpc_atomic_decimal(&level.amount, market.base_decimal)?;
+    let price = Price::from_decimal_dp(raw_price, instrument.price_precision())?;
+    let size = Quantity::from_decimal_dp(raw_size, instrument.size_precision())?;
+    anyhow::ensure!(
+        price.as_decimal() == raw_price
+            && size.as_decimal() == raw_size
+            && price.as_decimal() > rust_decimal::Decimal::ZERO
+            && size.as_decimal() > rust_decimal::Decimal::ZERO
+            && price.as_decimal() % instrument.price_increment().as_decimal()
+                == rust_decimal::Decimal::ZERO
+            && size.as_decimal() % instrument.size_increment().as_decimal()
+                == rust_decimal::Decimal::ZERO,
+        "DeepX Spot RPC level is invalid or outside the instrument grid"
+    );
+    Ok((price, size))
+}
+
+fn rpc_atomic_decimal(value: &str, scale: u8) -> anyhow::Result<rust_decimal::Decimal> {
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .ok_or_else(|| anyhow::anyhow!("DeepX Spot RPC integer lacks hexadecimal prefix"))?;
+    anyhow::ensure!(!value.is_empty(), "DeepX Spot RPC integer is empty");
+    let value = u128::from_str_radix(value, 16)
+        .map_err(|e| anyhow::anyhow!("invalid DeepX Spot RPC integer: {e}"))?;
+    let value = i128::try_from(value)
+        .map_err(|_| anyhow::anyhow!("DeepX Spot RPC integer exceeds Decimal range"))?;
+    Ok(rust_decimal::Decimal::from_i128_with_scale(value, u32::from(scale)).normalize())
 }
 
 pub(super) fn parse_book_deltas(
@@ -298,9 +591,77 @@ fn depth_order(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::websocket::book::DeepXWsBookLevel;
+    use nautilus_model::{
+        enums::CurrencyType,
+        identifiers::{InstrumentId, Symbol},
+        instruments::CurrencyPair,
+        types::Currency,
+    };
     use rstest::rstest;
+
+    use super::*;
+    use crate::websocket::{
+        book::DeepXWsBookLevel,
+        orderbook_rpc::{DeepXOrderbookRpcLevel, DeepXOrderbookRpcSide},
+    };
+
+    const SPOT_MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
+    const SPOT_BOOK: &str =
+        include_str!("../../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
+
+    fn spot_fixture() -> (
+        crate::http::DeepXSpotMarket,
+        DeepXSpotOrderBook,
+        InstrumentAny,
+    ) {
+        let markets: crate::http::DeepXApiResponse<Vec<crate::http::DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let book: crate::http::DeepXApiResponse<DeepXSpotOrderBook> =
+            serde_json::from_str(SPOT_BOOK).unwrap();
+        let market = markets
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let instrument = InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+                .raw_symbol(Symbol::new("ETH/USDC"))
+                .base_currency(
+                    Currency::new_checked("ETH", 18, 0, "ETH", CurrencyType::Crypto).unwrap(),
+                )
+                .quote_currency(
+                    Currency::new_checked("USDC", 6, 0, "USDC", CurrencyType::Crypto).unwrap(),
+                )
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        );
+        (market, book.data, instrument)
+    }
+
+    fn spot_rpc_snapshot(market: &crate::http::DeepXSpotMarket) -> DeepXOrderbookRpcSnapshot {
+        let level = |price: u128, amount: u128| DeepXOrderbookRpcLevel {
+            price: format!("0x{price:x}"),
+            amount: format!("0x{amount:x}"),
+            order_count: 2,
+        };
+        DeepXOrderbookRpcSnapshot {
+            spot: std::collections::BTreeMap::from([(
+                market.pair.clone(),
+                DeepXOrderbookRpcSide {
+                    bids: vec![level(2_435_670_000, 903_000_000_000_000_000)],
+                    asks: vec![level(2_435_820_000, 1_605_500_000_000_000_000)],
+                },
+            )]),
+            perp: std::collections::BTreeMap::new(),
+        }
+    }
 
     fn snapshot() -> DeepXWsBookSnapshot {
         let mut book = DeepXWsBookSnapshot {
@@ -440,5 +801,152 @@ mod tests {
             _ => book.engine_time = u64::MAX,
         }
         assert!(parse_book_depth10(&book, &instrument, Default::default()).is_err());
+    }
+
+    #[rstest]
+    fn spot_rest_snapshot_converts_exact_best_levels_and_depth() {
+        let (market, snapshot, instrument) = spot_fixture();
+        let book = parse_spot_order_book(
+            &snapshot,
+            &market,
+            &instrument,
+            NonZeroUsize::new(2).unwrap(),
+            UnixNanos::from(123),
+        )
+        .unwrap();
+
+        assert_eq!(
+            book.best_bid_price().unwrap().as_decimal().to_string(),
+            "2435.67"
+        );
+        assert_eq!(
+            book.best_ask_price().unwrap().as_decimal().to_string(),
+            "2435.82"
+        );
+        assert_eq!(book.bids(None).count(), 2);
+        assert_eq!(book.asks(None).count(), 2);
+        assert_eq!(book.ts_last.as_u64(), 1_789_620_906_510_000_000);
+    }
+
+    #[rstest]
+    fn spot_rest_snapshot_converts_current_quote() {
+        let (market, snapshot, instrument) = spot_fixture();
+        let quote =
+            parse_spot_order_book_quote_tick(&snapshot, &market, &instrument, UnixNanos::from(123))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(quote.bid_price.to_string(), "2435.67");
+        assert_eq!(quote.bid_size.to_string(), "0.9030");
+        assert_eq!(quote.ask_price.to_string(), "2435.82");
+        assert_eq!(quote.ask_size.to_string(), "1.6055");
+        assert_eq!(quote.ts_event.as_u64(), 1_789_620_906_510_000_000);
+        assert_eq!(quote.ts_init.as_u64(), 123);
+    }
+
+    #[rstest]
+    #[case("bids")]
+    #[case("asks")]
+    fn spot_rest_snapshot_with_empty_side_has_no_quote(#[case] empty_side: &str) {
+        let (market, mut snapshot, instrument) = spot_fixture();
+        match empty_side {
+            "bids" => snapshot.order_buy_list.clear(),
+            "asks" => snapshot.order_sell_list.clear(),
+            _ => unreachable!(),
+        }
+
+        assert!(
+            parse_spot_order_book_quote_tick(
+                &snapshot,
+                &market,
+                &instrument,
+                UnixNanos::from(123),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[rstest]
+    fn spot_rest_snapshot_rejects_off_grid_levels() {
+        let (market, snapshot, mut instrument) = spot_fixture();
+        let InstrumentAny::CurrencyPair(pair) = &mut instrument else {
+            unreachable!();
+        };
+        pair.size_increment = Quantity::from("0.0007");
+
+        assert!(
+            parse_spot_order_book(
+                &snapshot,
+                &market,
+                &instrument,
+                NonZeroUsize::new(2).unwrap(),
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    fn spot_rpc_snapshot_converts_exact_snapshot_deltas() {
+        let (market, _, instrument) = spot_fixture();
+        let snapshot = spot_rpc_snapshot(&market);
+        let deltas = parse_spot_rpc_book_deltas(
+            &snapshot,
+            &market,
+            &instrument,
+            NonZeroUsize::new(1).unwrap(),
+            7,
+            UnixNanos::from(123),
+        )
+        .unwrap();
+        let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
+        book.apply_deltas(&deltas).unwrap();
+
+        assert_eq!(deltas.deltas.len(), 3);
+        assert_eq!(book.best_bid_price().unwrap(), Price::from("2435.67"));
+        assert_eq!(book.best_ask_price().unwrap(), Price::from("2435.82"));
+        assert_eq!(book.ts_last.as_u64(), 123);
+    }
+
+    #[rstest]
+    fn spot_rpc_snapshot_converts_depth10_and_best_quote() {
+        let (market, _, instrument) = spot_fixture();
+        let snapshot = spot_rpc_snapshot(&market);
+        let depth =
+            parse_spot_rpc_book_depth10(&snapshot, &market, &instrument, 8, UnixNanos::from(124))
+                .unwrap();
+        let quote =
+            parse_spot_rpc_quote_tick(&snapshot, &market, &instrument, UnixNanos::from(124))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(depth.bids[0].price, Price::from("2435.67"));
+        assert_eq!(depth.asks[0].size, Quantity::from("1.6055"));
+        assert_eq!(depth.bid_counts[0], 2);
+        assert_eq!(quote.bid_price.as_decimal().to_string(), "2435.67");
+        assert_eq!(quote.ask_price.as_decimal().to_string(), "2435.82");
+    }
+
+    #[rstest]
+    fn spot_rpc_snapshot_rejects_off_grid_quantities() {
+        let (market, _, mut instrument) = spot_fixture();
+        let InstrumentAny::CurrencyPair(pair) = &mut instrument else {
+            unreachable!();
+        };
+        pair.size_increment = Quantity::from("0.0007");
+        let snapshot = spot_rpc_snapshot(&market);
+
+        assert!(
+            parse_spot_rpc_book_deltas(
+                &snapshot,
+                &market,
+                &instrument,
+                NonZeroUsize::new(1).unwrap(),
+                1,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
     }
 }

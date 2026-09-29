@@ -165,8 +165,7 @@ impl ExecutionClientFactory for DeepXExecutionClientFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::{cell::RefCell, rc::Rc};
 
     use nautilus_common::{
         cache::Cache,

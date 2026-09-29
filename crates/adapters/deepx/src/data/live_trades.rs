@@ -16,7 +16,10 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -42,6 +45,7 @@ pub(super) struct TradeSubscription {
     active: Arc<Mutex<bool>>,
     cancellation: CancellationToken,
     trade_state: Arc<Mutex<Option<DeepXWsTradeStream>>>,
+    book_sequence: Arc<AtomicU64>,
 }
 
 impl TradeSubscription {
@@ -50,11 +54,41 @@ impl TradeSubscription {
             active: Arc::new(Mutex::new(true)),
             cancellation: CancellationToken::new(),
             trade_state: Arc::new(Mutex::new(None)),
+            book_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub(super) fn is_active(&self) -> bool {
         *self.active.lock().expect(MUTEX_POISONED)
+    }
+
+    pub(super) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(super) fn next_book_sequence(&self) -> anyhow::Result<u64> {
+        self.book_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+                sequence.checked_add(1)
+            })
+            .map(|sequence| sequence + 1)
+            .map_err(|_| anyhow::anyhow!("DeepX Spot book sequence overflowed"))
+    }
+
+    pub(super) fn publish(
+        &self,
+        connection_epoch: &Mutex<bool>,
+        sender: &UnboundedSender<DataEvent>,
+        events: Vec<DataEvent>,
+    ) -> anyhow::Result<()> {
+        let epoch = connection_epoch.lock().expect(MUTEX_POISONED);
+        let active = self.active.lock().expect(MUTEX_POISONED);
+        if *epoch && *active {
+            for event in events {
+                sender.send(event)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn retire(&self) {
@@ -67,6 +101,7 @@ impl TradeSubscription {
             active: Arc::new(Mutex::new(true)),
             cancellation: CancellationToken::new(),
             trade_state: Arc::clone(&self.trade_state),
+            book_sequence: Arc::clone(&self.book_sequence),
         }
     }
 }

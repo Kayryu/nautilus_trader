@@ -126,9 +126,10 @@ fn timestamp_ns(timestamp_ms: u64) -> anyhow::Result<UnixNanos> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
     use rstest::rstest;
+
+    use super::*;
 
     fn instrument() -> InstrumentAny {
         InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt())

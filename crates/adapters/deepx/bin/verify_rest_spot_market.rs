@@ -122,6 +122,14 @@ async fn main() -> anyhow::Result<()> {
         directory_market.pair,
         directory_market.tick_size,
     );
+    println!(
+        "Spot candle volumes={:?}",
+        candles
+            .details
+            .iter()
+            .map(|candle| candle.volume.to_string())
+            .collect::<Vec<_>>(),
+    );
     println!("DeepX Spot market verification completed; no credentials or transactions sent");
     Ok(())
 }

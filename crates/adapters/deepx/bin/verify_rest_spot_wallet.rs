@@ -80,8 +80,14 @@ async fn main() -> anyhow::Result<()> {
         .flat_map(|market| &market.subaccounts)
         .map(|subaccount| subaccount.trades.items.len())
         .sum::<usize>();
-    ensure!(order_count > 0, "Spot wallet order page is empty");
-    ensure!(trade_count > 0, "Spot wallet trade page is empty");
+    ensure!(
+        order_count > 0 || !orders.has_next,
+        "empty Spot wallet order page advertises a continuation"
+    );
+    ensure!(
+        trade_count > 0 || !trades.has_next,
+        "empty Spot wallet trade page advertises a continuation"
+    );
 
     println!(
         concat!(

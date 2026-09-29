@@ -19,10 +19,10 @@ mod snapshot;
 
 use serde::{Deserialize, Serialize};
 pub use snapshot::{
-    ApprovedRuntimeIdentity, DeepXRuntimeChangeDecision, DeepXRuntimeInterfaceCatalog,
-    DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface, DeepXRuntimeSnapshotPermit,
-    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate,
-    DeepXRuntimeVariantIdentity, RuntimeSnapshot, SnapshotError,
+    ApprovedRuntimeIdentity, DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeChangeDecision,
+    DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
+    DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
+    DeepXRuntimeSnapshotUpdate, DeepXRuntimeVariantIdentity, RuntimeSnapshot, SnapshotError,
 };
 use subxt_core::{
     Config,
@@ -1349,7 +1349,369 @@ mod tests {
             hex::encode(place.bytes()),
             "b90284fcad0b19bb29d4674531d6f115237e16afce377cbfb9294139140c58ea9fb2de1dd0727359f52ad0f969c5e0fcd042ce886cef677527ee2e5bade3c20164af2fe16976826a1a23eba0d47d081f085ec31746725b00000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
         );
-        assert!(no_op.has_valid_hash() && remark.has_valid_hash() && place.has_valid_hash());
+        let limit_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Ioc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(limit_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cda154c8c33e393b013f3847bdc805d86005bc9f86c7136924940e9f4d5279c852026d42369f3f10720b404640f6b744d7001faa2278dc034e50bc43bd20cd2d801000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d03000000000000000000107af494000000000000000000000000000100000000",
+        );
+        let market_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 0,
+                order_type: DeepXPerpOrderType::Market(None),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(market_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cde6e00cb63f5f822612a9bd055c3f3616e43479224ff4d7603e0d184e406f2c2797e3f719ff59fd06db69d28e7b51c38f4672a595d866ca30991b19f0a4053ad00000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d0300000000000000000000000000000000000000000000000000010000000000",
+        );
+        let post_only_reduce_only_sell = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: false,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: true,
+                post_only: DeepXPostOnlyParam::MustPostOnly,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(post_only_reduce_only_sell.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cc1f64aff3ef4886dff70093171d731a8b90dbc1b11a86707e65413cdbc23f8ed50bf261d74d5d495daa4517188fc412708791a3304818df3c973a9b54f3f699c01000b7d2203a2910100160211111111111111111111111111111111111111110700000080c6a47e8d03000000000000000000107af494000000000000000000000000000000000101",
+        );
+        let cancel = sign_perp_cancel(
+            &permit,
+            &key(),
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 1_725_000_000_001,
+                market_id: 7,
+                fast_cancel: false,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(cancel.bytes()),
+            "050284fcad0b19bb29d4674531d6f115237e16afce377c152b54a48813785aa57c9baf3e9c735f6605547989f68154c0842e1ac0b027e00713afa4407c312135214709a88f0bc537ebf72727cb2df9a383ef953d9a894200000b7d2203a291010016031111111111111111111111111111111111111111012203a29101000007000000",
+        );
+        assert!(
+            no_op.has_valid_hash()
+                && remark.has_valid_hash()
+                && place.has_valid_hash()
+                && cancel.has_valid_hash()
+        );
+    }
+
+    #[rstest]
+    fn spec371_matches_live_python_sdk_vectors() {
+        let response: RpcResponse = serde_json::from_str(include_str!(
+            "../../test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
+        )).unwrap();
+        let bytes = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let old_snapshot = snapshot();
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &crate::common::DeepXEnvironment::Testnet,
+            old_snapshot.identity().genesis_hash,
+            371,
+            1,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(snapshot.identity().spec_version, 371);
+        assert_eq!(
+            hex::encode(snapshot.identity().metadata_sha256),
+            "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15"
+        );
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let remark = sign_dynamic_pallet_call(
+            &permit,
+            &key(),
+            "System",
+            "remark",
+            vec![Value::from_bytes(b"deepx-offline-signing-check")],
+            1_725_000_000_123,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(remark.bytes()),
+            "f50184fcad0b19bb29d4674531d6f115237e16afce377cc68afede7c39a8c51c9b56c4318e88613a966c209d559e9fcf68ad4da6b9160d56739bde6bb50780464211f37eeca92e514feefdb8bd8c643f47e2cc03deebc200000b7b2203a291010000006c64656570782d6f66666c696e652d7369676e696e672d636865636b",
+        );
+        let no_op = sign_no_op(&permit, &key(), 1_725_000_000_124).unwrap();
+        assert_eq!(
+            hex::encode(no_op.bytes()),
+            "850184fcad0b19bb29d4674531d6f115237e16afce377cbd583a84ae2b8912fc6a7760233a6c695d0e58e18fdbcef984101c616747430b4029fcc67ca9dc844d2c42e524f3f5c6b986f08e9a3d7a23ab3af3ca4897f8f901000b7c2203a2910100131c",
+        );
+        let place = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: u128::MAX,
+                price: u128::MAX,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: Some(u128::MAX),
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(place.bytes()),
+            "b90284fcad0b19bb29d4674531d6f115237e16afce377cb4fdb632655a86ec12b30c06130762cfc7d4773a4c74561e5fa072046ce144997e42b89c0fee251d46196cd0d7526adfaed6831c1dcfe893c9e8e174c7fb942301000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+        );
+        let limit_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Ioc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(limit_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377c55f33a8bfbd8f3dc02eca6182adf273f25b50703d938041e4d2dc6018d11f68b50e97da64fc6b52f9165032b893621b643c383e4f26cc5719306d29b0b55918401000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d03000000000000000000107af494000000000000000000000000000100000000",
+        );
+        let market_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 0,
+                order_type: DeepXPerpOrderType::Market(None),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(market_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cca6ad7b9fc3b9b85a7040e0c1eb50f4aeca0b45c75393c676e28993d21e3c00622cd442f7ab6e9ca61d9de5a1adf2cef5ceeafe308f3ddb9f5928cab648dd5bf01000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d0300000000000000000000000000000000000000000000000000010000000000",
+        );
+        let post_only_reduce_only_sell = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: false,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: true,
+                post_only: DeepXPostOnlyParam::MustPostOnly,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(post_only_reduce_only_sell.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cea59477d5fb34533252188655b6412650435b035aaa831a67d93b20f71ac07177ab647c50fd953eb0d9ae949dc6b455d72e06cea2a1378edda2214fc2a8a35cf00000b7d2203a2910100160211111111111111111111111111111111111111110700000080c6a47e8d03000000000000000000107af494000000000000000000000000000000000101",
+        );
+        let cancel = sign_perp_cancel(
+            &permit,
+            &key(),
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 1_725_000_000_001,
+                market_id: 7,
+                fast_cancel: false,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(cancel.bytes()),
+            "050284fcad0b19bb29d4674531d6f115237e16afce377c452661dbf696e0d16df0acff2587aa76059c511610f557c4d35971617441e5f07f62600861ac45973dace2c47d48605d0373e7a99177e64f9112498f1838852e00000b7d2203a291010016031111111111111111111111111111111111111111012203a29101000007000000",
+        );
+        assert!(
+            remark.has_valid_hash()
+                && no_op.has_valid_hash()
+                && place.has_valid_hash()
+                && cancel.has_valid_hash()
+        );
+    }
+
+    #[rstest]
+    fn additional_order_calls_match_live_sdk_vectors() {
+        let response: RpcResponse = serde_json::from_str(include_str!(
+            "../../test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
+        ))
+        .unwrap();
+        let bytes = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let old_snapshot = snapshot();
+        let runtime = RuntimeSnapshot::approved_testnet(
+            &crate::common::DeepXEnvironment::Testnet,
+            old_snapshot.identity().genesis_hash,
+            371,
+            1,
+            &bytes,
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(runtime);
+        let permit = service.acquire().unwrap();
+        let spot = sign_spot_place_order(
+            &permit,
+            &key(),
+            DeepXSpotPlaceParams {
+                subaccount: [0x11; 20],
+                pair: [0x22; 32],
+                is_buy: true,
+                quote_amount: [0x33; 32],
+                base_amount: [0x44; 32],
+                order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+                post_only: DeepXPostOnlyParam::None,
+                reduce_only: true,
+            },
+            1_725_000_000_126,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(spot.bytes()),
+            "690384fcad0b19bb29d4674531d6f115237e16afce377cc9d77c74cceef6627f758f3d669608a4ee257d855eef9da477cb2626c90195765cebb8d76d8d39429399d10a6b88c2f179ccfa68f61dc0981ec647da1d4945ba01000b7e2203a2910100140111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000001",
+        );
+        let close = sign_perp_close(
+            &permit,
+            &key(),
+            DeepXPerpCloseParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                price: 123,
+                slippage: None,
+            },
+            1_725_000_000_127,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(close.bytes()),
+            "210284fcad0b19bb29d4674531d6f115237e16afce377c87a8b3c22a0abb14d596f04842477750059ada9eb78f0c8c39366e149abed37034d1dde1f881afda42f881fbad1bbe7dcc0ade6390114b80dd21445f5398e9e701000b7f2203a2910100160e111111111111111111111111111111111111111107007b00000000000000000000000000000000",
+        );
+        let spot_cancel = sign_spot_cancel(
+            &permit,
+            &key(),
+            DeepXSpotCancelParams {
+                subaccount: [0x11; 20],
+                pair: [0x22; 32],
+                order_id: 1_725_000_000_128,
+                is_buy: false,
+                fast_cancel: false,
+            },
+            1_725_000_000_129,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(spot_cancel.bytes()),
+            "810284fcad0b19bb29d4674531d6f115237e16afce377c6123c984492ce7bbe3177a19d693d8a8284bb0f63b36dcb89cfb0e3a2e99bae00ab801a969ba7df9e492e63b7179d42b145c014a4c81e5f985967f76a2e22ec001000b812203a2910100140311111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222802203a291010000000000",
+        );
+        let pnl = sign_perp_set_profit_and_loss_point(
+            &permit,
+            &key(),
+            DeepXPerpProfitAndLossPointParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                take_profit_point: 123,
+                stop_loss_point: 456,
+            },
+            1_725_000_000_130,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(pnl.bytes()),
+            "5d0284fcad0b19bb29d4674531d6f115237e16afce377ce67839366830606287ce288fd27c3ef4fa159d63fffd4c41ab8269279504653361da97fdf4ac2b895ec7191d8e0e239463dadf50c23ff85f082a6e05f565a4c300000b822203a2910100160d111111111111111111111111111111111111111107007b000000000000000000000000000000c8010000000000000000000000000000",
+        );
+        let delete_subaccount = sign_delete_subaccount(
+            &permit,
+            &key(),
+            DeepXDeleteSubaccountParams {
+                subaccount: [0x11; 20],
+            },
+            1_725_000_000_131,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(delete_subaccount.bytes()),
+            "d50184fcad0b19bb29d4674531d6f115237e16afce377ce536bcc04e8cdcd9561fe62a5be6dace7c75c16841b8ba8974cabcaffe284d032af1ee81bd37e840bca645ab9075c7a7183a5bae4b8c3ff307d26c0b29d2df7800000b832203a291010013011111111111111111111111111111111111111111",
+        );
+        let remove_delegate = sign_remove_delegate_account(
+            &permit,
+            &key(),
+            DeepXRemoveDelegateAccountParams {
+                delegate: [0x22; 20],
+            },
+            1_725_000_000_132,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(remove_delegate.bytes()),
+            "d50184fcad0b19bb29d4674531d6f115237e16afce377ca03e70bf0001a60c4d12230b4571571df8a83495f3bbb1c0b0366561383e7d9c40748912805d2a7ae5aced740e1cc65bbdf66ea094e2041c65c77c3dd554382b00000b842203a2910100131d2222222222222222222222222222222222222222",
+        );
+        assert!(
+            spot.has_valid_hash()
+                && close.has_valid_hash()
+                && spot_cancel.has_valid_hash()
+                && pnl.has_valid_hash()
+                && delete_subaccount.has_valid_hash()
+                && remove_delegate.has_valid_hash()
+        );
     }
 
     #[rstest]
@@ -1378,6 +1740,72 @@ mod tests {
         assert_eq!(
             hex::encode(signed.bytes()),
             "b90284fcad0b19bb29d4674531d6f115237e16afce377c20f3fc4c9d8b313e32298602a7336f137e453ac098c95812f909033f5df1dba341ef8e7b770ef911213478b6361a4223cc117f1b5ec9545621ff1c66f6ba031700000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+        );
+        let limit_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Ioc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(limit_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cf6d5e54464c67cbccc28cb70bf6b231df7a4ffe3e5877db847dc289a7e83a364144a9ef7b823692163362914158c80b60e59e435196f83d95e2fe35040bb3f4a01000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d03000000000000000000107af494000000000000000000000000000100000000",
+        );
+        let market_ioc = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: true,
+                size: 1_000_000_000_000_000,
+                price: 0,
+                order_type: DeepXPerpOrderType::Market(None),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: false,
+                post_only: DeepXPostOnlyParam::None,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(market_ioc.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377cc874f7ea0d5c726894ff8b6521ca77a047f1642f909a6830bcb151b3e79bc942236059799d655fcc7030aaf6810693f7e6cdacbf454358b9a84425ebb0fd77c200000b7d2203a2910100160211111111111111111111111111111111111111110700010080c6a47e8d0300000000000000000000000000000000000000000000000000010000000000",
+        );
+        let post_only_reduce_only_sell = sign_perp_place_order(
+            &permit,
+            &key(),
+            DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 7,
+                is_long: false,
+                size: 1_000_000_000_000_000,
+                price: 2_499_050_000,
+                order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                take_profit: None,
+                stop_loss: None,
+                reduce_only: true,
+                post_only: DeepXPostOnlyParam::MustPostOnly,
+            },
+            1_725_000_000_125,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(post_only_reduce_only_sell.bytes()),
+            "790284fcad0b19bb29d4674531d6f115237e16afce377ccd5ab655383a2dc7cfbc91d192e7b96fdd96576430637b17d5a88ccf6ae6beb4215b2b0a966ac5e4f1a1ed1cd0193e4fe33bea511d1ae535de4bc545de7f181500000b7d2203a2910100160211111111111111111111111111111111111111110700000080c6a47e8d03000000000000000000107af494000000000000000000000000000000000101",
         );
         assert!(signed.has_valid_hash());
     }

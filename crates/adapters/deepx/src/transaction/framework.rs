@@ -20,7 +20,10 @@ use nautilus_common::messages::{
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    events::{OrderAccepted, OrderEventAny, OrderRejected, OrderSubmitted},
+    events::{
+        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderPendingCancel,
+        OrderRejected, OrderSubmitted,
+    },
     identifiers::VenueOrderId,
 };
 use thiserror::Error;
@@ -33,6 +36,7 @@ use super::{
 };
 
 const FINALIZED_REJECTION_REASON: &str = "DeepX finalized transaction failed";
+const FINALIZED_CANCEL_REJECTION_REASON: &str = "DeepX finalized cancellation failed";
 
 /// Authoritative finalized evidence eligible for one terminal framework order event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +53,18 @@ pub enum DeepXFrameworkOrderTerminalEvidence {
         /// Canonical finalized inclusion evidence for the failure.
         inclusion: DeepXInclusionEvidence,
     },
+    /// A matching finalized `PerpMarket.OrderCancelled` proves order cancellation.
+    Canceled {
+        /// Venue order ID proved by the matching cancellation event.
+        venue_order_id: u64,
+        /// Canonical finalized inclusion evidence for the cancellation.
+        inclusion: DeepXInclusionEvidence,
+    },
+    /// Finalized dispatch or cancellation-event failure proves the cancel command failed.
+    CancelRejected {
+        /// Canonical finalized inclusion evidence for the failed cancellation.
+        inclusion: DeepXInclusionEvidence,
+    },
 }
 
 /// Framework order-event milestones supported by current durable evidence.
@@ -59,6 +75,7 @@ pub enum DeepXFrameworkOrderTerminalEvidence {
 pub struct DeepXFrameworkOrderEventEligibility {
     context: DeepXFrameworkOrderContext,
     submitted: bool,
+    submitted_payload: DeepXFrameworkOrderEventPayload,
     terminal: Option<DeepXFrameworkOrderTerminalEvidence>,
 }
 
@@ -75,6 +92,12 @@ impl DeepXFrameworkOrderEventEligibility {
         self.submitted
     }
 
+    /// Returns the durable event type corresponding to the submission boundary.
+    #[must_use]
+    pub const fn submitted_payload(&self) -> DeepXFrameworkOrderEventPayload {
+        self.submitted_payload
+    }
+
     /// Returns authoritative finalized evidence for a terminal order event, when available.
     #[must_use]
     pub const fn terminal(&self) -> Option<DeepXFrameworkOrderTerminalEvidence> {
@@ -82,11 +105,11 @@ impl DeepXFrameworkOrderEventEligibility {
     }
 }
 
-/// Failures while classifying durable placement evidence for framework events.
+/// Failures while classifying durable placement or cancellation evidence for framework events.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DeepXFrameworkOrderEventEligibilityError {
-    /// The durable transaction is not a perpetual placement.
-    #[error("DeepX framework order-event classification requires a perpetual placement")]
+    /// The durable transaction is not a supported placement or cancellation.
+    #[error("DeepX framework order-event classification requires a supported order operation")]
     UnsupportedOperation,
     /// The placement does not use the timestamp-derived venue order ID domain.
     #[error("DeepX framework order-event classification requires a timestamp order ID")]
@@ -144,30 +167,46 @@ pub enum DeepXFrameworkOrderEventAcknowledgementError {
     OutOfOrder,
 }
 
-/// Classifies framework order-event eligibility from one durable perpetual placement.
+/// Classifies framework order-event eligibility from a Perp or Spot placement, or cancellation.
 ///
 /// Submission-pool acceptance proves only that transmission was acknowledged. Best-block
-/// inclusion remains reorganization-sensitive. Only a finalized successful placement is eligible
-/// for `OrderAccepted`, and only a finalized authoritative failure is eligible for
-/// `OrderRejected`. Ambiguous and not-included outcomes never become rejection evidence.
+/// inclusion remains reorganization-sensitive. Placement eligibility requires finalized business
+/// evidence, and cancellation eligibility requires finalized matching cancellation evidence.
+/// Ambiguous and not-included outcomes never become terminal events.
 ///
 /// This pure boundary does not construct, persist, deduplicate, or emit framework events.
 ///
 /// # Errors
 ///
-/// Returns an error unless the record describes a framework-owned, timestamp-identified perpetual
-/// placement with an unambiguous lifecycle and required finalized inclusion evidence.
+/// Returns an error unless the record describes a framework-owned, timestamp-identified placement
+/// or Perp/Spot cancellation with an unambiguous lifecycle.
 pub fn classify_perp_place_framework_order_events(
     record: &DeepXTransactionRecord,
 ) -> Result<DeepXFrameworkOrderEventEligibility, DeepXFrameworkOrderEventEligibilityError> {
-    if !matches!(
+    let is_place = matches!(
         record.identity().operation(),
-        Some(DeepXTransactionOperation::PerpPlace { .. })
-    ) {
+        Some(
+            DeepXTransactionOperation::PerpPlace { .. }
+                | DeepXTransactionOperation::SpotPlace { .. }
+        )
+    );
+    let cancellation_order_id = match record.identity().operation() {
+        Some(DeepXTransactionOperation::PerpCancel { order_id, .. }) => Some(*order_id),
+        Some(DeepXTransactionOperation::SpotCancel {
+            order_id,
+            fast_cancel: false,
+            ..
+        }) => Some(*order_id),
+        Some(DeepXTransactionOperation::SpotCancel {
+            fast_cancel: true, ..
+        }) => return Err(DeepXFrameworkOrderEventEligibilityError::UnsupportedOperation),
+        _ => None,
+    };
+    if !is_place && cancellation_order_id.is_none() {
         return Err(DeepXFrameworkOrderEventEligibilityError::UnsupportedOperation);
     }
     let DeepXNonceReservation::TimestampOrderId {
-        value: venue_order_id,
+        value: place_order_id,
     } = record.identity().nonce()
     else {
         return Err(DeepXFrameworkOrderEventEligibilityError::UnsupportedNonceDomain);
@@ -194,15 +233,29 @@ pub fn classify_perp_place_framework_order_events(
             .lifecycle()
             .inclusion()
             .ok_or(DeepXFrameworkOrderEventEligibilityError::MissingFinalizedInclusion)?;
-        Some(match inclusion.outcome() {
-            DeepXInclusionOutcome::Success => DeepXFrameworkOrderTerminalEvidence::Accepted {
-                venue_order_id,
-                inclusion,
+        Some(
+            match (is_place, cancellation_order_id, inclusion.outcome()) {
+                (true, _, DeepXInclusionOutcome::Success) => {
+                    DeepXFrameworkOrderTerminalEvidence::Accepted {
+                        venue_order_id: place_order_id,
+                        inclusion,
+                    }
+                }
+                (true, _, DeepXInclusionOutcome::Failed) => {
+                    DeepXFrameworkOrderTerminalEvidence::Rejected { inclusion }
+                }
+                (false, Some(order_id), DeepXInclusionOutcome::Success) => {
+                    DeepXFrameworkOrderTerminalEvidence::Canceled {
+                        venue_order_id: order_id,
+                        inclusion,
+                    }
+                }
+                (false, Some(_), DeepXInclusionOutcome::Failed) => {
+                    DeepXFrameworkOrderTerminalEvidence::CancelRejected { inclusion }
+                }
+                _ => unreachable!("validated operation has a supported terminal result"),
             },
-            DeepXInclusionOutcome::Failed => {
-                DeepXFrameworkOrderTerminalEvidence::Rejected { inclusion }
-            }
-        })
+        )
     } else {
         None
     };
@@ -210,6 +263,11 @@ pub fn classify_perp_place_framework_order_events(
     Ok(DeepXFrameworkOrderEventEligibility {
         context,
         submitted,
+        submitted_payload: if is_place {
+            DeepXFrameworkOrderEventPayload::Submitted
+        } else {
+            DeepXFrameworkOrderEventPayload::PendingCancel
+        },
         terminal,
     })
 }
@@ -223,8 +281,9 @@ pub fn classify_perp_place_framework_order_events(
 /// # Errors
 ///
 /// Returns an error when eligibility cannot be classified or the resulting durable record would
-/// violate its framework context and lifecycle invariants.
-pub fn stage_perp_place_framework_order_events(
+/// violate its framework context and lifecycle invariants. Supported records are Perp and Spot
+/// placements and Perp cancellations.
+pub fn stage_perp_framework_order_events(
     record: &mut DeepXTransactionRecord,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
@@ -243,7 +302,7 @@ pub fn stage_perp_place_framework_order_events(
             ts_event,
             ts_init,
             reconciliation,
-            DeepXFrameworkOrderEventPayload::Submitted,
+            eligibility.submitted_payload(),
         ));
     }
     if let Some(terminal) = eligibility.terminal() {
@@ -253,6 +312,12 @@ pub fn stage_perp_place_framework_order_events(
             }
             DeepXFrameworkOrderTerminalEvidence::Rejected { .. } => {
                 DeepXFrameworkOrderEventPayload::Rejected
+            }
+            DeepXFrameworkOrderTerminalEvidence::Canceled { venue_order_id, .. } => {
+                DeepXFrameworkOrderEventPayload::Canceled { venue_order_id }
+            }
+            DeepXFrameworkOrderTerminalEvidence::CancelRejected { .. } => {
+                DeepXFrameworkOrderEventPayload::CancelRejected
             }
         };
         changed |= outbox.stage_terminal(DeepXFrameworkOrderEventStage::new(
@@ -340,7 +405,7 @@ pub fn acknowledge_perp_place_framework_order_event(
 /// # Errors
 ///
 /// Returns an error when the durable record is invalid or has no framework context and outbox.
-pub fn materialize_perp_place_framework_order_events(
+pub fn materialize_perp_framework_order_events(
     record: &DeepXTransactionRecord,
 ) -> Result<Vec<OrderEventAny>, DeepXFrameworkOrderEventMaterializationError> {
     record.encode()?;
@@ -354,18 +419,49 @@ pub fn materialize_perp_place_framework_order_events(
     if let Some(stage) = outbox.submitted()
         && !stage.is_acknowledged()
     {
-        let mut event = OrderSubmitted::new(
-            context.trader_id(),
-            context.strategy_id(),
-            context.instrument_id(),
-            context.client_order_id(),
-            context.account_id(),
-            stage.event_id(),
-            stage.ts_event(),
-            stage.ts_init(),
-        );
-        event.causation_id = Some(context.command_id());
-        events.push(OrderEventAny::Submitted(event));
+        let event = match stage.payload() {
+            DeepXFrameworkOrderEventPayload::Submitted => {
+                let mut event = OrderSubmitted::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    context.account_id(),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::Submitted(event)
+            }
+            DeepXFrameworkOrderEventPayload::PendingCancel => {
+                let order_id = match record.identity().operation() {
+                    Some(
+                        DeepXTransactionOperation::PerpCancel { order_id, .. }
+                        | DeepXTransactionOperation::SpotCancel { order_id, .. },
+                    ) => *order_id,
+                    _ => {
+                        unreachable!("durable validation rejects cancel event on another operation")
+                    }
+                };
+                let mut event = OrderPendingCancel::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    Some(context.account_id()),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(order_id.to_string())),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::PendingCancel(event)
+            }
+            _ => unreachable!("durable validation rejects terminal payload in submitted slot"),
+        };
+        events.push(event);
     }
     if let Some(stage) = outbox.terminal()
         && !stage.is_acknowledged()
@@ -404,8 +500,53 @@ pub fn materialize_perp_place_framework_order_events(
                 event.causation_id = Some(context.command_id());
                 OrderEventAny::Rejected(event)
             }
+            DeepXFrameworkOrderEventPayload::Canceled { venue_order_id } => {
+                let mut event = OrderCanceled::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(venue_order_id.to_string())),
+                    Some(context.account_id()),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::Canceled(event)
+            }
+            DeepXFrameworkOrderEventPayload::CancelRejected => {
+                let order_id = match record.identity().operation() {
+                    Some(
+                        DeepXTransactionOperation::PerpCancel { order_id, .. }
+                        | DeepXTransactionOperation::SpotCancel { order_id, .. },
+                    ) => *order_id,
+                    _ => {
+                        unreachable!("durable validation rejects cancel event on another operation")
+                    }
+                };
+                let mut event = OrderCancelRejected::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    FINALIZED_CANCEL_REJECTION_REASON.into(),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(order_id.to_string())),
+                    Some(context.account_id()),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::CancelRejected(event)
+            }
             DeepXFrameworkOrderEventPayload::Submitted => {
                 unreachable!("durable outbox validation rejects submitted terminal payload")
+            }
+            DeepXFrameworkOrderEventPayload::PendingCancel => {
+                unreachable!("durable outbox validation rejects pending cancel terminal payload")
             }
         };
         events.push(event);
@@ -495,6 +636,112 @@ mod tests {
         )
     }
 
+    fn cancel_record() -> DeepXTransactionRecord {
+        let runtime = ApprovedRuntimeIdentity {
+            environment: DeepXEnvironment::Testnet,
+            genesis_hash: [1; 32],
+            metadata_sha256: [2; 32],
+            spec_version: 369,
+            transaction_version: 1,
+            signed_extensions: vec!["CheckNonce".to_string()],
+        };
+        let identity = DeepXTransactionIdentity::new_perp_cancel(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            [7; 20],
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: ORDER_ID + 1,
+            },
+            DeepXDirectRuntimeIdentity::from(&runtime),
+            [7; 20],
+            42,
+            3,
+            false,
+        );
+        DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(100, [3; 32]),
+            framework_context(),
+        )
+    }
+
+    fn spot_cancel_record() -> DeepXTransactionRecord {
+        let runtime = ApprovedRuntimeIdentity {
+            environment: DeepXEnvironment::Testnet,
+            genesis_hash: [1; 32],
+            metadata_sha256: [2; 32],
+            spec_version: 369,
+            transaction_version: 1,
+            signed_extensions: vec!["CheckNonce".to_string()],
+        };
+        let instrument_id = InstrumentId::from_as_ref("ETH-USDC.DEEPX").unwrap();
+        let context = DeepXFrameworkOrderContext::new(
+            nautilus_model::identifiers::TraderId::from("TRADER-001"),
+            nautilus_model::identifiers::StrategyId::from("S-DEEPX-001"),
+            instrument_id,
+            ClientOrderId::from("O-19700101-000000-001-001-1"),
+            nautilus_model::identifiers::AccountId::from("DEEPX-001"),
+            event_id(1),
+            nautilus_core::UnixNanos::from(10),
+            event_id(2),
+            nautilus_core::UnixNanos::from(9),
+            Some(event_id(3)),
+            Some(event_id(4)),
+            event_id(5),
+            event_id(6),
+        );
+        let identity = DeepXTransactionIdentity::new_spot_cancel(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            [7; 20],
+            instrument_id,
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId {
+                value: ORDER_ID + 1,
+            },
+            DeepXDirectRuntimeIdentity::from(&runtime),
+            crate::signing::DeepXSpotCancelParams {
+                subaccount: [7; 20],
+                pair: [8; 32],
+                order_id: 42,
+                is_buy: true,
+                fast_cancel: false,
+            },
+        );
+        DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(100, [3; 32]),
+            context,
+        )
+    }
+
+    fn submitted_cancel_record() -> DeepXTransactionRecord {
+        let mut record = cancel_record();
+        let identity = record.identity();
+        let runtime = identity.runtime();
+        let bytes = vec![4, 5, 6];
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer: identity.signer(),
+                nonce: ORDER_ID + 1,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: runtime.genesis_hash,
+                    metadata_sha256: runtime.metadata_sha256,
+                    spec_version: runtime.spec_version,
+                    transaction_version: runtime.transaction_version,
+                    signed_extensions: runtime.signed_extensions.clone(),
+                },
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record
+    }
+
     fn signed_record() -> DeepXTransactionRecord {
         let mut record = record();
         let bytes = vec![1, 2, 3];
@@ -540,7 +787,7 @@ mod tests {
         record
             .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
             .unwrap();
-        stage_perp_place_framework_order_events(
+        stage_perp_framework_order_events(
             &mut record,
             UnixNanos::from(100),
             UnixNanos::from(101),
@@ -586,7 +833,7 @@ mod tests {
             Err(DeepXFrameworkOrderEventEligibilityError::MissingFrameworkContext),
         );
         assert!(matches!(
-            materialize_perp_place_framework_order_events(&generic),
+            materialize_perp_framework_order_events(&generic),
             Err(DeepXFrameworkOrderEventMaterializationError::MissingFrameworkContext),
         ));
     }
@@ -678,11 +925,125 @@ mod tests {
     }
 
     #[rstest]
+    fn finalized_perp_cancel_stages_pending_and_authoritative_terminal_event() {
+        for (outcome, expected_payload) in [
+            (
+                DeepXInclusionOutcome::Success,
+                DeepXFrameworkOrderEventPayload::Canceled { venue_order_id: 42 },
+            ),
+            (
+                DeepXInclusionOutcome::Failed,
+                DeepXFrameworkOrderEventPayload::CancelRejected,
+            ),
+        ] {
+            let mut record = submitted_cancel_record();
+            let inclusion = inclusion(outcome);
+            record
+                .apply_observation(DeepXTransactionObservation::Included(inclusion))
+                .unwrap();
+            record
+                .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
+                .unwrap();
+
+            assert!(
+                stage_perp_framework_order_events(
+                    &mut record,
+                    UnixNanos::from(300),
+                    UnixNanos::from(301),
+                    true,
+                )
+                .unwrap()
+            );
+            let outbox = record.framework_order_outbox().unwrap();
+            assert_eq!(
+                outbox.submitted().unwrap().payload(),
+                DeepXFrameworkOrderEventPayload::PendingCancel,
+            );
+            assert_eq!(outbox.terminal().unwrap().payload(), expected_payload);
+            let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+            assert_eq!(restored.framework_order_outbox(), Some(outbox));
+            let events = materialize_perp_framework_order_events(&restored).unwrap();
+            assert!(
+                matches!(events.first(), Some(OrderEventAny::PendingCancel(event))
+                if event.venue_order_id == Some(VenueOrderId::new("42"))
+                    && event.causation_id == Some(framework_context().command_id()))
+            );
+            match outcome {
+                DeepXInclusionOutcome::Success => assert!(matches!(
+                    events.get(1),
+                    Some(OrderEventAny::Canceled(event))
+                        if event.venue_order_id == Some(VenueOrderId::new("42"))
+                            && event.causation_id == Some(framework_context().command_id())
+                )),
+                DeepXInclusionOutcome::Failed => assert!(matches!(
+                    events.get(1),
+                    Some(OrderEventAny::CancelRejected(event))
+                        if event.venue_order_id == Some(VenueOrderId::new("42"))
+                            && event.causation_id == Some(framework_context().command_id())
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_spot_cancel_stages_pending_and_authoritative_terminal_event() {
+        let mut record = spot_cancel_record();
+        let identity = record.identity();
+        let bytes = vec![7, 8, 9];
+        record
+            .record_signed(&SignedPalletExtrinsic {
+                extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+                bytes,
+                signer: identity.signer(),
+                nonce: ORDER_ID + 1,
+                runtime: ApprovedRuntimeIdentity {
+                    environment: DeepXEnvironment::Testnet,
+                    genesis_hash: identity.runtime().genesis_hash,
+                    metadata_sha256: identity.runtime().metadata_sha256,
+                    spec_version: identity.runtime().spec_version,
+                    transaction_version: identity.runtime().transaction_version,
+                    signed_extensions: identity.runtime().signed_extensions.clone(),
+                },
+            })
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        let inclusion = inclusion(DeepXInclusionOutcome::Success);
+        record
+            .apply_observation(DeepXTransactionObservation::Included(inclusion))
+            .unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
+            .unwrap();
+
+        stage_perp_framework_order_events(
+            &mut record,
+            UnixNanos::from(300),
+            UnixNanos::from(301),
+            false,
+        )
+        .unwrap();
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+        let events = materialize_perp_framework_order_events(&restored).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(OrderEventAny::PendingCancel(event))
+                if event.venue_order_id == Some(VenueOrderId::new("42"))
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(OrderEventAny::Canceled(event))
+                if event.venue_order_id == Some(VenueOrderId::new("42"))
+        ));
+    }
+
+    #[rstest]
     fn staging_before_submission_is_a_noop() {
         let mut record = signed_record();
 
         assert!(
-            !stage_perp_place_framework_order_events(
+            !stage_perp_framework_order_events(
                 &mut record,
                 UnixNanos::from(100),
                 UnixNanos::from(101),
@@ -701,7 +1062,7 @@ mod tests {
         let mut record = submitted_record();
 
         assert!(
-            stage_perp_place_framework_order_events(
+            stage_perp_framework_order_events(
                 &mut record,
                 UnixNanos::from(100),
                 UnixNanos::from(101),
@@ -710,7 +1071,7 @@ mod tests {
             .unwrap()
         );
         assert!(
-            !stage_perp_place_framework_order_events(
+            !stage_perp_framework_order_events(
                 &mut record,
                 UnixNanos::from(200),
                 UnixNanos::from(201),
@@ -744,7 +1105,7 @@ mod tests {
                 .reconciliation()
         );
 
-        let events = materialize_perp_place_framework_order_events(&restored).unwrap();
+        let events = materialize_perp_framework_order_events(&restored).unwrap();
         let [OrderEventAny::Submitted(event)] = events.as_slice() else {
             panic!("expected exactly one submitted event")
         };
@@ -762,7 +1123,7 @@ mod tests {
     #[rstest]
     fn malformed_staged_reconciliation_is_rejected() {
         let mut record = submitted_record();
-        stage_perp_place_framework_order_events(
+        stage_perp_framework_order_events(
             &mut record,
             UnixNanos::from(100),
             UnixNanos::from(101),
@@ -802,7 +1163,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            stage_perp_place_framework_order_events(
+            stage_perp_framework_order_events(
                 &mut record,
                 UnixNanos::from(300),
                 UnixNanos::from(301),
@@ -826,7 +1187,7 @@ mod tests {
         let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
         assert_eq!(restored.framework_order_outbox(), Some(outbox));
 
-        let events = materialize_perp_place_framework_order_events(&restored).unwrap();
+        let events = materialize_perp_framework_order_events(&restored).unwrap();
         assert!(matches!(events.first(), Some(OrderEventAny::Submitted(_))));
         match (outcome, &events[1]) {
             (DeepXInclusionOutcome::Success, OrderEventAny::Accepted(event)) => {
@@ -891,7 +1252,7 @@ mod tests {
                 .unwrap()
                 .is_acknowledged()
         );
-        let pending = materialize_perp_place_framework_order_events(&record).unwrap();
+        let pending = materialize_perp_framework_order_events(&record).unwrap();
         let [OrderEventAny::Accepted(event)] = pending.as_slice() else {
             panic!("expected only the pending terminal event")
         };
@@ -1007,7 +1368,7 @@ mod tests {
         assert!(
             !acknowledge_perp_place_framework_order_event(&mut record, submitted_receipt).unwrap()
         );
-        let pending = materialize_perp_place_framework_order_events(&record).unwrap();
+        let pending = materialize_perp_framework_order_events(&record).unwrap();
         let [OrderEventAny::Accepted(event)] = pending.as_slice() else {
             panic!("expected only the pending terminal event")
         };
@@ -1020,7 +1381,7 @@ mod tests {
             !acknowledge_perp_place_framework_order_event(&mut record, terminal_receipt).unwrap()
         );
         assert!(
-            materialize_perp_place_framework_order_events(&record)
+            materialize_perp_framework_order_events(&record)
                 .unwrap()
                 .is_empty()
         );

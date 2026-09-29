@@ -389,7 +389,8 @@ fn value_matches_optional_u128(value: &ScaleValue<u32>, expected: Option<u128>) 
 /// Verifies the close-generated order without equating its account-sequence ID to the nonce.
 ///
 /// This binds creation of a reduce-only order, not execution or complete position closure.
-/// Position-derived direction and size are not inferred from the durable close call.
+/// Position-derived direction and size are not inferred from the durable close call. The generated
+/// order must still have positive size and leverage, with no initial fill.
 ///
 /// # Errors
 ///
@@ -426,16 +427,19 @@ pub fn verify_perp_close_inclusion_events(
             let Some(order_id) = field("order_id").and_then(ScaleValue::as_u128).filter(|id| *id <= u128::from(u64::MAX)) else { return false; };
             let Some(ScaleValue { value: ValueDef::Composite(Composite::Named(order)), .. }) = field("order") else { return false; };
             let field = |name| order.iter().find_map(|(key, value)| (key == name).then_some(value));
+            let Some(is_long) = field("is_long").and_then(ScaleValue::as_bool) else { return false; };
+            let Some(size) = field("size").and_then(ScaleValue::as_u128).filter(|size| *size > 0) else { return false; };
+            let Some(leverage) = field("leverage").and_then(ScaleValue::as_u128).filter(|leverage| *leverage > 0) else { return false; };
             outer.len() == 2 && order.len() == 16
                 && field("order_id").and_then(ScaleValue::as_u128) == Some(order_id)
                 && field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
                 && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
-                && field("is_long").and_then(ScaleValue::as_bool).is_some()
-                && field("size").and_then(ScaleValue::as_u128).is_some()
-                && field("size_remain").and_then(ScaleValue::as_u128) == field("size").and_then(ScaleValue::as_u128)
+                && field("is_long").and_then(ScaleValue::as_bool) == Some(is_long)
+                && field("size").and_then(ScaleValue::as_u128) == Some(size)
+                && field("size_remain").and_then(ScaleValue::as_u128) == Some(size)
                 && field("size_filled").and_then(ScaleValue::as_u128) == Some(0)
                 && field("create_time").and_then(ScaleValue::as_u128) == Some(u128::from(block_number))
-                && field("leverage").and_then(ScaleValue::as_u128).is_some()
+                && field("leverage").and_then(ScaleValue::as_u128) == Some(leverage)
                 && field("price").and_then(ScaleValue::as_u128).is_some_and(|actual| *price == 0 || actual == *price)
                 && field("order_type").is_some_and(|v| if *price == 0 {
                     value_matches_order_type(v, crate::signing::DeepXSpotOrderType::Market(*slippage))
@@ -2563,12 +2567,22 @@ mod tests {
         if spec == 366 {
             runtime_snapshot()
         } else {
-            let metadata: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"))).unwrap();
+            let encoded = match spec {
+                369 => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"
+                )),
+                371 => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
+                )),
+                _ => panic!("unsupported test runtime specification {spec}"),
+            };
+            let metadata: Value = serde_json::from_str(encoded).unwrap();
             RuntimeSnapshot::approved_testnet(
                 &DeepXEnvironment::Testnet,
                 hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-                369,
+                spec,
                 1,
                 &hex::decode(
                     metadata["result"]
@@ -2590,7 +2604,7 @@ mod tests {
     fn perp_profit_and_loss_events_bind_points(
         #[case] take: u128,
         #[case] stop: u128,
-        #[values(366, 369)] spec: u32,
+        #[values(366, 369, 371)] spec: u32,
     ) {
         let snapshot = runtime_snapshot_for_spec(spec);
         let baseline = cancel_identity([0x11; 20], 7, false);
@@ -2681,7 +2695,7 @@ mod tests {
             )
             .is_err()
         );
-        if spec == 369 {
+        if spec != 366 {
             assert!(
                 verify_perp_profit_and_loss_point_inclusion_events(
                     &runtime_snapshot(),
@@ -2768,7 +2782,7 @@ mod tests {
     fn perp_close_events_bind_generated_order(
         #[case] price: u128,
         #[case] slippage: Option<u64>,
-        #[values(366, 369)] spec: u32,
+        #[values(366, 369, 371)] spec: u32,
     ) {
         let snapshot = runtime_snapshot_for_spec(spec);
         let baseline = perp_place_identity(true, price == 0);
@@ -2845,7 +2859,7 @@ mod tests {
             ]))
             .is_err()
         );
-        if spec == 369 {
+        if spec != 366 {
             assert!(
                 verify_perp_close_inclusion_events(
                     &runtime_snapshot(),
@@ -4192,9 +4206,12 @@ mod tests {
                     "chain_getBlockHash",
                     "chain_getFinalizedHead",
                     "chain_getHeader",
+                    "eth_call",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
                     "state_getStorage",
+                    "state_queryStorageAt",
+                    "state_call",
                 ],
             }),
             "chain_getFinalizedHead" => json!(

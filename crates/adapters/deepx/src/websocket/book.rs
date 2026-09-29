@@ -212,9 +212,10 @@ fn apply_levels(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    use super::*;
 
     fn frame(
         kind: &str,

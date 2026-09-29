@@ -41,6 +41,8 @@ const TESTNET_METADATA_SHA256: &str =
 const TESTNET_SPEC_VERSION: u32 = 366;
 const TESTNET_SPEC_369_METADATA_SHA256: &str =
     "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c";
+const TESTNET_SPEC_371_METADATA_SHA256: &str =
+    "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15";
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
 const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
@@ -389,6 +391,16 @@ pub struct RuntimeSnapshot {
     client_state: ClientState<DeepXRuntimeConfig>,
 }
 
+/// Immutable runtime identity approved only for finalized read operations.
+///
+/// Unlike [`RuntimeSnapshot`], this type cannot initialize a signing service or produce a signing
+/// permit. It exists so a captured runtime can be approved for read-only evidence without also
+/// authorizing transaction encoding or signing.
+#[derive(Clone, Debug)]
+pub struct DeepXReadOnlyRuntimeSnapshot {
+    identity: ApprovedRuntimeIdentity,
+}
+
 #[derive(Debug)]
 struct RuntimeSnapshotServiceState {
     active: Arc<RuntimeSnapshot>,
@@ -664,7 +676,7 @@ impl Drop for DeepXRuntimeSnapshotPermit {
 }
 
 impl RuntimeSnapshot {
-    /// Builds the only runtime identity currently approved for DeepX testnet signing.
+    /// Builds a runtime identity currently approved for DeepX testnet signing.
     ///
     /// # Errors
     ///
@@ -677,56 +689,23 @@ impl RuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        if !environment.is_testnet() {
-            return Err(SnapshotError::UnsupportedDeployment(
-                environment.to_string(),
-            ));
-        }
-        let genesis_hash = decode_32(TESTNET_GENESIS_HASH)?;
-        if observed_genesis_hash != genesis_hash
-            || observed_transaction_version != TESTNET_TRANSACTION_VERSION
-        {
-            return Err(SnapshotError::RuntimeIdentityMismatch);
-        }
-        let approved_metadata_hash = decode_32(match observed_spec_version {
+        let approved_metadata_hash = match observed_spec_version {
             TESTNET_SPEC_VERSION => TESTNET_METADATA_SHA256,
             369 => TESTNET_SPEC_369_METADATA_SHA256,
+            371 => TESTNET_SPEC_371_METADATA_SHA256,
             _ => return Err(SnapshotError::RuntimeIdentityMismatch),
-        })?;
-        let actual_metadata_hash: [u8; 32] = digest(&SHA256, metadata_bytes)
-            .as_ref()
-            .try_into()
-            .map_err(|_| SnapshotError::InvalidApprovedIdentity)?;
-        if actual_metadata_hash != approved_metadata_hash {
-            return Err(SnapshotError::MetadataHashMismatch);
-        }
-
-        let metadata = metadata::decode_from(metadata_bytes)?;
-        let extension_metadata = metadata
-            .extrinsic()
-            .transaction_extensions_to_use_for_encoding()
-            .collect::<Vec<_>>();
-        let signed_extensions = extension_metadata
-            .iter()
-            .map(|extension| extension.identifier().to_string())
-            .collect::<Vec<_>>();
-        if signed_extensions != TESTNET_SIGNED_EXTENSIONS {
-            return Err(SnapshotError::SignedExtensionsMismatch);
-        }
-        validate_unknown_extensions(&metadata)?;
-        let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata)?;
-
-        let identity = ApprovedRuntimeIdentity {
-            environment: environment.clone(),
-            genesis_hash,
-            metadata_sha256: actual_metadata_hash,
-            spec_version: observed_spec_version,
-            transaction_version: TESTNET_TRANSACTION_VERSION,
-            signed_extensions,
         };
+        let (identity, interfaces, metadata) = validate_testnet_runtime_snapshot(
+            environment,
+            observed_genesis_hash,
+            observed_spec_version,
+            observed_transaction_version,
+            metadata_bytes,
+            approved_metadata_hash,
+        )?;
         let client_state = ClientState {
             metadata,
-            genesis_hash: H256::from(genesis_hash),
+            genesis_hash: H256::from(identity.genesis_hash),
             runtime_version: RuntimeVersion {
                 spec_version: observed_spec_version,
                 transaction_version: TESTNET_TRANSACTION_VERSION,
@@ -759,6 +738,102 @@ impl RuntimeSnapshot {
     pub(crate) const fn metadata(&self) -> &Metadata {
         &self.client_state.metadata
     }
+}
+
+impl DeepXReadOnlyRuntimeSnapshot {
+    /// Builds a fixture-approved DeepX testnet snapshot which cannot authorize signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the observed genesis, runtime versions, metadata hash, extension
+    /// order, and extension encodings match a captured finalized read-only fixture.
+    pub fn approved_testnet(
+        environment: &DeepXEnvironment,
+        observed_genesis_hash: [u8; 32],
+        observed_spec_version: u32,
+        observed_transaction_version: u32,
+        metadata_bytes: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        let approved_metadata_hash = match observed_spec_version {
+            TESTNET_SPEC_VERSION => TESTNET_METADATA_SHA256,
+            369 => TESTNET_SPEC_369_METADATA_SHA256,
+            371 => TESTNET_SPEC_371_METADATA_SHA256,
+            _ => return Err(SnapshotError::RuntimeIdentityMismatch),
+        };
+        let (identity, _, _) = validate_testnet_runtime_snapshot(
+            environment,
+            observed_genesis_hash,
+            observed_spec_version,
+            observed_transaction_version,
+            metadata_bytes,
+            approved_metadata_hash,
+        )?;
+        Ok(Self { identity })
+    }
+
+    /// Returns the fixture-approved identity associated with this read-only snapshot.
+    #[must_use]
+    pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.identity
+    }
+}
+
+fn validate_testnet_runtime_snapshot(
+    environment: &DeepXEnvironment,
+    observed_genesis_hash: [u8; 32],
+    observed_spec_version: u32,
+    observed_transaction_version: u32,
+    metadata_bytes: &[u8],
+    approved_metadata_hash: &str,
+) -> Result<
+    (
+        ApprovedRuntimeIdentity,
+        DeepXRuntimeInterfaceCatalog,
+        Metadata,
+    ),
+    SnapshotError,
+> {
+    if !environment.is_testnet() {
+        return Err(SnapshotError::UnsupportedDeployment(
+            environment.to_string(),
+        ));
+    }
+    let genesis_hash = decode_32(TESTNET_GENESIS_HASH)?;
+    if observed_genesis_hash != genesis_hash
+        || observed_transaction_version != TESTNET_TRANSACTION_VERSION
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch);
+    }
+    let approved_metadata_hash = decode_32(approved_metadata_hash)?;
+    let actual_metadata_hash: [u8; 32] = digest(&SHA256, metadata_bytes)
+        .as_ref()
+        .try_into()
+        .map_err(|_| SnapshotError::InvalidApprovedIdentity)?;
+    if actual_metadata_hash != approved_metadata_hash {
+        return Err(SnapshotError::MetadataHashMismatch);
+    }
+
+    let metadata = metadata::decode_from(metadata_bytes)?;
+    let signed_extensions = metadata
+        .extrinsic()
+        .transaction_extensions_to_use_for_encoding()
+        .map(|extension| extension.identifier().to_string())
+        .collect::<Vec<_>>();
+    if signed_extensions != TESTNET_SIGNED_EXTENSIONS {
+        return Err(SnapshotError::SignedExtensionsMismatch);
+    }
+    validate_unknown_extensions(&metadata)?;
+    let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata)?;
+    let identity = ApprovedRuntimeIdentity {
+        environment: environment.clone(),
+        genesis_hash,
+        metadata_sha256: actual_metadata_hash,
+        spec_version: observed_spec_version,
+        transaction_version: TESTNET_TRANSACTION_VERSION,
+        signed_extensions,
+    };
+
+    Ok((identity, interfaces, metadata))
 }
 
 fn collect_variants(
@@ -837,10 +912,13 @@ fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
 
 #[cfg(test)]
 mod tests {
-    use frame_metadata::{META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed};
+    use frame_metadata::{
+        META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed,
+        v14::{StorageEntryModifier, StorageEntryType, StorageHasher},
+    };
     use parity_scale_codec::{Decode, Encode};
     use rstest::rstest;
-    use scale_info::form::PortableForm;
+    use scale_info::{TypeDefPrimitive, form::PortableForm};
     use serde::Deserialize;
     use serde_json::Value;
 
@@ -871,6 +949,41 @@ mod tests {
         "/test_data/runtime/testnet/",
         "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
     ));
+    const SPEC_371_METADATA_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
+    ));
+    const SPEC_371_FIXTURE_MANIFEST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/manifest.json",
+    ));
+    const SPEC_371_GENESIS_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/genesis_hash.json",
+    ));
+    const SPEC_371_FINALIZED_HEAD_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/finalized_head.json",
+    ));
+    const SPEC_371_FINALIZED_HEADER_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/finalized_header.json",
+    ));
+    const SPEC_371_FINALIZED_BLOCK_HASH_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/finalized_block_hash.json",
+    ));
+    const SPEC_371_RUNTIME_VERSION_RESPONSE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test_data/runtime/testnet/",
+        "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/runtime_version.json",
+    ));
 
     #[derive(Deserialize)]
     struct RpcResponse {
@@ -891,6 +1004,8 @@ mod tests {
         endpoint_role: String,
         block_reference: String,
         block_hash: String,
+        #[serde(default)]
+        block_number: Option<u32>,
         identity: FixtureIdentity,
         metadata_bytes: usize,
         signed_extensions: Option<Vec<String>>,
@@ -917,8 +1032,23 @@ mod tests {
         result: RuntimeVersion,
     }
 
+    #[derive(Deserialize)]
+    struct Header {
+        number: String,
+    }
+
+    #[derive(Deserialize)]
+    struct HeaderResponse {
+        result: Header,
+    }
+
     fn metadata_bytes() -> Vec<u8> {
         let response: RpcResponse = serde_json::from_str(METADATA_RESPONSE).unwrap();
+        hex::decode(response.result.trim_start_matches("0x")).unwrap()
+    }
+
+    fn spec_371_metadata_bytes() -> Vec<u8> {
+        let response: RpcResponse = serde_json::from_str(SPEC_371_METADATA_RESPONSE).unwrap();
         hex::decode(response.result.trim_start_matches("0x")).unwrap()
     }
 
@@ -1053,6 +1183,608 @@ mod tests {
                 index: 0,
             },
         );
+    }
+
+    #[rstest]
+    fn spec_371_is_approved_for_read_only_and_signing_use() {
+        let genesis_hash = decode_32(TESTNET_GENESIS_HASH).unwrap();
+        let metadata = spec_371_metadata_bytes();
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis_hash,
+            371,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata,
+        )
+        .unwrap();
+
+        assert_eq!(read_only.identity().spec_version, 371);
+        assert_eq!(
+            hex::encode(read_only.identity().metadata_sha256),
+            TESTNET_SPEC_371_METADATA_SHA256,
+        );
+        let signing = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis_hash,
+            371,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(signing.identity(), read_only.identity());
+        assert_eq!(
+            signing
+                .interfaces()
+                .call("PerpMarket", "place_order")
+                .unwrap(),
+            &DeepXRuntimeVariantIdentity {
+                name: "place_order".to_string(),
+                index: 2,
+            },
+        );
+    }
+
+    #[rstest]
+    fn spec_371_read_only_approval_rejects_identity_drift() {
+        let genesis_hash = decode_32(TESTNET_GENESIS_HASH).unwrap();
+        let metadata = spec_371_metadata_bytes();
+        let mut changed_metadata = metadata.clone();
+        changed_metadata[100] ^= 1;
+
+        for result in [
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                [0; 32],
+                371,
+                TESTNET_TRANSACTION_VERSION,
+                &metadata,
+            ),
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis_hash,
+                370,
+                TESTNET_TRANSACTION_VERSION,
+                &metadata,
+            ),
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis_hash,
+                371,
+                2,
+                &metadata,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(SnapshotError::RuntimeIdentityMismatch)
+            ));
+        }
+        assert!(matches!(
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis_hash,
+                371,
+                TESTNET_TRANSACTION_VERSION,
+                &changed_metadata,
+            ),
+            Err(SnapshotError::MetadataHashMismatch),
+        ));
+    }
+
+    #[rstest]
+    fn spec_371_metadata_diff_is_only_the_runtime_version_byte() {
+        const SPEC_369_METADATA_RESPONSE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json",
+        ));
+        let spec_369: RpcResponse = serde_json::from_str(SPEC_369_METADATA_RESPONSE).unwrap();
+        let spec_369 = hex::decode(spec_369.result.trim_start_matches("0x")).unwrap();
+        let spec_371 = spec_371_metadata_bytes();
+        let differences = spec_369
+            .iter()
+            .zip(&spec_371)
+            .enumerate()
+            .filter_map(|(offset, (old, new))| (old != new).then_some((offset, *old, *new)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(spec_369.len(), spec_371.len());
+        assert_eq!(differences, vec![(92_129, 0x71, 0x73)]);
+    }
+
+    #[rstest]
+    fn spec_371_perp_position_storage_metadata_layout_is_exact() {
+        let bytes = spec_371_metadata_bytes();
+        let mut input = bytes.as_slice();
+        let RuntimeMetadataPrefixed(prefix, RuntimeMetadata::V14(metadata)) =
+            RuntimeMetadataPrefixed::decode(&mut input).unwrap()
+        else {
+            panic!("Expected V14 fixture metadata");
+        };
+        assert_eq!(prefix, META_RESERVED);
+        assert!(input.is_empty());
+        let perp_market = metadata
+            .pallets
+            .iter()
+            .find(|pallet| pallet.name == "PerpMarket")
+            .unwrap();
+        let perp_storage = perp_market.storage.as_ref().unwrap();
+        assert_eq!(perp_storage.prefix, "PerpMarket");
+        let positions = perp_storage
+            .entries
+            .iter()
+            .find(|entry| entry.name == "UserPerpPositions")
+            .unwrap();
+        assert_eq!(positions.modifier, StorageEntryModifier::Default);
+        let StorageEntryType::Map {
+            hashers,
+            key,
+            value,
+        } = &positions.ty
+        else {
+            panic!("UserPerpPositions must be a storage map");
+        };
+        assert!(matches!(hashers.as_slice(), [StorageHasher::Identity]));
+        assert_fixed_u8_array(&metadata.types, key.id, 20, Some("H160"));
+        assert_eq!(positions.default, [0]);
+
+        let position_sequence = metadata.types.resolve(value.id).unwrap();
+        let TypeDef::Sequence(position_sequence) = &position_sequence.type_def else {
+            panic!("UserPerpPositions value must be Vec<PerpPosition>");
+        };
+        let position = metadata
+            .types
+            .resolve(position_sequence.type_param.id)
+            .unwrap();
+        assert_eq!(
+            position.path.segments.last().map(String::as_str),
+            Some("PerpPosition")
+        );
+        let TypeDef::Composite(position) = &position.type_def else {
+            panic!("PerpPosition must be a composite type");
+        };
+        let expected_fields = [
+            ("market_id", TypeDefPrimitive::U16),
+            ("is_long", TypeDefPrimitive::Bool),
+            ("base_asset_amount", TypeDefPrimitive::U128),
+            ("entry_price", TypeDefPrimitive::U128),
+            ("leverage", TypeDefPrimitive::U64),
+            ("last_funding_rate", TypeDefPrimitive::I128),
+            ("version", TypeDefPrimitive::U64),
+            ("realized_pnl", TypeDefPrimitive::I128),
+            ("funding_payment", TypeDefPrimitive::I128),
+        ];
+        assert_eq!(position.fields.len(), 13);
+        for (field, (expected_name, expected_type)) in position.fields.iter().zip(expected_fields) {
+            assert_eq!(field.name.as_deref(), Some(expected_name));
+            assert_primitive(&metadata.types, field.ty.id, expected_type);
+        }
+        assert_eq!(position.fields[9].name.as_deref(), Some("owner"));
+        assert_fixed_u8_array(&metadata.types, position.fields[9].ty.id, 20, Some("H160"));
+        assert_eq!(position.fields[10].name.as_deref(), Some("take_profit"));
+        assert_option_primitive(
+            &metadata.types,
+            position.fields[10].ty.id,
+            TypeDefPrimitive::U128,
+        );
+        assert_eq!(position.fields[11].name.as_deref(), Some("stop_loss"));
+        assert_option_primitive(
+            &metadata.types,
+            position.fields[11].ty.id,
+            TypeDefPrimitive::U128,
+        );
+        assert_eq!(
+            position.fields[12].name.as_deref(),
+            Some("last_settle_price")
+        );
+        assert_primitive(
+            &metadata.types,
+            position.fields[12].ty.id,
+            TypeDefPrimitive::U128,
+        );
+
+        let subaccount = metadata
+            .pallets
+            .iter()
+            .find(|pallet| pallet.name == "Subaccount")
+            .unwrap();
+        let subaccount_storage = subaccount.storage.as_ref().unwrap();
+        assert_eq!(subaccount_storage.prefix, "Subaccount");
+        let maximum = subaccount_storage
+            .entries
+            .iter()
+            .find(|entry| entry.name == "MaxPerpPositions")
+            .unwrap();
+        assert_eq!(maximum.modifier, StorageEntryModifier::Default);
+        let StorageEntryType::Plain(maximum_ty) = &maximum.ty else {
+            panic!("MaxPerpPositions must be plain storage");
+        };
+        assert_primitive(&metadata.types, maximum_ty.id, TypeDefPrimitive::U32);
+        assert_eq!(maximum.default, 8_u32.encode());
+    }
+
+    #[rstest]
+    fn spec_371_perp_order_storage_metadata_layout_is_exact() {
+        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
+            RuntimeMetadataPrefixed::decode(&mut spec_371_metadata_bytes().as_slice()).unwrap()
+        else {
+            panic!("Expected V14 fixture metadata");
+        };
+        let storage = metadata
+            .pallets
+            .iter()
+            .find(|pallet| pallet.name == "PerpMarket")
+            .unwrap()
+            .storage
+            .as_ref()
+            .unwrap();
+
+        let active = storage
+            .entries
+            .iter()
+            .find(|entry| entry.name == "ActivePerpOrdersFor")
+            .unwrap();
+        assert_eq!(active.modifier, StorageEntryModifier::Default);
+        assert_eq!(active.default, [0]);
+        let StorageEntryType::Map {
+            hashers,
+            key,
+            value,
+        } = &active.ty
+        else {
+            panic!("ActivePerpOrdersFor must be a storage map");
+        };
+        assert!(matches!(hashers.as_slice(), [StorageHasher::Identity]));
+        assert_fixed_u8_array(&metadata.types, key.id, 20, Some("H160"));
+        let active_map = metadata.types.resolve(value.id).unwrap();
+        assert_eq!(
+            active_map.path.segments.last().map(String::as_str),
+            Some("BTreeMap")
+        );
+        assert_eq!(active_map.type_params.len(), 2);
+        let market_id = active_map.type_params[0].ty.as_ref().unwrap().id;
+        assert_primitive(&metadata.types, market_id, TypeDefPrimitive::U16);
+        let active_orders = active_map.type_params[1].ty.as_ref().unwrap().id;
+        let active_orders = metadata.types.resolve(active_orders).unwrap();
+        let TypeDef::Sequence(active_orders) = &active_orders.type_def else {
+            panic!("ActivePerpOrdersFor values must be Vec<ActiveOrder>");
+        };
+        let active_order_id = active_orders.type_param.id;
+        let active_order = metadata.types.resolve(active_order_id).unwrap();
+        assert_eq!(
+            active_order.path.segments.last().map(String::as_str),
+            Some("ActiveOrder")
+        );
+        let TypeDef::Composite(active_order) = &active_order.type_def else {
+            panic!("ActiveOrder must be a composite type");
+        };
+        assert_eq!(active_order.fields.len(), 7);
+        assert_eq!(active_order.fields[0].name.as_deref(), Some("address"));
+        assert_fixed_u8_array(
+            &metadata.types,
+            active_order.fields[0].ty.id,
+            20,
+            Some("H160"),
+        );
+        for (index, (name, primitive)) in [
+            ("market_id", TypeDefPrimitive::U16),
+            ("order_id", TypeDefPrimitive::U64),
+            ("price", TypeDefPrimitive::U128),
+            ("created_at", TypeDefPrimitive::U64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let field_index = [1, 4, 5, 6][index];
+            assert_eq!(active_order.fields[field_index].name.as_deref(), Some(name));
+            assert_primitive(
+                &metadata.types,
+                active_order.fields[field_index].ty.id,
+                primitive,
+            );
+        }
+        assert_eq!(active_order.fields[2].name.as_deref(), Some("order_side"));
+        assert_unit_variants(
+            &metadata.types,
+            active_order.fields[2].ty.id,
+            &["Buy", "Sell"],
+        );
+        let order_side = metadata
+            .types
+            .resolve(active_order.fields[2].ty.id)
+            .unwrap();
+        let TypeDef::Variant(order_side) = &order_side.type_def else {
+            unreachable!();
+        };
+        assert_eq!(order_side.variants[0].index, 1);
+        assert_eq!(order_side.variants[1].index, 0);
+        assert_eq!(active_order.fields[3].name.as_deref(), Some("order_type"));
+        assert_order_type(&metadata.types, active_order.fields[3].ty.id);
+
+        let order_info = storage
+            .entries
+            .iter()
+            .find(|entry| entry.name == "OrderInfo")
+            .unwrap();
+        assert_eq!(order_info.modifier, StorageEntryModifier::Optional);
+        assert_eq!(order_info.default, [0]);
+        let StorageEntryType::Map {
+            hashers,
+            key,
+            value,
+        } = &order_info.ty
+        else {
+            panic!("OrderInfo must be a storage map");
+        };
+        assert!(matches!(
+            hashers.as_slice(),
+            [StorageHasher::Identity, StorageHasher::Identity]
+        ));
+        let order_key = metadata.types.resolve(key.id).unwrap();
+        let TypeDef::Tuple(order_key) = &order_key.type_def else {
+            panic!("OrderInfo key must be (H160, u64)");
+        };
+        assert_eq!(order_key.fields.len(), 2);
+        assert_fixed_u8_array(&metadata.types, order_key.fields[0].id, 20, Some("H160"));
+        assert_primitive(
+            &metadata.types,
+            order_key.fields[1].id,
+            TypeDefPrimitive::U64,
+        );
+        let order = metadata.types.resolve(value.id).unwrap();
+        assert_eq!(
+            order.path.segments.last().map(String::as_str),
+            Some("PerpOrder")
+        );
+        let TypeDef::Composite(order) = &order.type_def else {
+            panic!("PerpOrder must be a composite type");
+        };
+        assert_eq!(order.fields.len(), 16);
+        let primitive_fields = [
+            (0, "order_id", TypeDefPrimitive::U64),
+            (2, "market_id", TypeDefPrimitive::U16),
+            (3, "is_long", TypeDefPrimitive::Bool),
+            (4, "size", TypeDefPrimitive::U128),
+            (5, "price", TypeDefPrimitive::U128),
+            (7, "create_time", TypeDefPrimitive::U64),
+            (8, "leverage", TypeDefPrimitive::U64),
+            (10, "size_filled", TypeDefPrimitive::U128),
+            (11, "size_remain", TypeDefPrimitive::U128),
+            (14, "reduce_only", TypeDefPrimitive::Bool),
+        ];
+        for (index, name, primitive) in primitive_fields {
+            assert_eq!(order.fields[index].name.as_deref(), Some(name));
+            assert_primitive(&metadata.types, order.fields[index].ty.id, primitive);
+        }
+        assert_eq!(order.fields[1].name.as_deref(), Some("owner"));
+        assert_fixed_u8_array(&metadata.types, order.fields[1].ty.id, 20, Some("H160"));
+        assert_eq!(order.fields[6].name.as_deref(), Some("order_type"));
+        assert_order_type(&metadata.types, order.fields[6].ty.id);
+        assert_eq!(order.fields[9].name.as_deref(), Some("status"));
+        assert_unit_variants(
+            &metadata.types,
+            order.fields[9].ty.id,
+            &[
+                "Open",
+                "PartiallyFilled",
+                "Filled",
+                "Canceled",
+                "Rejected",
+                "Expired",
+            ],
+        );
+        for (index, name) in [(12, "take_profit"), (13, "stop_loss")] {
+            assert_eq!(order.fields[index].name.as_deref(), Some(name));
+            assert_option_primitive(
+                &metadata.types,
+                order.fields[index].ty.id,
+                TypeDefPrimitive::U128,
+            );
+        }
+        assert_eq!(order.fields[15].name.as_deref(), Some("post_only"));
+        assert_unit_variants(
+            &metadata.types,
+            order.fields[15].ty.id,
+            &["None", "MustPostOnly", "Adaptive"],
+        );
+    }
+
+    fn assert_order_type(types: &scale_info::PortableRegistry, type_id: u32) {
+        let ty = types.resolve(type_id).unwrap();
+        assert_eq!(
+            ty.path.segments.last().map(String::as_str),
+            Some("OrderType")
+        );
+        let TypeDef::Variant(order_type) = &ty.type_def else {
+            panic!("OrderType must be a variant type");
+        };
+        assert_eq!(
+            order_type
+                .variants
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Limit", "Market", "Stop"],
+        );
+        assert_eq!(order_type.variants[0].fields.len(), 1);
+        assert_unit_variants(
+            types,
+            order_type.variants[0].fields[0].ty.id,
+            &["GTC", "IOC", "FOK"],
+        );
+        assert_eq!(order_type.variants[1].fields.len(), 1);
+        assert_option_primitive(
+            types,
+            order_type.variants[1].fields[0].ty.id,
+            TypeDefPrimitive::U64,
+        );
+        assert!(order_type.variants[2].fields.is_empty());
+    }
+
+    fn assert_unit_variants(
+        types: &scale_info::PortableRegistry,
+        type_id: u32,
+        expected_names: &[&str],
+    ) {
+        let ty = types.resolve(type_id).unwrap();
+        let TypeDef::Variant(variants) = &ty.type_def else {
+            panic!("expected a variant type");
+        };
+        assert_eq!(
+            variants
+                .variants
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_names,
+        );
+        assert!(
+            variants
+                .variants
+                .iter()
+                .all(|variant| variant.fields.is_empty())
+        );
+    }
+
+    fn assert_primitive(
+        types: &scale_info::PortableRegistry,
+        type_id: u32,
+        expected: TypeDefPrimitive,
+    ) {
+        let ty = types.resolve(type_id).unwrap();
+        assert_eq!(ty.type_def, TypeDef::Primitive(expected));
+    }
+
+    fn assert_fixed_u8_array(
+        types: &scale_info::PortableRegistry,
+        type_id: u32,
+        expected_len: u32,
+        expected_name: Option<&str>,
+    ) {
+        let ty = types.resolve(type_id).unwrap();
+        if let Some(expected_name) = expected_name {
+            assert_eq!(
+                ty.path.segments.last().map(String::as_str),
+                Some(expected_name)
+            );
+        }
+        let TypeDef::Composite(composite) = &ty.type_def else {
+            panic!("fixed byte wrapper must be a composite type");
+        };
+        assert_eq!(composite.fields.len(), 1);
+        let bytes = types.resolve(composite.fields[0].ty.id).unwrap();
+        let TypeDef::Array(bytes) = &bytes.type_def else {
+            panic!("fixed byte wrapper must contain an array");
+        };
+        assert_eq!(bytes.len, expected_len);
+        assert_primitive(types, bytes.type_param.id, TypeDefPrimitive::U8);
+    }
+
+    fn assert_option_primitive(
+        types: &scale_info::PortableRegistry,
+        type_id: u32,
+        expected: TypeDefPrimitive,
+    ) {
+        let ty = types.resolve(type_id).unwrap();
+        assert_eq!(ty.path.segments.last().map(String::as_str), Some("Option"));
+        let TypeDef::Variant(option) = &ty.type_def else {
+            panic!("optional field must use Option");
+        };
+        assert_eq!(option.variants.len(), 2);
+        assert_eq!(option.variants[0].name, "None");
+        assert!(option.variants[0].fields.is_empty());
+        assert_eq!(option.variants[1].name, "Some");
+        assert_eq!(option.variants[1].fields.len(), 1);
+        assert_primitive(types, option.variants[1].fields[0].ty.id, expected);
+    }
+
+    #[rstest]
+    fn spec_371_finalized_runtime_fixture_set_is_self_consistent() {
+        let manifest: RuntimeFixtureManifest =
+            serde_json::from_str(SPEC_371_FIXTURE_MANIFEST).unwrap();
+        let genesis: RpcResponse = serde_json::from_str(SPEC_371_GENESIS_RESPONSE).unwrap();
+        let finalized_head: RpcResponse =
+            serde_json::from_str(SPEC_371_FINALIZED_HEAD_RESPONSE).unwrap();
+        let finalized_header: HeaderResponse =
+            serde_json::from_str(SPEC_371_FINALIZED_HEADER_RESPONSE).unwrap();
+        let finalized_block_hash: RpcResponse =
+            serde_json::from_str(SPEC_371_FINALIZED_BLOCK_HASH_RESPONSE).unwrap();
+        let runtime: RuntimeVersionResponse =
+            serde_json::from_str(SPEC_371_RUNTIME_VERSION_RESPONSE).unwrap();
+        let metadata = spec_371_metadata_bytes();
+        let block_number =
+            u32::from_str_radix(finalized_header.result.number.trim_start_matches("0x"), 16)
+                .unwrap();
+        let expected_records = [
+            (
+                "chain_getBlockHash",
+                serde_json::json!([0]),
+                "genesis_hash.json",
+                SPEC_371_GENESIS_RESPONSE.len(),
+            ),
+            (
+                "chain_getFinalizedHead",
+                serde_json::json!([]),
+                "finalized_head.json",
+                SPEC_371_FINALIZED_HEAD_RESPONSE.len(),
+            ),
+            (
+                "chain_getHeader",
+                serde_json::json!([manifest.block_hash]),
+                "finalized_header.json",
+                SPEC_371_FINALIZED_HEADER_RESPONSE.len(),
+            ),
+            (
+                "chain_getBlockHash",
+                serde_json::json!([block_number]),
+                "finalized_block_hash.json",
+                SPEC_371_FINALIZED_BLOCK_HASH_RESPONSE.len(),
+            ),
+            (
+                "state_getRuntimeVersion",
+                serde_json::json!([manifest.block_hash]),
+                "runtime_version.json",
+                SPEC_371_RUNTIME_VERSION_RESPONSE.len(),
+            ),
+            (
+                "state_getMetadata",
+                serde_json::json!([manifest.block_hash]),
+                "metadata.json",
+                SPEC_371_METADATA_RESPONSE.len(),
+            ),
+        ];
+
+        assert_eq!(manifest.deployment, "testnet");
+        assert_eq!(manifest.endpoint_role, "runtime_identity");
+        assert_eq!(manifest.block_reference, "finalized");
+        assert_eq!(manifest.block_hash, finalized_head.result);
+        assert_eq!(manifest.block_hash, finalized_block_hash.result);
+        assert_eq!(manifest.block_number, Some(block_number));
+        assert_eq!(manifest.identity.genesis_hash, genesis.result);
+        assert_eq!(manifest.identity.spec_version, runtime.result.spec_version);
+        assert_eq!(
+            manifest.identity.transaction_version,
+            runtime.result.transaction_version,
+        );
+        assert_eq!(
+            manifest.identity.metadata_sha256,
+            TESTNET_SPEC_371_METADATA_SHA256
+        );
+        assert_eq!(manifest.metadata_bytes, metadata.len());
+        assert_eq!(
+            manifest.signed_extensions.unwrap(),
+            TESTNET_SIGNED_EXTENSIONS
+                .iter()
+                .map(|extension| (*extension).to_string())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(manifest.fixtures.len(), expected_records.len());
+        for (actual, expected) in manifest.fixtures.iter().zip(expected_records) {
+            assert_eq!(actual.method, expected.0);
+            assert_eq!(actual.params, expected.1);
+            assert_eq!(actual.payload_path, expected.2);
+            assert_eq!(actual.bytes, expected.3);
+        }
     }
 
     #[rstest]

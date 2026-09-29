@@ -46,8 +46,9 @@ pub(super) fn parse_funding_sample(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[rstest]
     #[case("-0.000012500000000000001")]

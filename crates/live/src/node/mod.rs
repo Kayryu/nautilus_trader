@@ -77,7 +77,10 @@
 //! maintenance below 100ms (defaults are seconds to minutes). Cadence drifts
 //! by at most one body duration per fire.
 
-use std::{collections::HashSet, fmt::Debug, future::Future, pin::Pin, time::Duration};
+use std::{
+    cell::RefCell, collections::HashSet, fmt::Debug, future::Future, pin::Pin, rc::Rc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use indexmap::{IndexMap, IndexSet};
@@ -1056,6 +1059,7 @@ impl LiveNode {
         let mut startup_system_events = Vec::new();
         let mut startup_system_commands = Vec::new();
         let connection_deadline = dst::time::Instant::now() + self.config.timeout_connection;
+        let exec_engine = Rc::clone(&self.kernel.exec_engine);
 
         // Startup phase 1: Connect data clients and drain instrument events into cache.
         // This ensures the cache is populated before execution clients connect.
@@ -1069,6 +1073,7 @@ impl LiveNode {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &exec_engine,
         )
         .await;
 
@@ -1082,6 +1087,7 @@ impl LiveNode {
                 &mut exec_cmd_rx,
                 &mut data_evt_rx,
                 &mut data_cmd_rx,
+                &exec_engine,
             );
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
@@ -1121,6 +1127,7 @@ impl LiveNode {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &exec_engine,
         )
         .await;
 
@@ -1134,6 +1141,7 @@ impl LiveNode {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &exec_engine,
         );
         startup_system_events.extend(pending.take_system_events());
         startup_system_commands.extend(pending.take_system_commands());
@@ -2018,22 +2026,7 @@ impl LiveNode {
     /// transition) is never marked and its later `Fill` report stays eligible.
     fn dispatch_exec_event_and_commit_fill(&mut self, evt: ExecutionEvent) {
         if let ExecutionEvent::AcknowledgedOrder(envelope) = evt {
-            let (event, receipt_tx) = envelope.into_parts();
-            let result = self
-                .kernel
-                .exec_engine
-                .borrow_mut()
-                .process_with_receipt(&event);
-            if let Some(persistence_rx) = result.persistence_rx {
-                let mut receipt = result.receipt;
-
-                dst::task::spawn(async move {
-                    receipt = resolve_order_event_persistence(receipt, persistence_rx).await;
-                    let _ = receipt_tx.send(receipt);
-                });
-            } else {
-                let _ = receipt_tx.send(result.receipt);
-            }
+            dispatch_acknowledged_order_event(&self.kernel.exec_engine, envelope);
             return;
         }
 
@@ -3713,6 +3706,7 @@ fn flush_all_pending(
     exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
     data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    exec_engine: &Rc<RefCell<ExecutionEngine>>,
 ) {
     // Flush channel receivers into pending
     while let Ok(handler) = time_evt_rx.try_recv() {
@@ -3747,7 +3741,7 @@ fn flush_all_pending(
                 pending.order_evts.push(order_evt);
             }
             ExecutionEvent::AcknowledgedOrder(envelope) => {
-                pending.ack_order_evts.push(envelope);
+                dispatch_acknowledged_order_event(exec_engine, envelope);
             }
             ExecutionEvent::OrderSubmittedBatch(batch) => {
                 for submitted in batch {
@@ -3792,6 +3786,7 @@ async fn drive_with_event_buffering<F: std::future::Future>(
     exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
     data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    exec_engine: &Rc<RefCell<ExecutionEngine>>,
 ) -> F::Output {
     tokio::pin!(future);
 
@@ -3826,7 +3821,7 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                         pending.order_evts.push(order_evt);
                     }
                     ExecutionEvent::AcknowledgedOrder(envelope) => {
-                        pending.ack_order_evts.push(envelope);
+                        dispatch_acknowledged_order_event(exec_engine, envelope);
                     }
                     ExecutionEvent::OrderSubmittedBatch(batch) => {
                         for submitted in batch {
@@ -3855,6 +3850,23 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                 pending.data_cmds.push(cmd);
             }
         }
+    }
+}
+
+fn dispatch_acknowledged_order_event(
+    exec_engine: &Rc<RefCell<ExecutionEngine>>,
+    envelope: nautilus_common::messages::AcknowledgedOrderEvent,
+) {
+    let (event, receipt_tx) = envelope.into_parts();
+    let result = exec_engine.borrow_mut().process_with_receipt(&event);
+    if let Some(persistence_rx) = result.persistence_rx {
+        let mut receipt = result.receipt;
+        dst::task::spawn(async move {
+            receipt = resolve_order_event_persistence(receipt, persistence_rx).await;
+            let _ = receipt_tx.send(receipt);
+        });
+    } else {
+        let _ = receipt_tx.send(result.receipt);
     }
 }
 
@@ -4088,6 +4100,80 @@ mod tests {
         venue: Venue,
         outcome: FillReportClientOutcome,
         commands: Rc<RefCell<Vec<GenerateFillReports>>>,
+    }
+
+    #[derive(Debug)]
+    struct ReceiptConnectClient {
+        sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        event: OrderEventAny,
+        connected: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ExecutionClient for ReceiptConnectClient {
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        fn client_id(&self) -> ClientId {
+            ClientId::from("RECEIPT")
+        }
+
+        fn account_id(&self) -> AccountId {
+            AccountId::from("RECEIPT-001")
+        }
+
+        fn venue(&self) -> Venue {
+            Venue::from("RECEIPT")
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+            _info: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn connect(&mut self) -> anyhow::Result<()> {
+            let (envelope, receipt_rx) =
+                nautilus_common::messages::AcknowledgedOrderEvent::with_receipt_channel(
+                    self.event.clone(),
+                );
+            self.sender
+                .send(ExecutionEvent::AcknowledgedOrder(envelope))
+                .map_err(|e| anyhow::anyhow!("failed to send startup order event: {e}"))?;
+            let receipt = receipt_rx.await?;
+            anyhow::ensure!(
+                matches!(
+                    receipt.application,
+                    nautilus_common::messages::OrderEventApplicationStatus::Applied
+                        | nautilus_common::messages::OrderEventApplicationStatus::AlreadyApplied
+                ),
+                "startup order event was not applied"
+            );
+            self.connected = true;
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -8034,6 +8120,108 @@ mod tests {
         assert!(!pending.drain_data());
     }
 
+    #[tokio::test]
+    async fn test_connect_buffering_processes_acknowledged_event_before_client_completes() {
+        let node = LiveNode::build("ReceiptConnectNode".to_string(), None).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("ETHUSDT-PERP.RECEIPT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("RECEIPT")), true)
+            .unwrap();
+        let event = TestOrderEventStubs::submitted(&order, AccountId::from("RECEIPT-001"));
+        let (exec_evt_tx, mut exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(ReceiptConnectClient {
+                sender: exec_evt_tx,
+                event,
+                connected: false,
+            }))
+            .unwrap();
+        let exec_engine = Rc::clone(&node.kernel.exec_engine);
+        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (_system_evt_tx, mut system_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let (_system_cmd_tx, mut system_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+        let (_exec_cmd_tx, mut exec_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut pending = PendingEvents::default();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            drive_with_event_buffering(
+                ExecutionEngine::connect_detached(&exec_engine),
+                &mut pending,
+                &mut time_rx,
+                &mut system_evt_rx,
+                &mut system_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+                &exec_engine,
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(pending.ack_order_evts.is_empty());
+        assert!(exec_engine.borrow().get_all_clients()[0].is_connected());
+        assert_eq!(
+            node.kernel
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canceled_detached_connect_restores_execution_clients() {
+        let node = LiveNode::build("CanceledReceiptConnectNode".to_string(), None).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("ETHUSDT-PERP.RECEIPT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        let event = TestOrderEventStubs::submitted(&order, AccountId::from("RECEIPT-001"));
+        let (exec_evt_tx, _exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(ReceiptConnectClient {
+                sender: exec_evt_tx,
+                event,
+                connected: false,
+            }))
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                ExecutionEngine::connect_detached(&node.kernel.exec_engine),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            node.kernel.exec_engine.borrow().client_ids(),
+            vec![ClientId::from("RECEIPT")]
+        );
+    }
+
     #[rstest]
     fn test_pending_drain_data_returns_true_when_non_empty() {
         use nautilus_model::instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt};
@@ -8077,6 +8265,12 @@ mod tests {
             Ustr::from("polymarket-market-streams"),
             UnixNanos::default(),
         ))
+    }
+
+    fn test_execution_engine() -> Rc<RefCell<ExecutionEngine>> {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)))
     }
 
     #[rstest]
@@ -8267,6 +8461,7 @@ mod tests {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &test_execution_engine(),
         );
 
         let system_events = pending.take_system_events();
@@ -8342,6 +8537,7 @@ mod tests {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &test_execution_engine(),
         );
 
         // Both order and report events are drained by pending.drain()
@@ -8377,6 +8573,7 @@ mod tests {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &test_execution_engine(),
         );
 
         // Account events are forwarded immediately, never buffered in pending
@@ -8552,6 +8749,7 @@ mod tests {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &test_execution_engine(),
         );
 
         // Batch should be unpacked into individual Submitted events then drained
@@ -8586,6 +8784,7 @@ mod tests {
             &mut exec_cmd_rx,
             &mut data_evt_rx,
             &mut data_cmd_rx,
+            &test_execution_engine(),
         );
 
         // Batch should be unpacked into individual Canceled events then drained

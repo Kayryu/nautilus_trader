@@ -71,6 +71,10 @@ impl DeepXWsReadConnection {
         self.send_text(text, "account").await
     }
 
+    pub(crate) async fn send_json_rpc_text(&mut self, text: String) -> anyhow::Result<()> {
+        self.send_text(text, "JSON-RPC").await
+    }
+
     async fn send_text(&mut self, text: String, role: &str) -> anyhow::Result<()> {
         anyhow::ensure!(!self.closed, "DeepX WebSocket connection is closed");
         if !tokio::time::timeout(self.timeout, self.writer.send(Message::text(text)))
@@ -97,12 +101,33 @@ impl DeepXWsReadConnection {
             !timeout.is_zero(),
             "DeepX WebSocket timeout must be positive"
         );
-        let url = network.ws_connection_url()?;
+        Self::connect_url(&network.ws_connection_url()?, proxy_url, timeout).await
+    }
+
+    pub(crate) async fn connect_url(
+        url: &str,
+        proxy_url: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !timeout.is_zero(),
+            "DeepX WebSocket timeout must be positive"
+        );
+        let parsed_url =
+            reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid DeepX WebSocket URL"))?;
+        anyhow::ensure!(
+            matches!(parsed_url.scheme(), "ws" | "wss")
+                && parsed_url.host_str().is_some()
+                && parsed_url.username().is_empty()
+                && parsed_url.password().is_none()
+                && parsed_url.fragment().is_none(),
+            "invalid DeepX WebSocket URL"
+        );
         nautilus_cryptography::providers::install_cryptographic_provider();
         let (writer, reader) = tokio::time::timeout(
             timeout,
             WebSocketClientInner::connect_with_server(
-                &url,
+                url,
                 vec![],
                 TransportBackend::Tungstenite,
                 proxy_url,

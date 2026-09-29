@@ -98,8 +98,18 @@ path = "bin/verify_rest_instruments.rs"
 doc = false
 
 [[bin]]
+name = "deepx-verify-spot-instruments"
+path = "bin/verify_spot_instruments.rs"
+doc = false
+
+[[bin]]
 name = "deepx-verify-rest-trade-history"
 path = "bin/verify_rest_trade_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-spot-trade-history"
+path = "bin/verify_spot_trade_history.rs"
 doc = false
 
 [[bin]]
@@ -110,6 +120,41 @@ doc = false
 [[bin]]
 name = "deepx-verify-rest-account-snapshot"
 path = "bin/verify_rest_account_snapshot.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-margin"
+path = "bin/verify_finalized_margin.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-lending"
+path = "bin/verify_finalized_lending.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-perp-positions"
+path = "bin/verify_finalized_perp_positions.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-perp-orders"
+path = "bin/verify_finalized_perp_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-spot-orders"
+path = "bin/verify_finalized_spot_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-account"
+path = "bin/verify_finalized_account.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-wallet"
+path = "bin/verify_finalized_wallet.rs"
 doc = false
 
 [[bin]]
@@ -140,6 +185,21 @@ doc = false
 [[bin]]
 name = "deepx-verify-rest-liquidation-records"
 path = "bin/verify_rest_liquidation_records.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-liquidation-keeper-state"
+path = "bin/verify_rest_liquidation_keeper_state.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-liquidation-execution-records"
+path = "bin/verify_rest_liquidation_execution_records.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-invitation-codes"
+path = "bin/verify_rest_invitation_codes.rs"
 doc = false
 
 [[bin]]
@@ -175,6 +235,11 @@ doc = false
 [[bin]]
 name = "deepx-verify-rest-spot-market"
 path = "bin/verify_rest_spot_market.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-rest-spot-adl-candidates"
+path = "bin/verify_rest_spot_adl_candidates.rs"
 doc = false
 
 [[bin]]

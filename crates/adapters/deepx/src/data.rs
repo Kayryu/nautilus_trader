@@ -18,9 +18,13 @@
 mod bars;
 mod book;
 mod funding;
+mod live_spot_book;
 mod live_trades;
 mod public_prices;
+mod status;
 mod trades;
+
+const CANDLE_HISTORY_MAX_PAGES: usize = 100;
 
 use std::{
     cell::RefCell,
@@ -37,21 +41,23 @@ use nautilus_common::{
     clients::DataClient,
     clock::Clock,
     live::runner::try_get_data_event_sender,
-    messages::data::{
-        BarsResponse, BookResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-        RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCustomData,
-        RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
-        RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
-        SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-        SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
-        SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
-        TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
-        UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-        UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
-        UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes,
-        UnsubscribeTrades,
+    messages::{
+        DataEvent, DataResponse,
+        data::{
+            BarsResponse, BookResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth,
+            RequestBookSnapshot, RequestCustomData, RequestForwardPrices, RequestFundingRates,
+            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
+            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates,
+            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
+            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCustomData,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
+            UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+        },
     },
-    messages::{DataEvent, DataResponse},
     providers::InstrumentProvider,
 };
 use nautilus_core::{
@@ -68,8 +74,9 @@ use crate::{
     common::{DeepXError, consts::DEEPX_VENUE},
     config::DeepXDataClientConfig,
     http::{
-        DeepXFundingRateRequest, DeepXHttpClient, DeepXPerpCandlesRequest,
-        DeepXPerpTradesHistoryRequest,
+        DeepXAccountSortOrder, DeepXFundingRateRequest, DeepXHttpClient, DeepXPerpCandlesRequest,
+        DeepXPerpTradesHistoryRequest, DeepXSpotCandlesRequest, DeepXSpotOrderBookRequest,
+        DeepXSpotTradesRequest,
     },
     providers::{DeepXInstrumentProvider, DeepXMarketMetadata, DeepXMarketProvider},
 };
@@ -113,14 +120,17 @@ macro_rules! unsupported_requests {
 
 /// DeepX read-only REST and public market-data client, created disconnected.
 ///
-/// Connection loads and publishes verified perpetual instruments. Trade subscriptions lazily open
-/// acknowledgement-gated public WebSockets. L2 book subscriptions publish atomic delta batches or
-/// complete depth-10 snapshots and request fresh snapshots on bounded recovery. Spot instrument
-/// construction remains unsupported.
+/// Connection loads verified perpetual instruments and Spot instruments backed by finalized Watch
+/// RPC evidence. Trade subscriptions lazily open acknowledgement-gated public WebSockets. L2 book
+/// subscriptions publish atomic delta batches or complete depth-10 snapshots and request fresh
+/// snapshots on bounded recovery. Spot quote requests and live book subscriptions use verified
+/// current order-book snapshots.
 /// Historical perpetual bars preserve venue timestamps and require exact instrument precision.
 /// Historical perpetual trades are delivered as bounded correlated framework responses.
 /// Historical funding samples preserve minute bucket times without inferring a payment schedule.
 /// Live mark, index, and funding observations preserve venue values and envelope timestamps.
+/// Instrument status subscriptions poll REST pause/deletion flags every 30 seconds and timestamp
+/// emitted changes with the local observation time.
 pub struct DeepXDataClient {
     client_id: ClientId,
     config: DeepXDataClientConfig,
@@ -139,6 +149,10 @@ pub struct DeepXDataClient {
     mark_price_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
     index_price_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
     funding_rate_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
+    instrument_status_subscriptions: status::StatusSubscriptions,
+    instrument_status_snapshots: status::StatusSnapshots,
+    instrument_status_wakeup: status::StatusWakeup,
+    instrument_status_poll_started: bool,
 }
 
 impl std::fmt::Debug for DeepXDataClient {
@@ -171,12 +185,16 @@ impl DeepXDataClient {
             Some(config.http_timeout_secs),
             config.proxy_url.clone(),
         )?;
+        let provider = DeepXInstrumentProvider::with_network(
+            DeepXMarketProvider::new(http.clone()),
+            config.network.clone(),
+        );
         Ok(Self {
             client_id,
             config,
             cache,
             clock,
-            provider: DeepXInstrumentProvider::new(DeepXMarketProvider::new(http.clone())),
+            provider,
             http,
             tasks: TaskGroup::default(),
             request_epoch: Arc::new(Mutex::new(false)),
@@ -189,6 +207,10 @@ impl DeepXDataClient {
             mark_price_subscriptions: BTreeMap::new(),
             index_price_subscriptions: BTreeMap::new(),
             funding_rate_subscriptions: BTreeMap::new(),
+            instrument_status_subscriptions: Arc::default(),
+            instrument_status_snapshots: Arc::default(),
+            instrument_status_wakeup: Arc::new(tokio::sync::Notify::new()),
+            instrument_status_poll_started: false,
         })
     }
 
@@ -260,6 +282,19 @@ impl DeepXDataClient {
         client_id: Option<ClientId>,
         has_params: bool,
     ) -> anyhow::Result<(InstrumentAny, u64)> {
+        let (instrument, market) = self.history_market(instrument_id, client_id, has_params)?;
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            return Err(DeepXError::UnsupportedCapability("Spot history").into());
+        };
+        Ok((instrument, market.id))
+    }
+
+    fn history_market(
+        &self,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+        has_params: bool,
+    ) -> anyhow::Result<(InstrumentAny, DeepXMarketMetadata)> {
         self.require_connected()?;
         anyhow::ensure!(
             client_id.is_none_or(|id| id == self.client_id),
@@ -281,12 +316,15 @@ impl DeepXDataClient {
                 anyhow::anyhow!("DeepX instrument is unknown or unsupported: {instrument_id}")
             })?
             .clone();
-        let Some(DeepXMarketMetadata::Perpetual(market)) =
-            self.provider.catalog().market(&instrument_id)
-        else {
-            return Err(DeepXError::UnsupportedCapability("Spot history").into());
-        };
-        Ok((instrument, market.id))
+        let market = self
+            .provider
+            .catalog()
+            .market(&instrument_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("DeepX market metadata is unavailable: {instrument_id}")
+            })?
+            .clone();
+        Ok((instrument, market))
     }
 
     fn spawn_data_request<F>(&self, capability: &'static str, future: F) -> anyhow::Result<()>
@@ -307,6 +345,40 @@ impl DeepXDataClient {
                 Err(error) => log::error!("DeepX {capability} request failed: {error}"),
             }
         })?;
+        Ok(())
+    }
+
+    fn spawn_spot_book_task(
+        &mut self,
+        instrument: InstrumentAny,
+        market: Box<crate::http::DeepXSpotMarket>,
+        depth: NonZeroUsize,
+        output: live_spot_book::SpotBookOutputKind,
+        subscription: live_trades::TradeSubscription,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            depth.get() <= 1000,
+            "DeepX Spot RPC book depth exceeds 1000"
+        );
+        crate::websocket::orderbook_rpc::websocket_url(&self.config.network)?;
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX data event sender unavailable"))?
+            .clone();
+        let task = live_spot_book::SpotBookTask {
+            instrument,
+            market,
+            depth,
+            output,
+            network: self.config.network.clone(),
+            proxy_url: self.config.proxy_url.clone(),
+            timeout: Duration::from_secs(self.config.websocket_timeout_secs),
+            sender,
+            connection_epoch: Arc::clone(&self.request_epoch),
+            subscription,
+        };
+        self.tasks.spawn(task.run())?;
         Ok(())
     }
 
@@ -340,6 +412,15 @@ impl DeepXDataClient {
             subscription.retire();
         }
         self.funding_rate_subscriptions.clear();
+        self.instrument_status_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .clear();
+        self.instrument_status_snapshots
+            .lock()
+            .expect(MUTEX_POISONED)
+            .clear();
+        self.instrument_status_poll_started = false;
         self.tasks.abort();
         self.connected = false;
         self.sender = None;
@@ -451,7 +532,7 @@ impl DeepXDataClient {
 #[async_trait(?Send)]
 impl DataClient for DeepXDataClient {
     fn subscribe_quotes(&mut self, command: SubscribeQuotes) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -463,7 +544,30 @@ impl DataClient for DeepXDataClient {
             command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
             "DeepX subscription venue mismatch"
         );
-        let market_id = u16::try_from(market_id)?;
+        if let DeepXMarketMetadata::Spot(market) = market {
+            if self
+                .quote_subscriptions
+                .get(&command.instrument_id)
+                .is_some_and(live_trades::TradeSubscription::is_active)
+            {
+                return Ok(());
+            }
+            let subscription = live_trades::TradeSubscription::new();
+            self.spawn_spot_book_task(
+                instrument,
+                market,
+                NonZeroUsize::new(1).expect("nonzero quote depth"),
+                live_spot_book::SpotBookOutputKind::Quotes,
+                subscription.clone(),
+            )?;
+            self.quote_subscriptions
+                .insert(command.instrument_id, subscription);
+            return Ok(());
+        }
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            unreachable!("market metadata was matched above")
+        };
+        let market_id = u16::try_from(market.id)?;
         self.config.network.ws_connection_url()?;
         if self
             .quote_subscriptions
@@ -496,7 +600,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, command: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        self.history_instrument(
+        self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -515,7 +619,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn subscribe_book_deltas(&mut self, command: SubscribeBookDeltas) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -538,7 +642,33 @@ impl DataClient for DeepXDataClient {
             depth.get() <= 4096,
             "DeepX book depth exceeds retained capacity"
         );
-        let market_id = u16::try_from(market_id)?;
+        if let DeepXMarketMetadata::Spot(market) = market {
+            if let Some((active_depth, subscription)) =
+                self.book_subscriptions.get(&command.instrument_id)
+                && subscription.is_active()
+            {
+                anyhow::ensure!(
+                    *active_depth == depth,
+                    "DeepX active Spot book subscription depth mismatch"
+                );
+                return Ok(());
+            }
+            let subscription = live_trades::TradeSubscription::new();
+            self.spawn_spot_book_task(
+                instrument,
+                market,
+                depth,
+                live_spot_book::SpotBookOutputKind::Deltas,
+                subscription.clone(),
+            )?;
+            self.book_subscriptions
+                .insert(command.instrument_id, (depth, subscription));
+            return Ok(());
+        }
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            unreachable!("market metadata was matched above")
+        };
+        let market_id = u16::try_from(market.id)?;
         self.config.network.ws_connection_url()?;
         if let Some((active_depth, subscription)) =
             self.book_subscriptions.get(&command.instrument_id)
@@ -574,7 +704,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, command: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
-        self.history_instrument(
+        self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -593,7 +723,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn subscribe_book_depth10(&mut self, command: SubscribeBookDepth10) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -613,7 +743,30 @@ impl DataClient for DeepXDataClient {
             command.depth.is_none_or(|depth| depth.get() == 10),
             "DeepX depth10 subscription depth must be 10"
         );
-        let market_id = u16::try_from(market_id)?;
+        if let DeepXMarketMetadata::Spot(market) = market {
+            if self
+                .depth10_subscriptions
+                .get(&command.instrument_id)
+                .is_some_and(live_trades::TradeSubscription::is_active)
+            {
+                return Ok(());
+            }
+            let subscription = live_trades::TradeSubscription::new();
+            self.spawn_spot_book_task(
+                instrument,
+                market,
+                NonZeroUsize::new(10).expect("nonzero depth10 depth"),
+                live_spot_book::SpotBookOutputKind::Depth10,
+                subscription.clone(),
+            )?;
+            self.depth10_subscriptions
+                .insert(command.instrument_id, subscription);
+            return Ok(());
+        }
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            unreachable!("market metadata was matched above")
+        };
+        let market_id = u16::try_from(market.id)?;
         self.config.network.ws_connection_url()?;
         if self
             .depth10_subscriptions
@@ -646,7 +799,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn unsubscribe_book_depth10(&mut self, command: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
-        self.history_instrument(
+        self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -869,7 +1022,10 @@ impl DataClient for DeepXDataClient {
             !sender.is_closed(),
             "DeepX data event receiver is unavailable"
         );
-        let mut provider = DeepXInstrumentProvider::new(self.provider.catalog().clone());
+        let mut provider = DeepXInstrumentProvider::with_network(
+            self.provider.catalog().clone(),
+            self.config.network.clone(),
+        );
         provider.load_all(None).await?;
         let instruments = provider.store().list_all();
         anyhow::ensure!(
@@ -897,7 +1053,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             request.instrument_id,
             request.client_id,
             request
@@ -917,38 +1073,80 @@ impl DataClient for DeepXDataClient {
             limit.get() <= 10_000,
             "DeepX trade request limit exceeds 10000"
         );
-        let history = DeepXPerpTradesHistoryRequest {
-            market_id,
-            start_ms: lower.as_millis(),
-            end_ms: upper.as_millis(),
-            page_size: 100,
-            max_pages: 100,
-        };
-        history.validate()?;
         let http = self.http.clone();
         let client_id = self.client_id;
-        self.spawn_data_request("historical trades", async move {
-            let raw = http
-                .get_perp_trades_history_limited(&history, limit)
-                .await?;
-            let ts_init = get_atomic_clock_realtime().get_time_ns();
-            let mut ticks = raw
-                .iter()
-                .map(|trade| trades::parse_trade_tick(trade, &instrument, market_id, ts_init))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            ticks.retain(|trade| trade.ts_event >= lower && trade.ts_event <= upper);
-            ticks.reverse();
-            Ok(DataResponse::Trades(TradesResponse::new(
-                request.request_id,
-                client_id,
-                instrument.id(),
-                ticks,
-                start,
-                end,
-                ts_init,
-                request.params,
-            )))
-        })
+        match market {
+            DeepXMarketMetadata::Perpetual(market) => {
+                let market_id = market.id;
+                let history = DeepXPerpTradesHistoryRequest {
+                    market_id,
+                    start_ms: lower.as_millis(),
+                    end_ms: upper.as_millis(),
+                    page_size: 100,
+                    max_pages: 100,
+                };
+                history.validate()?;
+                self.spawn_data_request("historical trades", async move {
+                    let raw = http
+                        .get_perp_trades_history_limited(&history, limit)
+                        .await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let mut ticks = raw
+                        .iter()
+                        .map(|trade| {
+                            trades::parse_trade_tick(trade, &instrument, market_id, ts_init)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    ticks.retain(|trade| trade.ts_event >= lower && trade.ts_event <= upper);
+                    ticks.reverse();
+                    Ok(DataResponse::Trades(TradesResponse::new(
+                        request.request_id,
+                        client_id,
+                        instrument.id(),
+                        ticks,
+                        start,
+                        end,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+            DeepXMarketMetadata::Spot(market) => {
+                let history = DeepXSpotTradesRequest {
+                    name: Some(market.name.clone()),
+                    pair: None,
+                    wallet: None,
+                    start_ms: Some(lower.as_millis()),
+                    end_ms: Some(upper.as_millis()),
+                    cursor: None,
+                    sort: DeepXAccountSortOrder::Descending,
+                    page_size: Some(100),
+                };
+                history.validate()?;
+                self.spawn_data_request("historical Spot trades", async move {
+                    let raw = http.get_spot_trades_limited(&history, limit, 100).await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let mut ticks = raw
+                        .iter()
+                        .map(|trade| {
+                            trades::parse_spot_trade_tick(trade, &market, &instrument, ts_init)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    ticks.retain(|trade| trade.ts_event >= lower && trade.ts_event <= upper);
+                    ticks.reverse();
+                    Ok(DataResponse::Trades(TradesResponse::new(
+                        request.request_id,
+                        client_id,
+                        instrument.id(),
+                        ticks,
+                        start,
+                        end,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+        }
     }
 
     fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
@@ -1017,7 +1215,7 @@ impl DataClient for DeepXDataClient {
         );
         let bar_type = request.bar_type;
         let interval = bars::candle_interval(bar_type.spec())?;
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             bar_type.instrument_id(),
             request.client_id,
             request
@@ -1035,46 +1233,91 @@ impl DataClient for DeepXDataClient {
             limit.is_none_or(|limit| limit <= 5_000),
             "DeepX candle request limit exceeds 5000"
         );
-        let history = DeepXPerpCandlesRequest {
-            market_id,
-            interval,
-            start_ms: lower.as_millis(),
-            end_ms: Some(upper.as_millis()),
-            limit: limit.map(u32::try_from).transpose()?,
-        };
-        history.validate()?;
         let http = self.http.clone();
         let client_id = self.client_id;
-        self.spawn_data_request("historical bars", async move {
-            let page = http.get_perp_candles(&history).await?;
-            anyhow::ensure!(
-                page.pair == instrument.raw_symbol().as_str(),
-                "DeepX candle pair identity mismatch: expected {}, received {}",
-                instrument.raw_symbol(),
-                page.pair,
-            );
-            let ts_init = get_atomic_clock_realtime().get_time_ns();
-            let mut parsed = page
-                .details
-                .iter()
-                .map(|candle| bars::parse_bar(candle, bar_type, &instrument, ts_init))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            parsed.retain(|bar| bar.ts_event >= lower && bar.ts_event <= upper);
-            Ok(DataResponse::Bars(BarsResponse::new(
-                request.request_id,
-                client_id,
-                bar_type,
-                parsed,
-                start,
-                end,
-                ts_init,
-                request.params,
-            )))
-        })
+        match market {
+            DeepXMarketMetadata::Perpetual(market) => {
+                let history = DeepXPerpCandlesRequest {
+                    market_id: market.id,
+                    interval,
+                    start_ms: lower.as_millis(),
+                    end_ms: Some(upper.as_millis()),
+                    limit: limit.map(u32::try_from).transpose()?,
+                };
+                history.validate()?;
+                self.spawn_data_request("historical bars", async move {
+                    let page = http
+                        .get_perp_candles_history_limited(&history, CANDLE_HISTORY_MAX_PAGES)
+                        .await?;
+                    anyhow::ensure!(
+                        page.pair == instrument.raw_symbol().as_str(),
+                        "DeepX candle pair identity mismatch: expected {}, received {}",
+                        instrument.raw_symbol(),
+                        page.pair,
+                    );
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let mut parsed = page
+                        .details
+                        .iter()
+                        .map(|candle| bars::parse_bar(candle, bar_type, &instrument, ts_init))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    parsed.retain(|bar| bar.ts_event >= lower && bar.ts_event <= upper);
+                    Ok(DataResponse::Bars(BarsResponse::new(
+                        request.request_id,
+                        client_id,
+                        bar_type,
+                        parsed,
+                        start,
+                        end,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+            DeepXMarketMetadata::Spot(market) => {
+                let history = DeepXSpotCandlesRequest {
+                    name: Some(market.name.clone()),
+                    pair: None,
+                    interval,
+                    start_ms: lower.as_millis(),
+                    end_ms: Some(upper.as_millis()),
+                    limit: limit.map(u32::try_from).transpose()?,
+                };
+                history.validate()?;
+                self.spawn_data_request("historical Spot bars", async move {
+                    let page = http
+                        .get_spot_candles_history_limited(&history, CANDLE_HISTORY_MAX_PAGES)
+                        .await?;
+                    anyhow::ensure!(
+                        page.pair == market.name,
+                        "DeepX Spot candle pair identity mismatch: expected {}, received {}",
+                        market.name,
+                        page.pair,
+                    );
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let mut parsed = page
+                        .details
+                        .iter()
+                        .map(|candle| bars::parse_spot_bar(candle, bar_type, &instrument, ts_init))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    parsed.retain(|bar| bar.ts_event >= lower && bar.ts_event <= upper);
+                    Ok(DataResponse::Bars(BarsResponse::new(
+                        request.request_id,
+                        client_id,
+                        bar_type,
+                        parsed,
+                        start,
+                        end,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+        }
     }
 
     fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             request.instrument_id,
             request.client_id,
             request
@@ -1089,29 +1332,150 @@ impl DataClient for DeepXDataClient {
             depth.get() <= 4096,
             "DeepX book snapshot depth exceeds retained capacity"
         );
-        let market_id = u16::try_from(market_id)?;
-        self.config.network.ws_connection_url()?;
-        let network = self.config.network.clone();
-        let proxy_url = self.config.proxy_url.clone();
-        let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
         let client_id = self.client_id;
-        self.spawn_data_request("book snapshot", async move {
-            let book = book::request_book_snapshot(
-                network, proxy_url, timeout, market_id, depth, instrument,
-            )
-            .await?;
-            let ts_init = get_atomic_clock_realtime().get_time_ns();
-            Ok(DataResponse::Book(BookResponse::new(
-                request.request_id,
-                client_id,
-                request.instrument_id,
-                book,
-                None,
-                None,
-                ts_init,
-                request.params,
-            )))
-        })
+        match market {
+            DeepXMarketMetadata::Spot(market) => {
+                let http = self.http.clone();
+                let instrument_id = request.instrument_id;
+                self.spawn_data_request("Spot book snapshot", async move {
+                    let snapshot = http
+                        .get_spot_order_book(&DeepXSpotOrderBookRequest {
+                            name: Some(market.name.clone()),
+                            pair: None,
+                            tick_size: None,
+                        })
+                        .await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let book = book::parse_spot_order_book(
+                        &snapshot,
+                        &market,
+                        &instrument,
+                        depth,
+                        ts_init,
+                    )?;
+                    Ok(DataResponse::Book(BookResponse::new(
+                        request.request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+            DeepXMarketMetadata::Perpetual(market) => {
+                let market_id = u16::try_from(market.id)?;
+                self.config.network.ws_connection_url()?;
+                let network = self.config.network.clone();
+                let proxy_url = self.config.proxy_url.clone();
+                let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
+                self.spawn_data_request("book snapshot", async move {
+                    let book = book::request_book_snapshot(
+                        network, proxy_url, timeout, market_id, depth, instrument,
+                    )
+                    .await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    Ok(DataResponse::Book(BookResponse::new(
+                        request.request_id,
+                        client_id,
+                        request.instrument_id,
+                        book,
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+        }
+    }
+
+    fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
+        let (instrument, market) = self.history_market(
+            request.instrument_id,
+            request.client_id,
+            request
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
+        anyhow::ensure!(
+            request.start.is_none() && request.end.is_none(),
+            "DeepX quote requests only support a current order-book snapshot"
+        );
+        anyhow::ensure!(
+            request.limit.is_none_or(|limit| limit.get() == 1),
+            "DeepX current quote request limit must be one"
+        );
+        let client_id = self.client_id;
+        match market {
+            DeepXMarketMetadata::Spot(market) => {
+                let http = self.http.clone();
+                self.spawn_data_request("Spot quote snapshot", async move {
+                    let snapshot = http
+                        .get_spot_order_book(&DeepXSpotOrderBookRequest {
+                            name: Some(market.name.clone()),
+                            pair: None,
+                            tick_size: None,
+                        })
+                        .await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let quotes = book::parse_spot_order_book_quote_tick(
+                        &snapshot,
+                        &market,
+                        &instrument,
+                        ts_init,
+                    )?
+                    .into_iter()
+                    .collect();
+                    Ok(DataResponse::Quotes(QuotesResponse::new(
+                        request.request_id,
+                        client_id,
+                        request.instrument_id,
+                        quotes,
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+            DeepXMarketMetadata::Perpetual(market) => {
+                let market_id = u16::try_from(market.id)?;
+                self.config.network.ws_connection_url()?;
+                let network = self.config.network.clone();
+                let proxy_url = self.config.proxy_url.clone();
+                let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
+                self.spawn_data_request("Perpetual quote snapshot", async move {
+                    let book = book::request_book_snapshot(
+                        network,
+                        proxy_url,
+                        timeout,
+                        market_id,
+                        NonZeroUsize::new(1).expect("nonzero quote depth"),
+                        instrument.clone(),
+                    )
+                    .await?;
+                    let ts_init = get_atomic_clock_realtime().get_time_ns();
+                    let quotes =
+                        book::quote_tick_from_book(&book, &instrument, book.ts_last, ts_init)?
+                            .into_iter()
+                            .collect();
+                    Ok(DataResponse::Quotes(QuotesResponse::new(
+                        request.request_id,
+                        client_id,
+                        request.instrument_id,
+                        quotes,
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+        }
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
@@ -1184,7 +1548,6 @@ impl DataClient for DeepXDataClient {
         subscribe_instruments(command: SubscribeInstruments) => "instrument subscriptions";
         subscribe_instrument(command: SubscribeInstrument) => "instrument subscriptions";
         subscribe_bars(command: SubscribeBars) => "bar subscriptions";
-        subscribe_instrument_status(command: SubscribeInstrumentStatus) => "instrument status subscriptions";
         subscribe_instrument_close(command: SubscribeInstrumentClose) => "instrument close subscriptions";
         subscribe_option_greeks(command: SubscribeOptionGreeks) => "option greeks subscriptions";
     }
@@ -1194,17 +1557,74 @@ impl DataClient for DeepXDataClient {
         unsubscribe_instruments(command: UnsubscribeInstruments) => "instrument subscriptions";
         unsubscribe_instrument(command: UnsubscribeInstrument) => "instrument subscriptions";
         unsubscribe_bars(command: UnsubscribeBars) => "bar subscriptions";
-        unsubscribe_instrument_status(command: UnsubscribeInstrumentStatus) => "instrument status subscriptions";
         unsubscribe_instrument_close(command: UnsubscribeInstrumentClose) => "instrument close subscriptions";
         unsubscribe_option_greeks(command: UnsubscribeOptionGreeks) => "option greeks subscriptions";
     }
 
     unsupported_requests! {
         request_data(request: RequestCustomData) => "custom data requests";
-        request_quotes(request: RequestQuotes) => "quote requests";
         request_forward_prices(request: RequestForwardPrices) => "forward price requests";
         request_book_depth(request: RequestBookDepth) => "order book depth requests";
         request_book_deltas(request: RequestBookDeltas) => "order book delta requests";
+    }
+
+    fn subscribe_instrument_status(
+        &mut self,
+        command: SubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        self.require_connected()?;
+        let instrument_id = command.instrument_id;
+        anyhow::ensure!(
+            self.provider.catalog().market(&instrument_id).is_some(),
+            "DeepX instrument status subscription requires a loaded market"
+        );
+        self.instrument_status_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .insert(instrument_id);
+        self.instrument_status_wakeup.notify_one();
+        if self.instrument_status_poll_started {
+            return Ok(());
+        }
+
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX data event sender is unavailable"))?
+            .clone();
+        let cancellation = self.tasks.cancellation_token();
+        if let Err(error) = self.tasks.spawn(status::poll_market_status(
+            self.http.clone(),
+            Arc::clone(&self.instrument_status_subscriptions),
+            Arc::clone(&self.instrument_status_snapshots),
+            Arc::clone(&self.instrument_status_wakeup),
+            sender,
+            Arc::clone(&self.request_epoch),
+            cancellation,
+        )) {
+            self.instrument_status_subscriptions
+                .lock()
+                .expect(MUTEX_POISONED)
+                .remove(&instrument_id);
+            return Err(error.into());
+        }
+        self.instrument_status_poll_started = true;
+        Ok(())
+    }
+
+    fn unsubscribe_instrument_status(
+        &mut self,
+        command: &UnsubscribeInstrumentStatus,
+    ) -> anyhow::Result<()> {
+        self.instrument_status_subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .remove(&command.instrument_id);
+        self.instrument_status_snapshots
+            .lock()
+            .expect(MUTEX_POISONED)
+            .remove(&command.instrument_id);
+        Ok(())
     }
 }
 
@@ -1228,9 +1648,10 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         data::{BarSpecification, BarType},
-        enums::{AggregationSource, BarAggregation, PriceType},
-        identifiers::InstrumentId,
-        instruments::Instrument,
+        enums::{AggregationSource, BarAggregation, CurrencyType, PriceType},
+        identifiers::{InstrumentId, Symbol},
+        instruments::{CurrencyPair, Instrument},
+        types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
     use tokio::{
@@ -1242,6 +1663,12 @@ mod tests {
     use super::*;
 
     const SPOT: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+    const SPOT_TRADES: &str =
+        include_str!("../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
+    const SPOT_CANDLES: &str =
+        include_str!("../test_data/http/testnet/spot_candles_eth_usdc_1m.json");
+    const SPOT_BOOK: &str =
+        include_str!("../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
     const PERP: &str = include_str!("../test_data/http/testnet/perp_markets.json");
     const CAPTURED_PERP: &str = include_str!("../test_data/http/testnet/perp_markets_spec369.json");
 
@@ -1318,6 +1745,27 @@ mod tests {
         (client, receiver, requests, server)
     }
 
+    fn spot_instrument() -> InstrumentAny {
+        let base = Currency::new_checked("ETH", 18, 0, "ETH", CurrencyType::Crypto).unwrap();
+        let quote = Currency::new_checked("USDC", 6, 0, "USDC", CurrencyType::Crypto).unwrap();
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+                .raw_symbol(Symbol::new("ETH/USDC"))
+                .base_currency(base)
+                .quote_currency(quote)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .multiplier(Quantity::from(1))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
     fn all_request(client: &DeepXDataClient) -> RequestInstruments {
         RequestInstruments::new(
             None,
@@ -1353,6 +1801,393 @@ mod tests {
             UnixNanos::default(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn spot_trade_history_emits_exact_correlated_ticks() {
+        let router = Router::new().route(
+            "/internal/v1/market/spot/trades",
+            get(|| async { SPOT_TRADES }),
+        );
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        client.provider.store_mut().add(spot_instrument());
+        let raw: crate::http::DeepXApiResponse<crate::http::DeepXSpotTradesPage> =
+            serde_json::from_str(SPOT_TRADES).unwrap();
+        let latest = &raw.data.items[0];
+        let timestamp: jiff::Timestamp = latest.trade_time.parse().unwrap();
+        let request_id = UUID4::new();
+
+        client
+            .request_trades(RequestTrades::new(
+                InstrumentId::from("ETH-USDC.DEEPX"),
+                Some(timestamp),
+                Some(timestamp),
+                NonZeroUsize::new(2),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+
+        let DataEvent::Response(DataResponse::Trades(response)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected Spot trade response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.data.len(), 2);
+        let tick = response
+            .data
+            .iter()
+            .find(|tick| tick.trade_id.to_string() == latest.id.to_string())
+            .unwrap();
+        assert_eq!(tick.price.as_decimal(), latest.price);
+        assert_eq!(tick.size.as_decimal(), latest.base_amount);
+        assert_eq!(
+            tick.aggressor_side,
+            nautilus_model::enums::AggressorSide::Sell
+        );
+    }
+
+    #[tokio::test]
+    async fn spot_candle_history_emits_correlated_bars() {
+        let mut fixture: serde_json::Value = serde_json::from_str(SPOT_CANDLES).unwrap();
+        for candle in fixture["data"]["details"].as_array_mut().unwrap() {
+            candle["volume"] = serde_json::json!("1.2345");
+        }
+        let router = Router::new().route(
+            "/internal/v1/market/spot/candles",
+            get(move || {
+                let fixture = fixture.clone();
+                async move { axum::Json(fixture) }
+            }),
+        );
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        client.provider.store_mut().add(spot_instrument());
+        let fixture: crate::http::DeepXApiResponse<crate::http::DeepXSpotCandlesPage> =
+            serde_json::from_str(SPOT_CANDLES).unwrap();
+        let first = fixture.data.details.first().unwrap().time;
+        let last = fixture.data.details.last().unwrap().time;
+        let bar_type = BarType::new(
+            InstrumentId::from("ETH-USDC.DEEPX"),
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+        let request_id = UUID4::new();
+
+        client
+            .request_bars(RequestBars::new(
+                bar_type,
+                Some(jiff::Timestamp::from_millisecond(first as i64).unwrap()),
+                Some(jiff::Timestamp::from_millisecond(last as i64).unwrap()),
+                NonZeroUsize::new(3),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+
+        let DataEvent::Response(DataResponse::Bars(response)) = receiver.try_recv().unwrap() else {
+            panic!("expected Spot bars response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.data.len(), 3);
+        assert_eq!(
+            response.data[0].volume.as_decimal(),
+            rust_decimal::Decimal::new(12_345, 4)
+        );
+        assert_eq!(response.data[0].ts_event.as_millis(), first);
+    }
+
+    #[tokio::test]
+    async fn spot_book_snapshot_emits_correlated_exact_book() {
+        let router = Router::new().route(
+            "/internal/v1/market/spot/order-books",
+            get(|| async { SPOT_BOOK }),
+        );
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        client.provider.store_mut().add(spot_instrument());
+        let request_id = UUID4::new();
+
+        client
+            .request_book_snapshot(RequestBookSnapshot::new(
+                InstrumentId::from("ETH-USDC.DEEPX"),
+                NonZeroUsize::new(2),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+
+        let DataEvent::Response(DataResponse::Book(response)) = receiver.try_recv().unwrap() else {
+            panic!("expected Spot book response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(
+            response.data.best_bid_price().unwrap(),
+            Price::from("2435.67")
+        );
+        assert_eq!(
+            response.data.best_ask_price().unwrap(),
+            Price::from("2435.82")
+        );
+        assert_eq!(response.data.bids(None).count(), 2);
+        assert_eq!(response.data.asks(None).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn spot_quote_request_emits_one_correlated_top_of_book_tick() {
+        let router = Router::new().route(
+            "/internal/v1/market/spot/order-books",
+            get(|| async { SPOT_BOOK }),
+        );
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        client.provider.store_mut().add(spot_instrument());
+        let request_id = UUID4::new();
+
+        client
+            .request_quotes(RequestQuotes::new(
+                InstrumentId::from("ETH-USDC.DEEPX"),
+                None,
+                None,
+                None,
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+
+        let DataEvent::Response(DataResponse::Quotes(response)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected Spot quote response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.client_id, client.client_id());
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].bid_price.to_string(), "2435.67");
+        assert_eq!(response.data[0].ask_price.to_string(), "2435.82");
+        assert_eq!(response.data[0].bid_size.to_string(), "0.9030");
+        assert_eq!(response.data[0].ask_size.to_string(), "1.6055");
+        assert_eq!(response.data[0].ts_event.as_millis(), 1_789_620_906_510);
+    }
+
+    #[tokio::test]
+    async fn quote_request_rejects_history_and_multiple_values_before_task_creation() {
+        let (mut client, _receiver, _, _server) = client(serde_json::from_str(PERP).unwrap()).await;
+        client.connect().await.unwrap();
+        client.provider.store_mut().add(spot_instrument());
+        let start = jiff::Timestamp::from_millisecond(1_000).unwrap();
+        let end = jiff::Timestamp::from_millisecond(2_000).unwrap();
+
+        assert!(
+            client
+                .request_quotes(RequestQuotes::new(
+                    InstrumentId::from("ETH-USDC.DEEPX"),
+                    Some(start),
+                    Some(end),
+                    None,
+                    Some(client.client_id()),
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                ))
+                .is_err()
+        );
+        assert!(
+            client
+                .request_quotes(RequestQuotes::new(
+                    InstrumentId::from("ETH-USDC.DEEPX"),
+                    None,
+                    None,
+                    NonZeroUsize::new(2),
+                    Some(client.client_id()),
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                ))
+                .is_err()
+        );
+        assert!(client.tasks.is_empty());
+        client.disconnect().await.unwrap();
+    }
+
+    #[rstest]
+    #[case("deltas")]
+    #[case("depth10")]
+    #[case("quotes")]
+    #[tokio::test]
+    async fn spot_live_book_subscriptions_route_and_retire(#[case] kind: &str) {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        use nautilus_model::data::Data;
+
+        let spot_response: crate::http::DeepXApiResponse<Vec<crate::http::DeepXSpotMarket>> =
+            serde_json::from_str(SPOT).unwrap();
+        let market = spot_response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let pair = market.pair.clone();
+        let (unsubscribe_sender, unsubscribe_receiver) = tokio::sync::oneshot::channel();
+        let unsubscribe_sender = Arc::new(tokio::sync::Mutex::new(Some(unsubscribe_sender)));
+        let app = Router::new().route(
+            "/rpc",
+            get(move |upgrade: WebSocketUpgrade| {
+                let pair = pair.clone();
+                let unsubscribe_sender = Arc::clone(&unsubscribe_sender);
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(Message::Text(request))) = socket.recv().await else {
+                            return;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                        assert_eq!(request["method"], "orderbook_subscribe");
+                        assert_eq!(request["params"][0][0], pair);
+                        socket
+                            .send(Message::Text(
+                                serde_json::json!({"jsonrpc":"2.0","id":1,"result":"book-1"})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        socket
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "jsonrpc":"2.0",
+                                    "method":"orderbook_subscribe",
+                                    "params":{
+                                        "subscription":"book-1",
+                                        "result":{
+                                            "spot":{
+                                                (pair):{
+                                                    "bids":[{"price":"0x912d5ff0","amount":"0xc8819b7382d8000","order_count":3}],
+                                                    "asks":[{"price":"0x912fa9e0","amount":"0x1647e1be62e3c000","order_count":4}]
+                                                }
+                                            },
+                                            "perp":{}
+                                        }
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        while let Some(Ok(Message::Text(message))) = socket.recv().await {
+                            let request: serde_json::Value =
+                                serde_json::from_str(&message).unwrap();
+                            if request["method"] == "orderbook_unsubscribe" {
+                                if let Some(sender) = unsubscribe_sender.lock().await.take() {
+                                    let _ = sender.send(());
+                                }
+                                break;
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), app).await;
+        client.provider.catalog_mut().load_all().await.unwrap();
+        client.provider.store_mut().add(spot_instrument());
+        client.tasks.abort();
+        client
+            .tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .unwrap();
+        client.tasks.start_generation().unwrap();
+        client.sender = nautilus_common::live::runner::try_get_data_event_sender();
+        client.request_epoch = Arc::new(Mutex::new(true));
+        client.connected = true;
+        client.config.network.base_url_rpc_watch = Some(format!("{}/rpc", client.http.base_url()));
+
+        let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        match kind {
+            "deltas" => {
+                let mut command = book_subscribe();
+                command.instrument_id = instrument_id;
+                client.subscribe_book_deltas(command.clone()).unwrap();
+                client.subscribe_book_deltas(command).unwrap();
+            }
+            "depth10" => {
+                let mut command = depth10_subscribe();
+                command.instrument_id = instrument_id;
+                client.subscribe_book_depth10(command.clone()).unwrap();
+                client.subscribe_book_depth10(command).unwrap();
+            }
+            "quotes" => {
+                let mut command = quote_subscribe();
+                command.instrument_id = instrument_id;
+                client.subscribe_quotes(command.clone()).unwrap();
+                client.subscribe_quotes(command).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match (kind, event) {
+            ("deltas", DataEvent::Data(Data::Deltas(deltas))) => {
+                assert_eq!(deltas.deltas.len(), 3);
+            }
+            ("depth10", DataEvent::Data(Data::Depth10(depth10))) => {
+                assert_eq!(depth10.bids[0].size.to_string(), "0.9030");
+                assert_eq!(depth10.asks[0].size.to_string(), "1.6055");
+            }
+            ("quotes", DataEvent::Data(Data::Quote(quote))) => {
+                assert_eq!(quote.bid_size.to_string(), "0.9030");
+                assert_eq!(quote.ask_size.to_string(), "1.6055");
+            }
+            _ => panic!("Spot subscription published the wrong data type"),
+        }
+        match kind {
+            "deltas" => {
+                let mut command = book_unsubscribe();
+                command.instrument_id = instrument_id;
+                client.unsubscribe_book_deltas(&command).unwrap();
+            }
+            "depth10" => {
+                let mut command = depth10_unsubscribe();
+                command.instrument_id = instrument_id;
+                client.unsubscribe_book_depth10(&command).unwrap();
+            }
+            "quotes" => {
+                let mut command = quote_unsubscribe();
+                command.instrument_id = instrument_id;
+                client.unsubscribe_quotes(&command).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        tokio::time::timeout(Duration::from_secs(2), unsubscribe_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        finish_requests(&client).await;
+        assert!(receiver.try_recv().is_err());
+        client.disconnect().await.unwrap();
     }
 
     fn funding_request() -> RequestFundingRates {
@@ -2610,6 +3445,7 @@ mod tests {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         calls: Arc<AtomicUsize>,
+        expected_depth: usize,
     ) -> Router {
         use axum::extract::ws::{Message, WebSocketUpgrade};
         Router::new().route(
@@ -2625,7 +3461,7 @@ mod tests {
                         };
                         let request: serde_json::Value = serde_json::from_str(&request).unwrap();
                         assert_eq!(request["subscriptions"], serde_json::json!(["orderbook"]));
-                        assert_eq!(request["options"]["orderbook_depth"], 2);
+                        assert_eq!(request["options"]["orderbook_depth"], expected_depth);
                         assert_eq!(request["options"]["orderbook_price_size"], 0.01);
                         calls.fetch_add(1, Ordering::Relaxed);
                         let ack = serde_json::json!({"type":"subscribed","market":{"type":"perp","id":3},
@@ -2651,6 +3487,12 @@ mod tests {
                                 {"price":"1792.40","qty":"0.008","value":"14.3392"}
                             ));
                         }
+                        bids.as_array_mut().unwrap().truncate(expected_depth);
+                        let mut asks = serde_json::json!([
+                            {"price":"1792.80","qty":"0.006","value":"10.7568"},
+                            {"price":"1792.90","qty":"0.007","value":"12.5503"}
+                        ]);
+                        asks.as_array_mut().unwrap().truncate(expected_depth);
                         let frame = serde_json::json!({
                             "type":"data","channel":"orderbook",
                             "market":{"type":"perp","id":3},"timestamp":2001,
@@ -2658,10 +3500,7 @@ mod tests {
                                 "prevLastUpdateId":if scenario == "delta" {serde_json::json!(9)} else {serde_json::Value::Null},
                                 "lastUpdateId":10,"engineTime":2000,
                                 "bids":bids,
-                                "asks":[
-                                    {"price":"1792.80","qty":"0.006","value":"10.7568"},
-                                    {"price":"1792.90","qty":"0.007","value":"12.5503"}
-                                ]}
+                                "asks":asks}
                         });
                         if socket
                             .send(Message::Text(frame.to_string().into()))
@@ -2689,6 +3528,7 @@ mod tests {
                 Arc::clone(&entered),
                 Arc::clone(&release),
                 Arc::clone(&calls),
+                2,
             ),
         )
         .await;
@@ -2738,6 +3578,65 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn perpetual_quote_request_emits_acknowledged_snapshot_quote() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            book_snapshot_router(
+                "valid",
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::clone(&calls),
+                1,
+            ),
+        )
+        .await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        let request_id = UUID4::new();
+        client
+            .request_quotes(RequestQuotes::new(
+                InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+                None,
+                None,
+                Some(NonZeroUsize::new(1).unwrap()),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let DataEvent::Response(DataResponse::Quotes(response)) =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected Perpetual quote response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.client_id, client.client_id());
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].bid_price.to_string(), "1792.6000");
+        assert_eq!(response.data[0].bid_size.to_string(), "0.0040");
+        assert_eq!(response.data[0].ask_price.to_string(), "1792.8000");
+        assert_eq!(response.data[0].ask_size.to_string(), "0.0060");
+        assert_eq!(response.data[0].ts_event.as_millis(), 2000);
+        finish_requests(&client).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        client.disconnect().await.unwrap();
+    }
+
     #[rstest]
     #[case("precision")]
     #[case("delta")]
@@ -2753,6 +3652,7 @@ mod tests {
                 Arc::clone(&entered),
                 Arc::clone(&release),
                 Arc::new(AtomicUsize::new(0)),
+                2,
             ),
         )
         .await;
@@ -2817,6 +3717,7 @@ mod tests {
                 Arc::clone(&entered),
                 Arc::clone(&release),
                 Arc::new(AtomicUsize::new(0)),
+                2,
             ),
         )
         .await;
@@ -2851,6 +3752,7 @@ mod tests {
                 Arc::clone(&entered),
                 Arc::new(tokio::sync::Notify::new()),
                 Arc::new(AtomicUsize::new(0)),
+                2,
             ),
         )
         .await;

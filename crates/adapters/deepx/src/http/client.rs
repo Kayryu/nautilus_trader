@@ -17,6 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -28,48 +29,51 @@ use nautilus_network::{
     retry::{RetryConfig, RetryManager},
 };
 use rust_decimal::Decimal;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     error::{DeepXHttpError, Result},
     models::{
         DeepXAccountPage, DeepXApiResponse, DeepXBalanceChangeRecord, DeepXDelegateAccount,
         DeepXDelegateWallets, DeepXFundingRatePage, DeepXFundingRateRecord,
-        DeepXHourlyUnsettledFundingRecord, DeepXLendingAsset, DeepXLendingInterestRateHistory,
-        DeepXLendingInterestRateParams, DeepXLendingInterestRateRecord, DeepXLendingStatusHistory,
-        DeepXLendingStatusRecord, DeepXLiquidationRecord, DeepXLongShortRatioPage,
-        DeepXOpenInterestPage, DeepXPerpAccountTradeRecord, DeepXPerpCandlesPage,
+        DeepXHourlyUnsettledFundingRecord, DeepXInvitationStatus, DeepXLendingAsset,
+        DeepXLendingInterestRateHistory, DeepXLendingInterestRateParams,
+        DeepXLendingInterestRateRecord, DeepXLendingStatusHistory, DeepXLendingStatusRecord,
+        DeepXLiquidationRecord, DeepXLongShortRatioPage, DeepXLongShortRatioRecord,
+        DeepXOpenInterestPage, DeepXPerpAccountTradeRecord, DeepXPerpCandle, DeepXPerpCandlesPage,
         DeepXPerpFundingFeeRecord, DeepXPerpLastPrice, DeepXPerpLiquidationPrice, DeepXPerpMarket,
         DeepXPerpMarketLookup, DeepXPerpOrderBook, DeepXPerpOrderBookLevel, DeepXPerpOrderRecord,
         DeepXPerpPositionRecord, DeepXPerpTrade, DeepXPerpTradesPage, DeepXPerpVolume,
         DeepXPerpWalletOrderMarket, DeepXPerpWalletOrdersPage, DeepXPerpWalletTradeMarket,
         DeepXQuotaHistoryRecord, DeepXQuotaSummary, DeepXRawAccountPage,
-        DeepXSpotAccountTradeRecord, DeepXSpotCandlesPage, DeepXSpotLastPrice, DeepXSpotMarket,
-        DeepXSpotOrderBook, DeepXSpotOrderBookLevel, DeepXSpotOrderRecord, DeepXSpotTrade,
-        DeepXSpotTradesPage, DeepXSpotVolume, DeepXSpotWalletOrderMarket,
-        DeepXSpotWalletOrdersPage, DeepXSpotWalletTradeMarket, DeepXSpotWalletTradesPage,
-        DeepXSubaccountBalances, DeepXSubaccountDirectoryRecord, DeepXSubaccountEquity,
-        DeepXSubaccountMarginRatio, DeepXSubaccountProfile, DeepXSubaccountSnapshot,
-        DeepXUserStats, DeepXWalletAccountSnapshot, DeepXWalletDelegateAccounts,
-        DeepXWalletSubaccounts,
+        DeepXSpotAccountTradeRecord, DeepXSpotAdlCandidates, DeepXSpotCandle, DeepXSpotCandlesPage,
+        DeepXSpotLastPrice, DeepXSpotMarket, DeepXSpotOrderBook, DeepXSpotOrderBookLevel,
+        DeepXSpotOrderRecord, DeepXSpotTrade, DeepXSpotTradesPage, DeepXSpotVolume,
+        DeepXSpotWalletOrderMarket, DeepXSpotWalletOrdersPage, DeepXSpotWalletTradeMarket,
+        DeepXSpotWalletTradesPage, DeepXSubaccountBalances, DeepXSubaccountDirectoryRecord,
+        DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountProfile,
+        DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
+        DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
     },
     pagination::{CursorPagination, PaginationDecision, validate_cursor_page},
     query::{
         DeepXAccountSortOrder, DeepXAllSubaccountsRequest, DeepXBalanceChangesRequest,
         DeepXFundingRateRequest, DeepXHourlyUnsettledFundingCursor,
         DeepXHourlyUnsettledFundingRequest, DeepXLendingHistoryRequest, DeepXLendingMarketRequest,
+        DeepXLiquidationAdlRecordsRequest, DeepXLiquidationExecutionRecordsRequest,
         DeepXLiquidationRecordsRequest, DeepXLongShortRatioRequest, DeepXOpenInterestRequest,
         DeepXPerpAccountTradesRequest, DeepXPerpCandlesRequest, DeepXPerpFundingFeeRequest,
         DeepXPerpHistoryOrdersRequest, DeepXPerpLastPriceRequest, DeepXPerpLiquidationPriceRequest,
         DeepXPerpMarkPriceRequest, DeepXPerpOpenOrdersRequest, DeepXPerpOraclePriceRequest,
-        DeepXPerpOrderBookRequest, DeepXPerpPositionsRequest, DeepXPerpTradesHistoryRequest,
-        DeepXPerpTradesQuery, DeepXPerpTradesRequest, DeepXPerpVolumeRequest,
-        DeepXPerpWalletOrdersRequest, DeepXPerpWalletTradesRequest, DeepXQuotaHistoryRequest,
-        DeepXQuotaHistoryType, DeepXSpotAccountTradesRequest, DeepXSpotCandlesRequest,
-        DeepXSpotHistoryOrdersRequest, DeepXSpotLastPriceRequest, DeepXSpotOpenOrdersRequest,
-        DeepXSpotOrderBookRequest, DeepXSpotOrderByIdRequest, DeepXSpotOrderSide,
-        DeepXSpotTradesRequest, DeepXSpotVolumeRequest, DeepXSpotWalletOrdersRequest,
-        DeepXSpotWalletTradesRequest, DeepXWalletFundingFeeRequest,
+        DeepXPerpOrderBookRequest, DeepXPerpPositionOrdersRequest, DeepXPerpPositionsRequest,
+        DeepXPerpTradesHistoryRequest, DeepXPerpTradesQuery, DeepXPerpTradesRequest,
+        DeepXPerpVolumeRequest, DeepXPerpWalletOrdersRequest, DeepXPerpWalletTradesRequest,
+        DeepXQuotaHistoryRequest, DeepXQuotaHistoryType, DeepXSpotAccountTradesRequest,
+        DeepXSpotAdlCandidatesRequest, DeepXSpotCandlesRequest, DeepXSpotHistoryOrdersRequest,
+        DeepXSpotLastPriceRequest, DeepXSpotOpenOrdersRequest, DeepXSpotOrderBookRequest,
+        DeepXSpotOrderByIdRequest, DeepXSpotOrderSide, DeepXSpotTradesRequest,
+        DeepXSpotVolumeRequest, DeepXSpotWalletOrdersRequest, DeepXSpotWalletTradesRequest,
+        DeepXWalletFundingFeeRequest,
     },
     retry::{deepx_http_retry_config, should_retry_http_error},
 };
@@ -90,6 +94,7 @@ const PERP_LONG_SHORT_RATIO_PATH: &str = "/internal/v1/market/perp/long_short_ra
 const PERP_OPEN_INTEREST_PATH: &str = "/internal/v1/market/perp/open_interest";
 const PERP_TRADES_PATH: &str = "/internal/v1/market/perp/trades";
 const PERP_CANDLES_PATH: &str = "/internal/v1/market/perp/candles";
+const CANDLE_PAGE_SIZE: u32 = 5_000;
 const PERP_MARK_PRICE_PATH: &str = "/internal/v1/market/perp/mark_price";
 const PERP_ORACLE_PRICE_PATH: &str = "/internal/v1/market/perp/oracle_price";
 const PERP_VOLUME_PATH: &str = "/internal/v1/market/perp/volume";
@@ -107,6 +112,7 @@ const LENDING_INTEREST_RATE_HISTORY_PATH: &str =
 const LENDING_STATUS_HISTORY_PATH: &str = "/internal/v1/market/lending/status-history";
 const PERP_OPEN_ORDERS_PATH: &str = "/internal/v1/account/perp/open-orders";
 const PERP_HISTORY_ORDERS_PATH: &str = "/internal/v1/account/perp/history-orders";
+const PERP_POSITION_ORDERS_PATH: &str = "/internal/v1/account/perp/position-orders";
 const SPOT_OPEN_ORDERS_PATH: &str = "/internal/v1/account/spot/open-orders";
 const SPOT_HISTORY_ORDERS_PATH: &str = "/internal/v1/account/spot/history-orders";
 const SPOT_ORDER_BY_ID_PATH: &str = "/internal/v1/account/spot/order-by-id";
@@ -120,13 +126,19 @@ const PERP_WALLET_TRADES_PATH: &str = "/internal/v1/account/perp/trades-by-walle
 const PERP_FUNDING_FEE_PATH: &str = "/internal/v1/account/funding-fee";
 const WALLET_FUNDING_FEE_PATH: &str = "/internal/v1/account/funding-fee-by-wallet";
 const HOURLY_UNSETTLED_FUNDING_PATH: &str = "/internal/v1/account/hourly-unsettled-funding";
+const SPOT_ADL_CANDIDATES_PATH: &str = "/internal/v1/adl/spot/candidates";
 const PERP_POSITIONS_PATH: &str = "/internal/v1/account/position";
 const BALANCE_CHANGES_PATH: &str = "/internal/v1/account/balance-changes";
 const LIQUIDATION_RECORDS_PATH: &str = "/internal/v1/account/subaccounts/liquidation-records";
+const LIQUIDATION_ADL_RECORDS_PATH: &str = "/internal/v1/liquidation/adl-records";
+const LIQUIDATION_CRANKER_RECORDS_PATH: &str = "/internal/v1/liquidation/cranker-records";
+const LIQUIDATION_KEEPER_STATE_PATH: &str = "/internal/v1/liquidation/keeper-state";
+const LIQUIDATION_TP_SL_RECORDS_PATH: &str = "/internal/v1/liquidation/tp-sl-records";
 const PERP_LIQUIDATION_PRICE_PATH: &str = "/internal/v1/account/perp/liquidate-price";
 const USER_STATS_PATH: &str = "/internal/v1/account/user-stats";
 const QUOTA_SUMMARY_PATH: &str = "/internal/v1/account/quota/summary";
 const QUOTA_HISTORY_PATH: &str = "/internal/v1/account/quota/history";
+const QUOTA_CLAIM_PATH: &str = "/internal/v1/account/quota/claim";
 const WALLET_SUBACCOUNTS_PATH: &str = "/internal/v1/account/subaccounts";
 const ALL_SUBACCOUNTS_PATH: &str = "/internal/v1/account/subaccounts/all";
 const SUBACCOUNT_INFO_PATH: &str = "/internal/v1/account/subaccount-info";
@@ -135,6 +147,8 @@ const SUBACCOUNT_EQUITY_PATH: &str = "/internal/v1/account/equity";
 const SUBACCOUNT_MARGIN_RATIO_PATH: &str = "/internal/v1/account/margin-ratio";
 const DELEGATE_ACCOUNTS_PATH: &str = "/internal/v1/account/delegate-accounts";
 const DELEGATOR_ACCOUNTS_PATH: &str = "/internal/v1/account/delegator-accounts";
+const INVITATION_CHECK_PATH: &str = "/internal/v1/invitation/check";
+const INVITATION_CODE_PATH: &str = "/internal/v1/invitation/invitation-code";
 const PERP_ORDER_BY_TX_PATH: &str = "/internal/v1/account/perp/order-by-tx";
 
 const MAX_ERROR_BODY_CHARS: usize = 1_024;
@@ -685,6 +699,81 @@ impl DeepXHttpClient {
         Ok(page)
     }
 
+    /// Returns up to `limit` ascending long-short ratio observations under a page budget.
+    ///
+    /// Requires a fixed upper bound. Time filters remain on every cursor page, and market
+    /// identity, range, ordering, response size, and cursor progress are validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds or budgets, HTTP failures, invalid response identity,
+    /// out-of-range or unordered observations, oversized pages, or exhausted cursor budgets.
+    pub async fn get_perp_long_short_ratios_history_limited(
+        &self,
+        request: &DeepXLongShortRatioRequest,
+        limit: std::num::NonZeroUsize,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXLongShortRatioRecord>> {
+        request.validate()?;
+        let end = request.end_ms.ok_or_else(|| {
+            DeepXHttpError::InvalidRequest(
+                "long-short-ratio history requires a fixed end_ms".to_string(),
+            )
+        })?;
+        let page_size = request.limit.unwrap_or(100);
+        if page_size > 5_000 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "long-short-ratio page size exceeds 5000".to_string(),
+            ));
+        }
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut page_request = request.clone();
+        let mut records = Vec::new();
+        let mut previous = None;
+        let invalid = |message: String| DeepXHttpError::InvalidHistoryResponse {
+            endpoint: "perp long-short-ratio",
+            message,
+        };
+        loop {
+            let current_limit =
+                page_size.min(u32::try_from(limit.get() - records.len()).unwrap_or(u32::MAX));
+            page_request.limit = Some(current_limit);
+            let page = self.get_perp_long_short_ratios(&page_request).await?;
+            if page.details.len() > current_limit as usize {
+                return Err(invalid("page exceeds requested limit".to_string()));
+            }
+            for record in &page.details {
+                if record.time < request.start_ms || record.time > end {
+                    return Err(invalid(
+                        "observation is outside requested range".to_string(),
+                    ));
+                }
+                if previous.is_some_and(|time| record.time <= time) {
+                    return Err(invalid(
+                        "observation times are not strictly ascending".to_string(),
+                    ));
+                }
+                previous = Some(record.time);
+            }
+            if records.len() + page.details.len() == limit.get() {
+                records.extend(page.details);
+                return Ok(records);
+            }
+            let decision = pagination.observe_response_page(
+                "perp long-short-ratio",
+                page.details.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            records.extend(page.details);
+            match decision {
+                PaginationDecision::Complete => return Ok(records),
+                PaginationDecision::Continue(cursor) => page_request.cursor = Some(cursor),
+            }
+        }
+    }
+
     /// Returns one ascending page of perpetual open-interest history.
     ///
     /// # Errors
@@ -917,6 +1006,59 @@ impl DeepXHttpClient {
         }
     }
 
+    /// Returns up to `limit` validated raw Spot trades while preserving global order checks.
+    ///
+    /// Reaching the explicit record limit succeeds without fetching remaining pages. The same
+    /// market, timestamp, identity, cursor, and page-budget checks apply.
+    pub async fn get_spot_trades_limited(
+        &self,
+        request: &DeepXSpotTradesRequest,
+        limit: std::num::NonZeroUsize,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXSpotTrade>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut trades = Vec::new();
+        let mut ids = HashSet::new();
+        let mut previous = None;
+        loop {
+            let remaining = limit.get() - trades.len();
+            let page_size = request
+                .page_size
+                .unwrap_or(100)
+                .min(u32::try_from(remaining).unwrap_or(u32::MAX));
+            next_request.page_size = Some(page_size);
+            let page = self.get_spot_trades_page(&next_request).await?;
+            for (index, trade) in page.items.iter().enumerate() {
+                validate_spot_trade(index, trade, request, &mut previous)?;
+                validate_unique_account_identity(
+                    "spot trades",
+                    index,
+                    &mut ids,
+                    trade.id,
+                    "trade ID",
+                )?;
+            }
+            if trades.len() + page.items.len() >= limit.get() {
+                trades.extend(page.items.into_iter().take(remaining));
+                return Ok(trades);
+            }
+            let decision = pagination.observe_response_page(
+                "spot trades",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            trades.extend(page.items);
+            match decision {
+                PaginationDecision::Complete => return Ok(trades),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
+    }
+
     async fn get_spot_trades_page(
         &self,
         request: &DeepXSpotTradesRequest,
@@ -963,6 +1105,39 @@ impl DeepXHttpClient {
             .await?;
         validate_spot_candle_page(&page, request)?;
         Ok(page)
+    }
+
+    /// Returns a complete bounded Spot candle history using ascending time cursors.
+    ///
+    /// An explicit request limit caps the total result. Without one, the collector reads at most
+    /// `max_pages` pages of 5000 candles. No partial result is returned on budget exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero page budget, invalid pages, market identity changes, cursor
+    /// overflow, or a history exceeding the page budget.
+    pub async fn get_spot_candles_history_limited(
+        &self,
+        request: &DeepXSpotCandlesRequest,
+        max_pages: usize,
+    ) -> Result<DeepXSpotCandlesPage> {
+        request.validate()?;
+        let client = self;
+        let request = request.clone();
+        collect_candle_history(
+            "spot candle history",
+            request.start_ms,
+            request.end_ms,
+            request.limit,
+            max_pages,
+            move |start_ms, limit| {
+                let mut page_request = request.clone();
+                page_request.start_ms = start_ms;
+                page_request.limit = Some(limit);
+                async move { client.get_spot_candles(&page_request).await }
+            },
+        )
+        .await
     }
 
     /// Returns one validated Spot volume-statistics window.
@@ -1015,8 +1190,8 @@ impl DeepXHttpClient {
     ///
     /// The optional positive tick is server-side price aggregation. Aggregated bid and ask buckets
     /// can overlap, and server notionals can be rounded independently, so neither uncrossed-book
-    /// nor exact `price * quantity` invariants are invented here. This snapshot is mutable and not
-    /// connected to the framework Spot instrument or book pipeline.
+    /// nor exact `price * quantity` invariants are invented here. This one-shot snapshot is
+    /// mutable and does not imply continuity with the framework Spot book subscription.
     ///
     /// # Errors
     ///
@@ -1057,6 +1232,39 @@ impl DeepXHttpClient {
         Ok(page)
     }
 
+    /// Returns a complete bounded perpetual candle history using ascending time cursors.
+    ///
+    /// An explicit request limit caps the total result. Without one, the collector reads at most
+    /// `max_pages` pages of 5000 candles. No partial result is returned on budget exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero page budget, invalid pages, market identity changes, cursor
+    /// overflow, or a history exceeding the page budget.
+    pub async fn get_perp_candles_history_limited(
+        &self,
+        request: &DeepXPerpCandlesRequest,
+        max_pages: usize,
+    ) -> Result<DeepXPerpCandlesPage> {
+        request.validate()?;
+        let client = self;
+        let request = request.clone();
+        collect_candle_history(
+            "perp candle history",
+            request.start_ms,
+            request.end_ms,
+            request.limit,
+            max_pages,
+            move |start_ms, limit| {
+                let mut page_request = request.clone();
+                page_request.start_ms = start_ms;
+                page_request.limit = Some(limit);
+                async move { client.get_perp_candles(&page_request).await }
+            },
+        )
+        .await
+    }
+
     /// Returns one ascending page of raw perpetual mark-price history.
     ///
     /// # Errors
@@ -1082,6 +1290,39 @@ impl DeepXHttpClient {
         Ok(page)
     }
 
+    /// Returns a complete bounded perpetual mark-price history using ascending time cursors.
+    ///
+    /// An explicit request limit caps the total result. Without one, the collector reads at most
+    /// `max_pages` pages of 5000 observations and never returns partial history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero page budget, invalid pages, market identity changes, cursor
+    /// overflow, or a history exceeding the page budget.
+    pub async fn get_perp_mark_prices_history_limited(
+        &self,
+        request: &DeepXPerpMarkPriceRequest,
+        max_pages: usize,
+    ) -> Result<DeepXPerpCandlesPage> {
+        request.validate()?;
+        let client = self;
+        let request = request.clone();
+        collect_candle_history(
+            "perp mark-price history",
+            request.start_ms,
+            request.end_ms,
+            request.limit,
+            max_pages,
+            move |start_ms, limit| {
+                let mut page_request = request.clone();
+                page_request.start_ms = start_ms;
+                page_request.limit = Some(limit);
+                async move { client.get_perp_mark_prices(&page_request).await }
+            },
+        )
+        .await
+    }
+
     /// Returns one ascending page of raw perpetual oracle-price history.
     ///
     /// # Errors
@@ -1105,6 +1346,39 @@ impl DeepXHttpClient {
             request.limit,
         )?;
         Ok(page)
+    }
+
+    /// Returns a complete bounded perpetual oracle-price history using ascending time cursors.
+    ///
+    /// An explicit request limit caps the total result. Without one, the collector reads at most
+    /// `max_pages` pages of 5000 observations and never returns partial history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero page budget, invalid pages, market identity changes, cursor
+    /// overflow, or a history exceeding the page budget.
+    pub async fn get_perp_oracle_prices_history_limited(
+        &self,
+        request: &DeepXPerpOraclePriceRequest,
+        max_pages: usize,
+    ) -> Result<DeepXPerpCandlesPage> {
+        request.validate()?;
+        let client = self;
+        let request = request.clone();
+        collect_candle_history(
+            "perp oracle-price history",
+            request.start_ms,
+            request.end_ms,
+            request.limit,
+            max_pages,
+            move |start_ms, limit| {
+                let mut page_request = request.clone();
+                page_request.start_ms = start_ms;
+                page_request.limit = Some(limit);
+                async move { client.get_perp_oracle_prices(&page_request).await }
+            },
+        )
+        .await
     }
 
     /// Returns one perpetual volume-statistics window.
@@ -1662,6 +1936,128 @@ impl DeepXHttpClient {
             .collect()
     }
 
+    /// Returns one raw page of orders associated with a position lifecycle.
+    ///
+    /// The endpoint includes orders across statuses and both directions. Filled orders may
+    /// appear in every lifecycle affected by their fills, while placement-only orders remain
+    /// provisional until filled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid request fields, transport or HTTP failures, malformed page
+    /// metadata, or a venue-level failure envelope.
+    pub async fn get_perp_position_orders_raw(
+        &self,
+        request: &DeepXPerpPositionOrdersRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        request.validate()?;
+        let page: DeepXRawAccountPage = self
+            .get_json_with_query(PERP_POSITION_ORDERS_PATH, &request.as_query())
+            .await?;
+        validate_cursor_page(
+            "perp position orders",
+            page.has_next,
+            page.next_cursor.as_deref(),
+        )?;
+        Ok(page)
+    }
+
+    /// Returns all raw position-order pages under an explicit page budget.
+    ///
+    /// Cursor expiration or budget exhaustion returns an error rather than partial coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the single-page errors or an error for invalid page budgets, empty continuation
+    /// pages, missing or repeated cursors, or budget exhaustion.
+    pub async fn get_perp_position_order_pages_raw(
+        &self,
+        request: &DeepXPerpPositionOrdersRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_perp_position_orders_raw(&next_request).await?;
+            let decision = pagination.observe_response_page(
+                "perp position orders",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
+    }
+
+    /// Returns one validated typed page of orders associated with a position lifecycle.
+    ///
+    /// Venue enum values remain uninterpreted and no framework reports are constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the raw reader errors or an error for malformed fields, ownership mismatches,
+    /// invalid financial values, timestamps, or duplicate order IDs.
+    pub async fn get_perp_position_orders(
+        &self,
+        request: &DeepXPerpPositionOrdersRequest,
+    ) -> Result<DeepXAccountPage<DeepXPerpOrderRecord>> {
+        let page = self.get_perp_position_orders_raw(request).await?;
+        let mut previous = None;
+        decode_account_page(
+            "perp position orders",
+            page,
+            request.page_size,
+            |index, order| {
+                validate_perp_position_order_record(
+                    index,
+                    order,
+                    &request.subaccount,
+                    &mut previous,
+                )
+            },
+        )
+    }
+
+    /// Returns all validated typed position-order pages under an explicit page budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns the raw collector errors or a typed record validation error. No partial typed
+    /// result is returned when any page or record is invalid.
+    pub async fn get_perp_position_order_pages(
+        &self,
+        request: &DeepXPerpPositionOrdersRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXAccountPage<DeepXPerpOrderRecord>>> {
+        let mut previous = None;
+        self.get_perp_position_order_pages_raw(request, max_pages)
+            .await?
+            .into_iter()
+            .map(|page| {
+                decode_account_page(
+                    "perp position orders",
+                    page,
+                    request.page_size,
+                    |index, order| {
+                        validate_perp_position_order_record(
+                            index,
+                            order,
+                            &request.subaccount,
+                            &mut previous,
+                        )
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Returns one page of uninterpreted active Spot orders for a subaccount and market.
     ///
     /// # Errors
@@ -1726,6 +2122,70 @@ impl DeepXHttpClient {
                 )
             },
         )
+    }
+
+    /// Returns all validated active Spot-order pages within an explicit page budget.
+    ///
+    /// Cursor cycles, duplicate order IDs, ordering violations, and budget exhaustion return an
+    /// error without exposing a partial collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the single-page reader errors or an error for an invalid page budget, empty
+    /// continuation page, missing or repeated cursor, duplicate order, ordering violation, or
+    /// exhausted page budget.
+    pub async fn get_spot_open_order_pages(
+        &self,
+        request: &DeepXSpotOpenOrdersRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXAccountPage<DeepXSpotOrderRecord>>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut order_ids = HashSet::new();
+        let mut previous = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_spot_open_orders_raw(&next_request).await?;
+            let item_count = page.items.len();
+            let decision = pagination.observe_response_page(
+                "spot open orders",
+                item_count,
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            let decoded = decode_account_page(
+                "spot open orders",
+                page,
+                request.page_size,
+                |index, order| {
+                    let created = validate_spot_order_record(
+                        "spot open orders",
+                        index,
+                        order,
+                        &request.subaccount,
+                        request.name.as_deref(),
+                        request.pair.as_deref(),
+                        request.order_side,
+                    )?;
+                    validate_spot_order_sequence(
+                        "spot open orders",
+                        index,
+                        &order.order_id,
+                        created,
+                        request.sort,
+                        &mut previous,
+                        &mut order_ids,
+                    )
+                },
+            )?;
+            pages.push(decoded);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
     }
 
     /// Returns one page of uninterpreted historical Spot orders for a subaccount.
@@ -3042,6 +3502,258 @@ impl DeepXHttpClient {
             .collect()
     }
 
+    /// Returns the uninterpreted response data for spot ADL candidate discovery.
+    ///
+    /// The OpenAPI specifies only a generic response envelope. Raw amounts and candidate
+    /// ranking are therefore left uninterpreted; this read does not establish execution
+    /// eligibility or submit an ADL transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid request fields, transport or HTTP failures, malformed
+    /// responses, or a venue-level failure envelope.
+    pub async fn get_spot_adl_candidates_raw(
+        &self,
+        request: &DeepXSpotAdlCandidatesRequest,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        request.validate()?;
+        self.get_json_with_query(SPOT_ADL_CANDIDATES_PATH, &request.as_query())
+            .await
+    }
+
+    /// Returns validated spot ADL candidate data while preserving raw integer amounts.
+    ///
+    /// Candidate order and amount units remain venue observations; this method infers no ranking,
+    /// financial scale, eligibility, or execution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid request fields, transport or venue failures, malformed data,
+    /// identity mismatches, invalid raw integer strings, or duplicate candidate subaccounts.
+    pub async fn get_spot_adl_candidates(
+        &self,
+        request: &DeepXSpotAdlCandidatesRequest,
+    ) -> Result<DeepXSpotAdlCandidates> {
+        request.validate()?;
+        let candidates: DeepXSpotAdlCandidates = self
+            .get_json_with_query(SPOT_ADL_CANDIDATES_PATH, &request.as_query())
+            .await?;
+        validate_spot_adl_candidates(&candidates, request)?;
+        Ok(candidates)
+    }
+
+    /// Returns one raw page of wallet- or subaccount-scoped ADL records.
+    ///
+    /// Record payloads remain uninterpreted because OpenAPI provides an example but no stable
+    /// item schema. The cursor and page metadata are validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query fields, inconsistent cursor metadata, transport or HTTP
+    /// failures, malformed responses, or a venue-level failure envelope.
+    pub async fn get_liquidation_adl_records_raw(
+        &self,
+        request: &DeepXLiquidationAdlRecordsRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        request.validate()?;
+        let page: DeepXRawAccountPage = self
+            .get_json_with_query(LIQUIDATION_ADL_RECORDS_PATH, &request.as_query())
+            .await?;
+        validate_cursor_page(
+            "liquidation ADL records",
+            page.has_next,
+            page.next_cursor.as_deref(),
+        )?;
+        Ok(page)
+    }
+
+    /// Returns all raw ADL record pages within an explicit page budget.
+    ///
+    /// Reaching a terminal page succeeds. Exhausting the budget while the venue advertises more
+    /// records fails without returning a partial collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request or page budget, transport or venue failures,
+    /// malformed pages, empty continuation pages, repeated cursors, or budget exhaustion.
+    pub async fn get_liquidation_adl_record_pages_raw(
+        &self,
+        request: &DeepXLiquidationAdlRecordsRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_liquidation_adl_records_raw(&next_request).await?;
+            let decision = pagination.observe_response_page(
+                "liquidation ADL records",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
+    }
+
+    /// Returns one raw page of cranker execution records.
+    ///
+    /// Record fields remain uninterpreted because OpenAPI documents examples rather than a stable
+    /// item schema. The read does not prove chain inclusion or finality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters or cursor metadata, transport or HTTP failures,
+    /// malformed responses, or a venue-level failure envelope.
+    pub async fn get_liquidation_cranker_records_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        self.get_liquidation_execution_records_raw(
+            LIQUIDATION_CRANKER_RECORDS_PATH,
+            "liquidation cranker records",
+            request,
+        )
+        .await
+    }
+
+    /// Returns all raw cranker execution pages within an explicit page budget.
+    pub async fn get_liquidation_cranker_record_pages_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        self.get_liquidation_execution_record_pages_raw(
+            LIQUIDATION_CRANKER_RECORDS_PATH,
+            "liquidation cranker records",
+            request,
+            max_pages,
+        )
+        .await
+    }
+
+    /// Returns one raw page of TP/SL execution records.
+    ///
+    /// Record fields remain uninterpreted because OpenAPI provides no stable item schema. The
+    /// read does not prove chain inclusion or finality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters or cursor metadata, transport or HTTP failures,
+    /// malformed responses, or a venue-level failure envelope.
+    pub async fn get_liquidation_tp_sl_records_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        self.get_liquidation_execution_records_raw(
+            LIQUIDATION_TP_SL_RECORDS_PATH,
+            "liquidation TP/SL records",
+            request,
+        )
+        .await
+    }
+
+    /// Returns all raw TP/SL execution pages within an explicit page budget.
+    pub async fn get_liquidation_tp_sl_record_pages_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        self.get_liquidation_execution_record_pages_raw(
+            LIQUIDATION_TP_SL_RECORDS_PATH,
+            "liquidation TP/SL records",
+            request,
+            max_pages,
+        )
+        .await
+    }
+
+    async fn get_liquidation_execution_records_raw(
+        &self,
+        path: &str,
+        endpoint: &'static str,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        request.validate()?;
+        let page: DeepXRawAccountPage = self.get_json_with_query(path, &request.as_query()).await?;
+        validate_cursor_page(endpoint, page.has_next, page.next_cursor.as_deref())?;
+        Ok(page)
+    }
+
+    async fn get_liquidation_execution_record_pages_raw(
+        &self,
+        path: &str,
+        endpoint: &'static str,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut pages = Vec::new();
+        loop {
+            let page = self
+                .get_liquidation_execution_records_raw(path, endpoint, &next_request)
+                .await?;
+            let decision = pagination.observe_response_page(
+                endpoint,
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
+    }
+
+    /// Returns raw durable liquidation keeper state for one subaccount.
+    ///
+    /// The endpoint has phase-dependent data and no stable OpenAPI item schema, so the returned
+    /// JSON remains uninterpreted. Reading this state does not claim a liquidation action or
+    /// establish finality for a pending transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid subaccount or chain ID, transport or HTTP failures,
+    /// malformed responses, or a venue-level failure envelope.
+    pub async fn get_liquidation_keeper_state_raw(
+        &self,
+        subaccount: &str,
+        chain_id: Option<&str>,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        validate_account_address("liquidation keeper state", "subaccount", subaccount)?;
+        if chain_id.is_some_and(|value| value.trim().is_empty()) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation keeper state chain_id must not be empty".to_string(),
+            ));
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct KeeperStateQuery<'a> {
+            subaccount: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chain_id: Option<&'a str>,
+        }
+        self.get_json_with_query(
+            LIQUIDATION_KEEPER_STATE_PATH,
+            &KeeperStateQuery {
+                subaccount,
+                chain_id,
+            },
+        )
+        .await
+    }
+
     /// Returns one raw page of account liquidation records for one subaccount or wallet.
     ///
     /// # Errors
@@ -3208,6 +3920,82 @@ impl DeepXHttpClient {
         Ok(stats)
     }
 
+    /// Returns whether one wallet is bound to an invitation code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid wallet address, transport or venue failures, malformed
+    /// data, or a response for another address.
+    pub async fn get_invitation_status(&self, address: &str) -> Result<DeepXInvitationStatus> {
+        validate_account_address("invitation status", "wallet", address)?;
+        #[derive(Serialize)]
+        struct InvitationStatusQuery<'a> {
+            address: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum InvitationStatusData {
+            /// Current testnet response shape.
+            Flag(bool),
+            /// OpenAPI-documented response example shape.
+            Detailed(DeepXInvitationStatus),
+        }
+        let status: InvitationStatusData = self
+            .get_json_with_query(INVITATION_CHECK_PATH, &InvitationStatusQuery { address })
+            .await?;
+        match status {
+            InvitationStatusData::Flag(is_bound) => Ok(DeepXInvitationStatus {
+                address: address.to_string(),
+                is_bound,
+            }),
+            InvitationStatusData::Detailed(status)
+                if status.address.eq_ignore_ascii_case(address) =>
+            {
+                Ok(status)
+            }
+            InvitationStatusData::Detailed(_) => Err(invalid_account_state_response(
+                "invitation status",
+                "response belongs to another wallet".to_string(),
+            )),
+        }
+    }
+
+    /// Returns the invitation codes associated with one wallet.
+    ///
+    /// The API documents a string array but does not specify code format. Values are therefore
+    /// preserved exactly, while empty and duplicate entries are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid wallet, transport or HTTP failures, malformed responses,
+    /// empty or duplicate codes, or a venue-level failure envelope.
+    pub async fn get_invitation_codes(&self, address: &str) -> Result<Vec<String>> {
+        validate_account_address("invitation codes", "wallet", address)?;
+        #[derive(Serialize)]
+        struct InvitationCodesQuery<'a> {
+            address: &'a str,
+        }
+        let codes: Vec<String> = self
+            .get_json_with_query(INVITATION_CODE_PATH, &InvitationCodesQuery { address })
+            .await?;
+        let mut unique = HashSet::with_capacity(codes.len());
+        for code in &codes {
+            if code.trim().is_empty() {
+                return Err(invalid_account_state_response(
+                    "invitation codes",
+                    "response contains an empty code".to_string(),
+                ));
+            }
+            if !unique.insert(code) {
+                return Err(invalid_account_state_response(
+                    "invitation codes",
+                    "response contains a duplicate code".to_string(),
+                ));
+            }
+        }
+        Ok(codes)
+    }
+
     /// Returns the validated wallet-level quota and trading-volume aggregate.
     ///
     /// This reader does not establish claim eligibility, history completeness, or mutation
@@ -3228,6 +4016,32 @@ impl DeepXHttpClient {
             .await?;
         validate_quota_summary(&summary, wallet)?;
         Ok(summary)
+    }
+
+    /// Returns the raw backend state for one asynchronous quota claim task.
+    ///
+    /// OpenAPI documents a generic response envelope and an example, but no stable claim item
+    /// schema. The returned task state is left uninterpreted and is not chain-finality evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero claim ID, transport or HTTP failures, malformed responses, or
+    /// a venue-level failure envelope.
+    pub async fn get_quota_claim_raw(
+        &self,
+        claim_id: u64,
+    ) -> Result<Box<serde_json::value::RawValue>> {
+        if claim_id == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "quota-claim id must be greater than zero".to_string(),
+            ));
+        }
+        #[derive(Serialize)]
+        struct QuotaClaimQuery {
+            id: u64,
+        }
+        self.get_json_with_query(QUOTA_CLAIM_PATH, &QuotaClaimQuery { id: claim_id })
+            .await
     }
 
     /// Returns one raw chain-confirmed wallet quota-history page.
@@ -4014,6 +4828,29 @@ fn validate_perp_history_order_record(
 ) -> Result<()> {
     validate_perp_order_record(index, order, request)?;
     validate_perp_order_time_order("perp history orders", index, order, request.sort, previous)
+}
+
+fn validate_perp_position_order_record(
+    index: usize,
+    order: &DeepXPerpOrderRecord,
+    subaccount: &str,
+    previous: &mut Option<(u64, bool)>,
+) -> Result<()> {
+    const ENDPOINT: &str = "perp position orders";
+    validate_perp_order_record_scope(ENDPOINT, index, order, subaccount, None)?;
+    let order_id = order
+        .order_id
+        .parse::<u64>()
+        .map_err(|_| invalid_account_response(ENDPOINT, "invalid decimal order ID".to_string()))?;
+    let key = (order_id, order.is_long);
+    if previous.is_some_and(|previous| key <= previous) {
+        return Err(invalid_account_response(
+            ENDPOINT,
+            format!("item {index} violates ascending order ID/side order"),
+        ));
+    }
+    *previous = Some(key);
+    Ok(())
 }
 
 fn validate_perp_open_order_record(
@@ -5302,6 +6139,70 @@ fn parse_account_timestamp(
     })
 }
 
+fn validate_spot_adl_candidates(
+    response: &DeepXSpotAdlCandidates,
+    request: &DeepXSpotAdlCandidatesRequest,
+) -> Result<()> {
+    let invalid = |message: &str| DeepXHttpError::InvalidHistoryResponse {
+        endpoint: "spot ADL candidates",
+        message: message.to_string(),
+    };
+    let is_account_address = |address: &str| {
+        address.len() == 42
+            && address.starts_with("0x")
+            && address.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+    };
+    if !response
+        .target_subaccount
+        .eq_ignore_ascii_case(&request.target_subaccount)
+        || response.asset != request.asset
+        || response.liability != request.liability
+        || normalize_raw_integer(&response.min_cover_amount)
+            != normalize_raw_integer(&request.min_cover_amount)
+    {
+        return Err(invalid(
+            "response does not match the requested target or assets",
+        ));
+    }
+    if !is_account_address(&response.target_subaccount) {
+        return Err(invalid("response target is not a 20-byte hex address"));
+    }
+    for value in [
+        response.min_cover_amount.as_str(),
+        response.covered_amount.as_str(),
+    ] {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid("response contains a non-integer raw amount"));
+        }
+    }
+    let mut candidates = HashSet::new();
+    for candidate in &response.candidates {
+        if !is_account_address(&candidate.subaccount) {
+            return Err(invalid("candidate has an invalid subaccount address"));
+        }
+        if !candidates.insert(candidate.subaccount.to_ascii_lowercase()) {
+            return Err(invalid(
+                "response contains a duplicate candidate subaccount",
+            ));
+        }
+        for value in [&candidate.available_amount, &candidate.borrow_amount] {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid("candidate contains a non-integer raw amount"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_raw_integer(value: &str) -> &str {
+    let normalized = value.trim_start_matches('0');
+    if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    }
+}
+
 fn validate_account_address(endpoint: &str, role: &str, address: &str) -> Result<()> {
     if address.len() == 42
         && address.starts_with("0x")
@@ -5821,6 +6722,128 @@ fn into_api_data<T>(response: DeepXApiResponse<T>) -> Result<T> {
         });
     }
     Ok(response.data)
+}
+
+trait CandleHistoryRecord {
+    fn time_ms(&self) -> u64;
+}
+
+impl CandleHistoryRecord for DeepXPerpCandle {
+    fn time_ms(&self) -> u64 {
+        self.time
+    }
+}
+
+impl CandleHistoryRecord for DeepXSpotCandle {
+    fn time_ms(&self) -> u64 {
+        self.time
+    }
+}
+
+trait CandleHistoryPage<Candle>: Sized {
+    fn pair(&self) -> &str;
+    fn into_parts(self) -> (String, Vec<Candle>);
+    fn from_parts(pair: String, details: Vec<Candle>) -> Self;
+}
+
+impl CandleHistoryPage<DeepXPerpCandle> for DeepXPerpCandlesPage {
+    fn pair(&self) -> &str {
+        &self.pair
+    }
+
+    fn into_parts(self) -> (String, Vec<DeepXPerpCandle>) {
+        (self.pair, self.details)
+    }
+
+    fn from_parts(pair: String, details: Vec<DeepXPerpCandle>) -> Self {
+        Self { pair, details }
+    }
+}
+
+impl CandleHistoryPage<DeepXSpotCandle> for DeepXSpotCandlesPage {
+    fn pair(&self) -> &str {
+        &self.pair
+    }
+
+    fn into_parts(self) -> (String, Vec<DeepXSpotCandle>) {
+        (self.pair, self.details)
+    }
+
+    fn from_parts(pair: String, details: Vec<DeepXSpotCandle>) -> Self {
+        Self { pair, details }
+    }
+}
+
+async fn collect_candle_history<Candle, Page, F, Fut>(
+    endpoint: &'static str,
+    start_ms: u64,
+    end_ms: Option<u64>,
+    total_limit: Option<u32>,
+    max_pages: usize,
+    mut fetch_page: F,
+) -> Result<Page>
+where
+    Candle: CandleHistoryRecord,
+    Page: CandleHistoryPage<Candle>,
+    F: FnMut(u64, u32) -> Fut,
+    Fut: Future<Output = Result<Page>>,
+{
+    if max_pages == 0 {
+        return Err(DeepXHttpError::InvalidPaginationLimit);
+    }
+
+    let page_limit = total_limit.unwrap_or(CANDLE_PAGE_SIZE);
+    let mut next_start = start_ms;
+    let mut pair = None;
+    let mut details = Vec::new();
+    for page_index in 0..max_pages {
+        let remaining = total_limit
+            .map(|limit| limit as usize - details.len())
+            .unwrap_or(usize::MAX);
+        if remaining == 0 {
+            break;
+        }
+        let current_limit = page_limit.min(u32::try_from(remaining).unwrap_or(u32::MAX));
+        let page = fetch_page(next_start, current_limit).await?;
+        if let Some(expected_pair) = pair.as_ref() {
+            if page.pair() != expected_pair {
+                return Err(DeepXHttpError::InvalidHistoryResponse {
+                    endpoint,
+                    message: "market identity changed between pages".to_string(),
+                });
+            }
+        } else {
+            pair = Some(page.pair().to_string());
+        }
+        let (_, page_details) = page.into_parts();
+        let page_len = page_details.len();
+        let last_time = page_details.last().map(|candle| candle.time_ms());
+        details.extend(page_details);
+        if page_len < current_limit as usize
+            || total_limit.is_some_and(|limit| details.len() >= limit as usize)
+        {
+            break;
+        }
+        let last_time = last_time.ok_or_else(|| DeepXHttpError::InvalidHistoryResponse {
+            endpoint,
+            message: "page made no timestamp cursor progress".to_string(),
+        })?;
+        next_start =
+            last_time
+                .checked_add(1)
+                .ok_or_else(|| DeepXHttpError::InvalidHistoryResponse {
+                    endpoint,
+                    message: "timestamp cursor overflowed".to_string(),
+                })?;
+        if end_ms.is_some_and(|end| next_start > end) {
+            break;
+        }
+        if page_index + 1 == max_pages {
+            return Err(DeepXHttpError::PaginationLimitExceeded { max_pages });
+        }
+    }
+
+    Ok(Page::from_parts(pair.unwrap_or_default(), details))
 }
 
 fn validate_candle_page(
@@ -7289,6 +8312,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encodes_and_decodes_perp_position_order_page() {
+        let router = Router::new().route(
+            PERP_POSITION_ORDERS_PATH,
+            get(|Query(query): Query<PerpPositionOrdersQuery>| async move {
+                assert_eq!(query.user, "0x1111111111111111111111111111111111111111");
+                assert_eq!(query.position_id, 42);
+                assert_eq!(query.cursor, "opaque+/cursor=");
+                assert_eq!(query.page_size, 20);
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {"items": [], "hasNext": false, "nextCursor": null},
+                    "fail": false
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXPerpPositionOrdersRequest {
+            subaccount: "0x1111111111111111111111111111111111111111".to_string(),
+            position_id: 42,
+            cursor: Some("opaque+/cursor=".to_string()),
+            page_size: Some(20),
+        };
+
+        let page = client.get_perp_position_orders(&request).await.unwrap();
+
+        assert!(page.items.is_empty());
+        assert!(!page.has_next);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn rejects_perp_position_order_page_size_over_venue_limit() {
+        let client = DeepXHttpClient::new("http://127.0.0.1:1", Some(1), None).unwrap();
+        let request = DeepXPerpPositionOrdersRequest {
+            subaccount: "0x1111111111111111111111111111111111111111".to_string(),
+            position_id: 42,
+            cursor: None,
+            page_size: Some(101),
+        };
+
+        let error = client
+            .get_perp_position_orders_raw(&request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DeepXHttpError::InvalidRequest(message) if message.contains("100"))
+        );
+    }
+
+    #[tokio::test]
     async fn perp_open_order_pages_follow_cursor_and_reject_cross_page_duplicates() {
         let captured: serde_json::Value =
             serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
@@ -7653,6 +8728,70 @@ mod tests {
         let pages = client
             .get_spot_history_order_pages(
                 &DeepXSpotHistoryOrdersRequest {
+                    subaccount: "0x08bdb660e03c75954e0fcaa1e7ead150a92c891c".to_string(),
+                    name: Some("ETH/USDC".to_string()),
+                    pair: None,
+                    order_side: None,
+                    cursor: None,
+                    sort: DeepXAccountSortOrder::Descending,
+                    page_size: Some(3),
+                },
+                2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].items.len(), 3);
+        assert!(pages[1].items.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn spot_open_order_pages_follow_cursor_and_validate_across_pages() {
+        const CURSOR: &str = concat!(
+            "MTc4OTYyNzM3OTA1MzoxODg1NzM3ODQ6MTc6MHg5MDY4ZDRhYzg5MWExNDc4NGMx",
+            "Nzg3N2ViNzRiZDg0ODliMzM2N2M3MWQ3Mjc2NmRiZmE0ZGZiZmI2NjJmYTM3OjE3",
+            "ODk2MjczNzg2NTc6U0VMTA",
+        );
+        const TERMINAL: &str = concat!(
+            r#"{"code":200,"msg":"success","fail":false,"data":{"items":[],"#,
+            r#""hasNext":false,"nextCursor":null}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let app = Router::new().route(
+            SPOT_OPEN_ORDERS_PATH,
+            get(
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let call = observed.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        assert_eq!(query["name"], "ETH/USDC");
+                        assert_eq!(query["pageSize"], "3");
+                        match call {
+                            0 => {
+                                assert!(!query.contains_key("cursor"));
+                                SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE
+                            }
+                            1 => {
+                                assert_eq!(query["cursor"], CURSOR);
+                                TERMINAL
+                            }
+                            _ => panic!("unexpected Spot open-order page request"),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let pages = client
+            .get_spot_open_order_pages(
+                &DeepXSpotOpenOrdersRequest {
                     subaccount: "0x08bdb660e03c75954e0fcaa1e7ead150a92c891c".to_string(),
                     name: Some("ETH/USDC".to_string()),
                     pair: None,
@@ -11451,6 +12590,15 @@ mod tests {
 
     #[derive(Debug, Deserialize, Serialize)]
     #[serde(rename_all = "camelCase")]
+    struct PerpPositionOrdersQuery {
+        user: String,
+        position_id: u64,
+        cursor: String,
+        page_size: u32,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase")]
     struct PerpCandlesQuery {
         market_id: u64,
         time_frame: String,
@@ -11911,6 +13059,66 @@ mod tests {
                 endpoint: "perp long-short-ratio"
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn collects_perp_long_short_ratio_history_across_bounded_cursor_pages() {
+        let router = Router::new().route(
+            PERP_LONG_SHORT_RATIO_PATH,
+            get(|RawQuery(raw_query): RawQuery| async move {
+                let query = raw_query.unwrap_or_default();
+                assert!(query.contains("marketId=3"));
+                assert!(query.contains("start=100"));
+                assert!(query.contains("end=300"));
+                assert!(query.contains("limit=1"));
+                if query.contains("cursor=next") {
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {
+                            "marketId": 3,
+                            "details": [{"longShortRatio": "1.25", "time": 200}],
+                            "nextCursor": null,
+                            "hasNext": false
+                        },
+                        "fail": false
+                    }))
+                } else {
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {
+                            "marketId": 3,
+                            "details": [{"longShortRatio": "1.5", "time": 100}],
+                            "nextCursor": "next",
+                            "hasNext": true
+                        },
+                        "fail": false
+                    }))
+                }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXLongShortRatioRequest {
+            market_id: 3,
+            start_ms: 100,
+            end_ms: Some(300),
+            limit: Some(1),
+            cursor: None,
+        };
+
+        let records = client
+            .get_perp_long_short_ratios_history_limited(
+                &request,
+                std::num::NonZeroUsize::new(2).unwrap(),
+                2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].time, 100);
+        assert_eq!(records[1].time, 200);
     }
 
     #[rstest]
@@ -12610,6 +13818,33 @@ mod tests {
             assert_eq!(pages.len(), 2);
             assert_eq!(pages.iter().map(|page| page.items.len()).sum::<usize>(), 3);
         }
+    }
+
+    #[tokio::test]
+    async fn limited_spot_trades_stop_at_the_requested_count() {
+        let response: serde_json::Value =
+            serde_json::from_str(SPOT_TRADES_ETH_USDC_RESPONSE).unwrap();
+        let router = Router::new().route(
+            SPOT_TRADES_PATH,
+            get(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+
+        let trades = client
+            .get_spot_trades_limited(
+                &spot_trades_request(),
+                std::num::NonZeroUsize::new(2).unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].id, 188_405_950_000_036);
+        assert_eq!(trades[1].id, 188_405_950_000_026);
     }
 
     #[tokio::test]
@@ -13336,6 +14571,143 @@ mod tests {
         assert_eq!(page.details[0].time, 1_788_254_100_000);
     }
 
+    #[tokio::test]
+    async fn collects_perp_candle_history_across_bounded_time_pages() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            PERP_CANDLES_PATH,
+            get(move |Query(query): Query<PerpCandlesQuery>| {
+                let calls = Arc::clone(&route_calls);
+                async move {
+                    let page = calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(query.market_id, 3);
+                    assert_eq!(query.limit, CANDLE_PAGE_SIZE);
+                    assert_eq!(query.sort, "ASC");
+                    let (start, count) = match page {
+                        0 => {
+                            assert_eq!(query.start, 1_000);
+                            (1_000, CANDLE_PAGE_SIZE)
+                        }
+                        1 => {
+                            assert_eq!(query.start, 6_000);
+                            (6_000, 2)
+                        }
+                        _ => panic!("unexpected candle history page"),
+                    };
+                    let details = (0..count)
+                        .map(|offset| {
+                            json!({
+                                "volume": 1,
+                                "high": 1,
+                                "low": 1,
+                                "open": 1,
+                                "close": 1,
+                                "time": start + u64::from(offset),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {"pair": "ETH-USDC", "details": details},
+                        "fail": false,
+                    }))
+                }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXPerpCandlesRequest {
+            market_id: 3,
+            interval: DeepXPerpCandleInterval::OneMinute,
+            start_ms: 1_000,
+            end_ms: Some(6_001),
+            limit: None,
+        };
+
+        let history = client
+            .get_perp_candles_history_limited(&request, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(history.pair, "ETH-USDC");
+        assert_eq!(history.details.len(), 5_002);
+        assert_eq!(history.details[0].time, 1_000);
+        assert_eq!(history.details[4_999].time, 5_999);
+        assert_eq!(history.details[5_000].time, 6_000);
+        assert_eq!(history.details[5_001].time, 6_001);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn collects_spot_candle_history_across_bounded_time_pages() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            SPOT_CANDLES_PATH,
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let calls = Arc::clone(&route_calls);
+                async move {
+                    let page = calls.fetch_add(1, Ordering::Relaxed);
+                    let requested_start = query["start"].parse::<u64>().unwrap();
+                    assert_eq!(query["name"], "ETH/USDC");
+                    assert_eq!(query["limit"], CANDLE_PAGE_SIZE.to_string());
+                    assert_eq!(query["sort"], "ASC");
+                    let (start, count) = match page {
+                        0 => {
+                            assert_eq!(requested_start, 1_000);
+                            (1_000, CANDLE_PAGE_SIZE)
+                        }
+                        1 => {
+                            assert_eq!(requested_start, 6_000);
+                            (6_000, 2)
+                        }
+                        _ => panic!("unexpected Spot candle history page"),
+                    };
+                    let details = (0..count)
+                        .map(|offset| {
+                            json!({
+                                "volume": 1,
+                                "high": 1,
+                                "low": 1,
+                                "open": 1,
+                                "close": 1,
+                                "time": start + u64::from(offset),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {"pair": "ETH/USDC", "details": details},
+                        "fail": false,
+                    }))
+                }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXSpotCandlesRequest {
+            name: Some("ETH/USDC".to_string()),
+            pair: None,
+            interval: DeepXPerpCandleInterval::OneMinute,
+            start_ms: 1_000,
+            end_ms: Some(6_001),
+            limit: None,
+        };
+
+        let history = client
+            .get_spot_candles_history_limited(&request, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(history.pair, "ETH/USDC");
+        assert_eq!(history.details.len(), 5_002);
+        assert_eq!(history.details[4_999].time, 5_999);
+        assert_eq!(history.details[5_000].time, 6_000);
+        assert_eq!(history.details[5_001].time, 6_001);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
     fn candle_page() -> DeepXPerpCandlesPage {
         serde_json::from_value(json!({
             "pair": "ETH-USDC",
@@ -13517,7 +14889,10 @@ mod tests {
             limit: Some(3),
         };
 
-        let page = client.get_perp_mark_prices(&request).await.unwrap();
+        let page = client
+            .get_perp_mark_prices_history_limited(&request, 1)
+            .await
+            .unwrap();
 
         assert_eq!(page.pair, "ETH-USDC");
         assert_eq!(page.details.len(), 1);
@@ -13590,7 +14965,10 @@ mod tests {
             limit: Some(3),
         };
 
-        let page = client.get_perp_oracle_prices(&request).await.unwrap();
+        let page = client
+            .get_perp_oracle_prices_history_limited(&request, 1)
+            .await
+            .unwrap();
 
         assert_eq!(page.pair, "ETH-USDC");
         assert_eq!(page.details.len(), 1);

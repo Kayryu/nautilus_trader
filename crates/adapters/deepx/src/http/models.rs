@@ -897,6 +897,46 @@ pub struct DeepXLiquidationRecord {
     pub created_at: String,
 }
 
+/// One candidate in a spot ADL discovery response, with amounts retained as raw integers.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepXSpotAdlCandidate {
+    /// Candidate subaccount address.
+    pub subaccount: String,
+    /// Venue-reported available cover amount in its raw integer unit.
+    pub available_amount: String,
+    /// Venue-reported borrow amount in its raw integer unit.
+    pub borrow_amount: String,
+}
+
+/// Spot ADL candidate discovery response, preserving all amounts without financial scaling.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepXSpotAdlCandidates {
+    /// Target subaccount whose liability is being considered.
+    pub target_subaccount: String,
+    /// Asset proposed for covering the liability.
+    pub asset: String,
+    /// Liability asset symbol.
+    pub liability: String,
+    /// Requested minimum cover amount in the endpoint's raw integer unit.
+    pub min_cover_amount: String,
+    /// Venue-reported aggregate covered amount in its raw integer unit.
+    pub covered_amount: String,
+    /// Candidate subaccounts in venue response order; ranking is not inferred.
+    pub candidates: Vec<DeepXSpotAdlCandidate>,
+}
+
+/// Invitation binding status for one wallet address.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepXInvitationStatus {
+    /// Wallet queried by the request.
+    pub address: String,
+    /// Whether the wallet is currently bound to an invitation code.
+    pub is_bound: bool,
+}
+
 /// Aggregated wallet directory counters returned by the user-stats endpoint.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

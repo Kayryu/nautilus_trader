@@ -20,6 +20,7 @@ pub mod book;
 pub mod error;
 pub mod frame;
 pub mod handler;
+pub mod orderbook_rpc;
 pub mod protocol;
 pub mod public;
 pub mod task;

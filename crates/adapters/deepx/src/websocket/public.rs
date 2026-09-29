@@ -532,8 +532,9 @@ mod tests {
         );
     }
 
-    use super::*;
     use rstest::rstest;
+
+    use super::*;
 
     #[rstest]
     fn public_request_uses_documented_envelope_and_disables_compression() {

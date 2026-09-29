@@ -23,8 +23,13 @@ use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
 
 use crate::{
-    instruments::parse_perpetual_instrument,
+    config::DeepXNetworkConfig,
+    instruments::{parse_perpetual_instrument, parse_spot_instrument},
     providers::{DeepXMarketMetadata, DeepXMarketProvider},
+    rpc::{
+        observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
+        observe_finalized_spot_market_spec_batch,
+    },
 };
 
 /// Fail-closed error raised when Spot instrument construction is attempted.
@@ -39,20 +44,19 @@ use crate::{
 )]
 pub struct DeepXSpotInstrumentUnsupported;
 
-/// Provides DeepX perpetual instruments from the failure-atomic public market catalog.
+/// Provides DeepX instruments from the failure-atomic public market catalog.
 ///
-/// The provider wraps a [`DeepXMarketProvider`] and converts verified perpetual metadata into
-/// `CryptoPerpetual` instruments inside a standard [`InstrumentStore`]. Spot markets remain
-/// catalog metadata only: the public Spot market-list response does not prove a verified order
-/// quantity increment, so Spot instrument construction fails closed with
-/// [`DeepXSpotInstrumentUnsupported`] rather than guessing scaling.
+/// With network configuration, it converts perpetual metadata and finalized-checkpoint-verified
+/// Spot metadata into standard instruments. Without network configuration it loads perpetuals
+/// only.
 ///
 /// Loading is failure-atomic: the store is replaced only after the complete catalog loads and
-/// every perpetual market converts successfully. One unconvertible market fails the whole load so
+/// every supported market converts successfully. One unconvertible market fails the whole load so
 /// a partial instrument set can never be marked initialized.
 pub struct DeepXInstrumentProvider {
     store: InstrumentStore,
     catalog: DeepXMarketProvider,
+    network: Option<DeepXNetworkConfig>,
     ts_init: nautilus_core::UnixNanos,
 }
 
@@ -61,6 +65,7 @@ impl std::fmt::Debug for DeepXInstrumentProvider {
         f.debug_struct(stringify!(DeepXInstrumentProvider))
             .field("store", &self.store)
             .field("catalog", &self.catalog)
+            .field("network", &self.network)
             .finish_non_exhaustive()
     }
 }
@@ -72,8 +77,17 @@ impl DeepXInstrumentProvider {
         Self {
             store: InstrumentStore::new(),
             catalog,
+            network: None,
             ts_init: get_atomic_clock_realtime().get_time_ns(),
         }
+    }
+
+    /// Creates a provider which verifies Spot constraints against finalized chain state.
+    #[must_use]
+    pub fn with_network(catalog: DeepXMarketProvider, network: DeepXNetworkConfig) -> Self {
+        let mut provider = Self::new(catalog);
+        provider.network = Some(network);
+        provider
     }
 
     /// Returns a reference to the wrapped market catalog.
@@ -102,20 +116,80 @@ impl DeepXInstrumentProvider {
         parse_perpetual_instrument(perpetual, self.ts_init)
     }
 
-    /// Loads the complete catalog and converts every perpetual market, or fails without
-    /// touching the store.
-    ///
-    /// Spot entries are skipped under the documented quantity-increment gate: they remain
-    /// catalog metadata only and never reach the store.
-    async fn fetch_instruments(&mut self) -> Result<Vec<InstrumentAny>> {
-        self.catalog.load_all().await?;
+    /// Loads and converts a complete catalog without publishing partial catalog or store state.
+    async fn fetch_instruments(&self) -> Result<(DeepXMarketProvider, Vec<InstrumentAny>)> {
+        let mut catalog = self.catalog.clone();
+        catalog.load_all().await?;
         let mut instruments = Vec::new();
-        for market in self.catalog.markets() {
-            if let DeepXMarketMetadata::Perpetual(_) = market {
-                instruments.push(self.convert(market)?);
+        let spots = catalog
+            .markets()
+            .into_iter()
+            .filter_map(|market| match market {
+                DeepXMarketMetadata::Spot(spot) => Some(spot),
+                DeepXMarketMetadata::Perpetual(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let spot_evidence = if let Some(network) = &self.network {
+            if spots.is_empty() {
+                Vec::new()
+            } else {
+                let endpoints = observe_and_validate_rpc_endpoint_identities(network)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let pairs = spots
+                    .iter()
+                    .map(|spot| {
+                        nautilus_core::hex::decode_array::<32>(
+                            spot.pair.strip_prefix("0x").unwrap_or(&spot.pair),
+                        )
+                        .map_err(anyhow::Error::from)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                observe_finalized_spot_market_spec_batch(
+                    &network.environment,
+                    &endpoints,
+                    &capabilities,
+                    &pairs,
+                )
+                .await
+                .map_err(anyhow::Error::from)?
+            }
+        } else {
+            Vec::new()
+        };
+
+        if self.network.is_some() && spot_evidence.len() != spots.len() {
+            bail!("DeepX finalized Spot spec batch does not match the REST market count");
+        }
+        let mut evidence_by_pair = std::collections::BTreeMap::new();
+        for evidence in spot_evidence {
+            if evidence_by_pair.insert(evidence.pair(), evidence).is_some() {
+                bail!("duplicate DeepX finalized Spot spec pair");
             }
         }
-        Ok(instruments)
+
+        for market in catalog.markets() {
+            match market {
+                DeepXMarketMetadata::Perpetual(_) => instruments.push(self.convert(market)?),
+                DeepXMarketMetadata::Spot(spot) if self.network.is_some() => {
+                    let pair = nautilus_core::hex::decode_array::<32>(
+                        spot.pair.strip_prefix("0x").unwrap_or(&spot.pair),
+                    )?;
+                    let evidence = evidence_by_pair
+                        .remove(&pair)
+                        .ok_or_else(|| anyhow::anyhow!("missing finalized DeepX Spot spec"))?;
+                    instruments.push(parse_spot_instrument(spot, &evidence, self.ts_init)?);
+                }
+                DeepXMarketMetadata::Spot(_) => {}
+            }
+        }
+        if !evidence_by_pair.is_empty() {
+            bail!("finalized DeepX Spot specs contain pairs absent from the REST catalog");
+        }
+        Ok((catalog, instruments))
     }
 }
 
@@ -131,8 +205,9 @@ impl InstrumentProvider for DeepXInstrumentProvider {
 
     async fn load_all(&mut self, filters: Option<&HashMap<String, String>>) -> Result<()> {
         reject_filters(filters, "load_all")?;
-        let instruments = self.fetch_instruments().await?;
+        let (catalog, instruments) = self.fetch_instruments().await?;
 
+        self.catalog = catalog;
         self.store.clear();
         self.store.add_bulk(instruments);
         self.store.set_initialized();
@@ -153,7 +228,7 @@ impl InstrumentProvider for DeepXInstrumentProvider {
             return Ok(());
         }
 
-        let instruments = self.fetch_instruments().await?;
+        let (catalog, instruments) = self.fetch_instruments().await?;
         let mut store = InstrumentStore::new();
         store.add_bulk(instruments);
         for instrument in self.store.list_all() {
@@ -169,6 +244,7 @@ impl InstrumentProvider for DeepXInstrumentProvider {
             bail!("DeepX instruments not found: {}", absent.join(", "));
         }
 
+        self.catalog = catalog;
         self.store = store;
         self.store.set_initialized();
         Ok(())
@@ -279,6 +355,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_spot_rpc_failure_does_not_publish_catalog_or_store() {
+        let router = catalog_router().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http_client = DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut network = crate::config::DeepXNetworkConfig::default();
+        network.base_url_rpc = Some("http://127.0.0.1:1".to_string());
+        let mut provider =
+            DeepXInstrumentProvider::with_network(DeepXMarketProvider::new(http_client), network);
+
+        assert!(provider.load_all(None).await.is_err());
+
+        assert!(!provider.catalog().initialized());
+        assert!(provider.catalog().is_empty());
+        assert!(!provider.store().is_initialized());
+        assert!(provider.store().is_empty());
+    }
+
+    #[tokio::test]
     async fn load_all_preserves_previous_store_when_refresh_fails() {
         let mut provider = provider().await;
         provider.load_all(None).await.unwrap();
@@ -304,6 +400,8 @@ mod tests {
         let error = provider.load_ids(&[missing], None).await.unwrap_err();
 
         assert!(error.to_string().contains("SOL-USDC-PERP.DEEPX"));
+        assert!(!provider.catalog().initialized());
+        assert!(provider.catalog().is_empty());
         assert!(!provider.store().is_initialized());
         assert!(provider.store().is_empty());
     }

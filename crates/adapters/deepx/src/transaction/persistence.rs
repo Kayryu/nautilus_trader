@@ -39,16 +39,16 @@ use super::{
     DeepXTransactionRecordError, DeepXTransactionState, DeepXTransactionWatchError,
     acknowledge_perp_place_framework_order_event,
     collect_finalized_recovery_scan_with_event_evidence, observe_finality, observe_reorganization,
-    observe_submission_pool, stage_perp_place_framework_order_events,
+    observe_submission_pool, stage_perp_framework_order_events,
 };
 use crate::{
     common::DeepXPrivateKey,
     config::DeepXValidatedRpcEndpoints,
     rpc::DeepXValidatedRpcMethodCapabilities,
     signing::{
-        DeepXPerpCancelParams, DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic,
-        SigningError, derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot,
-        sign_perp_cancel, sign_spot_place_order,
+        DeepXPerpCancelParams, DeepXSpotCancelParams, DeepXSpotPlaceParams, RuntimeSnapshot,
+        SignedPalletExtrinsic, SigningError, derive_signer_account_id,
+        sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel, sign_spot_place_order,
     },
 };
 
@@ -129,7 +129,7 @@ impl DeepXCommittedTransactionRecord {
     #[must_use]
     pub fn matches(&self, record: &DeepXTransactionRecord) -> bool {
         record.encode().is_ok_and(|encoded| {
-            self.cache_key == record.cache_key_for_record() && self.encoded_record == encoded
+            record.accepts_cache_key(&self.cache_key) && self.encoded_record == encoded
         })
     }
 
@@ -162,11 +162,22 @@ impl DeepXCommittedTransactionRecord {
         record: &DeepXTransactionRecord,
         revision: DeepXTransactionRevision,
     ) -> Result<Self, DeepXTransactionPersistenceError> {
+        Self::acknowledge_committed_at_key(record, record.cache_key_for_record(), revision)
+    }
+
+    fn acknowledge_committed_at_key(
+        record: &DeepXTransactionRecord,
+        cache_key: String,
+        revision: DeepXTransactionRevision,
+    ) -> Result<Self, DeepXTransactionPersistenceError> {
+        if !record.accepts_cache_key(&cache_key) {
+            return Err(DeepXTransactionPersistenceError::AcknowledgementMismatch);
+        }
         let encoded_record = record
             .encode()
             .map_err(|error| DeepXTransactionPersistenceError::BeforeCommit(error.to_string()))?;
         Ok(Self {
-            cache_key: record.cache_key_for_record(),
+            cache_key,
             revision,
             encoded_record,
         })
@@ -462,6 +473,208 @@ where
     .await
 }
 
+/// Allocates and durably creates an operation-specific perpetual cancellation reservation.
+///
+/// Each cancellation has a key distinct from the placement record and prior cancellation attempts
+/// for the same client order. The nonce remains consumed if durable creation has an unknown result.
+/// This performs no signing or transaction submission.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, timestamp allocation, durable creation, or its exact
+/// acknowledgement cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_perp_cancel_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXPerpCancelParams,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    prepare_perp_cancel_reservation_inner(
+        store,
+        lease,
+        allocator,
+        local_time_ms,
+        chain_time_ms,
+        client_order_id,
+        instrument_id,
+        order_side,
+        runtime,
+        submission_scan_checkpoint,
+        params,
+        None,
+    )
+    .await
+}
+
+/// Allocates a perpetual cancellation reservation with framework command and event identity.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, timestamp allocation, framework identity, durable
+/// creation, or its exact acknowledgement cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_framework_perp_cancel_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXPerpCancelParams,
+    framework_order_context: DeepXFrameworkOrderContext,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    prepare_perp_cancel_reservation_inner(
+        store,
+        lease,
+        allocator,
+        local_time_ms,
+        chain_time_ms,
+        client_order_id,
+        instrument_id,
+        order_side,
+        runtime,
+        submission_scan_checkpoint,
+        params,
+        Some(framework_order_context),
+    )
+    .await
+}
+
+/// Allocates an ordinary Spot cancellation reservation with immutable framework identity.
+///
+/// Fast cancellation is deliberately excluded until its event-suppression behavior is proven.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, framework identity, durable creation, or acknowledgement
+/// cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_framework_spot_cancel_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXSpotCancelParams,
+    framework_order_context: DeepXFrameworkOrderContext,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    if params.fast_cancel {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
+    if lease.signer() != allocator.signer() {
+        return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
+    }
+    if framework_order_context.client_order_id() != client_order_id
+        || framework_order_context.instrument_id() != instrument_id
+        || !framework_order_context.has_distinct_event_identity()
+    {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
+    store.verify_signer_lease(lease).await?;
+    let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
+    let identity = DeepXTransactionIdentity::new_spot_cancel(
+        client_order_id,
+        allocator.signer(),
+        instrument_id,
+        order_side,
+        nonce,
+        runtime,
+        params,
+    );
+    let record = DeepXTransactionRecord::created_with_framework_order_context(
+        identity,
+        submission_scan_checkpoint,
+        framework_order_context,
+    );
+    let committed = store.create_committed(lease, &record).await?;
+    committed.verify(&record)?;
+    Ok(DeepXPreparedReservation { record, committed })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_perp_cancel_reservation_inner<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXPerpCancelParams,
+    framework_order_context: Option<DeepXFrameworkOrderContext>,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    if lease.signer() != allocator.signer() {
+        return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
+    }
+    if framework_order_context.is_some_and(|context| {
+        context.client_order_id() != client_order_id
+            || context.instrument_id() != instrument_id
+            || !context.has_distinct_event_identity()
+    }) {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
+    store.verify_signer_lease(lease).await?;
+    let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
+    let identity = DeepXTransactionIdentity::new_perp_cancel(
+        client_order_id,
+        allocator.signer(),
+        instrument_id,
+        order_side,
+        nonce,
+        runtime,
+        params.subaccount,
+        params.order_id,
+        params.market_id,
+        params.fast_cancel,
+    );
+    let record = match framework_order_context {
+        Some(context) => DeepXTransactionRecord::created_with_framework_order_context(
+            identity,
+            submission_scan_checkpoint,
+            context,
+        ),
+        None => DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity,
+            submission_scan_checkpoint,
+        ),
+    };
+    let committed = store.create_committed(lease, &record).await?;
+    committed.verify(&record)?;
+    Ok(DeepXPreparedReservation { record, committed })
+}
+
 /// Allocates a perpetual placement reservation with immutable framework recovery identity.
 ///
 /// # Errors
@@ -501,6 +714,60 @@ where
         Some(framework_order_context),
     )
     .await
+}
+
+/// Allocates a Spot placement reservation with immutable framework recovery identity.
+///
+/// # Errors
+///
+/// Returns an error if signer ownership, timestamp allocation, framework identity, durable create,
+/// or the exact Created acknowledgement cannot be proven.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_framework_spot_place_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXSpotPlaceParams,
+    framework_order_context: DeepXFrameworkOrderContext,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    if lease.signer() != allocator.signer() {
+        return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
+    }
+    if framework_order_context.client_order_id() != client_order_id
+        || framework_order_context.instrument_id() != instrument_id
+        || !framework_order_context.has_distinct_event_identity()
+    {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
+    store.verify_signer_lease(lease).await?;
+    let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
+    let identity = DeepXTransactionIdentity::new_spot_place(
+        client_order_id,
+        allocator.signer(),
+        instrument_id,
+        order_side,
+        nonce,
+        runtime,
+        params,
+    );
+    let record = DeepXTransactionRecord::created_with_framework_order_context(
+        identity,
+        submission_scan_checkpoint,
+        framework_order_context,
+    );
+    let committed = store.create_committed(lease, &record).await?;
+    committed.verify(&record)?;
+    Ok(DeepXPreparedReservation { record, committed })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2299,7 +2566,7 @@ where
 
     let mut candidate = record.clone();
     let changed =
-        stage_perp_place_framework_order_events(&mut candidate, ts_event, ts_init, reconciliation)?;
+        stage_perp_framework_order_events(&mut candidate, ts_event, ts_init, reconciliation)?;
     let committed = if changed {
         let committed = store
             .compare_and_set_committed(lease, committed_record, &candidate)
@@ -2755,6 +3022,289 @@ where
     .await?)
 }
 
+/// Reconciles a submitted Spot placement from its pre-submission finalized checkpoint.
+///
+/// Exact durable bytes and Spot call arguments are verified before network access. Successful
+/// inclusion requires the matching indexed Spot order-state event from the Spot recovery scanner.
+/// Pending-pool absence preserves the unresolved lifecycle and never authorizes replay.
+///
+/// # Errors
+///
+/// Returns an error unless the transaction is submitting or accepted, retains signed bytes and a
+/// finalized checkpoint, matches the runtime snapshot, and passes canonical Spot call verification.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery binds endpoint, durable store, snapshot, and verifier evidence"
+)]
+pub async fn reconcile_submitted_spot_place_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+    verifier: &DeepXSpotPlaceCallVerifier,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
+    let signed_extrinsic = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?;
+    let checkpoint = record
+        .submission_scan_checkpoint()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSubmissionScanCheckpoint)?;
+    verifier.verify(record.identity(), signed_extrinsic)?;
+
+    let collection = super::collect_finalized_spot_place_recovery_scan(
+        endpoints,
+        capabilities,
+        snapshot,
+        record.identity(),
+        checkpoint.finalized_block_number(),
+        checkpoint.finalized_block_hash(),
+        max_blocks_per_range,
+        signed_extrinsic.extrinsic_hash(),
+    )
+    .await?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            match observe_submission_pool(endpoints, signed_extrinsic.extrinsic_hash()).await? {
+                super::DeepXPoolObservation::Present => DeepXRecoveryDecision::PoolAccepted,
+                super::DeepXPoolObservation::Absent => {
+                    return Ok(DeepXCommittedObservation {
+                        record: record.clone(),
+                        committed: restored.committed().clone(),
+                    });
+                }
+            }
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::ActionRequired => {
+                return Ok(DeepXCommittedObservation {
+                    record: record.clone(),
+                    committed: restored.committed().clone(),
+                });
+            }
+            decision => decision,
+        },
+    };
+    let committed =
+        commit_recovery_decision(store, lease, restored.committed(), record, decision).await?;
+    if !matches!(decision, DeepXRecoveryDecision::FinalizedInclusion(_)) {
+        return Ok(committed);
+    }
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        committed.committed(),
+        committed.record(),
+        decision,
+    )
+    .await?)
+}
+
+/// Reconciles one submitted perpetual cancellation from its pre-submission finalized checkpoint.
+///
+/// Only canonical finalized inclusion with verified dispatch and cancellation evidence can
+/// produce a terminal lifecycle. Ordinary cancels require the matching event; fast Perp cancels
+/// use the pallet's event-suppressed inclusion contract. Pool acceptance remains nonterminal.
+///
+/// # Errors
+///
+/// Returns an error unless the record is an eligible ordinary perpetual cancellation whose exact
+/// signed bytes, runtime, and pre-submission checkpoint are verified before RPC access.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery binds endpoint, durable store, snapshot, and verifier evidence"
+)]
+pub async fn reconcile_submitted_perp_cancel_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+    verifier: &DeepXPerpCancelCallVerifier,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
+    let signed_extrinsic = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?;
+    let checkpoint = record
+        .submission_scan_checkpoint()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSubmissionScanCheckpoint)?;
+    verifier.verify(record.identity(), signed_extrinsic)?;
+    let collection = collect_finalized_recovery_scan_with_event_evidence(
+        endpoints,
+        capabilities,
+        snapshot,
+        record.identity(),
+        checkpoint.finalized_block_number(),
+        checkpoint.finalized_block_hash(),
+        max_blocks_per_range,
+        signed_extrinsic.extrinsic_hash(),
+    )
+    .await?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            match observe_submission_pool(endpoints, signed_extrinsic.extrinsic_hash()).await? {
+                super::DeepXPoolObservation::Present => DeepXRecoveryDecision::PoolAccepted,
+                super::DeepXPoolObservation::Absent => {
+                    return Ok(DeepXCommittedObservation {
+                        record: record.clone(),
+                        committed: restored.committed().clone(),
+                    });
+                }
+            }
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::ActionRequired => {
+                return Ok(DeepXCommittedObservation {
+                    record: record.clone(),
+                    committed: restored.committed().clone(),
+                });
+            }
+            decision => decision,
+        },
+    };
+    let committed =
+        commit_recovery_decision(store, lease, restored.committed(), record, decision).await?;
+    if !matches!(decision, DeepXRecoveryDecision::FinalizedInclusion(_)) {
+        return Ok(committed);
+    }
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        committed.committed(),
+        committed.record(),
+        decision,
+    )
+    .await?)
+}
+
+/// Reconciles a submitted ordinary Spot cancellation from its finalized pre-submission checkpoint.
+///
+/// Exact signed bytes are verified before network access and successful inclusion requires the
+/// matching indexed `SpotMarket.OrderCancelled` event. Fast Spot cancellation remains
+/// unsupported.
+///
+/// # Errors
+///
+/// Returns an error unless the record is an eligible ordinary Spot cancellation with exact signed
+/// bytes, an approved runtime snapshot, and a finalized scan checkpoint.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery binds endpoint, durable store, snapshot, and verifier evidence"
+)]
+pub async fn reconcile_submitted_spot_cancel_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+    verifier: &DeepXSpotCancelCallVerifier,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
+    let signed_extrinsic = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?;
+    let checkpoint = record
+        .submission_scan_checkpoint()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSubmissionScanCheckpoint)?;
+    verifier.verify(record.identity(), signed_extrinsic)?;
+    let collection = super::collect_finalized_spot_cancel_recovery_scan(
+        endpoints,
+        capabilities,
+        snapshot,
+        record.identity(),
+        checkpoint.finalized_block_number(),
+        checkpoint.finalized_block_hash(),
+        max_blocks_per_range,
+        signed_extrinsic.extrinsic_hash(),
+    )
+    .await?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            match observe_submission_pool(endpoints, signed_extrinsic.extrinsic_hash()).await? {
+                super::DeepXPoolObservation::Present => DeepXRecoveryDecision::PoolAccepted,
+                super::DeepXPoolObservation::Absent => {
+                    return Ok(DeepXCommittedObservation {
+                        record: record.clone(),
+                        committed: restored.committed().clone(),
+                    });
+                }
+            }
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::ActionRequired => {
+                return Ok(DeepXCommittedObservation {
+                    record: record.clone(),
+                    committed: restored.committed().clone(),
+                });
+            }
+            decision => decision,
+        },
+    };
+    let committed =
+        commit_recovery_decision(store, lease, restored.committed(), record, decision).await?;
+    if !matches!(decision, DeepXRecoveryDecision::FinalizedInclusion(_)) {
+        return Ok(committed);
+    }
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        committed.committed(),
+        committed.record(),
+        decision,
+    )
+    .await?)
+}
+
 /// Reconciles one acknowledged not-included record from its exact finalized checkpoint.
 ///
 /// All authority-bearing inputs are derived from `restored`. An up-to-date checkpoint preserves
@@ -3011,7 +3561,8 @@ mod tests {
             DeepXAbsenceEvidence, DeepXAutomaticReplayDecision, DeepXDirectRuntimeIdentity,
             DeepXInclusionEvidence, DeepXInclusionOutcome, DeepXNonceReservation,
             DeepXSubmissionPermit, DeepXSubmissionScanCheckpoint, DeepXTransactionIdentity,
-            DeepXTransactionObservation, submit_with_bounded_ambiguity_retry,
+            DeepXTransactionObservation, DeepXTransactionOperation,
+            submit_with_bounded_ambiguity_retry,
         },
     };
 
@@ -3029,9 +3580,12 @@ mod tests {
                     "chain_getBlockHash",
                     "chain_getFinalizedHead",
                     "chain_getHeader",
+                    "eth_call",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
                     "state_getStorage",
+                    "state_queryStorageAt",
+                    "state_call",
                 ],
             }),
             "chain_getBlockHash" => json!(format!("0x{}", "09".repeat(32))),
@@ -3110,9 +3664,12 @@ mod tests {
                     "chain_getBlockHash",
                     "chain_getFinalizedHead",
                     "chain_getHeader",
+                    "eth_call",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
                     "state_getStorage",
+                    "state_queryStorageAt",
+                    "state_call",
                 ],
             }),
             "chain_getFinalizedHead" => {
@@ -3220,9 +3777,12 @@ mod tests {
                     "chain_getBlockHash",
                     "chain_getFinalizedHead",
                     "chain_getHeader",
+                    "eth_call",
                     "state_getMetadata",
                     "state_getRuntimeVersion",
                     "state_getStorage",
+                    "state_queryStorageAt",
+                    "state_call",
                 ],
             }),
             "chain_getFinalizedHead" => json!(format!("0x{}", "09".repeat(32))),
@@ -4463,6 +5023,90 @@ mod tests {
         assert_eq!(allocator.last_reserved(), Some(1_725_000_000_125));
     }
 
+    #[tokio::test]
+    async fn perp_cancel_reservation_persists_exact_operation_and_nonce() {
+        let store = TestStore::empty();
+        let key = remark_key();
+        let signer = derive_signer_account_id(&key).unwrap();
+        let lease = store.acquire_signer_lease(signer).await.unwrap();
+        let allocator = DeepXTimestampNonceAllocator::from_records(signer, [], 10);
+        let checkpoint = DeepXSubmissionScanCheckpoint::new(40, [40; 32]);
+
+        let framework_context = DeepXFrameworkOrderContext::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("S-DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            AccountId::from("DEEPX-001"),
+            UUID4::from_bytes([1; 16]),
+            UnixNanos::from(10),
+            UUID4::from_bytes([2; 16]),
+            UnixNanos::from(9),
+            None,
+            None,
+            UUID4::from_bytes([3; 16]),
+            UUID4::from_bytes([4; 16]),
+        );
+        let prepared = prepare_framework_perp_cancel_reservation(
+            &store,
+            &lease,
+            &allocator,
+            1_725_000_000_125,
+            1_725_000_000_125,
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            remark_runtime(),
+            checkpoint,
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 42,
+                market_id: 3,
+                fast_cancel: false,
+            },
+            framework_context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.committed().revision().value(), 1);
+        assert_eq!(
+            prepared.record().submission_scan_checkpoint(),
+            Some(checkpoint)
+        );
+        assert_eq!(
+            prepared.record().framework_order_context(),
+            Some(framework_context)
+        );
+        assert_eq!(allocator.last_reserved(), Some(1_725_000_000_125));
+        assert!(matches!(
+            prepared.record().identity().operation(),
+            Some(DeepXTransactionOperation::PerpCancel {
+                subaccount,
+                order_id: 42,
+                market_id: 3,
+                fast_cancel: false,
+            }) if *subaccount == [0x11; 20]
+        ));
+    }
+
+    #[rstest]
+    fn restored_perp_cancel_acknowledgement_preserves_legacy_cache_key() {
+        let record = direct_operation_fixture(3);
+        let legacy_key = DeepXTransactionRecord::cache_key(ClientOrderId::new(
+            record.identity().client_order_id(),
+        ));
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed_at_key(
+            &record,
+            legacy_key.clone(),
+            DeepXTransactionRevision::new(4),
+        )
+        .unwrap();
+
+        assert_eq!(committed.cache_key(), legacy_key);
+        assert!(committed.matches(&record));
+    }
+
     fn direct_operation_fixture(operation: u8) -> DeepXTransactionRecord {
         match operation {
             0 => perp_place_fixture(u128::MAX, Some(u128::MAX)),
@@ -5444,7 +6088,7 @@ mod tests {
         record
             .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
             .unwrap();
-        stage_perp_place_framework_order_events(
+        stage_perp_framework_order_events(
             &mut record,
             UnixNanos::from(100),
             UnixNanos::from(101),

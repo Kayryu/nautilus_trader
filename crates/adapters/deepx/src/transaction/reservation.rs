@@ -193,6 +193,8 @@ impl DeepXFrameworkOrderContext {
 pub enum DeepXFrameworkOrderEventPayload {
     /// The durable transaction crossed the submission-start boundary.
     Submitted,
+    /// A durable cancellation crossed the submission-start boundary.
+    PendingCancel,
     /// Finalized business evidence proved venue acceptance.
     Accepted {
         /// Venue order ID proved by the finalized placement event.
@@ -200,6 +202,13 @@ pub enum DeepXFrameworkOrderEventPayload {
     },
     /// Finalized dispatch or business evidence proved venue rejection.
     Rejected,
+    /// Finalized business evidence proved order cancellation.
+    Canceled {
+        /// Venue order ID proved by the finalized cancellation event.
+        venue_order_id: u64,
+    },
+    /// Finalized dispatch or business evidence proved the cancellation failed.
+    CancelRejected,
 }
 
 /// One framework order event staged durably before any delivery attempt.
@@ -1276,7 +1285,7 @@ impl DeepXTransactionRecord {
         }
     }
 
-    /// Returns a stable, versioned cache key scoped by client order ID.
+    /// Returns the stable base cache key scoped by client order ID.
     #[must_use]
     pub fn cache_key(client_order_id: ClientOrderId) -> String {
         format!(
@@ -1285,11 +1294,75 @@ impl DeepXTransactionRecord {
         )
     }
 
+    /// Returns a stable cache key for one perpetual cancellation transaction.
+    #[must_use]
+    pub fn perp_cancel_cache_key(
+        client_order_id: ClientOrderId,
+        order_id: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "{DEEPX_TRANSACTION_CACHE_KEY_PREFIX}{}:perp-cancel:{order_id}:{nonce}",
+            hex::encode(client_order_id.as_str().as_bytes()),
+        )
+    }
+
+    /// Returns a stable cache key for one Spot cancellation transaction.
+    #[must_use]
+    pub fn spot_cancel_cache_key(
+        client_order_id: ClientOrderId,
+        pair: [u8; 32],
+        order_id: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "{DEEPX_TRANSACTION_CACHE_KEY_PREFIX}{}:spot-cancel:{}:{order_id}:{nonce}",
+            hex::encode(client_order_id.as_str().as_bytes()),
+            hex::encode(pair),
+        )
+    }
+
     pub(crate) fn cache_key_for_record(&self) -> String {
+        if let (
+            Some(DeepXTransactionOperation::PerpCancel { order_id, .. }),
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+        ) = (self.identity.operation(), self.identity.nonce())
+        {
+            return Self::perp_cancel_cache_key(
+                ClientOrderId::new(&self.identity.client_order_id),
+                *order_id,
+                nonce,
+            );
+        }
+        if let (
+            Some(DeepXTransactionOperation::SpotCancel { pair, order_id, .. }),
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+        ) = (self.identity.operation(), self.identity.nonce())
+        {
+            return Self::spot_cancel_cache_key(
+                ClientOrderId::new(&self.identity.client_order_id),
+                *pair,
+                *order_id,
+                nonce,
+            );
+        }
         format!(
             "{DEEPX_TRANSACTION_CACHE_KEY_PREFIX}{}",
             hex::encode(self.identity.client_order_id.as_bytes()),
         )
+    }
+
+    pub(crate) fn accepts_cache_key(&self, cache_key: &str) -> bool {
+        if self.cache_key_for_record() == cache_key {
+            return true;
+        }
+        matches!(
+            self.identity.operation(),
+            Some(
+                DeepXTransactionOperation::PerpCancel { .. }
+                    | DeepXTransactionOperation::SpotCancel { .. }
+            )
+        ) && Self::cache_key(ClientOrderId::new(&self.identity.client_order_id)) == cache_key
     }
 
     /// Encodes the record after checking durable invariants.
@@ -1387,7 +1460,12 @@ impl DeepXTransactionRecord {
         if self.framework_order_context.is_some_and(|context| {
             !matches!(
                 self.identity.operation(),
-                Some(DeepXTransactionOperation::PerpPlace { .. })
+                Some(
+                    DeepXTransactionOperation::PerpPlace { .. }
+                        | DeepXTransactionOperation::SpotPlace { .. }
+                        | DeepXTransactionOperation::PerpCancel { .. }
+                        | DeepXTransactionOperation::SpotCancel { .. }
+                )
             ) || !context.matches_identity(&self.identity)
                 || !matches!(
                     self.identity.nonce(),
@@ -1402,9 +1480,20 @@ impl DeepXTransactionRecord {
         if let (Some(context), Some(outbox)) =
             (self.framework_order_context, self.framework_order_outbox)
         {
+            let expected_submitted_payload = match self.identity.operation() {
+                Some(
+                    DeepXTransactionOperation::PerpPlace { .. }
+                    | DeepXTransactionOperation::SpotPlace { .. },
+                ) => DeepXFrameworkOrderEventPayload::Submitted,
+                Some(
+                    DeepXTransactionOperation::PerpCancel { .. }
+                    | DeepXTransactionOperation::SpotCancel { .. },
+                ) => DeepXFrameworkOrderEventPayload::PendingCancel,
+                _ => unreachable!("framework context operation was validated above"),
+            };
             if outbox.submitted.is_some_and(|stage| {
                 stage.event_id != context.submitted_event_id
-                    || stage.payload != DeepXFrameworkOrderEventPayload::Submitted
+                    || stage.payload != expected_submitted_payload
                     || matches!(
                         self.lifecycle.state(),
                         DeepXTransactionState::Created | DeepXTransactionState::Signed
@@ -1415,10 +1504,15 @@ impl DeepXTransactionRecord {
             if let Some(stage) = outbox.terminal {
                 let expected_payload = if self.lifecycle.state() == DeepXTransactionState::Finalized
                 {
-                    self.lifecycle
-                        .inclusion()
-                        .map(|inclusion| match inclusion.outcome() {
-                            super::DeepXInclusionOutcome::Success => {
+                    self.lifecycle.inclusion().map(|inclusion| {
+                        match (self.identity.operation(), inclusion.outcome()) {
+                            (
+                                Some(
+                                    DeepXTransactionOperation::PerpPlace { .. }
+                                    | DeepXTransactionOperation::SpotPlace { .. },
+                                ),
+                                super::DeepXInclusionOutcome::Success,
+                            ) => {
                                 let DeepXNonceReservation::TimestampOrderId { value } =
                                     self.identity.nonce()
                                 else {
@@ -1428,10 +1522,32 @@ impl DeepXTransactionRecord {
                                     venue_order_id: value,
                                 }
                             }
-                            super::DeepXInclusionOutcome::Failed => {
-                                DeepXFrameworkOrderEventPayload::Rejected
-                            }
-                        })
+                            (
+                                Some(
+                                    DeepXTransactionOperation::PerpPlace { .. }
+                                    | DeepXTransactionOperation::SpotPlace { .. },
+                                ),
+                                super::DeepXInclusionOutcome::Failed,
+                            ) => DeepXFrameworkOrderEventPayload::Rejected,
+                            (
+                                Some(
+                                    DeepXTransactionOperation::PerpCancel { order_id, .. }
+                                    | DeepXTransactionOperation::SpotCancel { order_id, .. },
+                                ),
+                                super::DeepXInclusionOutcome::Success,
+                            ) => DeepXFrameworkOrderEventPayload::Canceled {
+                                venue_order_id: *order_id,
+                            },
+                            (
+                                Some(
+                                    DeepXTransactionOperation::PerpCancel { .. }
+                                    | DeepXTransactionOperation::SpotCancel { .. },
+                                ),
+                                super::DeepXInclusionOutcome::Failed,
+                            ) => DeepXFrameworkOrderEventPayload::CancelRejected,
+                            _ => unreachable!("framework context operation was validated above"),
+                        }
+                    })
                 } else {
                     None
                 };
@@ -1517,7 +1633,10 @@ impl DeepXTransactionRecord {
                 | DeepXTransactionState::NotIncluded
         ) && matches!(
             self.identity.operation(),
-            Some(DeepXTransactionOperation::PerpPlace { .. })
+            Some(
+                DeepXTransactionOperation::PerpPlace { .. }
+                    | DeepXTransactionOperation::SpotPlace { .. }
+            )
         ) && self.submission_scan_checkpoint.is_none()
         {
             return Err(DeepXTransactionRecordError::InconsistentLifecycle);
@@ -2191,7 +2310,7 @@ mod tests {
         record
             .apply_observation(DeepXTransactionObservation::Finalized(inclusion))
             .unwrap();
-        crate::transaction::stage_perp_place_framework_order_events(
+        crate::transaction::stage_perp_framework_order_events(
             &mut record,
             UnixNanos::from(100),
             UnixNanos::from(101),
@@ -2384,6 +2503,101 @@ mod tests {
 
         assert_eq!(key, "deepx:transaction:v7:4f524445523a31");
         assert!(key.is_ascii());
+    }
+
+    #[rstest]
+    fn perpetual_cancel_records_have_distinct_transaction_keys() {
+        let client_order_id = ClientOrderId::new("O-19700101-000000-001-001-1");
+        let runtime_identity = identity(DeepXNonceReservation::TimestampOrderId { value: 10 });
+        let runtime = runtime_identity.runtime().clone();
+        let placement =
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 10,
+            }));
+        let cancel_record = |nonce| {
+            let identity = DeepXTransactionIdentity::new_perp_cancel(
+                client_order_id,
+                [7; 20],
+                InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+                OrderSide::Buy,
+                DeepXNonceReservation::TimestampOrderId { value: nonce },
+                runtime.clone(),
+                [8; 20],
+                42,
+                3,
+                false,
+            );
+            DeepXTransactionRecord::created(identity)
+        };
+        let first_cancel = cancel_record(11);
+        let retry_cancel = cancel_record(12);
+
+        assert_ne!(
+            placement.cache_key_for_record(),
+            first_cancel.cache_key_for_record()
+        );
+        assert_ne!(
+            first_cancel.cache_key_for_record(),
+            retry_cancel.cache_key_for_record()
+        );
+        assert!(
+            first_cancel
+                .cache_key_for_record()
+                .contains(":perp-cancel:42:11")
+        );
+        assert!(
+            first_cancel.accepts_cache_key(&DeepXTransactionRecord::cache_key(client_order_id,))
+        );
+        assert!(!placement.accepts_cache_key(&first_cancel.cache_key_for_record()));
+    }
+
+    #[test]
+    fn spot_cancel_records_have_distinct_transaction_keys() {
+        let client_order_id = ClientOrderId::new("O-19700101-000000-001-001-1");
+        let runtime = identity(DeepXNonceReservation::TimestampOrderId { value: 10 })
+            .runtime()
+            .clone();
+        let placement =
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 10,
+            }));
+        let cancel_record = |nonce| {
+            DeepXTransactionRecord::created(DeepXTransactionIdentity::new_spot_cancel(
+                client_order_id,
+                [7; 20],
+                InstrumentId::from_as_ref("ETH-USDC.DEEPX").unwrap(),
+                OrderSide::Buy,
+                DeepXNonceReservation::TimestampOrderId { value: nonce },
+                runtime.clone(),
+                crate::signing::DeepXSpotCancelParams {
+                    subaccount: [8; 20],
+                    pair: [9; 32],
+                    order_id: 42,
+                    is_buy: true,
+                    fast_cancel: false,
+                },
+            ))
+        };
+        let first_cancel = cancel_record(11);
+        let retry_cancel = cancel_record(12);
+
+        assert_ne!(
+            placement.cache_key_for_record(),
+            first_cancel.cache_key_for_record()
+        );
+        assert_ne!(
+            first_cancel.cache_key_for_record(),
+            retry_cancel.cache_key_for_record()
+        );
+        assert!(
+            first_cancel
+                .cache_key_for_record()
+                .contains(":spot-cancel:")
+        );
+        assert!(
+            first_cancel.accepts_cache_key(&DeepXTransactionRecord::cache_key(client_order_id,))
+        );
+        assert!(!placement.accepts_cache_key(&first_cancel.cache_key_for_record()));
     }
 
     #[rstest]

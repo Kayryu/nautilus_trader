@@ -194,6 +194,9 @@ pub struct DeepXExecutionClientConfig {
     /// HTTP operation timeout in seconds.
     #[builder(default = 30)]
     pub http_timeout_secs: u64,
+    /// WebSocket operations and startup account-event registration timeout in seconds.
+    #[builder(default = 30)]
+    pub websocket_timeout_secs: u64,
     /// Transaction encoding and submission backend.
     #[builder(default)]
     pub execution_backend: DeepXExecutionBackend,
@@ -203,6 +206,9 @@ pub struct DeepXExecutionClientConfig {
     /// Maximum accepted difference between local and chain time for timestamp nonce allocation.
     #[builder(default = DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS)]
     pub timestamp_nonce_max_clock_drift_ms: u64,
+    /// Use the event-suppressed fast path for perpetual order cancellations.
+    #[builder(default = false)]
+    pub fast_perp_cancel: bool,
     /// Durable PostgreSQL store for transaction records and exclusive signer ownership.
     pub postgres_cache_database_config: Option<PostgresConnectOptions>,
     /// Testnet network and RPC-role configuration.
@@ -218,9 +224,11 @@ impl Default for DeepXExecutionClientConfig {
             private_key: None,
             proxy_url: None,
             http_timeout_secs: 30,
+            websocket_timeout_secs: 30,
             execution_backend: DeepXExecutionBackend::default(),
             recovery_blocks_per_range: DEFAULT_RECOVERY_BLOCKS_PER_RANGE,
             timestamp_nonce_max_clock_drift_ms: DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
+            fast_perp_cancel: false,
             postgres_cache_database_config: None,
             network: DeepXNetworkConfig::default(),
         }
@@ -235,12 +243,14 @@ impl Debug for DeepXExecutionClientConfig {
             .field("private_key", &self.private_key.as_ref().map(|_| REDACTED))
             .field("proxy_url", &self.proxy_url.as_ref().map(|_| REDACTED))
             .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("websocket_timeout_secs", &self.websocket_timeout_secs)
             .field("execution_backend", &self.execution_backend)
             .field("recovery_blocks_per_range", &self.recovery_blocks_per_range)
             .field(
                 "timestamp_nonce_max_clock_drift_ms",
                 &self.timestamp_nonce_max_clock_drift_ms,
             )
+            .field("fast_perp_cancel", &self.fast_perp_cancel)
             .field(
                 "postgres_cache_database_config",
                 &self.postgres_cache_database_config,
@@ -263,6 +273,11 @@ impl DeepXExecutionClientConfig {
         if self.http_timeout_secs == 0 {
             return Err(crate::common::DeepXError::InvalidConfiguration(
                 "HTTP timeout must be non-zero".to_string(),
+            ));
+        }
+        if self.websocket_timeout_secs == 0 {
+            return Err(crate::common::DeepXError::InvalidConfiguration(
+                "WebSocket timeout must be non-zero".to_string(),
             ));
         }
         if self.recovery_blocks_per_range == 0 {
@@ -819,6 +834,7 @@ mod tests {
 
         assert!(config.proxy_url.is_none());
         assert_eq!(config.http_timeout_secs, 30);
+        assert_eq!(config.websocket_timeout_secs, 30);
         assert_eq!(
             config.recovery_blocks_per_range,
             DEFAULT_RECOVERY_BLOCKS_PER_RANGE
@@ -841,6 +857,20 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(DeepXError::InvalidConfiguration(message)) if message.contains("HTTP timeout"),
+        ));
+    }
+
+    #[rstest]
+    fn execution_config_rejects_zero_websocket_timeout() {
+        let config = DeepXExecutionClientConfig {
+            subaccount_id: Some("0x1111111111111111111111111111111111111111".to_string()),
+            websocket_timeout_secs: 0,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            config.validate(),
+            Err(DeepXError::InvalidConfiguration(message)) if message.contains("WebSocket timeout"),
         ));
     }
 

@@ -26,7 +26,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-use crate::http::DeepXPerpTrade;
+use crate::http::{DeepXPerpTrade, DeepXSpotMarket, DeepXSpotTrade};
 
 pub(super) fn parse_trade_tick(
     trade: &DeepXPerpTrade,
@@ -82,4 +82,172 @@ pub(super) fn parse_trade_tick(
         ts_event,
         ts_init,
     )
+}
+
+pub(super) fn parse_spot_trade_tick(
+    trade: &DeepXSpotTrade,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> Result<TradeTick> {
+    ensure!(trade.id != 0, "DeepX Spot trade ID must be nonzero");
+    ensure!(trade.height != 0, "DeepX Spot trade height must be nonzero");
+    ensure!(
+        trade.pair_name == market.name,
+        "DeepX Spot trade name mismatch"
+    );
+    let expected_pair = nautilus_core::hex::decode_array::<32>(
+        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
+    )
+    .context("invalid DeepX Spot market pair")?;
+    let observed_pair = nautilus_core::hex::decode_array::<32>(
+        trade.pair.strip_prefix("0x").unwrap_or(&trade.pair),
+    )
+    .context("invalid DeepX Spot trade pair")?;
+    ensure!(
+        expected_pair == observed_pair,
+        "DeepX Spot trade pair mismatch"
+    );
+    ensure!(
+        trade.price > Decimal::ZERO && trade.base_amount > Decimal::ZERO,
+        "DeepX Spot trade price and amount must be positive"
+    );
+    let price = Price::from_decimal_dp(trade.price, instrument.price_precision())
+        .context("DeepX Spot trade price cannot be represented")?;
+    let size = Quantity::from_decimal_dp(trade.base_amount, instrument.size_precision())
+        .context("DeepX Spot trade amount cannot be represented")?;
+    ensure!(
+        price.as_decimal() == trade.price,
+        "DeepX Spot trade price would lose precision"
+    );
+    ensure!(
+        size.as_decimal() == trade.base_amount,
+        "DeepX Spot trade amount would lose precision"
+    );
+    ensure!(
+        price.as_decimal() % instrument.price_increment().as_decimal() == Decimal::ZERO,
+        "DeepX Spot trade price is not a multiple of the instrument tick"
+    );
+    ensure!(
+        size.as_decimal() % instrument.size_increment().as_decimal() == Decimal::ZERO,
+        "DeepX Spot trade amount is not a multiple of the instrument step"
+    );
+    let aggressor = match trade.taker.as_str() {
+        "Buyer" => AggressorSide::Buy,
+        "Seller" => AggressorSide::Sell,
+        _ => anyhow::bail!("unknown DeepX Spot trade taker: {}", trade.taker),
+    };
+    let timestamp: jiff::Timestamp = trade
+        .trade_time
+        .parse()
+        .context("invalid DeepX Spot trade timestamp")?;
+    ensure!(
+        jiff::Timestamp::from_millisecond(timestamp.as_millisecond())? == timestamp,
+        "DeepX Spot trade timestamp is not millisecond aligned"
+    );
+    let ts_event = try_datetime_to_unix_nanos(timestamp)?;
+    TradeTick::new_checked(
+        instrument.id(),
+        price,
+        size,
+        aggressor,
+        TradeId::new(trade.id.to_string()),
+        ts_event,
+        ts_init,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        enums::CurrencyType,
+        identifiers::{InstrumentId, Symbol},
+        instruments::{CurrencyPair, InstrumentAny},
+        types::{Currency, Price, Quantity},
+    };
+
+    use super::*;
+    use crate::http::{DeepXApiResponse, DeepXSpotMarket};
+
+    const SPOT_MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
+    const SPOT_TRADES: &str =
+        include_str!("../../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
+
+    fn spot_instrument() -> InstrumentAny {
+        let base = Currency::new_checked("ETH", 18, 0, "ETH", CurrencyType::Crypto).unwrap();
+        let quote = Currency::new_checked("USDC", 6, 0, "USDC", CurrencyType::Crypto).unwrap();
+        InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+                .raw_symbol(Symbol::new("ETH/USDC"))
+                .base_currency(base)
+                .quote_currency(quote)
+                .price_precision(2)
+                .size_precision(4)
+                .price_increment(Price::from("0.01"))
+                .size_increment(Quantity::from("0.0001"))
+                .multiplier(Quantity::from(1))
+                .ts_event(UnixNanos::default())
+                .ts_init(UnixNanos::default())
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn fixture() -> (DeepXSpotMarket, DeepXSpotTrade) {
+        let markets: DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let trades: DeepXApiResponse<crate::http::DeepXSpotTradesPage> =
+            serde_json::from_str(SPOT_TRADES).unwrap();
+        (
+            markets
+                .data
+                .into_iter()
+                .find(|market| market.name == "ETH/USDC")
+                .unwrap(),
+            trades.data.items.into_iter().next().unwrap(),
+        )
+    }
+
+    #[rstest::rstest]
+    fn converts_spot_taker_and_exact_values_to_trade_tick() {
+        let (market, trade) = fixture();
+
+        let tick = parse_spot_trade_tick(&trade, &market, &spot_instrument(), UnixNanos::from(10))
+            .unwrap();
+
+        assert_eq!(tick.price.as_decimal(), trade.price);
+        assert_eq!(tick.size.as_decimal(), trade.base_amount);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
+        assert_eq!(tick.trade_id.to_string(), trade.id.to_string());
+        let timestamp: jiff::Timestamp = trade.trade_time.parse().unwrap();
+        assert_eq!(tick.ts_event.as_millis(), timestamp.as_millisecond() as u64);
+    }
+
+    #[rstest::rstest]
+    fn rejects_unknown_spot_taker() {
+        let (market, mut trade) = fixture();
+        trade.taker = "Unknown".to_string();
+
+        let error =
+            parse_spot_trade_tick(&trade, &market, &spot_instrument(), UnixNanos::default())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("unknown DeepX Spot trade taker"));
+    }
+
+    #[rstest::rstest]
+    fn rejects_spot_trade_values_off_instrument_grid() {
+        let (market, trade) = fixture();
+        let mut instrument = spot_instrument();
+        let InstrumentAny::CurrencyPair(pair) = &mut instrument else {
+            unreachable!();
+        };
+        pair.size_increment = Quantity::from("0.0003");
+
+        let error =
+            parse_spot_trade_tick(&trade, &market, &instrument, UnixNanos::default()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not a multiple of the instrument step"));
+    }
 }

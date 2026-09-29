@@ -54,9 +54,13 @@ class DeepXExecutionClientConfig:
     @property
     def http_timeout_secs(self) -> int: ...
     @property
+    def websocket_timeout_secs(self) -> int: ...
+    @property
     def recovery_blocks_per_range(self) -> int: ...
     @property
     def timestamp_nonce_max_clock_drift_ms(self) -> int: ...
+    @property
+    def fast_perp_cancel(self) -> bool: ...
     @property
     def network(self) -> DeepXNetworkConfig: ...
     def __init__(
@@ -66,11 +70,13 @@ class DeepXExecutionClientConfig:
         private_key: str | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
+        websocket_timeout_secs: int | None = None,
         execution_backend: str | None = None,
         recovery_blocks_per_range: int | None = None,
         timestamp_nonce_max_clock_drift_ms: int | None = None,
         postgres_cache_database_config: infrastructure.PostgresConnectOptions | None = None,
         network: DeepXNetworkConfig | None = None,
+        fast_perp_cancel: bool | None = None,
     ) -> None: ...
     @property
     def has_private_key(self) -> bool: ...

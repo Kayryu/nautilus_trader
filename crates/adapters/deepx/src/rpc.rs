@@ -16,13 +16,19 @@
 //! Read-only DeepX Substrate RPC identity collection.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Formatter},
 };
 
+use alloy::{
+    primitives::{Address, Bytes, FixedBytes},
+    sol,
+    sol_types::SolCall,
+};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
-use parity_scale_codec::Decode;
+use parity_scale_codec::{Compact, Decode, Encode};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -34,8 +40,9 @@ use crate::{
         DeepXRpcRole, DeepXValidatedRpcEndpoints, validate_rpc_endpoint_identities,
     },
     signing::{
-        ApprovedRuntimeIdentity, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
-        DeepXRuntimeSnapshotUpdate, RuntimeSnapshot, SnapshotError,
+        ApprovedRuntimeIdentity, DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService,
+        DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate, RuntimeSnapshot,
+        SnapshotError,
     },
 };
 
@@ -49,10 +56,50 @@ pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
     "chain_getBlockHash",
     "chain_getFinalizedHead",
     "chain_getHeader",
+    "eth_call",
     "state_getMetadata",
     "state_getRuntimeVersion",
     "state_getStorage",
+    "state_queryStorageAt",
+    "state_call",
 ];
+
+const DEEPX_MARGIN_RUNTIME_API_METHOD: &str =
+    "PerpRuntimeRpcApi_total_collateral_and_margin_required_for";
+const DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_batch_position_for";
+const DEEPX_LENDING_POOL_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_pool_accounting_v2";
+const DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_deposit_v2";
+const DEEPX_LENDING_BORROW_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_borrow_v2";
+const DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
+const DEEPX_MAX_LENDING_POSITION_ASSETS: usize = 64;
+const DEEPX_LENDING_ASSET_QUERY_CONCURRENCY: usize = 8;
+const DEEPX_DEFAULT_MAX_PERP_POSITIONS: u32 = 8;
+const DEEPX_ABSOLUTE_MAX_PERP_POSITIONS: u32 = 256;
+const DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS: u32 = 256;
+const DEEPX_ABSOLUTE_MAX_PERP_ORDERS: u32 = 4_096;
+const DEEPX_LENDING_PRECOMPILE_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x50,
+]);
+
+sol! {
+    function maxWithdrawAmountFor(
+        address subaccount,
+        uint8 lendingMarket,
+        bytes asset
+    ) external view returns (uint128);
+
+    struct DeepXSpotMarketSpecAbi {
+        uint128 minOrderSize;
+        uint128 tickSize;
+        uint128 stepSize;
+    }
+
+    function getSpotMarketSpec(bytes32 pair) external view returns (DeepXSpotMarketSpecAbi);
+}
+
+const DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x4d,
+]);
 
 /// RPC methods required from the transaction recovery endpoint.
 pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
@@ -73,6 +120,12 @@ struct ObservedRuntimeVersion {
 #[derive(Debug, Deserialize)]
 struct ObservedBlockHeader {
     number: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObservedStorageChangeSet {
+    block: String,
+    changes: Vec<(String, Option<String>)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +219,27 @@ pub struct DeepXObservedRuntimeSnapshot {
     checkpoint: DeepXFinalizedCheckpoint,
 }
 
+/// Read-only runtime approval paired with its observed finalized checkpoint.
+#[derive(Clone, Debug)]
+pub struct DeepXObservedReadOnlyRuntimeSnapshot {
+    snapshot: DeepXReadOnlyRuntimeSnapshot,
+    checkpoint: DeepXFinalizedCheckpoint,
+}
+
+impl DeepXObservedReadOnlyRuntimeSnapshot {
+    /// Returns the fixture-approved read-only runtime snapshot.
+    #[must_use]
+    pub const fn snapshot(&self) -> &DeepXReadOnlyRuntimeSnapshot {
+        &self.snapshot
+    }
+
+    /// Returns the finalized checkpoint used to collect the snapshot.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+}
+
 impl DeepXObservedRuntimeSnapshot {
     /// Returns the fixture-approved immutable runtime snapshot.
     #[must_use]
@@ -255,6 +329,974 @@ impl DeepXFinalizedChainTimeEvidence {
     #[must_use]
     pub const fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
+    }
+}
+
+/// Raw Spot market constraints observed at one finalized runtime checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedSpotMarketSpecEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    pair: [u8; 32],
+    min_order_size: u128,
+    tick_size: u128,
+    step_size: u128,
+}
+
+impl DeepXFinalizedSpotMarketSpecEvidence {
+    /// Returns the finalized checkpoint used for the precompile read.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity observed at the checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the deployment-provided bytes32 pair identifier.
+    #[must_use]
+    pub const fn pair(&self) -> [u8; 32] {
+        self.pair
+    }
+
+    /// Returns the raw runtime minimum order size.
+    #[must_use]
+    pub const fn min_order_size(&self) -> u128 {
+        self.min_order_size
+    }
+
+    /// Returns the raw runtime price tick size.
+    #[must_use]
+    pub const fn tick_size(&self) -> u128 {
+        self.tick_size
+    }
+
+    /// Returns the raw runtime quantity step size.
+    #[must_use]
+    pub const fn step_size(&self) -> u128 {
+        self.step_size
+    }
+}
+
+/// Margin weighting used by the DeepX runtime calculation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepXMarginDirection {
+    /// Initial collateral weights and order/position requirements.
+    Initial,
+    /// Maintenance collateral weights, requirements, unrealized PnL, and unsettled funding.
+    Maintenance,
+}
+
+impl DeepXMarginDirection {
+    const fn as_runtime_u8(self) -> u8 {
+        match self {
+            Self::Initial => 0,
+            Self::Maintenance => 1,
+        }
+    }
+}
+
+/// One direction-specific aggregate returned by the DeepX perpetual runtime API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXMarginRequirement {
+    total_collateral: u128,
+    total_margin_required: u128,
+}
+
+impl DeepXMarginRequirement {
+    /// Returns aggregate weighted collateral in the runtime quote precision.
+    #[must_use]
+    pub const fn total_collateral(&self) -> u128 {
+        self.total_collateral
+    }
+
+    /// Returns aggregate required margin in the runtime quote precision.
+    #[must_use]
+    pub const fn total_margin_required(&self) -> u128 {
+        self.total_margin_required
+    }
+}
+
+/// Initial and maintenance margin evidence pinned to one finalized runtime checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedMarginEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    initial: DeepXMarginRequirement,
+    maintenance: DeepXMarginRequirement,
+}
+
+impl DeepXFinalizedMarginEvidence {
+    /// Returns the finalized checkpoint used for both runtime API calls.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns initial-margin collateral and requirement aggregates.
+    #[must_use]
+    pub const fn initial(&self) -> DeepXMarginRequirement {
+        self.initial
+    }
+
+    /// Returns maintenance-margin collateral and requirement aggregates.
+    #[must_use]
+    pub const fn maintenance(&self) -> DeepXMarginRequirement {
+        self.maintenance
+    }
+}
+
+/// Runtime status of one DeepX V2 lending pool.
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXLendingPoolStatus {
+    /// New lending activity is paused.
+    Paused,
+    /// The pool is undergoing a storage migration and is not readable as V2 state.
+    Migrating,
+    /// The pool is active.
+    Active,
+    /// The pool is frozen.
+    Frozen,
+}
+
+/// Raw accounting evidence for one DeepX V2 lending pool.
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct DeepXLendingPoolEvidence {
+    market_id: u8,
+    asset: Vec<u8>,
+    decimal: u32,
+    cash_balance: u128,
+    locked_liquidity: u128,
+    available_liquidity: u128,
+    total_scaled_deposits: u128,
+    total_scaled_borrows: u128,
+    total_effective_deposits: u128,
+    total_effective_borrows: u128,
+    deposit_index: u128,
+    borrow_index: u128,
+    protocol_reserve: u128,
+    bad_debt: u128,
+    accounting_dust: i128,
+    internal_transfer_dust: i128,
+    status: DeepXLendingPoolStatus,
+    apr_borrow: u128,
+    apr_lend: u128,
+}
+
+impl DeepXLendingPoolEvidence {
+    /// Returns the lending market ID.
+    #[must_use]
+    pub const fn market_id(&self) -> u8 {
+        self.market_id
+    }
+
+    /// Returns the exact runtime asset symbol bytes.
+    #[must_use]
+    pub fn asset(&self) -> &[u8] {
+        &self.asset
+    }
+
+    /// Returns the token decimal precision reported by the pool.
+    #[must_use]
+    pub const fn decimal(&self) -> u32 {
+        self.decimal
+    }
+
+    /// Returns the raw V2 cumulative deposit index.
+    #[must_use]
+    pub const fn deposit_index(&self) -> u128 {
+        self.deposit_index
+    }
+
+    /// Returns the raw V2 cumulative borrow index.
+    #[must_use]
+    pub const fn borrow_index(&self) -> u128 {
+        self.borrow_index
+    }
+
+    /// Returns the pool-level locked liquidity.
+    ///
+    /// This value is not a user balance and must not be mapped to Nautilus locked funds.
+    #[must_use]
+    pub const fn locked_liquidity(&self) -> u128 {
+        self.locked_liquidity
+    }
+
+    /// Returns the runtime pool status.
+    #[must_use]
+    pub const fn status(&self) -> DeepXLendingPoolStatus {
+        self.status
+    }
+}
+
+/// Finalized raw lending position and effective balances for one market asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXLendingPositionEvidence {
+    market_id: u8,
+    asset: Vec<u8>,
+    scaled_deposit: u128,
+    scaled_borrow: u128,
+    effective_deposit: Option<u128>,
+    effective_borrow: Option<u128>,
+    max_withdraw_amount: Option<u128>,
+    pool: DeepXLendingPoolEvidence,
+}
+
+impl DeepXLendingPositionEvidence {
+    /// Returns the lending market ID.
+    #[must_use]
+    pub const fn market_id(&self) -> u8 {
+        self.market_id
+    }
+
+    /// Returns the exact runtime asset symbol bytes.
+    #[must_use]
+    pub fn asset(&self) -> &[u8] {
+        &self.asset
+    }
+
+    /// Returns the stored V2 scaled deposit shares.
+    #[must_use]
+    pub const fn scaled_deposit(&self) -> u128 {
+        self.scaled_deposit
+    }
+
+    /// Returns the stored V2 scaled borrow shares.
+    #[must_use]
+    pub const fn scaled_borrow(&self) -> u128 {
+        self.scaled_borrow
+    }
+
+    /// Returns the effective deposit amount calculated by the runtime at the checkpoint.
+    #[must_use]
+    pub const fn effective_deposit(&self) -> Option<u128> {
+        self.effective_deposit
+    }
+
+    /// Returns the effective borrow amount calculated by the runtime at the checkpoint.
+    #[must_use]
+    pub const fn effective_borrow(&self) -> Option<u128> {
+        self.effective_borrow
+    }
+
+    /// Returns the precompile-reported maximum currently withdrawable token amount.
+    ///
+    /// This value is capped by account-wide free collateral, the effective deposit, and pool
+    /// liquidity. It is not a Nautilus free balance or evidence of pending-order locked funds.
+    #[must_use]
+    pub const fn max_withdraw_amount(&self) -> Option<u128> {
+        self.max_withdraw_amount
+    }
+
+    /// Returns matching pool-level accounting evidence from the same checkpoint.
+    #[must_use]
+    pub const fn pool(&self) -> &DeepXLendingPoolEvidence {
+        &self.pool
+    }
+}
+
+/// Complete raw lending evidence for one account at one finalized runtime checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedLendingEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    positions: Vec<DeepXLendingPositionEvidence>,
+}
+
+/// One raw perpetual position decoded directly from finalized runtime storage.
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct DeepXPerpPositionStorageEvidence {
+    market_id: u16,
+    is_long: bool,
+    base_asset_amount: u128,
+    entry_price: u128,
+    leverage: u64,
+    last_funding_rate: i128,
+    version: u64,
+    realized_pnl: i128,
+    funding_payment: i128,
+    owner: [u8; 20],
+    take_profit: Option<u128>,
+    stop_loss: Option<u128>,
+    last_settle_price: u128,
+}
+
+impl DeepXPerpPositionStorageEvidence {
+    /// Returns the deployment-provided perpetual market ID.
+    #[must_use]
+    pub const fn market_id(&self) -> u16 {
+        self.market_id
+    }
+
+    /// Returns whether the position is long.
+    #[must_use]
+    pub const fn is_long(&self) -> bool {
+        self.is_long
+    }
+
+    /// Returns the raw base-asset position amount.
+    #[must_use]
+    pub const fn base_asset_amount(&self) -> u128 {
+        self.base_asset_amount
+    }
+
+    /// Returns the raw entry price.
+    #[must_use]
+    pub const fn entry_price(&self) -> u128 {
+        self.entry_price
+    }
+
+    /// Returns effective leverage in runtime leverage precision.
+    #[must_use]
+    pub const fn leverage(&self) -> u64 {
+        self.leverage
+    }
+
+    /// Returns the cumulative-funding-index snapshot at the last settlement.
+    #[must_use]
+    pub const fn last_funding_rate(&self) -> i128 {
+        self.last_funding_rate
+    }
+
+    /// Returns the runtime position version.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Returns raw realized PnL.
+    #[must_use]
+    pub const fn realized_pnl(&self) -> i128 {
+        self.realized_pnl
+    }
+
+    /// Returns raw settled funding payment.
+    #[must_use]
+    pub const fn funding_payment(&self) -> i128 {
+        self.funding_payment
+    }
+
+    /// Returns the exact owner encoded inside the position.
+    #[must_use]
+    pub const fn owner(&self) -> [u8; 20] {
+        self.owner
+    }
+
+    /// Returns the optional raw take-profit point.
+    #[must_use]
+    pub const fn take_profit(&self) -> Option<u128> {
+        self.take_profit
+    }
+
+    /// Returns the optional raw stop-loss point.
+    #[must_use]
+    pub const fn stop_loss(&self) -> Option<u128> {
+        self.stop_loss
+    }
+
+    /// Returns the raw last settlement price.
+    #[must_use]
+    pub const fn last_settle_price(&self) -> u128 {
+        self.last_settle_price
+    }
+}
+
+/// Perpetual positions read from one account's finalized runtime storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedPerpPositionsEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    runtime_max_positions: u32,
+    positions: Vec<DeepXPerpPositionStorageEvidence>,
+}
+
+/// Time-in-force encoded in finalized perpetual-order storage.
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXStoredTimeInForce {
+    /// Good until canceled.
+    Gtc,
+    /// Immediate or cancel.
+    Ioc,
+    /// Fill or kill.
+    Fok,
+}
+
+/// Order type encoded in finalized perpetual-order storage.
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXStoredPerpOrderType {
+    /// Limit order with its exact runtime time-in-force value.
+    Limit(DeepXStoredTimeInForce),
+    /// Market order with an optional raw slippage limit.
+    Market(Option<u64>),
+    /// System stop order.
+    Stop,
+}
+
+/// Lifecycle state encoded in finalized perpetual-order storage.
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXStoredOrderStatus {
+    /// Active on the order book.
+    Open,
+    /// Partially filled with a remainder still active.
+    PartiallyFilled,
+    /// Fully filled.
+    Filled,
+    /// Canceled by a user or the protocol.
+    Canceled,
+    /// Reverted or failed on-chain.
+    Rejected,
+    /// Canceled according to order-type rules or by the exchange.
+    Expired,
+}
+
+impl DeepXStoredOrderStatus {
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Open | Self::PartiallyFilled)
+    }
+}
+
+/// Post-only behavior encoded in finalized perpetual-order storage.
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXStoredPostOnlyParam {
+    /// No post-only constraint.
+    None,
+    /// The order must rest without immediately matching.
+    MustPostOnly,
+    /// The runtime may adapt the price to post the order.
+    Adaptive,
+}
+
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+enum DeepXStoredOrderSide {
+    #[codec(index = 1)]
+    Buy,
+    #[codec(index = 0)]
+    Sell,
+}
+
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+struct DeepXActivePerpOrderIndexEntry {
+    address: [u8; 20],
+    market_id: u16,
+    order_side: DeepXStoredOrderSide,
+    order_type: DeepXStoredPerpOrderType,
+    order_id: u64,
+    price: u128,
+    created_at: u64,
+}
+
+/// One complete active perpetual order decoded from finalized runtime storage.
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct DeepXPerpOrderStorageEvidence {
+    order_id: u64,
+    owner: [u8; 20],
+    market_id: u16,
+    is_long: bool,
+    size: u128,
+    price: u128,
+    order_type: DeepXStoredPerpOrderType,
+    create_time: u64,
+    leverage: u64,
+    status: DeepXStoredOrderStatus,
+    size_filled: u128,
+    size_remain: u128,
+    take_profit: Option<u128>,
+    stop_loss: Option<u128>,
+    reduce_only: bool,
+    post_only: DeepXStoredPostOnlyParam,
+}
+
+impl DeepXPerpOrderStorageEvidence {
+    /// Returns the runtime order ID.
+    #[must_use]
+    pub const fn order_id(&self) -> u64 {
+        self.order_id
+    }
+
+    /// Returns the exact owner encoded in `OrderInfo`.
+    #[must_use]
+    pub const fn owner(&self) -> [u8; 20] {
+        self.owner
+    }
+
+    /// Returns the runtime perpetual market ID.
+    #[must_use]
+    pub const fn market_id(&self) -> u16 {
+        self.market_id
+    }
+
+    /// Returns whether the order increases or reduces the long side.
+    #[must_use]
+    pub const fn is_long(&self) -> bool {
+        self.is_long
+    }
+
+    /// Returns the raw total order size.
+    #[must_use]
+    pub const fn size(&self) -> u128 {
+        self.size
+    }
+
+    /// Returns the raw order price.
+    #[must_use]
+    pub const fn price(&self) -> u128 {
+        self.price
+    }
+
+    /// Returns the exact stored order type.
+    #[must_use]
+    pub const fn order_type(&self) -> &DeepXStoredPerpOrderType {
+        &self.order_type
+    }
+
+    /// Returns the raw runtime creation timestamp.
+    #[must_use]
+    pub const fn create_time(&self) -> u64 {
+        self.create_time
+    }
+
+    /// Returns the raw effective leverage cap.
+    #[must_use]
+    pub const fn leverage(&self) -> u64 {
+        self.leverage
+    }
+
+    /// Returns the active stored lifecycle state.
+    #[must_use]
+    pub const fn status(&self) -> DeepXStoredOrderStatus {
+        self.status
+    }
+
+    /// Returns the raw filled size.
+    #[must_use]
+    pub const fn size_filled(&self) -> u128 {
+        self.size_filled
+    }
+
+    /// Returns the raw remaining size.
+    #[must_use]
+    pub const fn size_remain(&self) -> u128 {
+        self.size_remain
+    }
+
+    /// Returns the optional raw take-profit point.
+    #[must_use]
+    pub const fn take_profit(&self) -> Option<u128> {
+        self.take_profit
+    }
+
+    /// Returns the optional raw stop-loss point.
+    #[must_use]
+    pub const fn stop_loss(&self) -> Option<u128> {
+        self.stop_loss
+    }
+
+    /// Returns whether the order is reduce-only.
+    #[must_use]
+    pub const fn reduce_only(&self) -> bool {
+        self.reduce_only
+    }
+
+    /// Returns the exact stored post-only behavior.
+    #[must_use]
+    pub const fn post_only(&self) -> DeepXStoredPostOnlyParam {
+        self.post_only
+    }
+}
+
+/// One perpetual order corroborated against finalized `OrderInfo` and active-index storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedPerpOrderStorageEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    order: DeepXPerpOrderStorageEvidence,
+}
+
+impl DeepXFinalizedPerpOrderStorageEvidence {
+    /// Returns the finalized checkpoint used for both order storage reads.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns the active or terminal order stored for this account and order ID.
+    #[must_use]
+    pub const fn order(&self) -> &DeepXPerpOrderStorageEvidence {
+        &self.order
+    }
+}
+
+/// A bounded set of active or terminal perpetual orders from one finalized checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedPerpOrderStorageBatchEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    orders: Vec<DeepXPerpOrderStorageEvidence>,
+}
+
+/// One complete Spot order decoded from finalized runtime storage.
+#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
+pub struct DeepXSpotOrderStorageEvidence {
+    order_id: u64,
+    owner: [u8; 20],
+    pair: [u8; 32],
+    price: Option<[u8; 32]>,
+    quote_amount: [u8; 32],
+    base_amount: [u8; 32],
+    create_time: u64,
+    status: DeepXStoredOrderStatus,
+    order_type: DeepXStoredSpotOrderType,
+    post_only: DeepXStoredPostOnlyParam,
+    reduce_only: bool,
+    is_buy: bool,
+}
+
+impl DeepXSpotOrderStorageEvidence {
+    /// Returns the runtime order ID.
+    #[must_use]
+    pub const fn order_id(&self) -> u64 {
+        self.order_id
+    }
+
+    /// Returns the exact owner encoded in `OrderInfo`.
+    #[must_use]
+    pub const fn owner(&self) -> [u8; 20] {
+        self.owner
+    }
+
+    /// Returns the deployment-provided Spot pair identity.
+    #[must_use]
+    pub const fn pair(&self) -> [u8; 32] {
+        self.pair
+    }
+
+    /// Returns the order creation block number retained by the runtime.
+    #[must_use]
+    pub const fn create_time(&self) -> u64 {
+        self.create_time
+    }
+
+    /// Returns the raw optional runtime price as little-endian U256 bytes.
+    #[must_use]
+    pub const fn price(&self) -> Option<[u8; 32]> {
+        self.price
+    }
+
+    /// Returns the raw quote amount as little-endian U256 bytes.
+    #[must_use]
+    pub const fn quote_amount(&self) -> [u8; 32] {
+        self.quote_amount
+    }
+
+    /// Returns the raw base amount as little-endian U256 bytes.
+    #[must_use]
+    pub const fn base_amount(&self) -> [u8; 32] {
+        self.base_amount
+    }
+
+    /// Returns the runtime order status.
+    #[must_use]
+    pub const fn status(&self) -> DeepXStoredOrderStatus {
+        self.status
+    }
+
+    /// Returns the runtime Spot order type.
+    #[must_use]
+    pub const fn order_type(&self) -> DeepXStoredSpotOrderType {
+        self.order_type
+    }
+
+    /// Returns the runtime post-only parameter.
+    #[must_use]
+    pub const fn post_only(&self) -> DeepXStoredPostOnlyParam {
+        self.post_only
+    }
+
+    /// Returns the runtime reduce-only flag.
+    #[must_use]
+    pub const fn reduce_only(&self) -> bool {
+        self.reduce_only
+    }
+
+    /// Returns whether the order is a buy.
+    #[must_use]
+    pub const fn is_buy(&self) -> bool {
+        self.is_buy
+    }
+}
+
+/// Spot order type stored by the runtime.
+#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
+pub enum DeepXStoredSpotOrderType {
+    Limit(DeepXStoredTimeInForce),
+    Market(Option<u64>),
+    Stop,
+}
+
+/// Batch Spot order evidence observed at one finalized checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedSpotOrderStorageBatchEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    orders: Vec<DeepXSpotOrderStorageEvidence>,
+    active_order_ids: Vec<u64>,
+    active_order_pairs: Vec<(u64, [u8; 32])>,
+}
+
+impl DeepXFinalizedSpotOrderStorageBatchEvidence {
+    /// Returns the finalized checkpoint used for storage reads.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the approved runtime identity at the checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns the decoded order evidence.
+    #[must_use]
+    pub fn orders(&self) -> &[DeepXSpotOrderStorageEvidence] {
+        &self.orders
+    }
+
+    /// Returns every active Spot order ID in the finalized account index.
+    #[must_use]
+    pub fn active_order_ids(&self) -> &[u64] {
+        &self.active_order_ids
+    }
+
+    /// Returns each active Spot order ID with its runtime pair identity.
+    #[must_use]
+    pub fn active_order_pairs(&self) -> &[(u64, [u8; 32])] {
+        &self.active_order_pairs
+    }
+}
+
+impl DeepXFinalizedPerpOrderStorageBatchEvidence {
+    /// Returns the finalized checkpoint used for every storage read.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns the requested orders in canonical order-ID order.
+    #[must_use]
+    pub fn orders(&self) -> &[DeepXPerpOrderStorageEvidence] {
+        &self.orders
+    }
+}
+
+/// Active perpetual orders corroborated across the finalized account index and `OrderInfo` map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedPerpOrdersEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    orders: Vec<DeepXPerpOrderStorageEvidence>,
+}
+
+impl DeepXFinalizedPerpOrdersEvidence {
+    /// Returns the finalized checkpoint used for every storage read.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns canonical market-then-order-ID ordered active orders.
+    #[must_use]
+    pub fn orders(&self) -> &[DeepXPerpOrderStorageEvidence] {
+        &self.orders
+    }
+}
+
+impl DeepXFinalizedPerpPositionsEvidence {
+    /// Returns the finalized checkpoint used for both storage reads.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns the runtime-configured concurrent position limit at the checkpoint.
+    #[must_use]
+    pub const fn runtime_max_positions(&self) -> u32 {
+        self.runtime_max_positions
+    }
+
+    /// Returns canonical market-ordered positions owned by the queried subaccount.
+    #[must_use]
+    pub fn positions(&self) -> &[DeepXPerpPositionStorageEvidence] {
+        &self.positions
+    }
+}
+
+impl DeepXFinalizedLendingEvidence {
+    /// Returns the finalized checkpoint used for every lending runtime API call.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the fixture-approved runtime identity at the finalized checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried account.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns all non-zero lending positions across the complete `u8` market domain.
+    #[must_use]
+    pub fn positions(&self) -> &[DeepXLendingPositionEvidence] {
+        &self.positions
+    }
+}
+
+/// Complete raw account evidence pinned to one finalized runtime checkpoint.
+///
+/// This groups the independently validated chain time, margin, lending, perpetual-position, and
+/// active-order evidence without assigning framework balance, position-lifecycle, or
+/// order-lifecycle semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXFinalizedAccountEvidence {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    timestamp_ms: u64,
+    margin: DeepXFinalizedMarginEvidence,
+    lending: DeepXFinalizedLendingEvidence,
+    perp_positions: DeepXFinalizedPerpPositionsEvidence,
+    perp_orders: DeepXFinalizedPerpOrdersEvidence,
+}
+
+impl DeepXFinalizedAccountEvidence {
+    /// Returns the finalized checkpoint shared by every contained observation.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the read-only fixture-approved runtime identity at the checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the exact queried subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns `Timestamp.Now` decoded as Unix milliseconds at the shared checkpoint.
+    #[must_use]
+    pub const fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
+    /// Returns both direction-specific aggregate margin observations.
+    #[must_use]
+    pub const fn margin(&self) -> &DeepXFinalizedMarginEvidence {
+        &self.margin
+    }
+
+    /// Returns complete raw V2 lending observations.
+    #[must_use]
+    pub const fn lending(&self) -> &DeepXFinalizedLendingEvidence {
+        &self.lending
+    }
+
+    /// Returns finalized perpetual-position storage observations.
+    #[must_use]
+    pub const fn perp_positions(&self) -> &DeepXFinalizedPerpPositionsEvidence {
+        &self.perp_positions
+    }
+
+    /// Returns finalized active perpetual-order storage observations.
+    #[must_use]
+    pub const fn perp_orders(&self) -> &DeepXFinalizedPerpOrdersEvidence {
+        &self.perp_orders
     }
 }
 
@@ -380,6 +1422,246 @@ pub enum DeepXFinalizedChainTimeError {
     /// The timestamp storage value is not one exact non-zero SCALE `u64`.
     #[error("DeepX finalized Timestamp.Now storage is invalid")]
     InvalidStorage,
+}
+
+/// Errors raised while reading `Timestamp.Now` from a finalized historical block.
+#[derive(Debug, Error)]
+pub(crate) enum DeepXFinalizedBlockTimeError {
+    /// Watch capability evidence does not belong to the validated endpoint or lacks required reads.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized block-time reads")]
+    RpcCapabilitiesMismatch,
+    /// The requested block height is not finalized yet.
+    #[error("DeepX block {requested} is above finalized block {finalized}")]
+    NotFinalized { requested: u32, finalized: u32 },
+    /// One block identity or timestamp request failed.
+    #[error("failed to query DeepX finalized block-time evidence: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The RPC returned a malformed or inconsistent block identity.
+    #[error("DeepX finalized block-time identity is invalid")]
+    InvalidBlock,
+    /// Timestamp storage at the requested block is malformed.
+    #[error("DeepX finalized block Timestamp.Now storage is invalid")]
+    InvalidStorage,
+}
+
+/// Errors raised while collecting finalized DeepX margin evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedMarginError {
+    /// Watch capability evidence does not belong to the validated endpoint or lacks runtime calls.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized margin runtime calls")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// One direction-specific runtime API request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized {direction:?} margin evidence: {source}")]
+    Rpc {
+        /// Margin weighting requested from the runtime.
+        direction: DeepXMarginDirection,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// One runtime response was not one exact SCALE map entry for the requested subaccount.
+    #[error("DeepX finalized {0:?} margin evidence is invalid")]
+    InvalidEvidence(DeepXMarginDirection),
+}
+
+/// Errors raised while collecting finalized DeepX lending evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedLendingError {
+    /// Watch capability evidence does not belong to the endpoint or lacks required read methods.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized lending reads")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// The complete account-position runtime request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized lending positions: {0}")]
+    PositionsRpc(#[source] anyhow::Error),
+    /// One asset-specific runtime request or JSON-RPC response failed.
+    #[error(
+        "failed to query DeepX finalized lending method {method} for market {market_id}: {source}"
+    )]
+    AssetRpc {
+        /// Runtime API method which failed.
+        method: &'static str,
+        /// Lending market containing the asset.
+        market_id: u8,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// One finalized EVM precompile request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized maximum withdrawal for market {market_id}: {source}")]
+    WithdrawalRpc {
+        /// Lending market containing the asset.
+        market_id: u8,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The account-position response was not canonical, complete, or exactly scoped.
+    #[error("DeepX finalized lending position evidence is invalid")]
+    InvalidPositions,
+    /// One asset response was malformed or contradicted the retained position identity.
+    #[error("DeepX finalized lending asset evidence is invalid for market {0}")]
+    InvalidAssetEvidence(u8),
+    /// One maximum-withdrawal response was not one exact ABI-encoded `uint128`.
+    #[error("DeepX finalized maximum withdrawal evidence is invalid for market {0}")]
+    InvalidWithdrawalEvidence(u8),
+}
+
+/// Errors raised while collecting finalized Spot market specification evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedSpotMarketSpecError {
+    /// Watch capability evidence does not belong to the endpoint or lacks `eth_call`.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized Spot market reads")]
+    RpcCapabilitiesMismatch,
+    /// The bounded batch size is zero or exceeds the supported maximum.
+    #[error("DeepX finalized Spot spec batch size {0} is outside 1..=256")]
+    InvalidBatchSize(usize),
+    /// A deployment pair identifier appears more than once in a batch.
+    #[error("DeepX finalized Spot spec batch contains a duplicate pair")]
+    DuplicatePair,
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// The finalized EVM precompile request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized Spot market spec for pair 0x{pair}: {source}")]
+    Rpc {
+        /// Deployment-provided bytes32 Spot pair identity.
+        pair: String,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The ABI response is malformed or contains an invalid zero constraint.
+    #[error("DeepX finalized Spot market spec is invalid for pair 0x{0}")]
+    InvalidEvidence(String),
+}
+
+/// Errors raised while collecting finalized perpetual-position storage evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedPerpPositionsError {
+    /// Watch capability evidence does not belong to the endpoint or lacks storage reads.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized position storage reads")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or signing-service application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// One finalized storage request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized perpetual-position storage {storage}: {source}")]
+    Rpc {
+        /// Storage entry which failed.
+        storage: &'static str,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The runtime position limit was zero, excessive, malformed, or had trailing bytes.
+    #[error("DeepX finalized maximum perpetual-position count is invalid")]
+    InvalidMaximum,
+    /// The position vector was malformed, exceeded the runtime maximum, contained trailing bytes,
+    /// or contradicted account and market invariants.
+    #[error("DeepX finalized perpetual-position storage evidence is invalid")]
+    InvalidEvidence,
+}
+
+/// Errors raised while collecting finalized active perpetual-order storage evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedPerpOrdersError {
+    /// Watch capability evidence does not belong to the endpoint or lacks storage reads.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized order storage reads")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or signing-service application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// One finalized storage request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized perpetual-order storage {storage}: {source}")]
+    Rpc {
+        /// Storage entry which failed.
+        storage: &'static str,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The active-order index was malformed, excessive, non-canonical, or incorrectly scoped.
+    #[error("DeepX finalized active perpetual-order index is invalid")]
+    InvalidIndex,
+    /// `OrderInfo` was missing, malformed, non-active, or contradicted its account index entry.
+    #[error("DeepX finalized perpetual-order detail evidence is invalid")]
+    InvalidOrderEvidence,
+}
+
+/// Errors raised while collecting finalized Spot order storage evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedSpotOrdersError {
+    /// Watch capability evidence does not belong to the endpoint or lacks storage reads.
+    #[error("DeepX Watch RPC capabilities do not authorize finalized Spot order storage reads")]
+    RpcCapabilitiesMismatch,
+    /// Finalized runtime observation or signing-service application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(DeepXRuntimeSnapshotObservationError),
+    /// A finalized storage request or JSON-RPC response failed.
+    #[error("failed to query DeepX finalized Spot order storage {storage}: {source}")]
+    Rpc {
+        /// Storage entry which failed.
+        storage: &'static str,
+        /// Underlying request or response error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The active-order index was malformed or did not match the requested order IDs.
+    #[error("DeepX finalized Spot active-order index is invalid")]
+    InvalidIndex,
+    /// `OrderInfo` was missing, malformed, or contradicted its account index entry.
+    #[error("DeepX finalized Spot order detail evidence is invalid")]
+    InvalidOrderEvidence,
+}
+
+/// Errors raised while collecting complete finalized raw account evidence.
+#[derive(Debug, Error)]
+pub enum DeepXFinalizedAccountError {
+    /// Watch capability evidence does not belong to the endpoint or lacks required read methods.
+    #[error("DeepX Watch RPC capabilities do not authorize complete finalized account reads")]
+    RpcCapabilitiesMismatch,
+    /// Read-only finalized runtime observation failed.
+    #[error(transparent)]
+    RuntimeObservation(#[from] DeepXRuntimeSnapshotObservationError),
+    /// Finalized runtime observation or signing-service application failed.
+    #[error(transparent)]
+    Runtime(#[from] DeepXRuntimeSnapshotRefreshError),
+    /// Finalized chain-time collection failed.
+    #[error(transparent)]
+    ChainTime(#[from] DeepXFinalizedChainTimeError),
+    /// Finalized margin collection failed.
+    #[error(transparent)]
+    Margin(#[from] Box<DeepXFinalizedMarginError>),
+    /// Finalized lending collection failed.
+    #[error(transparent)]
+    Lending(#[from] Box<DeepXFinalizedLendingError>),
+    /// Finalized perpetual-position collection failed.
+    #[error(transparent)]
+    PerpPositions(#[from] Box<DeepXFinalizedPerpPositionsError>),
+    /// Finalized active perpetual-order collection failed.
+    #[error(transparent)]
+    PerpOrders(#[from] Box<DeepXFinalizedPerpOrdersError>),
 }
 
 /// Collects the genesis hash directly from the configured endpoint for `role`.
@@ -564,6 +1846,23 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     observe_approved_finalized_runtime_snapshot_at(&config.environment, url, |_, _, _| Ok(())).await
 }
 
+/// Collects a read-only approved runtime snapshot pinned to one finalized DeepX block.
+///
+/// The returned type cannot initialize a signing service or authorize transaction encoding. This
+/// permits exact captured runtime fixtures to support finalized evidence reads independently from
+/// the stricter signing-runtime allowlist.
+///
+/// # Errors
+///
+/// Returns an error for unsupported configuration, request or response failure, malformed hashes
+/// or metadata, or a runtime snapshot outside the read-only fixture allowlist.
+pub async fn observe_approved_finalized_read_only_runtime_snapshot(
+    config: &DeepXNetworkConfig,
+) -> Result<DeepXObservedReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
+    let url = config.rpc_url()?;
+    observe_approved_finalized_read_only_runtime_snapshot_at(&config.environment, url).await
+}
+
 /// Collects an approved runtime snapshot from the chain-identity-validated Watch endpoint.
 ///
 /// This bootstrap observation initializes a snapshot service before its first atomic refresh. The
@@ -656,11 +1955,1946 @@ pub async fn observe_and_apply_finalized_chain_time(
         observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
             .await?;
     let checkpoint = applied.checkpoint();
+    let timestamp_ms =
+        observe_finalized_chain_time_at(endpoints.url_for(DeepXRpcRole::Watch), checkpoint).await?;
+
+    Ok(DeepXFinalizedChainTimeEvidence {
+        checkpoint,
+        runtime_identity: applied.identity().clone(),
+        timestamp_ms,
+    })
+}
+
+/// Reads `Timestamp.Now` at an already observed finalized checkpoint.
+///
+/// The supplied checkpoint is used directly as the state-query block hash, so the timestamp can
+/// be paired with other evidence read from that exact checkpoint without observing unrelated
+/// account components.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes storage reads and the timestamp is
+/// one exact non-zero SCALE `u64` value.
+pub(crate) async fn observe_finalized_timestamp_at_checkpoint(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    checkpoint: DeepXFinalizedCheckpoint,
+) -> Result<u64, DeepXFinalizedChainTimeError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_getStorage")
+    {
+        return Err(DeepXFinalizedChainTimeError::RpcCapabilitiesMismatch);
+    }
+    observe_finalized_chain_time_at(endpoints.url_for(DeepXRpcRole::Watch), checkpoint).await
+}
+
+/// Reads `Timestamp.Now` at `block_number` after proving the height is finalized.
+///
+/// The block hash is resolved by height from the identity-validated Watch endpoint, then its
+/// header number is checked before reading storage at that exact hash. Heights above the current
+/// finalized head are rejected.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes every required method and the
+/// requested canonical block is finalized with one exact non-zero SCALE timestamp.
+pub(crate) async fn observe_finalized_block_timestamp(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    block_number: u32,
+) -> Result<u64, DeepXFinalizedBlockTimeError> {
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch.role() != DeepXRpcRole::Watch
+        || watch.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || [
+            "chain_getBlockHash",
+            "chain_getFinalizedHead",
+            "chain_getHeader",
+            "state_getStorage",
+        ]
+        .iter()
+        .any(|method| !watch.methods().contains(*method))
+    {
+        return Err(DeepXFinalizedBlockTimeError::RpcCapabilitiesMismatch);
+    }
+
     let client = BlockchainHttpRpcClient::new(
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
         None,
         None,
     );
+    let finalized_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getFinalizedHead",
+            "params": [],
+        }))
+        .await
+        .map_err(DeepXFinalizedBlockTimeError::Rpc)?;
+    decode_prefixed_hash(&finalized_hash, "finalized block hash")
+        .map_err(|_| DeepXFinalizedBlockTimeError::InvalidBlock)?;
+    let finalized_header: ObservedBlockHeader = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getHeader",
+            "params": [finalized_hash],
+        }))
+        .await
+        .map_err(DeepXFinalizedBlockTimeError::Rpc)?;
+    let finalized_number = decode_block_number(&finalized_header.number)
+        .map_err(|_| DeepXFinalizedBlockTimeError::InvalidBlock)?;
+    if block_number > finalized_number {
+        return Err(DeepXFinalizedBlockTimeError::NotFinalized {
+            requested: block_number,
+            finalized: finalized_number,
+        });
+    }
+
+    let block_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getBlockHash",
+            "params": [block_number],
+        }))
+        .await
+        .map_err(DeepXFinalizedBlockTimeError::Rpc)?;
+    decode_prefixed_hash(&block_hash, "historical block hash")
+        .map_err(|_| DeepXFinalizedBlockTimeError::InvalidBlock)?;
+    let header: ObservedBlockHeader = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getHeader",
+            "params": [block_hash.clone()],
+        }))
+        .await
+        .map_err(DeepXFinalizedBlockTimeError::Rpc)?;
+    if decode_block_number(&header.number)
+        .map_err(|_| DeepXFinalizedBlockTimeError::InvalidBlock)?
+        != block_number
+    {
+        return Err(DeepXFinalizedBlockTimeError::InvalidBlock);
+    }
+    let encoded: Option<String> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getStorage",
+            "params": [timestamp_now_storage_key(), block_hash],
+        }))
+        .await
+        .map_err(DeepXFinalizedBlockTimeError::Rpc)?;
+    let encoded = encoded.ok_or(DeepXFinalizedBlockTimeError::InvalidStorage)?;
+    decode_timestamp_now(&encoded).map_err(|_| DeepXFinalizedBlockTimeError::InvalidStorage)
+}
+
+/// Observes initial and maintenance margin aggregates at one finalized Watch checkpoint.
+///
+/// Both `state_call` requests use the exact checkpoint whose runtime metadata was fixture-approved
+/// and atomically applied to `service`. The node's custom lending RPC is deliberately not used
+/// because its current implementation ignores the caller's block hash and reads best state.
+/// Values remain raw runtime quote units; this boundary does not infer a currency, asset balances,
+/// or Nautilus free/locked semantics.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_call`, the finalized runtime
+/// remains approved, and both SCALE responses contain exactly the requested subaccount and no
+/// trailing data.
+pub async fn observe_and_apply_finalized_margin_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedMarginEvidence, DeepXFinalizedMarginError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_call")
+    {
+        return Err(DeepXFinalizedMarginError::RpcCapabilitiesMismatch);
+    }
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let (initial, maintenance) = observe_finalized_margin_requirements_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedMarginEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        initial,
+        maintenance,
+    })
+}
+
+/// Observes finalized margin evidence under the read-only runtime approval boundary.
+///
+/// This path never constructs or updates a signing service. Both direction-specific runtime calls
+/// remain pinned to the exact finalized checkpoint whose runtime identity was approved.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_call`, the finalized
+/// runtime is approved for read-only use, and both SCALE responses are canonical and belong only
+/// to `subaccount`.
+pub async fn observe_finalized_margin_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedMarginEvidence, DeepXFinalizedMarginError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_call")
+    {
+        return Err(DeepXFinalizedMarginError::RpcCapabilitiesMismatch);
+    }
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedMarginError::RuntimeObservation)?;
+    let (initial, maintenance) = observe_finalized_margin_requirements_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedMarginEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        initial,
+        maintenance,
+    })
+}
+
+/// Observes raw Spot market constraints at one approved finalized Watch checkpoint.
+///
+/// The call reads `SpotMarket.getSpotMarketSpec(bytes32)` using EIP-1898 `requireCanonical`
+/// block-hash semantics. The result preserves runtime units and does not infer token scaling.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `eth_call`, the finalized runtime
+/// is approved for read-only use, and the precompile returns exactly three positive `uint128`
+/// values.
+pub async fn observe_finalized_spot_market_spec_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    pair: [u8; 32],
+) -> Result<DeepXFinalizedSpotMarketSpecEvidence, DeepXFinalizedSpotMarketSpecError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("eth_call")
+    {
+        return Err(DeepXFinalizedSpotMarketSpecError::RpcCapabilitiesMismatch);
+    }
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedSpotMarketSpecError::RuntimeObservation)?;
+    observe_spot_market_spec_at(endpoints, pair, &observation).await
+}
+
+/// Observes a bounded set of Spot market constraints at one approved finalized Watch checkpoint.
+///
+/// Every EIP-1898 `eth_call` shares one checkpoint and the returned entries retain that checkpoint.
+/// The input must contain between one and 256 unique deployment pair identifiers.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `eth_call`, the finalized runtime
+/// is approved for read-only use, and every precompile response is valid.
+pub async fn observe_finalized_spot_market_spec_batch(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    pairs: &[[u8; 32]],
+) -> Result<Vec<DeepXFinalizedSpotMarketSpecEvidence>, DeepXFinalizedSpotMarketSpecError> {
+    if pairs.is_empty() || pairs.len() > 256 {
+        return Err(DeepXFinalizedSpotMarketSpecError::InvalidBatchSize(
+            pairs.len(),
+        ));
+    }
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("eth_call")
+    {
+        return Err(DeepXFinalizedSpotMarketSpecError::RpcCapabilitiesMismatch);
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    if pairs.iter().any(|pair| !unique.insert(*pair)) {
+        return Err(DeepXFinalizedSpotMarketSpecError::DuplicatePair);
+    }
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedSpotMarketSpecError::RuntimeObservation)?;
+    let mut evidence = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        evidence.push(observe_spot_market_spec_at(endpoints, *pair, &observation).await?);
+    }
+    Ok(evidence)
+}
+
+async fn observe_spot_market_spec_at(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    pair: [u8; 32],
+    observation: &DeepXObservedReadOnlyRuntimeSnapshot,
+) -> Result<DeepXFinalizedSpotMarketSpecEvidence, DeepXFinalizedSpotMarketSpecError> {
+    let pair_hex = hex::encode(pair);
+    let call_data = getSpotMarketSpecCall {
+        pair: FixedBytes::from(pair),
+    }
+    .abi_encode();
+    let client = BlockchainHttpRpcClient::new(
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+        None,
+        None,
+    );
+    let encoded: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS.to_string(),
+                    "data": format!("0x{}", hex::encode(call_data)),
+                },
+                {
+                    "blockHash": format!("0x{}", hex::encode(observation.checkpoint().block_hash())),
+                    "requireCanonical": true,
+                },
+            ],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedSpotMarketSpecError::Rpc {
+            pair: pair_hex.clone(),
+            source,
+        })?;
+    let (min_order_size, tick_size, step_size) = decode_finalized_spot_market_spec(&encoded)
+        .ok_or_else(|| DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex))?;
+
+    Ok(DeepXFinalizedSpotMarketSpecEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        pair,
+        min_order_size,
+        tick_size,
+        step_size,
+    })
+}
+
+fn decode_finalized_spot_market_spec(encoded: &str) -> Option<(u128, u128, u128)> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())
+        .filter(|value| value.len() == 96)?;
+    let decode_word = |word: &[u8]| {
+        if word.len() != 32 || word[..16].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        let value = <[u8; 16]>::try_from(&word[16..]).ok()?;
+        Some(u128::from_be_bytes(value))
+    };
+    let min_order_size = decode_word(&bytes[0..32])?;
+    let tick_size = decode_word(&bytes[32..64])?;
+    let step_size = decode_word(&bytes[64..96])?;
+    (min_order_size > 0 && tick_size > 0 && step_size > 0).then_some((
+        min_order_size,
+        tick_size,
+        step_size,
+    ))
+}
+
+/// Observes all V2 lending positions and effective balances at one finalized Watch checkpoint.
+///
+/// The initial batch request enumerates the complete `u8` lending market domain. Every returned
+/// asset is then corroborated with its V2 pool accounting and runtime-calculated effective deposit
+/// and borrow at the exact same block hash. Assets with a deposit are also queried through the
+/// lending precompile for their current maximum withdrawal. Values remain raw runtime units;
+/// neither maximum withdrawal nor pool-level locked liquidity is interpreted as a user free or
+/// locked balance.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_call` and `eth_call`, the
+/// finalized runtime remains approved, and every SCALE and ABI response is canonical,
+/// identity-consistent, and contains no trailing data.
+pub async fn observe_and_apply_finalized_lending_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedLendingEvidence, DeepXFinalizedLendingError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_call")
+        || !watch_capabilities.methods().contains("eth_call")
+    {
+        return Err(DeepXFinalizedLendingError::RpcCapabilitiesMismatch);
+    }
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let positions = observe_finalized_lending_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedLendingEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        positions,
+    })
+}
+
+/// Observes finalized lending evidence under the read-only runtime approval boundary.
+///
+/// This path never constructs or updates a signing service. All runtime and precompile reads remain
+/// pinned to the exact finalized checkpoint whose runtime identity was approved.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_call` and `eth_call`, the
+/// finalized runtime is approved for read-only use, and every SCALE and ABI response is canonical,
+/// identity-consistent, and contains no trailing data.
+pub async fn observe_finalized_lending_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedLendingEvidence, DeepXFinalizedLendingError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities.methods().contains("state_call")
+        || !watch_capabilities.methods().contains("eth_call")
+    {
+        return Err(DeepXFinalizedLendingError::RpcCapabilitiesMismatch);
+    }
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedLendingError::RuntimeObservation)?;
+    let positions = observe_finalized_lending_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedLendingEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        positions,
+    })
+}
+
+/// Observes finalized active perpetual orders and applies the runtime to a signing snapshot service.
+///
+/// The account's `ActivePerpOrdersFor` index and every referenced `OrderInfo` value are read from
+/// one finalized checkpoint. This path performs no signing or mutation, but runtime changes are
+/// applied to `service` so execution-owned callers retain the existing signing gate.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_queryStorageAt`, the runtime
+/// can be applied to `service`, and the complete account index and order details corroborate.
+pub async fn observe_and_apply_finalized_perp_orders_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedPerpOrdersEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let orders = observe_finalized_perp_orders_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedPerpOrdersEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        orders,
+    })
+}
+
+/// Observes finalized active perpetual orders under the read-only runtime approval boundary.
+///
+/// This path cannot construct or update a signing service. The account index and all referenced
+/// order details remain pinned to the exact finalized checkpoint whose runtime identity was
+/// approved for read-only use.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_queryStorageAt`, the runtime
+/// is approved for read-only use, and the complete account index and order details corroborate.
+pub async fn observe_finalized_perp_orders_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedPerpOrdersEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedPerpOrdersError::RuntimeObservation)?;
+    let orders = observe_finalized_perp_orders_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedPerpOrdersEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        orders,
+    })
+}
+
+/// Observes one active or terminal perpetual order and applies the observed runtime snapshot.
+pub async fn observe_and_apply_finalized_perp_order_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+    order_id: u64,
+) -> Result<DeepXFinalizedPerpOrderStorageEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let order = observe_finalized_perp_order_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+        order_id,
+    )
+    .await?;
+    Ok(DeepXFinalizedPerpOrderStorageEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        order,
+    })
+}
+
+/// Observes one active or terminal perpetual order under read-only runtime approval.
+pub async fn observe_finalized_perp_order_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+    order_id: u64,
+) -> Result<DeepXFinalizedPerpOrderStorageEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedPerpOrdersError::RuntimeObservation)?;
+    let order = observe_finalized_perp_order_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+        order_id,
+    )
+    .await?;
+    Ok(DeepXFinalizedPerpOrderStorageEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        order,
+    })
+}
+
+/// Observes a bounded set of active or terminal perpetual orders at one finalized checkpoint.
+pub async fn observe_and_apply_finalized_perp_orders_by_id_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<DeepXFinalizedPerpOrderStorageBatchEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let orders = observe_finalized_perp_orders_by_id_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+        order_ids,
+    )
+    .await?;
+    Ok(DeepXFinalizedPerpOrderStorageBatchEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        orders,
+    })
+}
+
+/// Observes a bounded set of active or terminal perpetual orders under read-only approval.
+pub async fn observe_finalized_perp_orders_by_id_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<DeepXFinalizedPerpOrderStorageBatchEvidence, DeepXFinalizedPerpOrdersError> {
+    validate_perp_order_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedPerpOrdersError::RuntimeObservation)?;
+    let orders = observe_finalized_perp_orders_by_id_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+        order_ids,
+    )
+    .await?;
+    Ok(DeepXFinalizedPerpOrderStorageBatchEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        orders,
+    })
+}
+
+fn validate_perp_order_capabilities(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+) -> Result<(), DeepXFinalizedPerpOrdersError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities
+            .methods()
+            .contains("state_queryStorageAt")
+    {
+        return Err(DeepXFinalizedPerpOrdersError::RpcCapabilitiesMismatch);
+    }
+    Ok(())
+}
+
+async fn observe_finalized_perp_orders_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+) -> Result<Vec<DeepXPerpOrderStorageEvidence>, DeepXFinalizedPerpOrdersError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let index_key = active_perp_orders_storage_key(subaccount);
+    let mut index_change_sets: Vec<ObservedStorageChangeSet> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_queryStorageAt",
+            "params": [[index_key.clone()], block_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
+            storage: "PerpMarket.ActivePerpOrdersFor",
+            source,
+        })?;
+    if index_change_sets.len() != 1 || index_change_sets[0].block != block_hash {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+    }
+    let index_changes = std::mem::take(&mut index_change_sets[0].changes);
+    if index_changes.len() != 1 || index_changes[0].0 != index_key {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+    }
+    let encoded_index = index_changes
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+        .ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+    let index = decode_active_perp_order_index(encoded_index, subaccount)?;
+    if index.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let expected = index
+        .into_iter()
+        .map(|entry| {
+            (
+                perp_order_info_storage_key(subaccount, entry.order_id),
+                entry,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() > DEEPX_ABSOLUTE_MAX_PERP_ORDERS as usize {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+    }
+    let keys = expected.keys().cloned().collect::<Vec<_>>();
+    let mut order_change_sets: Vec<ObservedStorageChangeSet> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_queryStorageAt",
+            "params": [keys, block_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
+            storage: "PerpMarket.OrderInfo",
+            source,
+        })?;
+    if order_change_sets.len() != 1 || order_change_sets[0].block != block_hash {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let changes = std::mem::take(&mut order_change_sets[0].changes);
+    if changes.len() != expected.len() {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let changes = changes.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != expected.len() || changes.keys().ne(expected.keys()) {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+
+    let mut orders = Vec::with_capacity(expected.len());
+    for (key, index_entry) in expected {
+        let encoded = changes
+            .get(&key)
+            .and_then(Option::as_deref)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let bytes = decode_storage_hex(encoded)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let mut input = bytes.as_slice();
+        let order = DeepXPerpOrderStorageEvidence::decode(&mut input)
+            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        if !input.is_empty() || !perp_order_matches_index(&order, &index_entry, subaccount) {
+            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+        }
+        orders.push(order);
+    }
+    orders.sort_unstable_by_key(|order| (order.market_id, order.order_id));
+    Ok(orders)
+}
+
+async fn observe_finalized_perp_order_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+    order_id: u64,
+) -> Result<DeepXPerpOrderStorageEvidence, DeepXFinalizedPerpOrdersError> {
+    observe_finalized_perp_orders_by_id_at(watch_url, checkpoint, subaccount, &[order_id])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)
+}
+
+async fn observe_finalized_perp_orders_by_id_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<Vec<DeepXPerpOrderStorageEvidence>, DeepXFinalizedPerpOrdersError> {
+    if order_ids.len() > DEEPX_ABSOLUTE_MAX_PERP_ORDERS as usize
+        || order_ids.iter().any(|order_id| *order_id == 0)
+    {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let expected_ids = order_ids.iter().copied().collect::<BTreeSet<_>>();
+    if expected_ids.len() != order_ids.len() {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    if expected_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let index_key = active_perp_orders_storage_key(subaccount);
+    let order_keys = expected_ids
+        .iter()
+        .map(|order_id| {
+            (
+                *order_id,
+                perp_order_info_storage_key(subaccount, *order_id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut keys = vec![index_key.clone()];
+    keys.extend(order_keys.values().cloned());
+    let mut changesets: Vec<ObservedStorageChangeSet> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_queryStorageAt",
+            "params": [keys, block_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
+            storage: "PerpMarket.OrderInfo",
+            source,
+        })?;
+    if changesets.len() != 1 || changesets[0].block != block_hash {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let raw_changes = std::mem::take(&mut changesets[0].changes);
+    if raw_changes.len() != keys.len() {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let changes = raw_changes.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != keys.len() || keys.iter().any(|key| !changes.contains_key(key)) {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+    }
+    let index = decode_active_perp_order_index(
+        changes
+            .get(&index_key)
+            .cloned()
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?,
+        subaccount,
+    )?;
+    let active_by_id = index
+        .into_iter()
+        .map(|entry| (entry.order_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut orders = Vec::with_capacity(expected_ids.len());
+    for order_id in expected_ids {
+        let order_key = order_keys
+            .get(&order_id)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let encoded_order = changes
+            .get(order_key)
+            .and_then(Option::as_deref)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let bytes = decode_storage_hex(encoded_order)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let mut input = bytes.as_slice();
+        let order = DeepXPerpOrderStorageEvidence::decode(&mut input)
+            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        let active_entry = active_by_id.get(&order_id);
+        if !input.is_empty()
+            || order.order_id != order_id
+            || order.owner != subaccount
+            || order.create_time == 0
+            || order.size == 0
+            || order.size_filled.checked_add(order.size_remain) != Some(order.size)
+            || order.status.is_active() != active_entry.is_some()
+            || active_entry
+                .is_some_and(|entry| !perp_order_matches_index(&order, entry, subaccount))
+        {
+            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+        }
+        let status_quantities_match = match order.status {
+            DeepXStoredOrderStatus::Open => {
+                order.size_filled == 0 && order.size_remain == order.size
+            }
+            DeepXStoredOrderStatus::PartiallyFilled => {
+                order.size_filled > 0 && order.size_remain > 0
+            }
+            DeepXStoredOrderStatus::Filled => {
+                order.size_filled == order.size && order.size_remain == 0
+            }
+            DeepXStoredOrderStatus::Canceled
+            | DeepXStoredOrderStatus::Rejected
+            | DeepXStoredOrderStatus::Expired => true,
+        };
+        if !status_quantities_match {
+            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
+        }
+        orders.push(order);
+    }
+    Ok(orders)
+}
+
+/// Observes Spot orders by ID from one finalized checkpoint and applies its runtime identity.
+pub async fn observe_and_apply_finalized_spot_orders_by_id_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<DeepXFinalizedSpotOrderStorageBatchEvidence, DeepXFinalizedSpotOrdersError> {
+    validate_spot_order_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let orders = observe_finalized_spot_orders_by_id_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+        order_ids,
+    )
+    .await?;
+    Ok(DeepXFinalizedSpotOrderStorageBatchEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        orders: orders.0,
+        active_order_ids: orders.1,
+        active_order_pairs: orders.2,
+    })
+}
+
+/// Observes Spot orders by ID under read-only runtime approval.
+pub async fn observe_finalized_spot_orders_by_id_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<DeepXFinalizedSpotOrderStorageBatchEvidence, DeepXFinalizedSpotOrdersError> {
+    validate_spot_order_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedSpotOrdersError::RuntimeObservation)?;
+    let orders = observe_finalized_spot_orders_by_id_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+        order_ids,
+    )
+    .await?;
+    Ok(DeepXFinalizedSpotOrderStorageBatchEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        orders: orders.0,
+        active_order_ids: orders.1,
+        active_order_pairs: orders.2,
+    })
+}
+
+fn validate_spot_order_capabilities(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+) -> Result<(), DeepXFinalizedSpotOrdersError> {
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch.role() != DeepXRpcRole::Watch
+        || watch.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch.methods().contains("state_queryStorageAt")
+    {
+        return Err(DeepXFinalizedSpotOrdersError::RpcCapabilitiesMismatch);
+    }
+    Ok(())
+}
+
+async fn observe_finalized_spot_orders_by_id_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<
+    (
+        Vec<DeepXSpotOrderStorageEvidence>,
+        Vec<u64>,
+        Vec<(u64, [u8; 32])>,
+    ),
+    DeepXFinalizedSpotOrdersError,
+> {
+    if order_ids.len() > DEEPX_ABSOLUTE_MAX_PERP_ORDERS as usize
+        || order_ids.iter().any(|id| *id == 0)
+    {
+        return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+    }
+    let expected = order_ids.iter().copied().collect::<BTreeSet<_>>();
+    if expected.len() != order_ids.len() {
+        return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+    }
+    let index_key = active_spot_orders_storage_key(subaccount);
+    let order_keys = expected
+        .iter()
+        .map(|id| (*id, spot_order_info_storage_key(subaccount, *id)))
+        .collect::<BTreeMap<_, _>>();
+    let mut keys = vec![index_key.clone()];
+    keys.extend(order_keys.values().cloned());
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let mut sets: Vec<ObservedStorageChangeSet> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_queryStorageAt",
+            "params": [keys, block_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedSpotOrdersError::Rpc {
+            storage: "SpotMarket.OrderInfo",
+            source,
+        })?;
+    if sets.len() != 1 || sets[0].block != block_hash {
+        return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+    }
+    let raw = std::mem::take(&mut sets[0].changes);
+    if raw.len() != keys.len() {
+        return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+    }
+    let changes = raw.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != keys.len() || keys.iter().any(|key| !changes.contains_key(key)) {
+        return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+    }
+    let mut active_by_id = BTreeMap::new();
+    let encoded_index = changes
+        .get(&index_key)
+        .cloned()
+        .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+    if let Some(encoded_index) = encoded_index {
+        let index_bytes = decode_storage_hex(&encoded_index)
+            .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+        let mut input = index_bytes.as_slice();
+        let Compact(pair_count) = Compact::<u32>::decode(&mut input)
+            .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+        if pair_count > DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS {
+            return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
+        }
+        let mut previous_pair = None;
+        let mut total_orders = 0_u32;
+        for _ in 0..pair_count {
+            let pair = <[u8; 32]>::decode(&mut input)
+                .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+            if previous_pair.is_some_and(|previous| previous >= pair) {
+                return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
+            }
+            previous_pair = Some(pair);
+            let Compact(order_count) = Compact::<u32>::decode(&mut input)
+                .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+            total_orders = total_orders
+                .checked_add(order_count)
+                .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+            if order_count == 0 || total_orders > DEEPX_ABSOLUTE_MAX_PERP_ORDERS {
+                return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
+            }
+            for _ in 0..order_count {
+                let id = u64::decode(&mut input)
+                    .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+                let is_buy = bool::decode(&mut input)
+                    .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
+                if id == 0 || active_by_id.insert(id, (pair, is_buy)).is_some() {
+                    return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
+                }
+            }
+        }
+        if !input.is_empty() {
+            return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
+        }
+    }
+    let active_order_ids = active_by_id.keys().copied().collect::<Vec<_>>();
+    let active_order_pairs = active_by_id
+        .iter()
+        .map(|(id, (pair, _))| (*id, *pair))
+        .collect::<Vec<_>>();
+    let mut orders = Vec::with_capacity(expected.len());
+    for id in expected {
+        let key = order_keys
+            .get(&id)
+            .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
+        let encoded = changes
+            .get(key)
+            .and_then(Option::as_deref)
+            .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
+        let bytes = decode_storage_hex(encoded)
+            .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
+        let mut input = bytes.as_slice();
+        let order = DeepXSpotOrderStorageEvidence::decode(&mut input)
+            .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
+        if !input.is_empty()
+            || order.order_id != id
+            || order.owner != subaccount
+            || order.create_time == 0
+        {
+            return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+        }
+        let indexed = active_by_id.get(&id);
+        if order.status.is_active() != indexed.is_some()
+            || indexed.is_some_and(|(pair, is_buy)| *pair != order.pair || *is_buy != order.is_buy)
+        {
+            return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
+        }
+        orders.push(order);
+    }
+    Ok((orders, active_order_ids, active_order_pairs))
+}
+
+fn decode_active_perp_order_index(
+    encoded: Option<String>,
+    subaccount: [u8; 20],
+) -> Result<Vec<DeepXActivePerpOrderIndexEntry>, DeepXFinalizedPerpOrdersError> {
+    let Some(encoded) = encoded else {
+        return Ok(Vec::new());
+    };
+    let bytes = decode_storage_hex(&encoded).ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+    let mut input = bytes.as_slice();
+    let Compact(market_count) = Compact::<u32>::decode(&mut input)
+        .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+    if market_count > DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+    }
+    let mut previous_market = None;
+    let mut order_ids = BTreeSet::new();
+    let mut entries = Vec::new();
+    for _ in 0..market_count {
+        let market_id =
+            u16::decode(&mut input).map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+        if previous_market.is_some_and(|previous| previous >= market_id) {
+            return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+        }
+        previous_market = Some(market_id);
+        let Compact(order_count) = Compact::<u32>::decode(&mut input)
+            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+        let total = u32::try_from(entries.len())
+            .ok()
+            .and_then(|length| length.checked_add(order_count))
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+        if order_count == 0 || total > DEEPX_ABSOLUTE_MAX_PERP_ORDERS {
+            return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+        }
+        entries.reserve(order_count as usize);
+        for _ in 0..order_count {
+            let entry = DeepXActivePerpOrderIndexEntry::decode(&mut input)
+                .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
+            if entry.address != subaccount
+                || entry.market_id != market_id
+                || entry.order_id == 0
+                || entry.created_at == 0
+                || !order_ids.insert(entry.order_id)
+            {
+                return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+            }
+            entries.push(entry);
+        }
+    }
+    if !input.is_empty() {
+        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
+    }
+    Ok(entries)
+}
+
+fn perp_order_matches_index(
+    order: &DeepXPerpOrderStorageEvidence,
+    index: &DeepXActivePerpOrderIndexEntry,
+    subaccount: [u8; 20],
+) -> bool {
+    let expected_long = matches!(index.order_side, DeepXStoredOrderSide::Buy);
+    order.order_id == index.order_id
+        && order.owner == subaccount
+        && order.market_id == index.market_id
+        && order.is_long == expected_long
+        && order.order_type == index.order_type
+        && order.price == index.price
+        && order.create_time == index.created_at
+        && order.order_id != 0
+        && order.create_time != 0
+        && order.leverage != 0
+        && order.status.is_active()
+        && order.size != 0
+        && order.size_remain != 0
+        && order.size_filled.checked_add(order.size_remain) == Some(order.size)
+        && (!matches!(order.order_type, DeepXStoredPerpOrderType::Limit(_)) || order.price != 0)
+}
+
+/// Observes finalized perpetual positions and applies the runtime to a signing snapshot service.
+///
+/// Both `Subaccount.MaxPerpPositions` and the account's `PerpMarket.UserPerpPositions` value are
+/// read from the same finalized checkpoint. This path performs no signing or mutation, but runtime
+/// changes are applied to `service` so execution-owned callers retain the existing signing gate.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_queryStorageAt`, the runtime
+/// can be applied to `service`, and both storage values decode canonically with exact account
+/// scope.
+pub async fn observe_and_apply_finalized_perp_positions_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedPerpPositionsEvidence, DeepXFinalizedPerpPositionsError> {
+    validate_perp_position_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    let (runtime_max_positions, positions) = observe_finalized_perp_positions_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedPerpPositionsEvidence {
+        checkpoint: applied.checkpoint(),
+        runtime_identity: applied.identity().clone(),
+        subaccount,
+        runtime_max_positions,
+        positions,
+    })
+}
+
+/// Observes finalized perpetual positions under the read-only runtime approval boundary.
+///
+/// This path cannot construct or update a signing service. Both runtime storage reads remain pinned
+/// to the exact finalized checkpoint whose runtime identity was approved for read-only use.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes `state_queryStorageAt`, the runtime
+/// is approved for read-only use, and both storage values decode canonically with exact account
+/// scope.
+pub async fn observe_finalized_perp_positions_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedPerpPositionsEvidence, DeepXFinalizedPerpPositionsError> {
+    validate_perp_position_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await
+    .map_err(DeepXFinalizedPerpPositionsError::RuntimeObservation)?;
+    let (runtime_max_positions, positions) = observe_finalized_perp_positions_at(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        subaccount,
+    )
+    .await?;
+
+    Ok(DeepXFinalizedPerpPositionsEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        runtime_max_positions,
+        positions,
+    })
+}
+
+/// Observes complete finalized raw account evidence and applies the runtime to a signing service.
+///
+/// Chain time, margin, lending, perpetual-position, and active-order reads all use the exact
+/// checkpoint whose runtime was applied to `service`. This function performs no signing,
+/// persistence mutation, or transaction submission and does not convert raw values into framework
+/// account state.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes every required read method, the
+/// runtime can be applied to `service`, and every component is complete and internally valid.
+pub async fn observe_and_apply_finalized_account_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedAccountEvidence, DeepXFinalizedAccountError> {
+    validate_account_evidence_capabilities(endpoints, capabilities)?;
+    let applied =
+        observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
+            .await?;
+    collect_finalized_account_evidence(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        applied.checkpoint(),
+        applied.identity(),
+        subaccount,
+    )
+    .await
+}
+
+/// Observes complete finalized raw account evidence under the read-only runtime boundary.
+///
+/// This path cannot construct or update a signing service. Every account read remains pinned to
+/// the exact finalized checkpoint whose runtime identity was approved for read-only use.
+///
+/// # Errors
+///
+/// Returns an error unless Watch capability evidence authorizes every required read method, the
+/// runtime is approved for read-only use, and every component is complete and internally valid.
+pub async fn observe_finalized_account_evidence(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedAccountEvidence, DeepXFinalizedAccountError> {
+    validate_account_evidence_capabilities(endpoints, capabilities)?;
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+        environment,
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+    )
+    .await?;
+    collect_finalized_account_evidence(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        observation.checkpoint(),
+        observation.snapshot().identity(),
+        subaccount,
+    )
+    .await
+}
+
+fn validate_account_evidence_capabilities(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+) -> Result<(), DeepXFinalizedAccountError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || ![
+            "state_call",
+            "eth_call",
+            "state_getStorage",
+            "state_queryStorageAt",
+        ]
+        .into_iter()
+        .all(|method| watch_capabilities.methods().contains(method))
+    {
+        return Err(DeepXFinalizedAccountError::RpcCapabilitiesMismatch);
+    }
+    Ok(())
+}
+
+async fn collect_finalized_account_evidence(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: &ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+) -> Result<DeepXFinalizedAccountEvidence, DeepXFinalizedAccountError> {
+    let timestamp_ms = observe_finalized_chain_time_at(watch_url, checkpoint).await?;
+    let (initial, maintenance) =
+        observe_finalized_margin_requirements_at(watch_url, checkpoint, subaccount)
+            .await
+            .map_err(|source| DeepXFinalizedAccountError::Margin(Box::new(source)))?;
+    let lending_positions = observe_finalized_lending_at(watch_url, checkpoint, subaccount)
+        .await
+        .map_err(|source| DeepXFinalizedAccountError::Lending(Box::new(source)))?;
+    let (runtime_max_positions, perp_positions) =
+        observe_finalized_perp_positions_at(watch_url, checkpoint, subaccount)
+            .await
+            .map_err(|source| DeepXFinalizedAccountError::PerpPositions(Box::new(source)))?;
+    let perp_orders = observe_finalized_perp_orders_at(watch_url, checkpoint, subaccount)
+        .await
+        .map_err(|source| DeepXFinalizedAccountError::PerpOrders(Box::new(source)))?;
+
+    let runtime_identity = runtime_identity.clone();
+    Ok(DeepXFinalizedAccountEvidence {
+        checkpoint,
+        runtime_identity: runtime_identity.clone(),
+        subaccount,
+        timestamp_ms,
+        margin: DeepXFinalizedMarginEvidence {
+            checkpoint,
+            runtime_identity: runtime_identity.clone(),
+            subaccount,
+            initial,
+            maintenance,
+        },
+        lending: DeepXFinalizedLendingEvidence {
+            checkpoint,
+            runtime_identity: runtime_identity.clone(),
+            subaccount,
+            positions: lending_positions,
+        },
+        perp_positions: DeepXFinalizedPerpPositionsEvidence {
+            checkpoint,
+            runtime_identity: runtime_identity.clone(),
+            subaccount,
+            runtime_max_positions,
+            positions: perp_positions,
+        },
+        perp_orders: DeepXFinalizedPerpOrdersEvidence {
+            checkpoint,
+            runtime_identity,
+            subaccount,
+            orders: perp_orders,
+        },
+    })
+}
+
+fn validate_perp_position_capabilities(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+) -> Result<(), DeepXFinalizedPerpPositionsError> {
+    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
+    if watch_capabilities.role() != DeepXRpcRole::Watch
+        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
+        || !watch_capabilities
+            .methods()
+            .contains("state_queryStorageAt")
+    {
+        return Err(DeepXFinalizedPerpPositionsError::RpcCapabilitiesMismatch);
+    }
+    Ok(())
+}
+
+async fn observe_finalized_perp_positions_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+) -> Result<(u32, Vec<DeepXPerpPositionStorageEvidence>), DeepXFinalizedPerpPositionsError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let maximum_key = subaccount_max_perp_positions_storage_key();
+    let positions_key = user_perp_positions_storage_key(subaccount);
+    let mut change_sets: Vec<ObservedStorageChangeSet> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_queryStorageAt",
+            "params": [[maximum_key.clone(), positions_key.clone()], block_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedPerpPositionsError::Rpc {
+            storage: "Subaccount.MaxPerpPositions and PerpMarket.UserPerpPositions",
+            source,
+        })?;
+    if change_sets.len() != 1 || change_sets[0].block != block_hash {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+    }
+    let changes = std::mem::take(&mut change_sets[0].changes);
+    if changes.len() != 2 {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+    }
+    let mut changes = changes.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != 2 {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+    }
+    let encoded_maximum = changes
+        .remove(&maximum_key)
+        .ok_or(DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
+    let encoded_positions = changes
+        .remove(&positions_key)
+        .ok_or(DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
+    let runtime_max_positions = decode_max_perp_positions(encoded_maximum)?;
+    let positions = decode_perp_positions(encoded_positions, subaccount, runtime_max_positions)?;
+    Ok((runtime_max_positions, positions))
+}
+
+fn decode_max_perp_positions(
+    encoded: Option<String>,
+) -> Result<u32, DeepXFinalizedPerpPositionsError> {
+    let maximum = match encoded {
+        None => DEEPX_DEFAULT_MAX_PERP_POSITIONS,
+        Some(encoded) => {
+            let bytes = decode_storage_hex(&encoded)
+                .ok_or(DeepXFinalizedPerpPositionsError::InvalidMaximum)?;
+            let mut input = bytes.as_slice();
+            let value = u32::decode(&mut input)
+                .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidMaximum)?;
+            if !input.is_empty() {
+                return Err(DeepXFinalizedPerpPositionsError::InvalidMaximum);
+            }
+            value
+        }
+    };
+    if maximum == 0 || maximum > DEEPX_ABSOLUTE_MAX_PERP_POSITIONS {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidMaximum);
+    }
+    Ok(maximum)
+}
+
+fn decode_perp_positions(
+    encoded: Option<String>,
+    subaccount: [u8; 20],
+    maximum: u32,
+) -> Result<Vec<DeepXPerpPositionStorageEvidence>, DeepXFinalizedPerpPositionsError> {
+    let Some(encoded) = encoded else {
+        return Ok(Vec::new());
+    };
+    let bytes =
+        decode_storage_hex(&encoded).ok_or(DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
+    let mut input = bytes.as_slice();
+    let Compact(length) = Compact::<u32>::decode(&mut input)
+        .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
+    if length > maximum {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+    }
+    let mut market_ids = BTreeSet::new();
+    let mut positions = Vec::with_capacity(length as usize);
+    for _ in 0..length {
+        let position = DeepXPerpPositionStorageEvidence::decode(&mut input)
+            .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
+        if position.owner != subaccount
+            || position.base_asset_amount == 0
+            || position.entry_price == 0
+            || position.leverage == 0
+            || position.last_settle_price == 0
+            || !market_ids.insert(position.market_id)
+        {
+            return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+        }
+        positions.push(position);
+    }
+    if !input.is_empty() {
+        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
+    }
+    positions.sort_unstable_by_key(DeepXPerpPositionStorageEvidence::market_id);
+    Ok(positions)
+}
+
+fn decode_storage_hex(encoded: &str) -> Option<Vec<u8>> {
+    encoded
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())
+}
+
+fn storage_value_key(pallet: &[u8], item: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(32);
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(pallet));
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(item));
+    encoded
+}
+
+fn subaccount_max_perp_positions_storage_key() -> String {
+    format!(
+        "0x{}",
+        hex::encode(storage_value_key(b"Subaccount", b"MaxPerpPositions")),
+    )
+}
+
+fn user_perp_positions_storage_key(subaccount: [u8; 20]) -> String {
+    let mut encoded = storage_value_key(b"PerpMarket", b"UserPerpPositions");
+    encoded.extend_from_slice(&subaccount);
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn active_perp_orders_storage_key(subaccount: [u8; 20]) -> String {
+    let mut encoded = storage_value_key(b"PerpMarket", b"ActivePerpOrdersFor");
+    encoded.extend_from_slice(&subaccount);
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn active_spot_orders_storage_key(subaccount: [u8; 20]) -> String {
+    let mut encoded = storage_value_key(b"SpotMarket", b"ActiveSpotOrdersFor");
+    encoded.extend_from_slice(&subaccount);
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn spot_order_info_storage_key(subaccount: [u8; 20], order_id: u64) -> String {
+    let mut encoded = storage_value_key(b"SpotMarket", b"OrderInfo");
+    encoded.extend_from_slice(&subaccount);
+    encoded.extend_from_slice(&order_id.encode());
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn perp_order_info_storage_key(subaccount: [u8; 20], order_id: u64) -> String {
+    let mut encoded = storage_value_key(b"PerpMarket", b"OrderInfo");
+    encoded.extend_from_slice(&subaccount);
+    encoded.extend_from_slice(&order_id.encode());
+    format!("0x{}", hex::encode(encoded))
+}
+
+async fn observe_finalized_lending_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+) -> Result<Vec<DeepXLendingPositionEvidence>, DeepXFinalizedLendingError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let market_ids = (u8::MIN..=u8::MAX).collect::<Vec<_>>();
+    let input = (vec![subaccount], market_ids).encode();
+    let encoded: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_call",
+            "params": [
+                DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD,
+                format!("0x{}", hex::encode(input)),
+                block_hash.clone(),
+            ],
+        }))
+        .await
+        .map_err(DeepXFinalizedLendingError::PositionsRpc)?;
+    let raw_positions = decode_lending_positions(&encoded, subaccount)?;
+    stream::iter(
+        raw_positions
+            .into_iter()
+            .map(|raw| observe_finalized_lending_asset(&client, &block_hash, subaccount, raw)),
+    )
+    .buffered(DEEPX_LENDING_ASSET_QUERY_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DeepXRawLendingPosition {
+    market_id: u8,
+    asset: Vec<u8>,
+    scaled_deposit: u128,
+    scaled_borrow: u128,
+}
+
+async fn observe_finalized_lending_asset(
+    client: &BlockchainHttpRpcClient,
+    block_hash: &str,
+    subaccount: [u8; 20],
+    raw: DeepXRawLendingPosition,
+) -> Result<DeepXLendingPositionEvidence, DeepXFinalizedLendingError> {
+    let market_id = raw.market_id;
+    let pool_input = (market_id, raw.asset.clone()).encode();
+    let balance_input = (subaccount, market_id, raw.asset.clone()).encode();
+    let call = |method: &'static str, input: Vec<u8>| async move {
+        client
+            .execute_rpc_call::<String>(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "state_call",
+                "params": [
+                    method,
+                    format!("0x{}", hex::encode(input)),
+                    block_hash,
+                ],
+            }))
+            .await
+            .map_err(|source| DeepXFinalizedLendingError::AssetRpc {
+                method,
+                market_id,
+                source,
+            })
+    };
+    let withdrawal = async {
+        if raw.scaled_deposit == 0 {
+            Ok(None)
+        } else {
+            observe_finalized_max_withdrawal(client, block_hash, subaccount, market_id, &raw.asset)
+                .await
+                .map(Some)
+        }
+    };
+    let (pool, effective_deposit, effective_borrow, max_withdraw_amount) = tokio::join!(
+        call(DEEPX_LENDING_POOL_RUNTIME_API_METHOD, pool_input),
+        call(
+            DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD,
+            balance_input.clone()
+        ),
+        call(DEEPX_LENDING_BORROW_RUNTIME_API_METHOD, balance_input),
+        withdrawal,
+    );
+    let pool =
+        decode_lending_asset_response::<Option<DeepXLendingPoolEvidence>>(&pool?, market_id)?
+            .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
+    let effective_deposit =
+        decode_lending_asset_response::<Option<u128>>(&effective_deposit?, market_id)?;
+    let effective_borrow =
+        decode_lending_asset_response::<Option<u128>>(&effective_borrow?, market_id)?;
+    let max_withdraw_amount = max_withdraw_amount?;
+
+    validate_lending_asset_evidence(
+        raw,
+        pool,
+        effective_deposit,
+        effective_borrow,
+        max_withdraw_amount,
+    )
+}
+
+async fn observe_finalized_max_withdrawal(
+    client: &BlockchainHttpRpcClient,
+    block_hash: &str,
+    subaccount: [u8; 20],
+    market_id: u8,
+    asset: &[u8],
+) -> Result<u128, DeepXFinalizedLendingError> {
+    let call_data = maxWithdrawAmountForCall {
+        subaccount: Address::from(subaccount),
+        lendingMarket: market_id,
+        asset: Bytes::copy_from_slice(asset),
+    }
+    .abi_encode();
+    let encoded: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string(),
+                    "data": format!("0x{}", hex::encode(call_data)),
+                },
+                {
+                    "blockHash": block_hash,
+                    "requireCanonical": true,
+                },
+            ],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedLendingError::WithdrawalRpc { market_id, source })?;
+    decode_max_withdrawal(&encoded, market_id)
+}
+
+fn decode_max_withdrawal(encoded: &str, market_id: u8) -> Result<u128, DeepXFinalizedLendingError> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())
+        .filter(|value| value.len() == 32 && value[..16].iter().all(|byte| *byte == 0))
+        .ok_or(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(
+            market_id,
+        ))?;
+    let raw = <[u8; 16]>::try_from(&bytes[16..])
+        .map_err(|_| DeepXFinalizedLendingError::InvalidWithdrawalEvidence(market_id))?;
+    Ok(u128::from_be_bytes(raw))
+}
+
+fn validate_lending_asset_evidence(
+    raw: DeepXRawLendingPosition,
+    pool: DeepXLendingPoolEvidence,
+    effective_deposit: Option<u128>,
+    effective_borrow: Option<u128>,
+    max_withdraw_amount: Option<u128>,
+) -> Result<DeepXLendingPositionEvidence, DeepXFinalizedLendingError> {
+    let market_id = raw.market_id;
+    if pool.market_id != market_id
+        || pool.asset != raw.asset
+        || (raw.scaled_deposit == 0) != effective_deposit.is_none()
+        || (raw.scaled_borrow == 0) != effective_borrow.is_none()
+        || (raw.scaled_deposit == 0) != max_withdraw_amount.is_none()
+        || max_withdraw_amount.is_some_and(|amount| {
+            amount > effective_deposit.unwrap_or_default() || amount > pool.available_liquidity
+        })
+    {
+        return Err(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id));
+    }
+
+    Ok(DeepXLendingPositionEvidence {
+        market_id,
+        asset: raw.asset,
+        scaled_deposit: raw.scaled_deposit,
+        scaled_borrow: raw.scaled_borrow,
+        effective_deposit,
+        effective_borrow,
+        max_withdraw_amount,
+        pool,
+    })
+}
+
+fn decode_lending_positions(
+    encoded: &str,
+    subaccount: [u8; 20],
+) -> Result<Vec<DeepXRawLendingPosition>, DeepXFinalizedLendingError> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .ok_or(DeepXFinalizedLendingError::InvalidPositions)
+        .and_then(|value| {
+            hex::decode(value).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)
+        })?;
+    let mut input = bytes.as_slice();
+    let account_count = decode_bounded_compact_len(&mut input, 1)
+        .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
+    if account_count == 0 {
+        if input.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(DeepXFinalizedLendingError::InvalidPositions);
+    }
+    let account =
+        <[u8; 20]>::decode(&mut input).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
+    if account != subaccount {
+        return Err(DeepXFinalizedLendingError::InvalidPositions);
+    }
+    let market_count = decode_bounded_compact_len(&mut input, usize::from(u8::MAX) + 1)
+        .filter(|count| *count > 0)
+        .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
+    let mut positions = Vec::new();
+    let mut previous_market = None;
+    for _ in 0..market_count {
+        let market_id =
+            u8::decode(&mut input).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
+        if previous_market.is_some_and(|previous| market_id <= previous) {
+            return Err(DeepXFinalizedLendingError::InvalidPositions);
+        }
+        previous_market = Some(market_id);
+        let asset_count = decode_bounded_compact_len(&mut input, DEEPX_MAX_LENDING_POSITION_ASSETS)
+            .filter(|count| *count > 0)
+            .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
+        let mut previous_asset: Option<Vec<u8>> = None;
+        for _ in 0..asset_count {
+            let asset = decode_bounded_bytes(&mut input, DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES)
+                .filter(|value| !value.is_empty())
+                .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
+            if previous_asset
+                .as_ref()
+                .is_some_and(|previous| asset <= *previous)
+            {
+                return Err(DeepXFinalizedLendingError::InvalidPositions);
+            }
+            previous_asset = Some(asset.clone());
+            let scaled_deposit = u128::decode(&mut input)
+                .map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
+            let scaled_borrow = u128::decode(&mut input)
+                .map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
+            if scaled_deposit == 0 && scaled_borrow == 0 {
+                return Err(DeepXFinalizedLendingError::InvalidPositions);
+            }
+            positions.push(DeepXRawLendingPosition {
+                market_id,
+                asset,
+                scaled_deposit,
+                scaled_borrow,
+            });
+        }
+    }
+    if !input.is_empty() {
+        return Err(DeepXFinalizedLendingError::InvalidPositions);
+    }
+    Ok(positions)
+}
+
+fn decode_bounded_compact_len(input: &mut &[u8], maximum: usize) -> Option<usize> {
+    let Compact(value) = Compact::<u32>::decode(input).ok()?;
+    let value = usize::try_from(value).ok()?;
+    (value <= maximum).then_some(value)
+}
+
+fn decode_bounded_bytes(input: &mut &[u8], maximum: usize) -> Option<Vec<u8>> {
+    let len = decode_bounded_compact_len(input, maximum)?;
+    if input.len() < len {
+        return None;
+    }
+    let (value, remaining) = input.split_at(len);
+    *input = remaining;
+    Some(value.to_vec())
+}
+
+fn decode_lending_asset_response<T: Decode>(
+    encoded: &str,
+    market_id: u8,
+) -> Result<T, DeepXFinalizedLendingError> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())
+        .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
+    let mut input = bytes.as_slice();
+    let value = T::decode(&mut input)
+        .map_err(|_| DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
+    if !input.is_empty() {
+        return Err(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id));
+    }
+    Ok(value)
+}
+
+async fn observe_finalized_margin_requirements_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+    subaccount: [u8; 20],
+) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let observe = |direction: DeepXMarginDirection| {
+        let input = (vec![subaccount], direction.as_runtime_u8()).encode();
+        client.execute_rpc_call::<String>(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_call",
+            "params": [
+                DEEPX_MARGIN_RUNTIME_API_METHOD,
+                format!("0x{}", hex::encode(input)),
+                block_hash,
+            ],
+        }))
+    };
+    let (initial, maintenance) = tokio::join!(
+        observe(DeepXMarginDirection::Initial),
+        observe(DeepXMarginDirection::Maintenance),
+    );
+    let initial = initial.map_err(|source| DeepXFinalizedMarginError::Rpc {
+        direction: DeepXMarginDirection::Initial,
+        source,
+    })?;
+    let maintenance = maintenance.map_err(|source| DeepXFinalizedMarginError::Rpc {
+        direction: DeepXMarginDirection::Maintenance,
+        source,
+    })?;
+    Ok((
+        decode_margin_requirement(&initial, subaccount, DeepXMarginDirection::Initial)?,
+        decode_margin_requirement(&maintenance, subaccount, DeepXMarginDirection::Maintenance)?,
+    ))
+}
+
+fn decode_margin_requirement(
+    encoded: &str,
+    subaccount: [u8; 20],
+    direction: DeepXMarginDirection,
+) -> Result<DeepXMarginRequirement, DeepXFinalizedMarginError> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .ok_or(DeepXFinalizedMarginError::InvalidEvidence(direction))
+        .and_then(|value| {
+            hex::decode(value).map_err(|_| DeepXFinalizedMarginError::InvalidEvidence(direction))
+        })?;
+    let mut input = bytes.as_slice();
+    let values = BTreeMap::<[u8; 20], (u128, u128)>::decode(&mut input)
+        .map_err(|_| DeepXFinalizedMarginError::InvalidEvidence(direction))?;
+    if !input.is_empty() || values.len() != 1 {
+        return Err(DeepXFinalizedMarginError::InvalidEvidence(direction));
+    }
+    let (total_collateral, total_margin_required) = values
+        .get(&subaccount)
+        .copied()
+        .ok_or(DeepXFinalizedMarginError::InvalidEvidence(direction))?;
+    Ok(DeepXMarginRequirement {
+        total_collateral,
+        total_margin_required,
+    })
+}
+
+fn timestamp_now_storage_key() -> String {
+    let mut encoded = Vec::with_capacity(32);
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Timestamp"));
+    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Now"));
+    format!("0x{}", hex::encode(encoded))
+}
+
+async fn observe_finalized_chain_time_at(
+    watch_url: &str,
+    checkpoint: DeepXFinalizedCheckpoint,
+) -> Result<u64, DeepXFinalizedChainTimeError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let encoded: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
@@ -673,20 +3907,7 @@ pub async fn observe_and_apply_finalized_chain_time(
         }))
         .await
         .map_err(DeepXFinalizedChainTimeError::Rpc)?;
-    let timestamp_ms = decode_timestamp_now(&encoded)?;
-
-    Ok(DeepXFinalizedChainTimeEvidence {
-        checkpoint,
-        runtime_identity: applied.identity().clone(),
-        timestamp_ms,
-    })
-}
-
-fn timestamp_now_storage_key() -> String {
-    let mut encoded = Vec::with_capacity(32);
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Timestamp"));
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Now"));
-    format!("0x{}", hex::encode(encoded))
+    decode_timestamp_now(&encoded)
 }
 
 fn decode_timestamp_now(encoded: &str) -> Result<u64, DeepXFinalizedChainTimeError> {
@@ -708,8 +3929,47 @@ fn decode_timestamp_now(encoded: &str) -> Result<u64, DeepXFinalizedChainTimeErr
 async fn observe_approved_finalized_runtime_snapshot_at<E>(
     environment: &DeepXEnvironment,
     url: String,
-    mut observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
+    observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
 ) -> Result<DeepXObservedRuntimeSnapshot, E>
+where
+    E: From<DeepXRuntimeSnapshotObservationError>,
+{
+    let (snapshot, checkpoint) = observe_finalized_runtime_snapshot_at(
+        environment,
+        url,
+        observe,
+        RuntimeSnapshot::approved_testnet,
+    )
+    .await?;
+    Ok(DeepXObservedRuntimeSnapshot {
+        snapshot,
+        checkpoint,
+    })
+}
+
+async fn observe_approved_finalized_read_only_runtime_snapshot_at(
+    environment: &DeepXEnvironment,
+    url: String,
+) -> Result<DeepXObservedReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
+    let (snapshot, checkpoint) = observe_finalized_runtime_snapshot_at(
+        environment,
+        url,
+        |_, _, _| Ok::<_, DeepXRuntimeSnapshotObservationError>(()),
+        DeepXReadOnlyRuntimeSnapshot::approved_testnet,
+    )
+    .await?;
+    Ok(DeepXObservedReadOnlyRuntimeSnapshot {
+        snapshot,
+        checkpoint,
+    })
+}
+
+async fn observe_finalized_runtime_snapshot_at<E, S>(
+    environment: &DeepXEnvironment,
+    url: String,
+    mut observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
+    approve: impl FnOnce(&DeepXEnvironment, [u8; 32], u32, u32, &[u8]) -> Result<S, SnapshotError>,
+) -> Result<(S, DeepXFinalizedCheckpoint), E>
 where
     E: From<DeepXRuntimeSnapshotObservationError>,
 {
@@ -787,7 +4047,7 @@ where
         })?;
 
     observe(genesis_hash, &runtime_version, Some(&metadata))?;
-    let snapshot = RuntimeSnapshot::approved_testnet(
+    let snapshot = approve(
         environment,
         genesis_hash,
         runtime_version.spec_version,
@@ -796,13 +4056,13 @@ where
     )
     .map_err(DeepXRuntimeSnapshotObservationError::Snapshot)?;
 
-    Ok(DeepXObservedRuntimeSnapshot {
+    Ok((
         snapshot,
-        checkpoint: DeepXFinalizedCheckpoint {
+        DeepXFinalizedCheckpoint {
             block_hash: finalized_hash,
             block_number: finalized_block_number,
         },
-    })
+    ))
 }
 
 fn decode_prefixed_hash(
@@ -837,11 +4097,16 @@ mod tests {
     };
 
     use axum::{Json, Router, routing::post};
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{enums::AccountType, identifiers::AccountId, types::Money};
     use serde_json::Value;
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::{DeepXEnvironment, common::consts::DEEPX_TESTNET_GENESIS_HASH};
+    use crate::{
+        DeepXEnvironment, DeepXFlatAccountBalanceError, common::consts::DEEPX_TESTNET_GENESIS_HASH,
+        map_finalized_flat_account_balances,
+    };
 
     const GENESIS_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
@@ -863,8 +4128,801 @@ mod tests {
          genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
          metadata.json"
     );
+    const SPEC_371_METADATA_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+         genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/\
+         metadata.json"
+    );
     const FINALIZED_HASH: &str =
         "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+
+    #[derive(Encode)]
+    struct EncodedLendingPosition {
+        positions: BTreeMap<Vec<u8>, (u128, u128)>,
+    }
+
+    fn lending_pool(market_id: u8, asset: &[u8]) -> DeepXLendingPoolEvidence {
+        DeepXLendingPoolEvidence {
+            market_id,
+            asset: asset.to_vec(),
+            decimal: 6,
+            cash_balance: 2_000_000,
+            locked_liquidity: 100_000,
+            available_liquidity: 1_900_000,
+            total_scaled_deposits: 1_500_000,
+            total_scaled_borrows: 500_000,
+            total_effective_deposits: 1_600_000,
+            total_effective_borrows: 550_000,
+            deposit_index: 1_010_000_000_000_000_000,
+            borrow_index: 1_020_000_000_000_000_000,
+            protocol_reserve: 10_000,
+            bad_debt: 0,
+            accounting_dust: 0,
+            internal_transfer_dust: 0,
+            status: DeepXLendingPoolStatus::Active,
+            apr_borrow: 50_000_000_000_000_000,
+            apr_lend: 20_000_000_000_000_000,
+        }
+    }
+
+    fn flat_account_evidence() -> DeepXFinalizedAccountEvidence {
+        let checkpoint = DeepXFinalizedCheckpoint {
+            block_hash: [0x22; 32],
+            block_number: 42,
+        };
+        let runtime_identity = ApprovedRuntimeIdentity {
+            environment: DeepXEnvironment::Testnet,
+            genesis_hash: [0x11; 32],
+            metadata_sha256: [0x33; 32],
+            spec_version: 371,
+            transaction_version: 1,
+            signed_extensions: Vec::new(),
+        };
+        let subaccount = [0x44; 20];
+        let lending_position = DeepXLendingPositionEvidence {
+            market_id: 1,
+            asset: b"usdc".to_vec(),
+            scaled_deposit: 1_200_000,
+            scaled_borrow: 0,
+            effective_deposit: Some(1_234_567),
+            effective_borrow: None,
+            max_withdraw_amount: Some(1_234_567),
+            pool: lending_pool(1, b"usdc"),
+        };
+        DeepXFinalizedAccountEvidence {
+            checkpoint,
+            runtime_identity: runtime_identity.clone(),
+            subaccount,
+            timestamp_ms: 1_700_000_000_123,
+            margin: DeepXFinalizedMarginEvidence {
+                checkpoint,
+                runtime_identity: runtime_identity.clone(),
+                subaccount,
+                initial: DeepXMarginRequirement {
+                    total_collateral: 1_234_567,
+                    total_margin_required: 0,
+                },
+                maintenance: DeepXMarginRequirement {
+                    total_collateral: 1_234_567,
+                    total_margin_required: 0,
+                },
+            },
+            lending: DeepXFinalizedLendingEvidence {
+                checkpoint,
+                runtime_identity: runtime_identity.clone(),
+                subaccount,
+                positions: vec![lending_position],
+            },
+            perp_positions: DeepXFinalizedPerpPositionsEvidence {
+                checkpoint,
+                runtime_identity: runtime_identity.clone(),
+                subaccount,
+                runtime_max_positions: 8,
+                positions: Vec::new(),
+            },
+            perp_orders: DeepXFinalizedPerpOrdersEvidence {
+                checkpoint,
+                runtime_identity,
+                subaccount,
+                orders: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn finalized_flat_account_maps_only_fully_withdrawable_deposits() {
+        let evidence = flat_account_evidence();
+
+        let mapped = map_finalized_flat_account_balances(&evidence).unwrap();
+
+        assert_eq!(mapped.checkpoint(), evidence.checkpoint());
+        assert_eq!(mapped.runtime_identity(), evidence.runtime_identity());
+        assert_eq!(mapped.subaccount(), evidence.subaccount());
+        assert_eq!(mapped.timestamp_ms(), evidence.timestamp_ms());
+        assert_eq!(mapped.balances().len(), 1);
+        let balance = mapped.balances()[0];
+        assert_eq!(balance.currency.code.as_str(), "USDC");
+        assert_eq!(balance.total, balance.free);
+        assert_eq!(balance.locked, Money::zero(balance.currency));
+        assert_eq!(
+            balance.total,
+            Money::from_decimal(rust_decimal::Decimal::new(1_234_567, 6), balance.currency,)
+                .unwrap(),
+        );
+
+        let state = mapped
+            .into_account_state(
+                AccountId::from("DEEPX-001"),
+                AccountType::Margin,
+                UnixNanos::from(1_700_000_000_999_000_000),
+            )
+            .unwrap();
+        assert_eq!(state.account_id, AccountId::from("DEEPX-001"));
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert_eq!(state.balances, vec![balance]);
+        assert!(state.margins.is_empty());
+        assert!(state.is_reported);
+        assert_eq!(state.ts_event, UnixNanos::from(1_700_000_000_123_000_000));
+        assert_eq!(state.ts_init, UnixNanos::from(1_700_000_000_999_000_000));
+        assert_eq!(state.base_currency, None);
+    }
+
+    #[test]
+    fn finalized_flat_account_rejects_exposure_liability_and_restrictions() {
+        let mut evidence = flat_account_evidence();
+        evidence.margin.initial.total_margin_required = 1;
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::MarginRequired),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.perp_positions.positions = vec![perp_position(evidence.subaccount, 3)];
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::PerpetualPositionOpen),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.perp_orders.orders = vec![perp_order(evidence.subaccount, 3, 42)];
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::PerpetualOrderActive),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].scaled_borrow = 1;
+        evidence.lending.positions[0].effective_borrow = Some(1);
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::BorrowLiability { .. }),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].max_withdraw_amount = Some(1_234_566);
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::WithdrawalRestricted { .. }),
+        ));
+    }
+
+    #[test]
+    fn finalized_flat_account_rejects_unrepresentable_asset_evidence() {
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions.clear();
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::Empty),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence
+            .lending
+            .positions
+            .push(evidence.lending.positions[0].clone());
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::DuplicateAsset(asset)) if asset == "USDC",
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].asset = vec![0xff];
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::InvalidAsset),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].effective_deposit = Some(1);
+        evidence.lending.positions[0].max_withdraw_amount = Some(1);
+        evidence.lending.positions[0].pool.decimal = 18;
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::InexactAmount { .. }),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.timestamp_ms = u64::MAX;
+        let mapped = map_finalized_flat_account_balances(&evidence).unwrap();
+        assert!(matches!(
+            mapped.into_account_state(
+                AccountId::from("DEEPX-001"),
+                AccountType::Margin,
+                UnixNanos::default(),
+            ),
+            Err(DeepXFlatAccountBalanceError::TimestampOutOfRange(u64::MAX)),
+        ));
+    }
+
+    fn perp_position(subaccount: [u8; 20], market_id: u16) -> DeepXPerpPositionStorageEvidence {
+        DeepXPerpPositionStorageEvidence {
+            market_id,
+            is_long: true,
+            base_asset_amount: 250_000_000_000_000_000,
+            entry_price: 2_500_000_000_000_000_000,
+            leverage: 12_500,
+            last_funding_rate: -1_000,
+            version: 7,
+            realized_pnl: 500,
+            funding_payment: -25,
+            owner: subaccount,
+            take_profit: Some(3_000_000_000_000_000_000),
+            stop_loss: None,
+            last_settle_price: 2_550_000_000_000_000_000,
+        }
+    }
+
+    fn perp_order(
+        subaccount: [u8; 20],
+        market_id: u16,
+        order_id: u64,
+    ) -> DeepXPerpOrderStorageEvidence {
+        DeepXPerpOrderStorageEvidence {
+            order_id,
+            owner: subaccount,
+            market_id,
+            is_long: true,
+            size: 250_000_000_000_000_000,
+            price: 2_500_000_000,
+            order_type: DeepXStoredPerpOrderType::Limit(DeepXStoredTimeInForce::Gtc),
+            create_time: 1_700_000_000_000,
+            leverage: 12_500,
+            status: DeepXStoredOrderStatus::Open,
+            size_filled: 50_000_000_000_000_000,
+            size_remain: 200_000_000_000_000_000,
+            take_profit: Some(3_000_000_000),
+            stop_loss: None,
+            reduce_only: false,
+            post_only: DeepXStoredPostOnlyParam::MustPostOnly,
+        }
+    }
+
+    fn active_perp_order_index_entry(
+        order: &DeepXPerpOrderStorageEvidence,
+    ) -> DeepXActivePerpOrderIndexEntry {
+        DeepXActivePerpOrderIndexEntry {
+            address: order.owner,
+            market_id: order.market_id,
+            order_side: if order.is_long {
+                DeepXStoredOrderSide::Buy
+            } else {
+                DeepXStoredOrderSide::Sell
+            },
+            order_type: order.order_type.clone(),
+            order_id: order.order_id,
+            price: order.price,
+            created_at: order.create_time,
+        }
+    }
+
+    #[test]
+    fn finalized_perp_order_storage_keys_use_identity_encoding() {
+        let subaccount = [0x11; 20];
+        let index = active_perp_orders_storage_key(subaccount);
+        let order = perp_order_info_storage_key(subaccount, 0x0102_0304_0506_0708);
+
+        assert_eq!(index.len(), 106);
+        assert_eq!(order.len(), 122);
+        assert!(index.ends_with(&hex::encode(subaccount)));
+        assert!(order.ends_with("0807060504030201"));
+        assert_ne!(order, perp_order_info_storage_key(subaccount, 2));
+        assert_eq!(DeepXStoredOrderSide::Buy.encode(), [1]);
+        assert_eq!(DeepXStoredOrderSide::Sell.encode(), [0]);
+    }
+
+    #[test]
+    fn finalized_perp_order_index_decoder_is_bounded_scoped_and_canonical() {
+        let subaccount = [0x11; 20];
+        let first = perp_order(subaccount, 2, 10);
+        let second = perp_order(subaccount, 3, 11);
+        let encoded = BTreeMap::from([
+            (2_u16, vec![active_perp_order_index_entry(&first)]),
+            (3_u16, vec![active_perp_order_index_entry(&second)]),
+        ])
+        .encode();
+
+        let decoded =
+            decode_active_perp_order_index(Some(format!("0x{}", hex::encode(encoded))), subaccount)
+                .unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].market_id, 2);
+        assert_eq!(decoded[1].order_id, 11);
+        assert_eq!(
+            decode_active_perp_order_index(None, subaccount).unwrap(),
+            vec![]
+        );
+        assert!(perp_order_matches_index(
+            &first,
+            &active_perp_order_index_entry(&first),
+            subaccount,
+        ));
+    }
+
+    #[test]
+    fn finalized_perp_order_evidence_rejects_contradictions() {
+        let subaccount = [0x11; 20];
+        let order = perp_order(subaccount, 2, 10);
+        let mut foreign = active_perp_order_index_entry(&order);
+        foreign.address = [0x22; 20];
+        let mut trailing =
+            BTreeMap::from([(2_u16, vec![active_perp_order_index_entry(&order)])]).encode();
+        trailing.push(0);
+        for encoded in [
+            BTreeMap::from([(2_u16, vec![foreign])]).encode(),
+            trailing,
+            Compact(DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS + 1).encode(),
+        ] {
+            assert!(matches!(
+                decode_active_perp_order_index(
+                    Some(format!("0x{}", hex::encode(encoded))),
+                    subaccount,
+                ),
+                Err(DeepXFinalizedPerpOrdersError::InvalidIndex),
+            ));
+        }
+
+        let index = active_perp_order_index_entry(&order);
+        let mut invalid = order.clone();
+        invalid.status = DeepXStoredOrderStatus::Filled;
+        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
+        invalid = order.clone();
+        invalid.size_remain -= 1;
+        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
+        invalid = order;
+        invalid.owner = [0x22; 20];
+        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
+    }
+
+    #[test]
+    fn finalized_perp_position_storage_keys_use_identity_map_encoding() {
+        let subaccount = [0x11; 20];
+        let maximum = subaccount_max_perp_positions_storage_key();
+        let positions = user_perp_positions_storage_key(subaccount);
+
+        assert_eq!(maximum.len(), 66);
+        assert_eq!(positions.len(), 106);
+        assert!(positions.ends_with(&hex::encode(subaccount)));
+        assert_ne!(positions, user_perp_positions_storage_key([0x22; 20]));
+    }
+
+    #[test]
+    fn finalized_perp_position_decoder_is_bounded_scoped_and_canonical() {
+        let subaccount = [0x11; 20];
+        let first = perp_position(subaccount, 3);
+        let second = perp_position(subaccount, 2);
+        let encoded = format!("0x{}", hex::encode(vec![first, second].encode()));
+
+        let positions = decode_perp_positions(Some(encoded), subaccount, 8).unwrap();
+
+        assert_eq!(
+            positions
+                .iter()
+                .map(DeepXPerpPositionStorageEvidence::market_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3],
+        );
+        assert_eq!(decode_perp_positions(None, subaccount, 8).unwrap(), vec![]);
+        assert_eq!(decode_max_perp_positions(None).unwrap(), 8);
+        assert_eq!(
+            decode_max_perp_positions(Some(format!("0x{}", hex::encode(12_u32.encode())))).unwrap(),
+            12,
+        );
+    }
+
+    #[test]
+    fn finalized_perp_position_decoder_rejects_contradictory_evidence() {
+        let subaccount = [0x11; 20];
+        let valid = perp_position(subaccount, 2);
+        let mut foreign = valid.clone();
+        foreign.owner = [0x22; 20];
+        let mut zero_amount = valid.clone();
+        zero_amount.base_asset_amount = 0;
+
+        for positions in [vec![valid.clone(), valid], vec![foreign], vec![zero_amount]] {
+            assert!(matches!(
+                decode_perp_positions(
+                    Some(format!("0x{}", hex::encode(positions.encode()))),
+                    subaccount,
+                    8,
+                ),
+                Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
+            ));
+        }
+        let mut trailing = vec![perp_position(subaccount, 2)].encode();
+        trailing.push(0);
+        assert!(matches!(
+            decode_perp_positions(Some(format!("0x{}", hex::encode(trailing))), subaccount, 8,),
+            Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
+        ));
+        assert!(matches!(
+            decode_perp_positions(
+                Some(format!(
+                    "0x{}",
+                    hex::encode(vec![perp_position(subaccount, 2)].encode()),
+                )),
+                subaccount,
+                0,
+            ),
+            Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
+        ));
+        for invalid in [Some("0x".to_string()), Some("0x0000000000".to_string())] {
+            assert!(matches!(
+                decode_max_perp_positions(invalid),
+                Err(DeepXFinalizedPerpPositionsError::InvalidMaximum),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_margin_observation_pins_both_directions_to_one_checkpoint() {
+        let subaccount = [0x11; 20];
+        let checkpoint = DeepXFinalizedCheckpoint {
+            block_hash: [0x22; 32],
+            block_number: 42,
+        };
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| async move {
+                assert_eq!(request["method"], "state_call");
+                assert_eq!(request["params"][0], DEEPX_MARGIN_RUNTIME_API_METHOD);
+                assert_eq!(
+                    request["params"][2],
+                    format!("0x{}", hex::encode(checkpoint.block_hash()))
+                );
+                let encoded = request["params"][1].as_str().unwrap();
+                let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                let (accounts, direction) =
+                    <(Vec<[u8; 20]>, u8)>::decode(&mut bytes.as_slice()).unwrap();
+                assert_eq!(accounts, vec![subaccount]);
+                let values = match direction {
+                    0 => (1_000_000_u128, 250_000_u128),
+                    1 => (900_000_u128, 100_000_u128),
+                    _ => panic!("unexpected margin direction"),
+                };
+                let result = BTreeMap::from([(subaccount, values)]).encode();
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": format!("0x{}", hex::encode(result)),
+                }))
+            }),
+        );
+        let url = spawn_server(router).await;
+
+        let (initial, maintenance) =
+            observe_finalized_margin_requirements_at(&url, checkpoint, subaccount)
+                .await
+                .unwrap();
+
+        assert_eq!(initial.total_collateral(), 1_000_000);
+        assert_eq!(initial.total_margin_required(), 250_000);
+        assert_eq!(maintenance.total_collateral(), 900_000);
+        assert_eq!(maintenance.total_margin_required(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn finalized_lending_observation_pins_complete_raw_evidence_to_one_checkpoint() {
+        let subaccount = [0x11; 20];
+        let checkpoint = DeepXFinalizedCheckpoint {
+            block_hash: [0x22; 32],
+            block_number: 42,
+        };
+        let asset = b"usdc".to_vec();
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let asset = asset.clone();
+                async move {
+                    if request["method"] == "eth_call" {
+                        assert_eq!(
+                            request["params"][0]["to"],
+                            DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string()
+                        );
+                        assert_eq!(
+                            request["params"][1],
+                            json!({
+                                "blockHash": format!(
+                                    "0x{}",
+                                    hex::encode(checkpoint.block_hash())
+                                ),
+                                "requireCanonical": true,
+                            })
+                        );
+                        let encoded = request["params"][0]["data"].as_str().unwrap();
+                        let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                        let call = maxWithdrawAmountForCall::abi_decode(&bytes).unwrap();
+                        assert_eq!(call.subaccount, Address::from(subaccount));
+                        assert_eq!(call.lendingMarket, 1);
+                        assert_eq!(call.asset.as_ref(), asset.as_slice());
+                        return Json(json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": format!("0x{:064x}", 750_000),
+                        }));
+                    }
+                    assert_eq!(request["method"], "state_call");
+                    assert_eq!(
+                        request["params"][2],
+                        format!("0x{}", hex::encode(checkpoint.block_hash()))
+                    );
+                    let method = request["params"][0].as_str().unwrap();
+                    let encoded = request["params"][1].as_str().unwrap();
+                    let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                    let result = match method {
+                        DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD => {
+                            let (accounts, market_ids) =
+                                <(Vec<[u8; 20]>, Vec<u8>)>::decode(&mut bytes.as_slice()).unwrap();
+                            assert_eq!(accounts, vec![subaccount]);
+                            assert_eq!(market_ids, (u8::MIN..=u8::MAX).collect::<Vec<_>>());
+                            BTreeMap::from([(
+                                subaccount,
+                                BTreeMap::from([(
+                                    1_u8,
+                                    EncodedLendingPosition {
+                                        positions: BTreeMap::from([(
+                                            asset.clone(),
+                                            (970_936_185_u128, 0_u128),
+                                        )]),
+                                    },
+                                )]),
+                            )])
+                            .encode()
+                        }
+                        DEEPX_LENDING_POOL_RUNTIME_API_METHOD => {
+                            let (market_id, requested_asset) =
+                                <(u8, Vec<u8>)>::decode(&mut bytes.as_slice()).unwrap();
+                            assert_eq!((market_id, &requested_asset), (1, &asset));
+                            Some(lending_pool(market_id, &requested_asset)).encode()
+                        }
+                        DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD => {
+                            let (account, market_id, requested_asset) =
+                                <([u8; 20], u8, Vec<u8>)>::decode(&mut bytes.as_slice()).unwrap();
+                            assert_eq!(
+                                (account, market_id, &requested_asset),
+                                (subaccount, 1, &asset)
+                            );
+                            Some(970_957_336_u128).encode()
+                        }
+                        DEEPX_LENDING_BORROW_RUNTIME_API_METHOD => {
+                            let (account, market_id, requested_asset) =
+                                <([u8; 20], u8, Vec<u8>)>::decode(&mut bytes.as_slice()).unwrap();
+                            assert_eq!(
+                                (account, market_id, &requested_asset),
+                                (subaccount, 1, &asset)
+                            );
+                            Option::<u128>::None.encode()
+                        }
+                        _ => panic!("unexpected runtime API method"),
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": format!("0x{}", hex::encode(result)),
+                    }))
+                }
+            }),
+        );
+        let url = spawn_server(router).await;
+
+        let positions = observe_finalized_lending_at(&url, checkpoint, subaccount)
+            .await
+            .unwrap();
+
+        assert_eq!(positions.len(), 1);
+        let position = &positions[0];
+        assert_eq!(position.market_id(), 1);
+        assert_eq!(position.asset(), b"usdc");
+        assert_eq!(position.scaled_deposit(), 970_936_185);
+        assert_eq!(position.scaled_borrow(), 0);
+        assert_eq!(position.effective_deposit(), Some(970_957_336));
+        assert_eq!(position.effective_borrow(), None);
+        assert_eq!(position.max_withdraw_amount(), Some(750_000));
+        assert_eq!(position.pool().decimal(), 6);
+        assert_eq!(position.pool().asset(), b"usdc");
+        assert_eq!(position.pool().locked_liquidity(), 100_000);
+        assert_eq!(position.pool().status(), DeepXLendingPoolStatus::Active);
+    }
+
+    #[rstest::rstest]
+    fn finalized_lending_asset_validation_rejects_identity_and_presence_contradictions() {
+        let raw = || DeepXRawLendingPosition {
+            market_id: 1,
+            asset: b"usdc".to_vec(),
+            scaled_deposit: 100,
+            scaled_borrow: 0,
+        };
+
+        assert!(matches!(
+            validate_lending_asset_evidence(
+                raw(),
+                lending_pool(2, b"usdc"),
+                Some(101),
+                None,
+                Some(50),
+            ),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+        assert!(matches!(
+            validate_lending_asset_evidence(
+                raw(),
+                lending_pool(1, b"usdt"),
+                Some(101),
+                None,
+                Some(50),
+            ),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+        assert!(matches!(
+            validate_lending_asset_evidence(raw(), lending_pool(1, b"usdc"), None, None, Some(50)),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+        assert!(matches!(
+            validate_lending_asset_evidence(
+                raw(),
+                lending_pool(1, b"usdc"),
+                Some(101),
+                Some(1),
+                Some(50),
+            ),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+        assert!(matches!(
+            validate_lending_asset_evidence(
+                raw(),
+                lending_pool(1, b"usdc"),
+                Some(101),
+                None,
+                Some(102),
+            ),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+        assert!(matches!(
+            validate_lending_asset_evidence(
+                raw(),
+                lending_pool(1, b"usdc"),
+                Some(2_000_000),
+                None,
+                Some(1_900_001),
+            ),
+            Err(DeepXFinalizedLendingError::InvalidAssetEvidence(1)),
+        ));
+
+        let borrow_only = DeepXRawLendingPosition {
+            market_id: 1,
+            asset: b"usdc".to_vec(),
+            scaled_deposit: 0,
+            scaled_borrow: 100,
+        };
+        let evidence = validate_lending_asset_evidence(
+            borrow_only,
+            lending_pool(1, b"usdc"),
+            None,
+            Some(101),
+            None,
+        )
+        .unwrap();
+        assert_eq!(evidence.max_withdraw_amount(), None);
+    }
+
+    #[rstest::rstest]
+    #[case("0x")]
+    #[case("0x01")]
+    #[case(&format!("0x01{}", "00".repeat(31)))]
+    #[case(&format!("0x{}00", "00".repeat(32)))]
+    fn finalized_lending_rejects_non_canonical_withdrawal_abi(#[case] encoded: &str) {
+        assert!(matches!(
+            decode_max_withdrawal(encoded, 1),
+            Err(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(1)),
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case(BTreeMap::from([(
+        [0x22; 20],
+        BTreeMap::from([(
+            1_u8,
+            EncodedLendingPosition {
+                positions: BTreeMap::from([(b"usdc".to_vec(), (1_u128, 0_u128))]),
+            },
+        )]),
+    )]).encode())]
+    #[case(BTreeMap::from([(
+        [0x11; 20],
+        BTreeMap::from([(
+            1_u8,
+            EncodedLendingPosition {
+                positions: BTreeMap::from([(b"usdc".to_vec(), (0_u128, 0_u128))]),
+            },
+        )]),
+    )]).encode())]
+    #[case(BTreeMap::from([(
+        [0x11; 20],
+        BTreeMap::from([(
+            1_u8,
+            EncodedLendingPosition {
+                positions: BTreeMap::from([(vec![b'x'; 33], (1_u128, 0_u128))]),
+            },
+        )]),
+    )]).encode())]
+    #[case({
+        let mut encoded = BTreeMap::from([(
+            [0x11; 20],
+            BTreeMap::from([(
+                1_u8,
+                EncodedLendingPosition {
+                    positions: BTreeMap::from([(b"usdc".to_vec(), (1_u128, 0_u128))]),
+                },
+            )]),
+        )]).encode();
+        encoded.push(0);
+        encoded
+    })]
+    fn finalized_lending_decoder_rejects_foreign_zero_overlong_and_trailing_evidence(
+        #[case] encoded: Vec<u8>,
+    ) {
+        let result = decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]);
+
+        assert!(matches!(
+            result,
+            Err(DeepXFinalizedLendingError::InvalidPositions)
+        ));
+    }
+
+    #[rstest::rstest]
+    fn finalized_lending_decoder_accepts_canonical_empty_account_evidence() {
+        let encoded = BTreeMap::<[u8; 20], BTreeMap<u8, EncodedLendingPosition>>::new().encode();
+
+        assert_eq!(
+            decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]).unwrap(),
+            Vec::new(),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(BTreeMap::<[u8; 20], (u128, u128)>::new().encode())]
+    #[case(BTreeMap::from([([0x22; 20], (1_u128, 2_u128))]).encode())]
+    #[case({
+        let mut encoded = BTreeMap::from([([0x11; 20], (1_u128, 2_u128))]).encode();
+        encoded.push(0);
+        encoded
+    })]
+    fn finalized_margin_decoder_rejects_missing_foreign_and_trailing_evidence(
+        #[case] encoded: Vec<u8>,
+    ) {
+        let result = decode_margin_requirement(
+            &format!("0x{}", hex::encode(encoded)),
+            [0x11; 20],
+            DeepXMarginDirection::Initial,
+        );
+
+        assert!(matches!(
+            result,
+            Err(DeepXFinalizedMarginError::InvalidEvidence(
+                DeepXMarginDirection::Initial
+            ))
+        ));
+    }
 
     #[rstest::rstest]
     fn rpc_capability_debug_redacts_endpoint_url() {
@@ -1165,6 +5223,630 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observes_spec_371_through_read_only_and_signing_runtime_boundaries() {
+        let read_only_calls = Arc::new(AtomicUsize::new(0));
+        let read_only_url = spawn_runtime_snapshot_server_with(
+            371,
+            1,
+            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap(),
+            None,
+            None,
+            |_| {},
+            Arc::clone(&read_only_calls),
+        )
+        .await;
+        let read_only_config = DeepXNetworkConfig {
+            environment: DeepXEnvironment::Testnet,
+            base_url_rpc: Some(read_only_url),
+            ..Default::default()
+        };
+
+        let observation = observe_approved_finalized_read_only_runtime_snapshot(&read_only_config)
+            .await
+            .unwrap();
+
+        assert_eq!(read_only_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(observation.snapshot().identity().spec_version, 371);
+        assert_eq!(observation.checkpoint().block_number(), 42);
+
+        let signing_calls = Arc::new(AtomicUsize::new(0));
+        let signing_url = spawn_runtime_snapshot_server_with(
+            371,
+            1,
+            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap(),
+            None,
+            None,
+            |_| {},
+            Arc::clone(&signing_calls),
+        )
+        .await;
+        let signing_config = DeepXNetworkConfig {
+            environment: DeepXEnvironment::Testnet,
+            base_url_rpc: Some(signing_url),
+            ..Default::default()
+        };
+
+        let signing = observe_approved_finalized_runtime_snapshot(&signing_config)
+            .await
+            .unwrap();
+        assert_eq!(signing_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            signing.snapshot().identity(),
+            observation.snapshot().identity()
+        );
+        assert_eq!(signing.checkpoint(), observation.checkpoint());
+    }
+
+    #[tokio::test]
+    async fn finalized_spot_market_spec_is_pinned_to_approved_checkpoint() {
+        let pair = [0x33; 32];
+        let second_pair = [0x44; 32];
+        let metadata: Value = serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap();
+        let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
+        let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
+        let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+        runtime_version["result"]["specVersion"] = json!(371);
+        let header = json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "number": "0x2a" }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                let genesis = genesis.clone();
+                let finalized_head = finalized_head.clone();
+                let runtime_version = runtime_version.clone();
+                let metadata = metadata.clone();
+                let header = header.clone();
+                async move {
+                    let index = calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match index {
+                        0 => genesis,
+                        1 => finalized_head,
+                        2 => header,
+                        3 => runtime_version,
+                        4 => metadata,
+                        5 | 6 => {
+                            assert_eq!(request["method"], "eth_call");
+                            assert_eq!(
+                                request["params"][0]["to"],
+                                DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS.to_string(),
+                            );
+                            assert_eq!(
+                                request["params"][1],
+                                json!({
+                                    "blockHash": FINALIZED_HASH,
+                                    "requireCanonical": true,
+                                }),
+                            );
+                            let calldata = hex::decode(
+                                request["params"][0]["data"]
+                                    .as_str()
+                                    .unwrap()
+                                    .trim_start_matches("0x"),
+                            )
+                            .unwrap();
+                            let call = getSpotMarketSpecCall::abi_decode(&calldata).unwrap();
+                            assert!(
+                                call.pair == FixedBytes::from(pair)
+                                    || call.pair == FixedBytes::from(second_pair)
+                            );
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": format!("0x{:064x}{:064x}{:064x}", 11, 22, 33),
+                            })
+                        }
+                        _ => panic!("unexpected finalized Spot market spec request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_spot_market_spec_batch(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &[pair, second_pair],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].runtime_identity().spec_version, 371);
+        assert_eq!(evidence[0].checkpoint().block_number(), 42);
+        assert_eq!(evidence[0].checkpoint(), evidence[1].checkpoint());
+        assert_eq!(evidence[0].pair(), pair);
+        assert_eq!(evidence[0].min_order_size(), 11);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
+        assert_eq!(evidence[0].tick_size(), 22);
+        assert_eq!(evidence[0].step_size(), 33);
+    }
+
+    #[rstest::rstest]
+    fn decodes_only_complete_positive_spot_market_specs() {
+        assert_eq!(decode_finalized_spot_market_spec("0x"), None);
+        assert_eq!(decode_finalized_spot_market_spec("0x0000"), None);
+        for encoded in [
+            format!("0x{:064x}{:064x}{:064x}", 0, 22, 33),
+            format!("0x{:064x}{:064x}{:064x}", 11, 0, 33),
+            format!("0x{:064x}{:064x}{:064x}", 11, 22, 0),
+        ] {
+            assert_eq!(decode_finalized_spot_market_spec(&encoded), None);
+        }
+        let encoded = format!("0x{:064x}{:064x}{:064x}", 11, 22, 33);
+        assert_eq!(
+            decode_finalized_spot_market_spec(&encoded),
+            Some((11, 22, 33)),
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_371_read_only_snapshot_authorizes_finalized_margin_evidence() {
+        let subaccount = [0x11; 20];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
+                        "chain_getFinalizedHead" => {
+                            serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap()
+                        }
+                        "chain_getHeader" => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "number": "0x2a" },
+                        }),
+                        "state_getRuntimeVersion" => {
+                            let mut response: Value =
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+                            response["result"]["specVersion"] = json!(371);
+                            response
+                        }
+                        "state_getMetadata" => {
+                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                        }
+                        "state_call" => {
+                            assert_eq!(request["params"][0], DEEPX_MARGIN_RUNTIME_API_METHOD);
+                            assert_eq!(request["params"][2], FINALIZED_HASH);
+                            let encoded = request["params"][1].as_str().unwrap();
+                            let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                            let (accounts, direction) =
+                                <(Vec<[u8; 20]>, u8)>::decode(&mut bytes.as_slice()).unwrap();
+                            assert_eq!(accounts, vec![subaccount]);
+                            let values = match direction {
+                                0 => (1_000_000_u128, 250_000_u128),
+                                1 => (900_000_u128, 100_000_u128),
+                                _ => panic!("unexpected margin direction"),
+                            };
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": format!(
+                                    "0x{}",
+                                    hex::encode(BTreeMap::from([(subaccount, values)]).encode()),
+                                ),
+                            })
+                        }
+                        _ => panic!("unexpected read-only finalized margin request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_margin_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            subaccount,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.runtime_identity().spec_version, 371);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(evidence.initial().total_collateral(), 1_000_000);
+        assert_eq!(evidence.maintenance().total_margin_required(), 100_000);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn spec_371_read_only_snapshot_authorizes_finalized_perp_positions() {
+        let subaccount = [0x11; 20];
+        let maximum_key = subaccount_max_perp_positions_storage_key();
+        let positions_key = user_perp_positions_storage_key(subaccount);
+        let encoded_positions = format!(
+            "0x{}",
+            hex::encode(vec![perp_position(subaccount, 3)].encode()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                let maximum_key = maximum_key.clone();
+                let positions_key = positions_key.clone();
+                let encoded_positions = encoded_positions.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
+                        "chain_getFinalizedHead" => {
+                            serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap()
+                        }
+                        "chain_getHeader" => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "number": "0x2a" },
+                        }),
+                        "state_getRuntimeVersion" => {
+                            let mut response: Value =
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+                            response["result"]["specVersion"] = json!(371);
+                            response
+                        }
+                        "state_getMetadata" => {
+                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                        }
+                        "state_queryStorageAt" => {
+                            assert_eq!(request["params"][1], FINALIZED_HASH);
+                            assert_eq!(request["params"][0], json!([maximum_key, positions_key]),);
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": [{
+                                    "block": FINALIZED_HASH,
+                                    "changes": [
+                                        [maximum_key, Value::Null],
+                                        [positions_key, encoded_positions],
+                                    ],
+                                }],
+                            })
+                        }
+                        _ => panic!("unexpected read-only finalized position request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_perp_positions_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            subaccount,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.runtime_identity().spec_version, 371);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(evidence.runtime_max_positions(), 8);
+        assert_eq!(evidence.positions().len(), 1);
+        assert_eq!(evidence.positions()[0].market_id(), 3);
+        assert_eq!(evidence.positions()[0].owner(), subaccount);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
+    async fn spec_371_read_only_snapshot_corroborates_finalized_perp_orders() {
+        let subaccount = [0x11; 20];
+        let order = perp_order(subaccount, 3, 42);
+        let index_key = active_perp_orders_storage_key(subaccount);
+        let order_key = perp_order_info_storage_key(subaccount, order.order_id);
+        let encoded_index = format!(
+            "0x{}",
+            hex::encode(
+                BTreeMap::from([(order.market_id, vec![active_perp_order_index_entry(&order)],)])
+                    .encode(),
+            ),
+        );
+        let encoded_order = format!("0x{}", hex::encode(order.encode()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                let index_key = index_key.clone();
+                let order_key = order_key.clone();
+                let encoded_index = encoded_index.clone();
+                let encoded_order = encoded_order.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
+                        "chain_getFinalizedHead" => {
+                            serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap()
+                        }
+                        "chain_getHeader" => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "number": "0x2a" },
+                        }),
+                        "state_getRuntimeVersion" => {
+                            let mut response: Value =
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+                            response["result"]["specVersion"] = json!(371);
+                            response
+                        }
+                        "state_getMetadata" => {
+                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                        }
+                        "state_queryStorageAt" => {
+                            assert_eq!(request["params"][1], FINALIZED_HASH);
+                            let keys = request["params"][0].as_array().unwrap();
+                            let (key, value) = if keys == &[json!(index_key.clone())] {
+                                (index_key, encoded_index)
+                            } else {
+                                assert_eq!(keys, &[json!(order_key.clone())]);
+                                (order_key, encoded_order)
+                            };
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": [{
+                                    "block": FINALIZED_HASH,
+                                    "changes": [[key, value]],
+                                }],
+                            })
+                        }
+                        _ => panic!("unexpected read-only finalized order request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_perp_orders_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            subaccount,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.runtime_identity().spec_version, 371);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(evidence.orders().len(), 1);
+        assert_eq!(evidence.orders()[0].order_id(), 42);
+        assert_eq!(evidence.orders()[0].market_id(), 3);
+        assert_eq!(evidence.orders()[0].owner(), subaccount);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn spec_371_read_only_snapshot_pins_complete_account_evidence_to_one_checkpoint() {
+        let subaccount = [0x11; 20];
+        let timestamp_ms = 1_700_000_000_123_u64;
+        let maximum_key = subaccount_max_perp_positions_storage_key();
+        let positions_key = user_perp_positions_storage_key(subaccount);
+        let orders_key = active_perp_orders_storage_key(subaccount);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                let maximum_key = maximum_key.clone();
+                let positions_key = positions_key.clone();
+                let orders_key = orders_key.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
+                        "chain_getFinalizedHead" => {
+                            serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap()
+                        }
+                        "chain_getHeader" => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "number": "0x2a" },
+                        }),
+                        "state_getRuntimeVersion" => {
+                            let mut response: Value =
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+                            response["result"]["specVersion"] = json!(371);
+                            response
+                        }
+                        "state_getMetadata" => {
+                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                        }
+                        "state_getStorage" => {
+                            assert_eq!(
+                                request["params"],
+                                json!([timestamp_now_storage_key(), FINALIZED_HASH])
+                            );
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": format!(
+                                    "0x{}",
+                                    hex::encode(timestamp_ms.to_le_bytes())
+                                ),
+                            })
+                        }
+                        "state_call" => {
+                            assert_eq!(request["params"][2], FINALIZED_HASH);
+                            let method = request["params"][0].as_str().unwrap();
+                            let result = if method == DEEPX_MARGIN_RUNTIME_API_METHOD {
+                                let encoded = request["params"][1].as_str().unwrap();
+                                let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                                let (accounts, direction) =
+                                    <(Vec<[u8; 20]>, u8)>::decode(&mut bytes.as_slice()).unwrap();
+                                assert_eq!(accounts, vec![subaccount]);
+                                let values = match direction {
+                                    0 => (1_000_000_u128, 250_000_u128),
+                                    1 => (900_000_u128, 100_000_u128),
+                                    _ => panic!("unexpected margin direction"),
+                                };
+                                BTreeMap::from([(subaccount, values)]).encode()
+                            } else {
+                                assert_eq!(method, DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD);
+                                BTreeMap::<[u8; 20], BTreeMap<u8, EncodedLendingPosition>>::new()
+                                    .encode()
+                            };
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": format!("0x{}", hex::encode(result)),
+                            })
+                        }
+                        "state_queryStorageAt" => {
+                            assert_eq!(request["params"][1], FINALIZED_HASH);
+                            let keys = request["params"][0].as_array().unwrap();
+                            let changes = if keys
+                                == &[json!(maximum_key.clone()), json!(positions_key.clone())]
+                            {
+                                vec![
+                                    json!([maximum_key, Value::Null]),
+                                    json!([positions_key, Value::Null]),
+                                ]
+                            } else {
+                                assert_eq!(keys, &[json!(orders_key.clone())]);
+                                vec![json!([orders_key, Value::Null])]
+                            };
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": [{
+                                    "block": FINALIZED_HASH,
+                                    "changes": changes,
+                                }],
+                            })
+                        }
+                        _ => panic!("unexpected complete finalized account request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_account_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            subaccount,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.runtime_identity().spec_version, 371);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(evidence.subaccount(), subaccount);
+        assert_eq!(evidence.timestamp_ms(), timestamp_ms);
+        assert_eq!(evidence.margin().checkpoint(), evidence.checkpoint());
+        assert_eq!(evidence.lending().checkpoint(), evidence.checkpoint());
+        assert_eq!(
+            evidence.perp_positions().checkpoint(),
+            evidence.checkpoint()
+        );
+        assert_eq!(evidence.perp_orders().checkpoint(), evidence.checkpoint());
+        assert_eq!(evidence.margin().initial().total_collateral(), 1_000_000);
+        assert_eq!(
+            evidence.margin().maintenance().total_margin_required(),
+            100_000
+        );
+        assert!(evidence.lending().positions().is_empty());
+        assert_eq!(evidence.perp_positions().runtime_max_positions(), 8);
+        assert!(evidence.perp_positions().positions().is_empty());
+        assert!(evidence.perp_orders().orders().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 11);
+    }
+
+    #[tokio::test]
+    async fn rejects_finalized_account_evidence_without_every_capability_before_rpc() {
+        let endpoints = validated_endpoints("http://127.0.0.1:1");
+        for missing in [
+            "state_call",
+            "eth_call",
+            "state_getStorage",
+            "state_queryStorageAt",
+        ] {
+            let mut capabilities = validated_capabilities(&endpoints);
+            capabilities.watch.methods.remove(missing);
+
+            assert!(matches!(
+                observe_finalized_account_evidence(
+                    &DeepXEnvironment::Testnet,
+                    &endpoints,
+                    &capabilities,
+                    [0x11; 20],
+                )
+                .await,
+                Err(DeepXFinalizedAccountError::RpcCapabilitiesMismatch),
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_finalized_perp_orders_without_query_storage_capability_before_rpc() {
+        let endpoints = validated_endpoints("http://127.0.0.1:1");
+        let mut capabilities = validated_capabilities(&endpoints);
+        capabilities.watch.methods.remove("state_queryStorageAt");
+
+        assert!(matches!(
+            observe_finalized_perp_orders_evidence(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &capabilities,
+                [0x11; 20],
+            )
+            .await,
+            Err(DeepXFinalizedPerpOrdersError::RpcCapabilitiesMismatch),
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_finalized_perp_positions_without_query_storage_capability_before_rpc() {
+        let endpoints = validated_endpoints("http://127.0.0.1:1");
+        let mut capabilities = validated_capabilities(&endpoints);
+        capabilities.watch.methods.remove("state_queryStorageAt");
+
+        assert!(matches!(
+            observe_finalized_perp_positions_evidence(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &capabilities,
+                [0x11; 20],
+            )
+            .await,
+            Err(DeepXFinalizedPerpPositionsError::RpcCapabilitiesMismatch),
+        ));
+    }
+
+    #[tokio::test]
     async fn observes_and_applies_snapshot_from_validated_watch_endpoint() {
         let calls = Arc::new(AtomicUsize::new(0));
         let watch_url = spawn_runtime_snapshot_server(366, Arc::clone(&calls)).await;
@@ -1228,6 +5910,98 @@ mod tests {
             service.acquire().unwrap().snapshot().identity(),
             evidence.runtime_identity()
         );
+    }
+
+    #[tokio::test]
+    async fn observes_timestamp_from_exact_finalized_historical_block() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let timestamp_ms = 1_700_000_000_456u64;
+        let block_hash = format!("0x{}", "11".repeat(32));
+        let finalized_hash = format!("0x{}", "22".repeat(32));
+        let router = Router::new().route(
+            "/",
+            post({
+                let calls = Arc::clone(&calls);
+                let block_hash = block_hash.clone();
+                let finalized_hash = finalized_hash.clone();
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let block_hash = block_hash.clone();
+                    let finalized_hash = finalized_hash.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        let result = match request["method"].as_str().unwrap() {
+                            "chain_getFinalizedHead" => json!(finalized_hash),
+                            "chain_getHeader" => {
+                                let number = if request["params"][0] == finalized_hash {
+                                    "0x2a"
+                                } else {
+                                    "0x29"
+                                };
+                                json!({"number": number})
+                            }
+                            "chain_getBlockHash" => {
+                                assert_eq!(request["params"][0], 41);
+                                json!(block_hash)
+                            }
+                            "state_getStorage" => {
+                                assert_eq!(request["params"][1], block_hash);
+                                json!(format!("0x{}", hex::encode(timestamp_ms.to_le_bytes())))
+                            }
+                            method => panic!("unexpected RPC method {method}"),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                    }
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let observed = observe_finalized_block_timestamp(&endpoints, &capabilities, 41)
+            .await
+            .unwrap();
+
+        assert_eq!(observed, timestamp_ms);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn rejects_historical_timestamp_above_finalized_head_before_block_lookup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let calls = Arc::clone(&calls);
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        let result = match request["method"].as_str().unwrap() {
+                            "chain_getFinalizedHead" => json!(format!("0x{}", "22".repeat(32))),
+                            "chain_getHeader" => json!({"number": "0x2a"}),
+                            method => panic!("unexpected RPC method {method}"),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                    }
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        assert!(matches!(
+            observe_finalized_block_timestamp(&endpoints, &capabilities, 43).await,
+            Err(DeepXFinalizedBlockTimeError::NotFinalized {
+                requested: 43,
+                finalized: 42,
+            }),
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

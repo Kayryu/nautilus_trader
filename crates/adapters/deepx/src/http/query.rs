@@ -214,6 +214,85 @@ pub struct DeepXLiquidationRecordsRequest {
     pub page_size: Option<u32>,
 }
 
+/// Request for one page of wallet- or subaccount-scoped ADL execution records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXLiquidationAdlRecordsRequest {
+    /// Exact 20-byte hex subaccount address, mutually exclusive with `wallet`.
+    pub subaccount: Option<String>,
+    /// Exact 20-byte hex wallet address, mutually exclusive with `subaccount`.
+    pub wallet: Option<String>,
+    /// Optional venue status filter.
+    pub status: Option<String>,
+    /// Optional exact reason filter.
+    pub reason: Option<String>,
+    /// Optional ADL type filter.
+    pub adl_type: Option<String>,
+    /// Optional 32-byte submitted transaction hash filter.
+    pub tx_hash: Option<String>,
+    /// Optional 32-byte submitted extrinsic hash filter.
+    pub extrinsic_hash: Option<String>,
+    /// Optional inclusive lower trigger block.
+    pub trigger_block_from: Option<u64>,
+    /// Optional inclusive upper trigger block.
+    pub trigger_block_to: Option<u64>,
+    /// Optional inclusive lower creation time in Unix milliseconds.
+    pub start_ms: Option<u64>,
+    /// Optional inclusive upper creation time in Unix milliseconds.
+    pub end_ms: Option<u64>,
+    /// Opaque venue cursor returned by the preceding page.
+    pub cursor: Option<String>,
+    /// Requested venue response order.
+    pub sort: DeepXAccountSortOrder,
+    /// Optional number of records requested from the venue.
+    pub page_size: Option<u32>,
+}
+
+/// Request for one page of raw liquidation executor records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXLiquidationExecutionRecordsRequest {
+    /// Exact subaccount address, mutually exclusive with `wallet`.
+    pub subaccount: Option<String>,
+    /// Exact wallet address, mutually exclusive with `subaccount`.
+    pub wallet: Option<String>,
+    /// Optional execution status filter.
+    pub status: Option<String>,
+    /// Optional exact execution reason filter.
+    pub reason: Option<String>,
+    /// Optional 32-byte submitted transaction hash filter.
+    pub tx_hash: Option<String>,
+    /// Optional 32-byte submitted extrinsic hash filter.
+    pub extrinsic_hash: Option<String>,
+    /// Optional inclusive lower trigger block.
+    pub trigger_block_from: Option<u64>,
+    /// Optional inclusive upper trigger block.
+    pub trigger_block_to: Option<u64>,
+    /// Optional inclusive lower creation time in Unix milliseconds.
+    pub start_ms: Option<u64>,
+    /// Optional inclusive upper creation time in Unix milliseconds.
+    pub end_ms: Option<u64>,
+    /// Opaque venue cursor returned by the preceding page.
+    pub cursor: Option<String>,
+    /// Requested venue response order.
+    pub sort: DeepXAccountSortOrder,
+    /// Optional number of records requested from the venue.
+    pub page_size: Option<u32>,
+}
+
+/// Request for raw spot ADL candidate data for one target subaccount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXSpotAdlCandidatesRequest {
+    /// Exact 20-byte hex target subaccount address.
+    pub target_subaccount: String,
+    /// Asset symbol used to cover the target liability.
+    pub asset: String,
+    /// Liability asset symbol.
+    pub liability: String,
+    /// Minimum cover amount as an unsigned raw integer string, without a financial scale.
+    pub min_cover_amount: String,
+    /// Optional maximum number of candidates requested.
+    pub limit: Option<u32>,
+}
+
 /// Request for the current liquidation price of one subaccount and perpetual market.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXPerpLiquidationPriceRequest {
@@ -255,6 +334,19 @@ pub struct DeepXPerpHistoryOrdersRequest {
     pub page_size: Option<u32>,
     /// Requested venue response order.
     pub sort: DeepXAccountSortOrder,
+}
+
+/// Request for one page of orders associated with a perpetual position lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXPerpPositionOrdersRequest {
+    /// Exact 20-byte hex subaccount address.
+    pub subaccount: String,
+    /// Venue position lifecycle ID.
+    pub position_id: u64,
+    /// Opaque venue cursor returned by the preceding page.
+    pub cursor: Option<String>,
+    /// Number of records requested from the venue, at most 100.
+    pub page_size: Option<u32>,
 }
 
 /// Request for one page of active Spot orders owned by a subaccount.
@@ -774,6 +866,218 @@ impl DeepXLiquidationRecordsRequest {
     }
 }
 
+impl DeepXLiquidationAdlRecordsRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let account = match (&self.subaccount, &self.wallet) {
+            (Some(subaccount), None) => subaccount,
+            (None, Some(wallet)) => wallet,
+            _ => {
+                return Err(DeepXHttpError::InvalidRequest(
+                    "liquidation-adl-records requires exactly one subaccount or wallet".to_string(),
+                ));
+            }
+        };
+        validate_account_id("liquidation-adl-records", account)?;
+
+        for (name, value) in [
+            ("status", self.status.as_deref()),
+            ("reason", self.reason.as_deref()),
+            ("adl_type", self.adl_type.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(DeepXHttpError::InvalidRequest(format!(
+                    "liquidation-adl-records {name} must not be empty"
+                )));
+            }
+        }
+        for (name, hash) in [
+            ("tx_hash", self.tx_hash.as_deref()),
+            ("extrinsic_hash", self.extrinsic_hash.as_deref()),
+        ] {
+            if hash.is_some_and(|hash| {
+                hash.len() != 66
+                    || !hash.starts_with("0x")
+                    || !hash.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+            }) {
+                return Err(DeepXHttpError::InvalidRequest(format!(
+                    "liquidation-adl-records {name} must be a 32-byte hex hash"
+                )));
+            }
+        }
+        if self
+            .trigger_block_from
+            .zip(self.trigger_block_to)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-adl-records trigger_block_from must not exceed trigger_block_to"
+                    .to_string(),
+            ));
+        }
+        for bound in [self.start_ms, self.end_ms].into_iter().flatten() {
+            validate_millisecond("liquidation-adl-records", bound)?;
+        }
+        if self
+            .start_ms
+            .zip(self.end_ms)
+            .is_some_and(|(start, end)| start > end)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-adl-records start_ms must not exceed end_ms".to_string(),
+            ));
+        }
+        if self.page_size == Some(0) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-adl-records page_size must be greater than zero".to_string(),
+            ));
+        }
+        validate_cursor("liquidation-adl-records", self.cursor.as_deref())
+    }
+
+    pub(crate) fn as_query(&self) -> DeepXLiquidationAdlRecordsQuery<'_> {
+        DeepXLiquidationAdlRecordsQuery {
+            wallet: self.wallet.as_deref(),
+            subaccount: self.subaccount.as_deref(),
+            status: self.status.as_deref(),
+            reason: self.reason.as_deref(),
+            adl_type: self.adl_type.as_deref(),
+            tx_hash: self.tx_hash.as_deref(),
+            extrinsic_hash: self.extrinsic_hash.as_deref(),
+            trigger_block_from: self.trigger_block_from,
+            trigger_block_to: self.trigger_block_to,
+            start: self.start_ms,
+            end: self.end_ms,
+            cursor: self.cursor.as_deref(),
+            sort: self.sort,
+            page_size: self.page_size,
+        }
+    }
+}
+
+impl DeepXLiquidationExecutionRecordsRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let account = match (&self.subaccount, &self.wallet) {
+            (Some(subaccount), None) => subaccount,
+            (None, Some(wallet)) => wallet,
+            _ => {
+                return Err(DeepXHttpError::InvalidRequest(
+                    "liquidation-execution-records requires exactly one subaccount or wallet"
+                        .to_string(),
+                ));
+            }
+        };
+        validate_account_id("liquidation-execution-records", account)?;
+        for (name, value) in [
+            ("status", self.status.as_deref()),
+            ("reason", self.reason.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(DeepXHttpError::InvalidRequest(format!(
+                    "liquidation-execution-records {name} must not be empty"
+                )));
+            }
+        }
+        for (name, hash) in [
+            ("tx_hash", self.tx_hash.as_deref()),
+            ("extrinsic_hash", self.extrinsic_hash.as_deref()),
+        ] {
+            if hash.is_some_and(|hash| {
+                hash.len() != 66
+                    || !hash.starts_with("0x")
+                    || !hash.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+            }) {
+                return Err(DeepXHttpError::InvalidRequest(format!(
+                    "liquidation-execution-records {name} must be a 32-byte hex hash"
+                )));
+            }
+        }
+        if self
+            .trigger_block_from
+            .zip(self.trigger_block_to)
+            .is_some_and(|(from, to)| from > to)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-execution-records trigger_block_from must not exceed trigger_block_to"
+                    .to_string(),
+            ));
+        }
+        for bound in [self.start_ms, self.end_ms].into_iter().flatten() {
+            validate_millisecond("liquidation-execution-records", bound)?;
+        }
+        if self
+            .start_ms
+            .zip(self.end_ms)
+            .is_some_and(|(start, end)| start > end)
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-execution-records start_ms must not exceed end_ms".to_string(),
+            ));
+        }
+        if self.page_size.is_some_and(|size| size == 0 || size > 100) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation-execution-records page_size must be from 1 through 100".to_string(),
+            ));
+        }
+        validate_cursor("liquidation-execution-records", self.cursor.as_deref())
+    }
+
+    pub(crate) fn as_query(&self) -> DeepXLiquidationExecutionRecordsQuery<'_> {
+        DeepXLiquidationExecutionRecordsQuery {
+            wallet: self.wallet.as_deref(),
+            subaccount: self.subaccount.as_deref(),
+            status: self.status.as_deref(),
+            reason: self.reason.as_deref(),
+            tx_hash: self.tx_hash.as_deref(),
+            extrinsic_hash: self.extrinsic_hash.as_deref(),
+            trigger_block_from: self.trigger_block_from,
+            trigger_block_to: self.trigger_block_to,
+            start: self.start_ms,
+            end: self.end_ms,
+            cursor: self.cursor.as_deref(),
+            sort: self.sort,
+            page_size: self.page_size,
+        }
+    }
+}
+
+impl DeepXSpotAdlCandidatesRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_account_id("spot-adl-candidates", &self.target_subaccount)?;
+        if self.asset.trim().is_empty() || self.liability.trim().is_empty() {
+            return Err(DeepXHttpError::InvalidRequest(
+                "spot-adl-candidates requires nonempty asset and liability symbols".to_string(),
+            ));
+        }
+        if self.min_cover_amount.is_empty()
+            || !self
+                .min_cover_amount
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return Err(DeepXHttpError::InvalidRequest(
+                "spot-adl-candidates min_cover_amount must be an unsigned raw integer string"
+                    .to_string(),
+            ));
+        }
+        if self.limit == Some(0) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "spot-adl-candidates limit must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn as_query(&self) -> DeepXSpotAdlCandidatesQuery<'_> {
+        DeepXSpotAdlCandidatesQuery {
+            target_subaccount: &self.target_subaccount,
+            asset: &self.asset,
+            liability: &self.liability,
+            min_cover_amount: &self.min_cover_amount,
+            limit: self.limit,
+        }
+    }
+}
+
 impl DeepXPerpLiquidationPriceRequest {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_account_page_request(
@@ -826,6 +1130,38 @@ impl DeepXPerpHistoryOrdersRequest {
             market_id: self.market_id,
             cursor: self.cursor.as_deref(),
             sort: self.sort,
+            page_size: self.page_size,
+        }
+    }
+}
+
+impl DeepXPerpPositionOrdersRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_account_page_request(
+            "perp-position-orders",
+            &self.subaccount,
+            None,
+            self.cursor.as_deref(),
+            self.page_size,
+        )?;
+        if self.position_id == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp-position-orders position_id must be greater than zero".to_string(),
+            ));
+        }
+        if self.page_size.is_some_and(|page_size| page_size > 100) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp-position-orders page_size must not exceed 100".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn as_query(&self) -> DeepXPerpPositionOrdersQuery<'_> {
+        DeepXPerpPositionOrdersQuery {
+            user: &self.subaccount,
+            position_id: self.position_id,
+            cursor: self.cursor.as_deref(),
             page_size: self.page_size,
         }
     }
@@ -2521,6 +2857,79 @@ pub(crate) struct DeepXLiquidationRecordsQuery<'a> {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DeepXLiquidationAdlRecordsQuery<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subaccount: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adl_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extrinsic_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_block_from: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_block_to: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<&'a str>,
+    sort: DeepXAccountSortOrder,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeepXLiquidationExecutionRecordsQuery<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subaccount: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extrinsic_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_block_from: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_block_to: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<&'a str>,
+    sort: DeepXAccountSortOrder,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeepXSpotAdlCandidatesQuery<'a> {
+    target_subaccount: &'a str,
+    asset: &'a str,
+    liability: &'a str,
+    min_cover_amount: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DeepXPerpLiquidationPriceQuery<'a> {
     address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2538,6 +2947,17 @@ pub(crate) struct DeepXPerpHistoryOrdersQuery<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<&'a str>,
     sort: DeepXAccountSortOrder,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeepXPerpPositionOrdersQuery<'a> {
+    user: &'a str,
+    position_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page_size: Option<u32>,
 }

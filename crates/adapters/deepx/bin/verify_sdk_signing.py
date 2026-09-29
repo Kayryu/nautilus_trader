@@ -32,6 +32,7 @@ class OfflineSubstrate(SubstrateInterface):
         expected_hash = {
             366: "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37",
             369: "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
+            371: "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15",
         }.get(self.fixture_version["result"]["specVersion"])
         if (
             hashlib.sha256(metadata).hexdigest() != expected_hash
@@ -98,13 +99,20 @@ def load_sdk_builder(source_response: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sdk_contents_response", type=Path)
-    parser.add_argument("--spec-version", type=int, choices=(366, 369), default=366)
+    parser.add_argument(
+        "--spec-version", type=int, choices=(366, 369, 371), default=366
+    )
     args = parser.parse_args()
     global SNAPSHOT
     if args.spec_version == 369:
         SNAPSHOT = (
             FIXTURES
             / "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff"
+        )
+    elif args.spec_version == 371:
+        SNAPSHOT = (
+            FIXTURES
+            / "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda"
         )
     builder = load_sdk_builder(args.sdk_contents_response)
     source = (Path(__file__).resolve().parents[1] / "src/signing/mod.rs").read_text()
@@ -135,7 +143,151 @@ def main():
             },
             1_725_000_000_125,
         ),
+        (
+            "PerpMarket",
+            "place_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "market_id": 7,
+                    "is_long": True,
+                    "size": 1_000_000_000_000_000,
+                    "price": 2_499_050_000,
+                    "order_type": {"Limit": "IOC"},
+                    "take_profit": None,
+                    "stop_loss": None,
+                    "reduce_only": False,
+                    "post_only": "None",
+                }
+            },
+            1_725_000_000_125,
+        ),
+        (
+            "PerpMarket",
+            "place_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "market_id": 7,
+                    "is_long": True,
+                    "size": 1_000_000_000_000_000,
+                    "price": 0,
+                    "order_type": {"Market": None},
+                    "take_profit": None,
+                    "stop_loss": None,
+                    "reduce_only": False,
+                    "post_only": "None",
+                }
+            },
+            1_725_000_000_125,
+        ),
+        (
+            "PerpMarket",
+            "place_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "market_id": 7,
+                    "is_long": False,
+                    "size": 1_000_000_000_000_000,
+                    "price": 2_499_050_000,
+                    "order_type": {"Limit": "GTC"},
+                    "take_profit": None,
+                    "stop_loss": None,
+                    "reduce_only": True,
+                    "post_only": "MustPostOnly",
+                }
+            },
+            1_725_000_000_125,
+        ),
+        (
+            "PerpMarket",
+            "cancel_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "order_id": 1_725_000_000_001,
+                    "market_id": 7,
+                    "cancel_reason": "UserCanceled",
+                    "fast_cancel": False,
+                }
+            },
+            1_725_000_000_125,
+        ),
     ]
+    if args.spec_version == 371:
+        vectors.extend(
+            [
+                (
+                    "SpotMarket",
+                    "place_order",
+                    {
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "is_buy": True,
+                            "quote_amount": int.from_bytes(
+                                bytes([0x33]) * 32, "little"
+                            ),
+                            "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
+                            "order_type": {"Limit": "GTC"},
+                            "post_only": "None",
+                            "reduce_only": True,
+                        }
+                    },
+                    1_725_000_000_126,
+                ),
+                (
+                    "PerpMarket",
+                    "close_position",
+                    {
+                        "subaccount": "0x" + "11" * 20,
+                        "market_id": 7,
+                        "price": 123,
+                        "slippage": None,
+                    },
+                    1_725_000_000_127,
+                ),
+                (
+                    "SpotMarket",
+                    "cancel_order",
+                    {
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "order_id": 1_725_000_000_128,
+                            "is_buy": False,
+                            "cancel_reason": "UserCanceled",
+                            "fast_cancel": False,
+                        }
+                    },
+                    1_725_000_000_129,
+                ),
+                (
+                    "PerpMarket",
+                    "set_profit_and_loss_point",
+                    {
+                        "subaccount": "0x" + "11" * 20,
+                        "market_id": 7,
+                        "take_profit_point": 123,
+                        "stop_loss_point": 456,
+                    },
+                    1_725_000_000_130,
+                ),
+                (
+                    "Subaccount",
+                    "delete_subaccount",
+                    {"subaccount": "0x" + "11" * 20},
+                    1_725_000_000_131,
+                ),
+                (
+                    "Subaccount",
+                    "remove_delegate_account",
+                    {"delegate": "0x" + "22" * 20},
+                    1_725_000_000_132,
+                ),
+            ]
+        )
     for pallet, call, params, nonce in vectors:
         encoded = builder(
             substrate_ws="ws://offline.invalid",

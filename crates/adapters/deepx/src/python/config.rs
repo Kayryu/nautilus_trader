@@ -190,11 +190,13 @@ impl DeepXExecutionClientConfig {
         private_key = None,
         proxy_url = None,
         http_timeout_secs = None,
+        websocket_timeout_secs = None,
         execution_backend = None,
         recovery_blocks_per_range = None,
         timestamp_nonce_max_clock_drift_ms = None,
         postgres_cache_database_config = None,
         network = None,
+        fast_perp_cancel = None,
     ))]
     fn py_new(
         account_id: Option<AccountId>,
@@ -202,6 +204,7 @@ impl DeepXExecutionClientConfig {
         private_key: Option<String>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
+        websocket_timeout_secs: Option<u64>,
         execution_backend: Option<String>,
         recovery_blocks_per_range: Option<u64>,
         timestamp_nonce_max_clock_drift_ms: Option<u64>,
@@ -213,6 +216,7 @@ impl DeepXExecutionClientConfig {
         )]
         postgres_cache_database_config: Option<PostgresConnectOptions>,
         network: Option<DeepXNetworkConfig>,
+        fast_perp_cancel: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let execution_backend = match execution_backend {
@@ -231,11 +235,14 @@ impl DeepXExecutionClientConfig {
             private_key,
             proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            websocket_timeout_secs: websocket_timeout_secs
+                .unwrap_or(defaults.websocket_timeout_secs),
             execution_backend,
             recovery_blocks_per_range: recovery_blocks_per_range
                 .unwrap_or(defaults.recovery_blocks_per_range),
             timestamp_nonce_max_clock_drift_ms: timestamp_nonce_max_clock_drift_ms
                 .unwrap_or(defaults.timestamp_nonce_max_clock_drift_ms),
+            fast_perp_cancel: fast_perp_cancel.unwrap_or(defaults.fast_perp_cancel),
             postgres_cache_database_config,
             network: network.unwrap_or(defaults.network),
         };
@@ -275,8 +282,10 @@ nautilus_core::impl_pyo3_config_getters!(DeepXExecutionClientConfig {
     account_id: AccountId,
     subaccount_id: Option<String>,
     http_timeout_secs: u64,
+    websocket_timeout_secs: u64,
     recovery_blocks_per_range: u64,
     timestamp_nonce_max_clock_drift_ms: u64,
+    fast_perp_cancel: bool,
     network: DeepXNetworkConfig,
 });
 
@@ -306,6 +315,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap_err();
 
@@ -321,7 +332,9 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("automatic".to_string()),
+            None,
             None,
             None,
             None,
@@ -350,6 +363,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(PostgresConnectOptions::new(
                 "localhost".to_string(),
                 5432,
@@ -357,6 +371,7 @@ mod tests {
                 postgres_password.to_string(),
                 "nautilus".to_string(),
             )),
+            None,
             None,
         )
         .unwrap();

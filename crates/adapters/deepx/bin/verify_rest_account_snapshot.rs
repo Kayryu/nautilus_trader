@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let snapshot = client.get_wallet_account_snapshot(&wallet).await?;
     let stats = client.get_user_stats(&wallet).await?;
+    let invitation = client.get_invitation_status(&wallet).await?;
     let quota = client.get_quota_summary(&wallet).await?;
     let delegates = client.get_delegate_accounts(&wallet).await?;
     anyhow::ensure!(
@@ -57,6 +58,10 @@ async fn main() -> anyhow::Result<()> {
         snapshot.subaccounts.len(),
         stats.number_of_sub_accounts_created,
         stats.if_staked_quote_asset_amount,
+    );
+    println!(
+        "DeepX wallet invitation status verified wallet={} is_bound={}",
+        invitation.address, invitation.is_bound,
     );
     println!(
         "DeepX wallet quota verified owner={} subaccounts={} spot_volume_usd={} perp_volume_usd={} total_volume_usd={} earned={} granted={} reserved={} pending={}",

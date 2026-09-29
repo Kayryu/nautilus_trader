@@ -39,7 +39,11 @@ pub mod spot;
 pub mod transaction;
 pub mod websocket;
 
-pub use account::{DeepXAccountOwnershipError, DeepXAccountOwnershipProof};
+pub use account::{
+    DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedFlatAccountBalances,
+    DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_finalized_flat_account_balances,
+    map_finalized_margin_balance,
+};
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{
     DeepXDataClientConfig, DeepXExecutionBackend, DeepXExecutionClientConfig,
@@ -52,37 +56,62 @@ pub use execution::{
     DeepXAccountOwnershipStartupError, DeepXAccountStreamReadError, DeepXAccountStreamStartupError,
     DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
     DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXFinalizedPerpOrderEvidence,
-    DeepXFinalizedPerpOrderEvidenceError, DeepXMassReconciliationError, DeepXNonceRestorationError,
-    DeepXOrderContextError, DeepXOrderContextRestorationError, DeepXPerpOrderEvidence,
-    DeepXPerpOrderEvidenceError, DeepXPerpOrderMappingError, DeepXPerpPlacePreparationError,
-    DeepXRestoredOrderContext, DeepXRuntimeStartupError, DeepXTradeDedupError,
-    DeepXTransactionRuntimeError,
+    DeepXFinalizedPerpOrderEvidenceError, DeepXInstrumentStartupError,
+    DeepXMassReconciliationError, DeepXNonceRestorationError, DeepXOrderContextError,
+    DeepXOrderContextRestorationError, DeepXPerpOrderEvidence, DeepXPerpOrderEvidenceError,
+    DeepXPerpOrderMappingError, DeepXPerpPlacePreparationError, DeepXRestoredOrderContext,
+    DeepXRuntimeStartupError, DeepXTradeDedupError, DeepXTransactionRuntimeError,
 };
 pub use factories::{DeepXDataClientFactory, DeepXExecutionClientFactory};
-pub use instruments::parse_perpetual_instrument;
+pub use instruments::{parse_perpetual_instrument, parse_spot_instrument};
 pub use providers::{
     DeepXInstrumentProvider, DeepXMarketMetadata, DeepXMarketProvider,
     DeepXSpotInstrumentUnsupported,
 };
 pub use rpc::{
-    DeepXAppliedRuntimeSnapshot, DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence,
-    DeepXFinalizedCheckpoint, DeepXObservedRuntimeSnapshot, DeepXRpcEndpointIdentityError,
+    DeepXAppliedRuntimeSnapshot, DeepXFinalizedAccountError, DeepXFinalizedAccountEvidence,
+    DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence, DeepXFinalizedCheckpoint,
+    DeepXFinalizedLendingError, DeepXFinalizedLendingEvidence, DeepXFinalizedMarginError,
+    DeepXFinalizedMarginEvidence, DeepXFinalizedPerpOrderStorageBatchEvidence,
+    DeepXFinalizedPerpOrderStorageEvidence, DeepXFinalizedPerpOrdersError,
+    DeepXFinalizedPerpOrdersEvidence, DeepXFinalizedPerpPositionsError,
+    DeepXFinalizedPerpPositionsEvidence, DeepXFinalizedSpotMarketSpecError,
+    DeepXFinalizedSpotMarketSpecEvidence, DeepXFinalizedSpotOrderStorageBatchEvidence,
+    DeepXFinalizedSpotOrdersError, DeepXLendingPoolEvidence, DeepXLendingPoolStatus,
+    DeepXLendingPositionEvidence, DeepXMarginDirection, DeepXMarginRequirement,
+    DeepXObservedReadOnlyRuntimeSnapshot, DeepXObservedRuntimeSnapshot,
+    DeepXPerpOrderStorageEvidence, DeepXPerpPositionStorageEvidence, DeepXRpcEndpointIdentityError,
     DeepXRpcIdentityError, DeepXRpcMethodCapabilities, DeepXRpcMethodCapabilitiesError,
     DeepXRpcMethodCapabilityError, DeepXRuntimeSnapshotObservationError,
-    DeepXRuntimeSnapshotRefreshError, DeepXValidatedRpcMethodCapabilities,
-    observe_and_apply_approved_finalized_runtime_snapshot, observe_and_apply_finalized_chain_time,
+    DeepXRuntimeSnapshotRefreshError, DeepXSpotOrderStorageEvidence, DeepXStoredOrderStatus,
+    DeepXStoredPerpOrderType, DeepXStoredPostOnlyParam, DeepXStoredSpotOrderType,
+    DeepXStoredTimeInForce, DeepXValidatedRpcMethodCapabilities,
+    observe_and_apply_approved_finalized_runtime_snapshot,
+    observe_and_apply_finalized_account_evidence, observe_and_apply_finalized_chain_time,
+    observe_and_apply_finalized_lending_evidence, observe_and_apply_finalized_margin_evidence,
+    observe_and_apply_finalized_perp_order_evidence,
+    observe_and_apply_finalized_perp_orders_by_id_evidence,
+    observe_and_apply_finalized_perp_orders_evidence,
+    observe_and_apply_finalized_perp_positions_evidence,
+    observe_and_apply_finalized_spot_orders_by_id_evidence,
     observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-    observe_approved_finalized_runtime_snapshot, observe_rpc_endpoint_identity,
+    observe_approved_finalized_read_only_runtime_snapshot,
+    observe_approved_finalized_runtime_snapshot, observe_finalized_account_evidence,
+    observe_finalized_lending_evidence, observe_finalized_margin_evidence,
+    observe_finalized_perp_order_evidence, observe_finalized_perp_orders_by_id_evidence,
+    observe_finalized_perp_orders_evidence, observe_finalized_perp_positions_evidence,
+    observe_finalized_spot_market_spec_batch, observe_finalized_spot_market_spec_evidence,
+    observe_finalized_spot_orders_by_id_evidence, observe_rpc_endpoint_identity,
     observe_rpc_method_capabilities,
 };
 pub use signing::{
-    ApprovedRuntimeIdentity, DeepXPerpCancelParams, DeepXRuntimeChangeDecision, DeepXRuntimeConfig,
-    DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
-    DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
-    DeepXRuntimeSnapshotUpdate, DeepXRuntimeVariantIdentity, DeepXSpotCancelParams,
-    DeepXSpotOrderType, DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
-    SnapshotError, sign_dynamic_pallet_call, sign_no_op, sign_perp_cancel, sign_spot_cancel,
-    sign_spot_place_order,
+    ApprovedRuntimeIdentity, DeepXPerpCancelParams, DeepXReadOnlyRuntimeSnapshot,
+    DeepXRuntimeChangeDecision, DeepXRuntimeConfig, DeepXRuntimeInterfaceCatalog,
+    DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface, DeepXRuntimeSnapshotPermit,
+    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate,
+    DeepXRuntimeVariantIdentity, DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams,
+    RuntimeSnapshot, SignedPalletExtrinsic, SigningError, SnapshotError, sign_dynamic_pallet_call,
+    sign_no_op, sign_perp_cancel, sign_spot_cancel, sign_spot_place_order,
 };
 pub use spot::{DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError};
 pub use transaction::{
@@ -125,16 +154,19 @@ pub use transaction::{
     collect_finalized_spot_place_recovery_scan, commit_framework_order_event_staging,
     commit_initial_submission_acceptance, commit_reconciliation_observation,
     commit_recovery_decision, commit_reorganization_decision,
-    materialize_perp_place_framework_order_events, observe_and_commit_finality,
+    materialize_perp_framework_order_events, observe_and_commit_finality,
     observe_and_commit_reorganization, observe_canonical_block, observe_finality,
     observe_finalized_transaction_location, observe_reorganization, observe_submission_pool,
-    plan_missed_block_scan, prepare_framework_perp_place_reservation, prepare_initial_submission,
-    prepare_signed_perp_cancel_transaction, prepare_signed_perp_close_transaction,
-    prepare_signed_spot_cancel_transaction, prepare_signed_spot_place_transaction,
-    prepare_signed_transaction, prepare_timestamp_reservation, reconcile_not_included_checkpoint,
+    plan_missed_block_scan, prepare_framework_perp_cancel_reservation,
+    prepare_framework_perp_place_reservation, prepare_initial_submission,
+    prepare_perp_cancel_reservation, prepare_signed_perp_cancel_transaction,
+    prepare_signed_perp_close_transaction, prepare_signed_spot_cancel_transaction,
+    prepare_signed_spot_place_transaction, prepare_signed_transaction,
+    prepare_timestamp_reservation, reconcile_not_included_checkpoint,
     reconcile_not_included_checkpoint_with_observer, reconcile_submission_pool,
-    restore_timestamp_nonce_allocator, stage_perp_place_framework_order_events,
-    submit_direct_pallet_once_classified, submit_once_preserving_context,
-    submit_with_bounded_ambiguity_retry, verify_perp_cancel_business_event, verify_signer_lease,
-    verify_spot_cancel_inclusion_events, verify_spot_place_inclusion_events,
+    reconcile_submitted_perp_cancel_checkpoint, restore_timestamp_nonce_allocator,
+    stage_perp_framework_order_events, submit_direct_pallet_once_classified,
+    submit_once_preserving_context, submit_with_bounded_ambiguity_retry,
+    verify_perp_cancel_business_event, verify_signer_lease, verify_spot_cancel_inclusion_events,
+    verify_spot_place_inclusion_events,
 };

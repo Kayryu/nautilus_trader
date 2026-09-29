@@ -1069,10 +1069,9 @@ impl NautilusKernel {
     ///
     /// Must be called after data clients are connected and instrument events
     /// have been drained into the cache, so execution clients can load instruments.
-    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     pub async fn connect_exec_clients(&mut self) {
         log::info!("Connecting execution clients...");
-        self.exec_engine.borrow_mut().connect().await;
+        ExecutionEngine::connect_detached(&self.exec_engine).await;
     }
 
     /// Disconnects all engine clients.
