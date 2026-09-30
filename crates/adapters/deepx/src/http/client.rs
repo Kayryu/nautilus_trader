@@ -6654,7 +6654,12 @@ pub(crate) fn validate_subaccount_balances(
                 format!("asset {index} has an empty or duplicate symbol"),
             ));
         }
+        let quantity_exceeds_precision =
+            [asset.balance, asset.balance_borrowed, asset.borrow_interest]
+                .into_iter()
+                .any(|amount| amount.normalize().scale() > u32::from(asset.decimals));
         if asset.decimals > 28
+            || quantity_exceeds_precision
             || asset.price.is_sign_negative()
             || asset.balance.is_sign_negative()
             || asset.balance_usd.is_sign_negative()
@@ -6665,7 +6670,7 @@ pub(crate) fn validate_subaccount_balances(
         {
             return Err(invalid_account_state_response(
                 "subaccount balances",
-                format!("asset {index} has invalid precision or financial values"),
+                format!("asset {index} has invalid token precision or financial values"),
             ));
         }
     }

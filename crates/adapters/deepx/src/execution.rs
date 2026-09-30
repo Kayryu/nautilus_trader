@@ -60,8 +60,9 @@ use thiserror::Error;
 
 use crate::{
     account::{
-        DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFlatAccountBalanceError,
-        DeepXMarginBalanceError, map_finalized_flat_account_balances, map_finalized_margin_balance,
+        DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedMarginBalance,
+        DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_finalized_flat_account_balances,
+        map_finalized_margin_balance_with_evidence,
     },
     common::{
         DeepXEnvironment, DeepXPrivateKey,
@@ -106,32 +107,34 @@ use crate::{
         observe_finalized_timestamp_at_checkpoint,
     },
     signing::{
-        DeepXPerpCancelParams, DeepXPerpOrderType, DeepXPerpPlaceParams, DeepXPostOnlyParam,
-        DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXSpotCancelParams,
-        DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce, RuntimeSnapshot, SigningError,
-        derive_signer_account_id,
+        DeepXPerpCancelParams, DeepXPerpModifyParams, DeepXPerpOrderType, DeepXPerpPlaceParams,
+        DeepXPostOnlyParam, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
+        DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce,
+        RuntimeSnapshot, SigningError, derive_signer_account_id,
     },
     transaction::{
         DeepXCommittedFrameworkOrderOutbox, DeepXCommittedObservation, DeepXDirectRuntimeIdentity,
         DeepXDurableRecoveryObserver, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
         DeepXFinalizedTransactionLocation, DeepXFrameworkOrderContext,
         DeepXFrameworkOrderEventMaterializationError, DeepXFrameworkOrderOutboxCommitError,
-        DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpPlaceCallVerifier,
-        DeepXPerpProfitAndLossPointCallVerifier, DeepXPoolReconciliationCommitError,
-        DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXPreparedReservation,
-        DeepXPreparedSignedTransaction, DeepXPreparedSubmission, DeepXReorganizationCommitError,
-        DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-        DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
-        DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError,
-        DeepXSubmissionAttemptOutcome, DeepXSubmissionFailure, DeepXSubmissionPreparationError,
-        DeepXSubmissionScanCheckpoint, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
-        DeepXTransactionOperation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
-        DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
-        DeepXTransactionWatchError, commit_framework_order_event_acknowledgement,
-        commit_framework_order_event_staging, commit_initial_submission_acceptance,
-        load_verified_committed_for_signer, materialize_perp_framework_order_events,
-        observe_and_commit_finality, observe_and_commit_reorganization,
+        DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpModifyCallVerifier,
+        DeepXPerpPlaceCallVerifier, DeepXPerpProfitAndLossPointCallVerifier,
+        DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
+        DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
+        DeepXPreparedSubmission, DeepXReorganizationCommitError, DeepXReservationPreparationError,
+        DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+        DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier,
+        DeepXSubmissionAcceptanceCommitError, DeepXSubmissionAttemptOutcome,
+        DeepXSubmissionFailure, DeepXSubmissionPreparationError, DeepXSubmissionScanCheckpoint,
+        DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTransactionOperation,
+        DeepXTransactionPersistenceError, DeepXTransactionRecord, DeepXTransactionRecoveryAction,
+        DeepXTransactionState, DeepXTransactionStore, DeepXTransactionWatchError,
+        commit_framework_order_event_acknowledgement, commit_framework_order_event_staging,
+        commit_initial_submission_acceptance, load_verified_committed_for_signer,
+        materialize_perp_framework_order_events, observe_and_commit_finality,
+        observe_and_commit_reorganization,
         prepare_framework_perp_cancel_reservation as prepare_durable_framework_perp_cancel_reservation,
+        prepare_framework_perp_modify_reservation as prepare_durable_framework_perp_modify_reservation,
         prepare_framework_perp_place_reservation as prepare_durable_framework_perp_place_reservation,
         prepare_framework_spot_cancel_reservation as prepare_durable_framework_spot_cancel_reservation,
         prepare_framework_spot_place_reservation as prepare_durable_framework_spot_place_reservation,
@@ -141,9 +144,9 @@ use crate::{
         prepare_signed_perp_place_transaction as prepare_durable_signed_perp_place_transaction,
         reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
         reconcile_submission_pool, reconcile_submitted_perp_cancel_checkpoint,
-        reconcile_submitted_perp_place_checkpoint, reconcile_submitted_spot_cancel_checkpoint,
-        reconcile_submitted_spot_place_checkpoint, restore_timestamp_nonce_allocator,
-        submit_once_preserving_context,
+        reconcile_submitted_perp_modify_checkpoint, reconcile_submitted_perp_place_checkpoint,
+        reconcile_submitted_spot_cancel_checkpoint, reconcile_submitted_spot_place_checkpoint,
+        restore_timestamp_nonce_allocator, submit_once_preserving_context,
     },
     websocket::{
         DeepXWsAccountConnection, DeepXWsConfirmedAccountSubscription,
@@ -903,6 +906,9 @@ pub enum DeepXMassReconciliationError {
         /// Stable pending event ID.
         event_id: UUID4,
     },
+    /// A finalized modification could not restore its replacement order binding.
+    #[error("DeepX perpetual modification order binding could not be restored: {0}")]
+    ModifyOrderBinding(String),
     /// A durable transaction still requires recovery or operator action.
     #[error("DeepX transaction {client_order_id} still requires startup action {action:?}")]
     UnresolvedTransaction {
@@ -1048,6 +1054,24 @@ pub enum DeepXPerpOrderMappingError {
     /// The command envelope and its immutable order event disagree.
     #[error("DeepX submit-order command identity does not match its initialized order")]
     CommandIdentityMismatch,
+    /// A modify command does not identify the currently cached open order.
+    #[error("DeepX modify command does not match the cached open order")]
+    ModifyOrderIdentityMismatch,
+    /// The target order has no venue ID required by the transactional cancel leg.
+    #[error("DeepX modify command requires the exact venue order ID")]
+    MissingModifyVenueOrderId,
+    /// The order has already completed or is not in an amendable state.
+    #[error("DeepX order is not open and cannot be modified")]
+    OrderNotModifiable,
+    /// The requested change contains fields without a proven runtime mapping.
+    #[error("DeepX modify command contains unsupported parameters")]
+    UnsupportedModifyFields,
+    /// A modified total quantity cannot be less than the already-filled amount.
+    #[error("DeepX modified quantity is less than or equal to the already-filled quantity")]
+    ModifiedQuantityNotAboveFilled,
+    /// The requested quantity and price do not change the current order terms.
+    #[error("DeepX modify command does not change the current order terms")]
+    ModifyHasNoChanges,
     /// The order belongs to an instrument absent from the immutable perpetual catalog.
     #[error("DeepX submit-order instrument is not a validated perpetual market")]
     UnknownInstrument,
@@ -1361,6 +1385,48 @@ fn framework_order_context_from_cancel_order(
     )
 }
 
+fn framework_order_context_from_modify_order(
+    cmd: &ModifyOrder,
+    order: &OrderAny,
+    account_id: AccountId,
+    venue_order_id: u64,
+    quantity: Quantity,
+    price: Price,
+) -> DeepXFrameworkOrderContext {
+    let order_init = order.init_event();
+    let submitted_event_id = loop {
+        let candidate = UUID4::new();
+        if candidate != cmd.command_id && candidate != order_init.event_id {
+            break candidate;
+        }
+    };
+    let terminal_event_id = loop {
+        let candidate = UUID4::new();
+        if candidate != cmd.command_id
+            && candidate != order_init.event_id
+            && candidate != submitted_event_id
+        {
+            break candidate;
+        }
+    };
+    DeepXFrameworkOrderContext::new(
+        cmd.trader_id,
+        cmd.strategy_id,
+        cmd.instrument_id,
+        cmd.client_order_id,
+        account_id,
+        cmd.command_id,
+        cmd.ts_init,
+        order_init.event_id,
+        order_init.ts_init,
+        cmd.correlation_id,
+        cmd.causation_id,
+        submitted_event_id,
+        terminal_event_id,
+    )
+    .with_modify_details(venue_order_id, quantity, price)
+}
+
 fn validate_perp_place_order_side(
     order_side: OrderSide,
     is_long: bool,
@@ -1423,6 +1489,41 @@ fn validate_perp_cancel_record_scope(
         return Err(DeepXTransactionRuntimeError::MarketIdentityMismatch);
     }
     Ok(())
+}
+
+fn validate_perp_modify_record_scope(
+    ownership: &DeepXAccountOwnershipProof,
+    lease_signer: [u8; 20],
+    perpetual_market_ids: &HashMap<InstrumentId, u64>,
+    identity: &crate::transaction::DeepXTransactionIdentity,
+) -> Result<(), DeepXTransactionRuntimeError> {
+    let Some(DeepXTransactionOperation::PerpModify {
+        subaccount,
+        place_subaccount,
+        market_id,
+        place_market_id,
+        fast_cancel,
+        is_long,
+        ..
+    }) = identity.operation()
+    else {
+        return Err(DeepXTransactionRuntimeError::ReservationOperationMismatch);
+    };
+    if ownership.signer() != lease_signer
+        || identity.signer() != lease_signer
+        || ownership.subaccount() != *subaccount
+        || *subaccount != *place_subaccount
+        || *fast_cancel
+    {
+        return Err(DeepXTransactionRuntimeError::AccountIdentityMismatch);
+    }
+    if *market_id != *place_market_id
+        || perpetual_market_ids.get(&identity.instrument_id()).copied()
+            != Some(u64::from(*market_id))
+    {
+        return Err(DeepXTransactionRuntimeError::MarketIdentityMismatch);
+    }
+    validate_perp_place_order_side(identity.order_side(), *is_long)
 }
 
 /// Classification of an execution update against registered Nautilus order context.
@@ -1789,6 +1890,60 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
         Ok(())
     }
 
+    fn replace_tracked_venue_order_id(
+        &self,
+        client_order_id: ClientOrderId,
+        previous_venue_order_id: VenueOrderId,
+        venue_order_id: VenueOrderId,
+        context: OrderContext,
+    ) -> Result<(), DeepXOrderContextError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXOrderContextError::LockPoisoned)?;
+        if context.identity.client_order_id != client_order_id
+            || context.identity.instrument_id.venue != *DEEPX_VENUE
+        {
+            return Err(DeepXOrderContextError::Conflict(client_order_id));
+        }
+        if state.tracked_venue_by_client.get(&client_order_id) == Some(&venue_order_id)
+            && state.tracked.get(&client_order_id) == Some(&context)
+        {
+            return Ok(());
+        }
+        if state.tracked_venue_by_client.get(&client_order_id) != Some(&previous_venue_order_id) {
+            return Err(DeepXOrderContextError::VenueOrderBindingConflict {
+                client_order_id,
+                venue_order_id: state
+                    .tracked_venue_by_client
+                    .get(&client_order_id)
+                    .copied()
+                    .unwrap_or(previous_venue_order_id),
+            });
+        }
+        if state
+            .tracked_client_by_venue
+            .get(&venue_order_id)
+            .is_some_and(|existing| *existing != client_order_id)
+            || state.external_client_by_venue.contains_key(&venue_order_id)
+        {
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                venue_order_id,
+            ));
+        }
+        state
+            .tracked_client_by_venue
+            .remove(&previous_venue_order_id);
+        state
+            .tracked_client_by_venue
+            .insert(venue_order_id, client_order_id);
+        state
+            .tracked_venue_by_client
+            .insert(client_order_id, venue_order_id);
+        state.tracked.insert(client_order_id, context);
+        Ok(())
+    }
+
     fn register_external(
         &self,
         context: DeepXExternalOrderContext,
@@ -2116,6 +2271,28 @@ struct DeepXPerpCancelTask {
     emitter: ExecutionEventEmitter,
 }
 
+struct DeepXPerpModifyTask {
+    runtime: Arc<DeepXExecutionTransactionRuntime>,
+    credential: DeepXPrivateKey,
+    environment: DeepXEnvironment,
+    endpoints: DeepXValidatedRpcEndpoints,
+    capabilities: DeepXValidatedRpcMethodCapabilities,
+    ownership: DeepXAccountOwnershipProof,
+    runtime_identity: crate::signing::ApprovedRuntimeIdentity,
+    submission_url: String,
+    recovery_blocks_per_range: u64,
+    receipt_timeout: Duration,
+    params: DeepXPerpModifyParams,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    order_side: OrderSide,
+    order_context: OrderContext,
+    framework_context: DeepXFrameworkOrderContext,
+    perpetual_market_ids: HashMap<InstrumentId, u64>,
+    order_contexts: Arc<DeepXOrderContextRegistry>,
+    emitter: ExecutionEventEmitter,
+}
+
 struct DeepXSpotCancelTask {
     runtime: Arc<DeepXExecutionTransactionRuntime>,
     credential: DeepXPrivateKey,
@@ -2197,6 +2374,12 @@ impl Drop for DeepXStartupEpochGuard<'_> {
 }
 
 impl DeepXExecutionClient {
+    fn perp_modify_fill_semantics_proven(&self) -> bool {
+        // The pallet places the encoded size as-is after canceling
+        // without rebasing concurrent fills.
+        false
+    }
+
     fn report_order_context_for_venue_id(
         &self,
         venue_order_id: VenueOrderId,
@@ -4001,6 +4184,98 @@ impl DeepXExecutionClient {
         })
     }
 
+    /// Maps a framework modify command to the runtime's atomic cancel-and-place operation.
+    ///
+    /// The replacement leg carries the target total quantity. The chain pallet rebases it against
+    /// fills observed atomically when the cancellation executes.
+    /// Trigger changes, venue-ID ambiguity, quote quantities, and advanced order fields fail
+    /// before timestamp reservation or network access.
+    pub fn build_perp_modify_params(
+        &self,
+        cmd: &ModifyOrder,
+        order: &OrderAny,
+    ) -> Result<DeepXPerpModifyParams, DeepXPerpOrderMappingError> {
+        if cmd.trader_id != self.core.trader_id
+            || cmd
+                .client_id
+                .is_some_and(|client_id| client_id != self.core.client_id)
+        {
+            return Err(DeepXPerpOrderMappingError::ExecutionIdentityMismatch);
+        }
+        if cmd.strategy_id != order.strategy_id()
+            || cmd.instrument_id != order.instrument_id()
+            || cmd.client_order_id != order.client_order_id()
+            || cmd.venue_order_id != order.venue_order_id()
+        {
+            return Err(DeepXPerpOrderMappingError::ModifyOrderIdentityMismatch);
+        }
+        if order.is_closed() || !order.is_open() || order.instrument_id().venue != *DEEPX_VENUE {
+            return Err(DeepXPerpOrderMappingError::OrderNotModifiable);
+        }
+        if !matches!(
+            order.status(),
+            OrderStatus::Accepted | OrderStatus::PartiallyFilled
+        ) {
+            return Err(DeepXPerpOrderMappingError::OrderNotModifiable);
+        }
+        if order.order_type() != OrderType::Limit {
+            return Err(DeepXPerpOrderMappingError::UnsupportedOrderType(
+                order.order_type(),
+            ));
+        }
+        if cmd.trigger_price.is_some() || cmd.params.is_some() {
+            return Err(DeepXPerpOrderMappingError::UnsupportedModifyFields);
+        }
+        let venue_order_id = cmd
+            .venue_order_id
+            .ok_or(DeepXPerpOrderMappingError::MissingModifyVenueOrderId)?;
+        let cancel_order_id = venue_order_id
+            .as_str()
+            .parse::<u64>()
+            .map_err(|_| DeepXPerpOrderMappingError::MissingModifyVenueOrderId)?;
+
+        let target_quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let target_price = cmd.price.or_else(|| order.price());
+        if target_quantity == order.quantity() && target_price == order.price() {
+            return Err(DeepXPerpOrderMappingError::ModifyHasNoChanges);
+        }
+        let filled_quantity = order.filled_qty().as_decimal();
+        let target_quantity_decimal = target_quantity.as_decimal();
+        if target_quantity_decimal <= filled_quantity {
+            return Err(DeepXPerpOrderMappingError::ModifiedQuantityNotAboveFilled);
+        }
+        let mut submit = SubmitOrder::from_order(
+            order,
+            cmd.trader_id,
+            cmd.client_id,
+            None,
+            cmd.command_id,
+            cmd.ts_init,
+        );
+        submit.order_init.quantity = target_quantity;
+        submit.order_init.price = target_price;
+        let place = self.build_perp_place_params(&submit)?;
+        let subaccount = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
+            .ok_or(DeepXPerpOrderMappingError::InvalidSubaccount)?;
+        if place.subaccount != subaccount {
+            return Err(DeepXPerpOrderMappingError::InvalidSubaccount);
+        }
+        Ok(DeepXPerpModifyParams {
+            cancel: DeepXPerpCancelParams {
+                subaccount,
+                order_id: cancel_order_id,
+                market_id: place.market_id,
+                fast_cancel: false,
+            },
+            place,
+        })
+    }
+
     fn build_spot_place_params(&self, cmd: &SubmitOrder) -> anyhow::Result<DeepXSpotPlaceParams> {
         let order = &cmd.order_init;
         anyhow::ensure!(
@@ -5241,8 +5516,9 @@ impl DeepXExecutionClient {
 
     /// Observes finalized account-level initial and maintenance margin requirements.
     ///
-    /// The returned balance contains required margins in USDC. Collateral, balances, and full
-    /// account state remain available only through their separately validated evidence paths.
+    /// The returned balance contains required margins in USDC together with its finalized
+    /// checkpoint, runtime identity, and subaccount. Collateral, balances, and full account state
+    /// remain available only through their separately validated evidence paths.
     ///
     /// # Errors
     ///
@@ -5250,9 +5526,9 @@ impl DeepXExecutionClient {
     /// and both requirements convert exactly to framework USDC amounts.
     pub async fn observe_owned_finalized_margin_balance(
         &self,
-    ) -> Result<MarginBalance, DeepXTransactionRuntimeError> {
+    ) -> Result<DeepXFinalizedMarginBalance, DeepXTransactionRuntimeError> {
         let evidence = self.observe_owned_finalized_margin_evidence().await?;
-        Ok(map_finalized_margin_balance(&evidence)?)
+        Ok(map_finalized_margin_balance_with_evidence(&evidence)?)
     }
 
     /// Observes complete raw lending evidence using only state owned by this execution client.
@@ -6150,6 +6426,27 @@ impl DeepXExecutionClient {
                         .recovery_action()
                     } else if matches!(
                         item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpModify { .. })
+                    ) {
+                        let verifier = DeepXPerpModifyCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_submitted_perp_modify_checkpoint(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            &verifier,
+                        )
+                        .await?
+                        .record()
+                        .recovery_action()
+                    } else if matches!(
+                        item.record().identity().operation(),
                         Some(DeepXTransactionOperation::SpotCancel {
                             fast_cancel: false,
                             ..
@@ -6314,6 +6611,25 @@ impl DeepXExecutionClient {
                             DeepXDurableRecoveryObserver::PerpCancel(&verifier),
                         )
                         .await?
+                    } else if matches!(
+                        item.record().identity().operation(),
+                        Some(DeepXTransactionOperation::PerpModify { .. })
+                    ) {
+                        let verifier = DeepXPerpModifyCallVerifier::new(
+                            snapshot.clone(),
+                            self.credential.clone(),
+                        )?;
+                        reconcile_not_included_checkpoint_with_observer(
+                            endpoints,
+                            capabilities,
+                            snapshot,
+                            store,
+                            lease,
+                            &item,
+                            self.config.recovery_blocks_per_range,
+                            DeepXDurableRecoveryObserver::PerpModify(&verifier),
+                        )
+                        .await?
                     } else {
                         reconcile_not_included_checkpoint(
                             endpoints,
@@ -6401,7 +6717,62 @@ impl DeepXExecutionClient {
                 record = acknowledged.record().clone();
                 committed = acknowledged.committed().clone();
             }
+            self.restore_perp_modify_order_binding(&record)
+                .map_err(|e| DeepXMassReconciliationError::ModifyOrderBinding(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    fn restore_perp_modify_order_binding(
+        &self,
+        record: &DeepXTransactionRecord,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            record.identity().operation(),
+            Some(DeepXTransactionOperation::PerpModify { .. })
+        ) || record.lifecycle().state() != DeepXTransactionState::Finalized
+            || !record.lifecycle().inclusion().is_some_and(|inclusion| {
+                inclusion.outcome() == crate::transaction::DeepXInclusionOutcome::Success
+            })
+            || !record
+                .framework_order_outbox()
+                .and_then(|outbox| outbox.terminal())
+                .is_some_and(|stage| stage.is_acknowledged())
+        {
+            return Ok(());
+        }
+        let context = record
+            .framework_order_context()
+            .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing framework context"))?;
+        let previous = VenueOrderId::new(
+            context
+                .modify_venue_order_id()
+                .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing previous venue order ID"))?
+                .to_string(),
+        );
+        let crate::transaction::DeepXNonceReservation::TimestampOrderId { value } =
+            record.identity().nonce()
+        else {
+            anyhow::bail!("DeepX modify has no timestamp order ID nonce");
+        };
+        let mut order_context = match self
+            .order_contexts
+            .route(Some(context.client_order_id()), None)?
+        {
+            DeepXExecutionUpdateRoute::Tracked(context)
+            | DeepXExecutionUpdateRoute::Terminal(context) => context,
+            _ => anyhow::bail!("DeepX modify order context is not registered"),
+        };
+        order_context.quantity = context
+            .modify_quantity()
+            .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing replacement quantity"))?;
+        order_context.price = context.modify_price();
+        self.order_contexts.replace_tracked_venue_order_id(
+            context.client_order_id(),
+            previous,
+            VenueOrderId::new(value.to_string()),
+            order_context,
+        )?;
         Ok(())
     }
 
@@ -7851,6 +8222,358 @@ async fn deliver_perp_cancel_outbox(
     Ok(())
 }
 
+async fn deliver_perp_modify_outbox(
+    task: &DeepXPerpModifyTask,
+    staged: DeepXCommittedFrameworkOrderOutbox,
+) -> anyhow::Result<()> {
+    let mut record = staged.record().clone();
+    let mut committed = staged.committed().clone();
+    for event in materialize_perp_framework_order_events(&record)? {
+        let event_id = event.id();
+        let receipt_rx = task
+            .emitter
+            .try_send_order_event_with_receipt(event)
+            .map_err(|e| anyhow::anyhow!("DeepX modify event {event_id} dispatch failed: {e}"))?;
+        let receipt = dst::time::timeout(task.receipt_timeout, receipt_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("DeepX modify event {event_id} receipt timed out"))?
+            .map_err(|e| anyhow::anyhow!("DeepX modify event {event_id} receipt dropped: {e}"))?;
+        let acknowledged = commit_framework_order_event_acknowledgement(
+            &task.runtime.store,
+            &task.runtime.lease,
+            &committed,
+            &record,
+            receipt,
+        )
+        .await?;
+        record = acknowledged.record().clone();
+        committed = acknowledged.committed().clone();
+    }
+    if record.lifecycle().state() == DeepXTransactionState::Finalized
+        && record.lifecycle().inclusion().is_some_and(|inclusion| {
+            inclusion.outcome() == crate::transaction::DeepXInclusionOutcome::Success
+        })
+        && record
+            .framework_order_outbox()
+            .and_then(|outbox| outbox.terminal())
+            .is_some_and(|stage| stage.is_acknowledged())
+    {
+        let context = record
+            .framework_order_context()
+            .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing framework order context"))?;
+        let previous = VenueOrderId::new(
+            context
+                .modify_venue_order_id()
+                .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing previous venue order ID"))?
+                .to_string(),
+        );
+        let crate::transaction::DeepXNonceReservation::TimestampOrderId { value } =
+            record.identity().nonce()
+        else {
+            anyhow::bail!("DeepX modify has no timestamp order ID nonce");
+        };
+        let mut order_context = task.order_context.clone();
+        order_context.quantity = context
+            .modify_quantity()
+            .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing replacement quantity"))?;
+        order_context.price = context.modify_price();
+        task.order_contexts.replace_tracked_venue_order_id(
+            task.client_order_id,
+            previous,
+            VenueOrderId::new(value.to_string()),
+            order_context,
+        )?;
+    }
+    Ok(())
+}
+
+async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
+    task.order_contexts.register(task.order_context.clone())?;
+    anyhow::ensure!(
+        task.ownership.signer() == task.runtime.lease.signer()
+            && task.ownership.subaccount() == task.params.cancel.subaccount
+            && task.params.cancel.subaccount == task.params.place.subaccount
+            && task.params.cancel.market_id == task.params.place.market_id
+            && task.order_side
+                == if task.params.place.is_long {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                },
+        "DeepX perpetual modification ownership, side, or operation mismatch"
+    );
+    let restored_records =
+        load_verified_committed_for_signer(&task.runtime.store, &task.runtime.lease).await?;
+    if let Some(existing) = restored_records.iter().find(|item| {
+        item.record()
+            .framework_order_context()
+            .is_some_and(|context| context.command_id() == task.framework_context.command_id())
+    }) {
+        anyhow::ensure!(
+            !matches!(
+                existing.record().lifecycle().state(),
+                DeepXTransactionState::Created | DeepXTransactionState::Signed
+            ),
+            "DeepX modification command {} has an incomplete durable transaction; startup reconciliation is required",
+            task.client_order_id,
+        );
+        let staged = commit_framework_order_event_staging(
+            &task.runtime.store,
+            &task.runtime.lease,
+            existing.committed(),
+            existing.record(),
+            get_atomic_clock_realtime().get_time_ns(),
+            get_atomic_clock_realtime().get_time_ns(),
+            true,
+        )
+        .await?;
+        deliver_perp_modify_outbox(&task, staged).await?;
+        return Ok(());
+    }
+    for existing in &restored_records {
+        let Some(DeepXTransactionOperation::PerpModify {
+            subaccount,
+            cancel_order_id,
+            market_id,
+            ..
+        }) = existing.record().identity().operation()
+        else {
+            continue;
+        };
+        if *subaccount != task.params.cancel.subaccount
+            || *cancel_order_id != task.params.cancel.order_id
+            || *market_id != task.params.cancel.market_id
+        {
+            continue;
+        }
+        let finalized_failed = existing.record().lifecycle().state()
+            == DeepXTransactionState::Finalized
+            && existing
+                .record()
+                .lifecycle()
+                .inclusion()
+                .is_some_and(|inclusion| {
+                    inclusion.outcome() == crate::transaction::DeepXInclusionOutcome::Failed
+                });
+        if finalized_failed {
+            continue;
+        }
+        if existing.record().framework_order_context().is_some() {
+            let staged = commit_framework_order_event_staging(
+                &task.runtime.store,
+                &task.runtime.lease,
+                existing.committed(),
+                existing.record(),
+                get_atomic_clock_realtime().get_time_ns(),
+                get_atomic_clock_realtime().get_time_ns(),
+                true,
+            )
+            .await?;
+            deliver_perp_modify_outbox(&task, staged).await?;
+        }
+        log::warn!(
+            "DeepX perpetual order {} has an existing modification transaction; no second modification was created",
+            task.client_order_id,
+        );
+        return Ok(());
+    }
+
+    let identity = crate::transaction::DeepXTransactionIdentity::new_perp_modify(
+        task.client_order_id,
+        task.runtime.lease.signer(),
+        task.instrument_id,
+        task.order_side,
+        crate::transaction::DeepXNonceReservation::TimestampOrderId { value: 1 },
+        DeepXDirectRuntimeIdentity::from(&task.runtime_identity),
+        task.params,
+    );
+    validate_perp_modify_record_scope(
+        &task.ownership,
+        task.runtime.lease.signer(),
+        &task.perpetual_market_ids,
+        &identity,
+    )?;
+    let chain_time = observe_and_apply_finalized_chain_time(
+        &task.environment,
+        &task.endpoints,
+        &task.capabilities,
+        &task.runtime.snapshot_service,
+    )
+    .await?;
+    let reservation_permit = task.runtime.snapshot_service.acquire()?;
+    anyhow::ensure!(
+        chain_time.runtime_identity() == reservation_permit.snapshot().identity()
+            && chain_time.runtime_identity() == &task.runtime_identity,
+        "DeepX finalized chain time runtime identity changed before modify reservation"
+    );
+    let checkpoint = DeepXSubmissionScanCheckpoint::new(
+        u64::from(chain_time.checkpoint().block_number()),
+        chain_time.checkpoint().block_hash(),
+    );
+    let reservation = prepare_durable_framework_perp_modify_reservation(
+        &task.runtime.store,
+        &task.runtime.lease,
+        &task.runtime.nonce_allocator,
+        get_atomic_clock_realtime().get_time_ms(),
+        chain_time.timestamp_ms(),
+        task.client_order_id,
+        task.instrument_id,
+        task.order_side,
+        DeepXDirectRuntimeIdentity::from(reservation_permit.snapshot().identity()),
+        checkpoint,
+        task.params,
+        task.framework_context,
+    )
+    .await?;
+    drop(reservation_permit);
+
+    let signing_permit = task.runtime.snapshot_service.acquire()?;
+    anyhow::ensure!(
+        signing_permit.snapshot().identity() == &task.runtime_identity,
+        "DeepX runtime changed before perpetual order modification signing"
+    );
+    validate_perp_modify_record_scope(
+        &task.ownership,
+        task.runtime.lease.signer(),
+        &task.perpetual_market_ids,
+        reservation.record().identity(),
+    )?;
+    let signed = crate::transaction::prepare_signed_perp_modify_transaction(
+        &task.runtime.store,
+        &task.runtime.lease,
+        reservation.committed(),
+        reservation.record(),
+        &signing_permit,
+        &task.credential,
+    )
+    .await?;
+    drop(signing_permit);
+
+    let submission_permit = task.runtime.snapshot_service.acquire()?;
+    anyhow::ensure!(
+        submission_permit.snapshot().identity() == &task.runtime_identity,
+        "DeepX runtime changed before perpetual order modification submission"
+    );
+    validate_perp_modify_record_scope(
+        &task.ownership,
+        task.runtime.lease.signer(),
+        &task.perpetual_market_ids,
+        signed.record().identity(),
+    )?;
+    task.runtime
+        .store
+        .verify_signer_lease(&task.runtime.lease)
+        .await?;
+    let verifier = DeepXPerpModifyCallVerifier::new(
+        submission_permit.snapshot().clone(),
+        task.credential.clone(),
+    )?;
+    let prepared = prepare_initial_submission(
+        &task.runtime.store,
+        &task.runtime.lease,
+        signed.committed(),
+        signed.record(),
+        &verifier,
+    )
+    .await?;
+    let (submitting, transmission_permit) = prepared.into_parts();
+    let staged = commit_framework_order_event_staging(
+        &task.runtime.store,
+        &task.runtime.lease,
+        submitting.committed(),
+        submitting.record(),
+        get_atomic_clock_realtime().get_time_ns(),
+        get_atomic_clock_realtime().get_time_ns(),
+        false,
+    )
+    .await?;
+    deliver_perp_modify_outbox(&task, staged).await?;
+    let submission_url = task.submission_url.clone();
+    let outcome = submit_once_preserving_context(
+        submitting,
+        transmission_permit,
+        move |bytes, expected_hash| async move {
+            crate::transaction::submit_direct_pallet_once_classified(
+                &submission_url,
+                bytes,
+                expected_hash,
+            )
+            .await
+        },
+    )
+    .await;
+    let accepted = match outcome {
+        DeepXSubmissionAttemptOutcome::Accepted { context, submitted } => {
+            commit_initial_submission_acceptance(
+                &task.runtime.store,
+                &task.runtime.lease,
+                context.committed(),
+                context.record(),
+                submitted,
+            )
+            .await?
+        }
+        DeepXSubmissionAttemptOutcome::Unresolved { failure, .. } => {
+            log::warn!(
+                "DeepX perpetual order modification for {} is unresolved; startup reconciliation is required: {:?}",
+                task.client_order_id,
+                failure,
+            );
+            return Ok(());
+        }
+    };
+    let restored = load_verified_committed_for_signer(&task.runtime.store, &task.runtime.lease)
+        .await?
+        .into_iter()
+        .find(|item| {
+            item.record()
+                .framework_order_context()
+                .is_some_and(|context| context.command_id() == task.framework_context.command_id())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DeepX modify {} is missing from durable records",
+                task.client_order_id
+            )
+        })?;
+    let reconciliation_verifier = DeepXPerpModifyCallVerifier::new(
+        submission_permit.snapshot().clone(),
+        task.credential.clone(),
+    )?;
+    let reconciled = reconcile_submitted_perp_modify_checkpoint(
+        &task.endpoints,
+        &task.capabilities,
+        submission_permit.snapshot(),
+        &task.runtime.store,
+        &task.runtime.lease,
+        &restored,
+        task.recovery_blocks_per_range,
+        &reconciliation_verifier,
+    )
+    .await?;
+    drop(submission_permit);
+    if reconciled.record().recovery_action() != DeepXTransactionRecoveryAction::Complete {
+        log::warn!(
+            "DeepX perpetual order modification for {} remains pending finalized reconciliation: {:?}",
+            task.client_order_id,
+            reconciled.record().recovery_action(),
+        );
+    }
+    let staged = commit_framework_order_event_staging(
+        &task.runtime.store,
+        &task.runtime.lease,
+        reconciled.committed(),
+        reconciled.record(),
+        get_atomic_clock_realtime().get_time_ns(),
+        get_atomic_clock_realtime().get_time_ns(),
+        false,
+    )
+    .await?;
+    deliver_perp_modify_outbox(&task, staged).await?;
+    let _ = accepted;
+    Ok(())
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for DeepXExecutionClient {
     fn is_connected(&self) -> bool {
@@ -8124,12 +8847,177 @@ impl ExecutionClient for DeepXExecutionClient {
         anyhow::bail!("DeepX order-list submission is not operational")
     }
 
-    fn modify_order(&self, _cmd: ModifyOrder) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX order modification is not operational")
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX order modification requires a connected execution client"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id
+                && cmd
+                    .client_id
+                    .is_none_or(|client_id| client_id == self.core.client_id),
+            "DeepX modify command execution identity mismatch"
+        );
+        anyhow::ensure!(
+            cmd.instrument_id.venue == *DEEPX_VENUE,
+            "DeepX modify instrument venue mismatch"
+        );
+        if !self.perp_modify_fill_semantics_proven() {
+            self.emitter.emit_order_modify_rejected_event(
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                cmd.venue_order_id,
+                "DeepX perpetual modification is unavailable until replacement sizing is safe against concurrent fills",
+                get_atomic_clock_realtime().get_time_ns(),
+            );
+            return Ok(());
+        }
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
+        let params = match self.build_perp_modify_params(&cmd, &order) {
+            Ok(params) => params,
+            Err(e) => {
+                self.emitter.emit_order_modify_rejected_event(
+                    cmd.strategy_id,
+                    cmd.instrument_id,
+                    cmd.client_order_id,
+                    cmd.venue_order_id,
+                    &e.to_string(),
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+                return Ok(());
+            }
+        };
+        let target_quantity = cmd.quantity.unwrap_or_else(|| order.quantity());
+        let target_price = cmd.price.or_else(|| order.price()).ok_or_else(|| {
+            anyhow::anyhow!("DeepX perpetual limit modification requires a price")
+        })?;
+        let old_venue_order_id = cmd
+            .venue_order_id
+            .ok_or_else(|| anyhow::anyhow!("DeepX modify command requires a venue order ID"))?;
+        let admission_key = (cmd.client_order_id, old_venue_order_id);
+        {
+            let mut active = self
+                .active_cancels
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DeepX active order mutation registry is poisoned"))?;
+            anyhow::ensure!(
+                active.insert(admission_key),
+                "DeepX cancellation or modification is already being processed for this order"
+            );
+        }
+        let admission_guard = DeepXCancelAdmissionGuard {
+            active: Arc::clone(&self.active_cancels),
+            key: admission_key,
+        };
+        let submission_url = self.direct_submission_url()?;
+        let runtime = self
+            .transaction_runtime
+            .as_ref()
+            .cloned()
+            .ok_or(DeepXTransactionRuntimeError::NotInitialized)?;
+        let endpoints = self
+            .runtime_rpc_endpoints
+            .clone()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let capabilities = self
+            .runtime_rpc_capabilities
+            .clone()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let ownership = self
+            .account_ownership
+            .ok_or(DeepXTransactionRuntimeError::AccountIdentityMismatch)?;
+        let runtime_identity = self
+            .runtime_snapshot
+            .as_ref()
+            .ok_or(DeepXTransactionRuntimeError::SnapshotIdentityMismatch)?
+            .identity()
+            .clone();
+        let mut order_context = OrderContext::from(&order);
+        order_context.quantity = target_quantity;
+        order_context.price = Some(target_price);
+        let framework_context = framework_order_context_from_modify_order(
+            &cmd,
+            &order,
+            self.core.account_id,
+            params.cancel.order_id,
+            target_quantity,
+            target_price,
+        );
+        let task = DeepXPerpModifyTask {
+            runtime,
+            credential: self.credential.clone(),
+            environment: self.config.network.environment.clone(),
+            endpoints,
+            capabilities,
+            ownership,
+            runtime_identity,
+            submission_url,
+            recovery_blocks_per_range: self.config.recovery_blocks_per_range,
+            receipt_timeout: Duration::from_secs(self.config.websocket_timeout_secs),
+            params,
+            instrument_id: cmd.instrument_id,
+            client_order_id: cmd.client_order_id,
+            order_side: order.order_side(),
+            order_context,
+            framework_context,
+            perpetual_market_ids: self.perpetual_market_ids.clone(),
+            order_contexts: Arc::clone(&self.order_contexts),
+            emitter: self.emitter.clone(),
+        };
+        self.query_tasks.spawn(async move {
+            let _admission_guard = admission_guard;
+            if let Err(e) = run_perp_modify_task(task).await {
+                log::error!("DeepX perpetual order modification failed: {e:#}");
+            }
+        })?;
+        Ok(())
     }
 
-    fn batch_modify_orders(&self, _cmd: BatchModifyOrders) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX batch order modification is not operational")
+    fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX batch order modification requires a connected execution client"
+        );
+        if cmd.trader_id != self.core.trader_id
+            || cmd
+                .client_id
+                .is_some_and(|client_id| client_id != self.core.client_id)
+            || cmd.instrument_id.venue != *DEEPX_VENUE
+        {
+            anyhow::bail!("DeepX batch modify command execution identity mismatch");
+        }
+        for mut modify in cmd.modifies {
+            if modify.trader_id != cmd.trader_id
+                || modify.client_id.is_some_and(|id| id != self.core.client_id)
+                || modify.strategy_id != cmd.strategy_id
+                || modify.instrument_id != cmd.instrument_id
+            {
+                self.emitter.emit_order_modify_rejected_event(
+                    modify.strategy_id,
+                    modify.instrument_id,
+                    modify.client_order_id,
+                    modify.venue_order_id,
+                    "DeepX batch modify item identity does not match its command",
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+                continue;
+            }
+            modify.causation_id = Some(cmd.command_id);
+            modify.correlation_id = cmd.correlation_id.or(Some(cmd.command_id));
+            if let Err(e) = self.modify_order(modify.clone()) {
+                self.emitter.emit_order_modify_rejected_event(
+                    modify.strategy_id,
+                    modify.instrument_id,
+                    modify.client_order_id,
+                    modify.venue_order_id,
+                    &e.to_string(),
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
@@ -8321,12 +9209,112 @@ impl ExecutionClient for DeepXExecutionClient {
         Ok(())
     }
 
-    fn cancel_all_orders(&self, _cmd: CancelAllOrders) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX cancel-all is not operational")
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX cancel-all requires a connected execution client"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id
+                && cmd
+                    .client_id
+                    .is_none_or(|client_id| client_id == self.core.client_id),
+            "DeepX cancel-all command execution identity mismatch"
+        );
+        anyhow::ensure!(
+            cmd.instrument_id.venue == *DEEPX_VENUE,
+            "DeepX cancel-all instrument venue mismatch"
+        );
+
+        let orders = self
+            .core
+            .cache()
+            .orders_open(
+                Some(&self.core.venue),
+                Some(&cmd.instrument_id),
+                Some(&cmd.strategy_id),
+                Some(&self.core.account_id),
+                cmd.order_side,
+            )
+            .into_iter()
+            .map(|order| order.cloned())
+            .collect::<Vec<_>>();
+
+        for order in orders {
+            let mut cancel = CancelOrder::new(
+                cmd.trader_id,
+                Some(self.core.client_id),
+                order.strategy_id(),
+                order.instrument_id(),
+                order.client_order_id(),
+                order.venue_order_id(),
+                UUID4::new(),
+                cmd.ts_init,
+                cmd.params.clone(),
+                cmd.correlation_id.or(Some(cmd.command_id)),
+            );
+            cancel.causation_id = Some(cmd.command_id);
+            if let Err(e) = self.cancel_order(cancel) {
+                self.emitter.emit_order_cancel_rejected_event(
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    order.client_order_id(),
+                    order.venue_order_id(),
+                    &e.to_string(),
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
-    fn batch_cancel_orders(&self, _cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX batch cancellation is not operational")
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX batch cancellation requires a connected execution client"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id
+                && cmd
+                    .client_id
+                    .is_none_or(|client_id| client_id == self.core.client_id),
+            "DeepX batch cancel command execution identity mismatch"
+        );
+        anyhow::ensure!(
+            cmd.instrument_id.venue == *DEEPX_VENUE,
+            "DeepX batch cancel instrument venue mismatch"
+        );
+
+        for cancel in cmd.cancels {
+            if cancel.trader_id != cmd.trader_id
+                || cancel.client_id.is_some_and(|id| id != self.core.client_id)
+                || cancel.strategy_id != cmd.strategy_id
+                || cancel.instrument_id != cmd.instrument_id
+            {
+                self.emitter.emit_order_cancel_rejected_event(
+                    cancel.strategy_id,
+                    cancel.instrument_id,
+                    cancel.client_order_id,
+                    cancel.venue_order_id,
+                    "DeepX batch cancel item identity does not match its command",
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+                continue;
+            }
+            if let Err(e) = self.cancel_order(cancel.clone()) {
+                self.emitter.emit_order_cancel_rejected_event(
+                    cancel.strategy_id,
+                    cancel.instrument_id,
+                    cancel.client_order_id,
+                    cancel.venue_order_id,
+                    &e.to_string(),
+                    get_atomic_clock_realtime().get_time_ns(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
@@ -18339,6 +19327,77 @@ mod tests {
         assert!(client.core.is_stopped());
         assert!(!client.is_connected());
         assert_eq!(client.startup.completed_steps, 0);
+    }
+
+    #[rstest]
+    fn batch_cancel_rejects_each_invalid_item_and_continues() {
+        let mut client = test_client();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        ExecutionClient::start(&mut client).unwrap();
+        client.core.set_connected();
+
+        let trader_id = client.core.trader_id;
+        let client_id = client.core.client_id;
+        let strategy_id = StrategyId::from("S-DEEPX-001");
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let missing_order_id = ClientOrderId::from("O-DEEPX-MISSING");
+        let wrong_strategy_order_id = ClientOrderId::from("O-DEEPX-WRONG-STRATEGY");
+        let cancels = vec![
+            CancelOrder::new(
+                trader_id,
+                Some(client_id),
+                strategy_id,
+                instrument_id,
+                missing_order_id,
+                Some(VenueOrderId::from("1001")),
+                UUID4::new(),
+                UnixNanos::from(10),
+                None,
+                None,
+            ),
+            CancelOrder::new(
+                trader_id,
+                Some(client_id),
+                StrategyId::from("S-DEEPX-OTHER"),
+                instrument_id,
+                wrong_strategy_order_id,
+                Some(VenueOrderId::from("1002")),
+                UUID4::new(),
+                UnixNanos::from(10),
+                None,
+                None,
+            ),
+        ];
+        let command = BatchCancelOrders::new(
+            trader_id,
+            Some(client_id),
+            strategy_id,
+            instrument_id,
+            cancels,
+            UUID4::new(),
+            UnixNanos::from(10),
+            None,
+            None,
+        );
+
+        ExecutionClient::batch_cancel_orders(&client, command).unwrap();
+
+        let rejected = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
+        assert!(receiver.try_recv().is_err());
+        let rejected_client_order_ids = rejected
+            .into_iter()
+            .map(|event| match event {
+                ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+                    event.client_order_id
+                }
+                other => panic!("expected order cancel rejection, was {other:?}"),
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            rejected_client_order_ids,
+            std::collections::HashSet::from([missing_order_id, wrong_strategy_order_id]),
+        );
     }
 
     #[tokio::test]

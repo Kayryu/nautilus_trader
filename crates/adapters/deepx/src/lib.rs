@@ -41,8 +41,9 @@ pub mod websocket;
 
 pub use account::{
     DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedFlatAccountBalances,
-    DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_finalized_flat_account_balances,
-    map_finalized_margin_balance,
+    DeepXFinalizedMarginBalance, DeepXFlatAccountBalanceError, DeepXMarginBalanceError,
+    map_finalized_flat_account_balances, map_finalized_margin_balance,
+    map_finalized_margin_balance_with_evidence,
 };
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{
@@ -105,13 +106,14 @@ pub use rpc::{
     observe_rpc_method_capabilities,
 };
 pub use signing::{
-    ApprovedRuntimeIdentity, DeepXPerpCancelParams, DeepXReadOnlyRuntimeSnapshot,
-    DeepXRuntimeChangeDecision, DeepXRuntimeConfig, DeepXRuntimeInterfaceCatalog,
-    DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface, DeepXRuntimeSnapshotPermit,
-    DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError, DeepXRuntimeSnapshotUpdate,
-    DeepXRuntimeVariantIdentity, DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams,
-    RuntimeSnapshot, SignedPalletExtrinsic, SigningError, SnapshotError, sign_dynamic_pallet_call,
-    sign_no_op, sign_perp_cancel, sign_spot_cancel, sign_spot_place_order,
+    ApprovedRuntimeIdentity, DeepXPerpCancelParams, DeepXPerpModifyParams,
+    DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeChangeDecision, DeepXRuntimeConfig,
+    DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
+    DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotService, DeepXRuntimeSnapshotServiceError,
+    DeepXRuntimeSnapshotUpdate, DeepXRuntimeVariantIdentity, DeepXSpotCancelParams,
+    DeepXSpotOrderType, DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
+    SnapshotError, sign_dynamic_pallet_call, sign_no_op, sign_perp_cancel, sign_perp_modify_order,
+    sign_spot_cancel, sign_spot_place_order,
 };
 pub use spot::{DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError};
 pub use transaction::{

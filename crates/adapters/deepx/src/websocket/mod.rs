@@ -23,6 +23,7 @@ pub mod handler;
 pub mod orderbook_rpc;
 pub mod protocol;
 pub mod public;
+pub(crate) mod spot_trades;
 pub mod task;
 pub mod trades;
 pub mod transport;

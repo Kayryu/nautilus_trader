@@ -50,6 +50,7 @@ fn rest_action(operation: &super::DeepXTransactionOperation) -> (&'static str, &
     match operation {
         DeepXTransactionOperation::PerpPlace { .. } => ("Perp", "PlaceOrder"),
         DeepXTransactionOperation::PerpCancel { .. } => ("Perp", "CancelOrder"),
+        DeepXTransactionOperation::PerpModify { .. } => ("Perp", "ModifyOrder"),
         DeepXTransactionOperation::PerpClose { .. } => ("Perp", "ClosePosition"),
         DeepXTransactionOperation::PerpProfitAndLossPoint { .. } => {
             ("Perp", "SetProfitAndLossPoint")

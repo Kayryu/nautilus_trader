@@ -20,9 +20,10 @@ use std::{
 };
 
 use rust_decimal::Decimal;
+use serde::Deserialize;
 
 use super::public::{DeepXWsPublicChannel, DeepXWsPublicFrame};
-use crate::http::{DeepXPerpTrade, DeepXPerpTradesPage};
+use crate::http::{DeepXPerpTrade, DeepXPerpTradesPage, DeepXSpotMarket, DeepXSpotTrade};
 
 /// A subscription-owned public trade stream; fresh connections require explicit reconciliation.
 ///
@@ -264,6 +265,280 @@ impl DeepXWsTradeStream {
         *self = next;
         Ok(emitted)
     }
+}
+
+/// A bounded, market-bound public Spot trade stream with explicit recovery boundaries.
+#[derive(Clone, Debug)]
+pub(crate) struct DeepXWsSpotTradeStream {
+    market_name: String,
+    pair: String,
+    capacity: NonZeroUsize,
+    initialized: bool,
+    watermark_ms: Option<i64>,
+    recent: BTreeMap<u64, (i64, DeepXSpotTrade)>,
+    order: VecDeque<u64>,
+}
+
+impl DeepXWsSpotTradeStream {
+    /// Creates an uninitialized stream bound to one finalized Spot market.
+    #[must_use]
+    pub(crate) fn new(market: &DeepXSpotMarket, capacity: NonZeroUsize) -> Self {
+        Self {
+            market_name: market.name.clone(),
+            pair: market.pair.clone(),
+            capacity,
+            initialized: false,
+            watermark_ms: None,
+            recent: BTreeMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Returns whether the stream has accepted its initial trade page.
+    #[must_use]
+    pub(crate) const fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Applies one Spot trade page and returns only new executions chronologically.
+    ///
+    /// Failed batches leave stream state unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign, malformed, unordered, conflicting, or unretained old trades.
+    pub(crate) fn ingest(
+        &mut self,
+        frame: &super::spot_trades::DeepXWsSpotTradeFrame,
+    ) -> anyhow::Result<Vec<DeepXSpotTrade>> {
+        let super::spot_trades::DeepXWsSpotTradeFrame::Data { market, data, .. } = frame else {
+            anyhow::bail!("DeepX Spot trade stream requires a data frame");
+        };
+        anyhow::ensure!(
+            market.name == self.market_name
+                && market
+                    .pair
+                    .as_deref()
+                    .is_some_and(|pair| pair.eq_ignore_ascii_case(&self.pair)),
+            "DeepX Spot trade stream market mismatch"
+        );
+        let page: DeepXWsSpotTradePage = serde_json::from_str(data.get())?;
+        anyhow::ensure!(
+            page.items.len() <= self.capacity.get(),
+            "DeepX Spot trade page exceeds identity capacity"
+        );
+        self.apply_page(page.items)
+    }
+
+    /// Returns inclusive REST recovery bounds from the retained boundary and a fresh WS page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either page is empty, invalid, or moves behind the retained boundary.
+    pub(crate) fn recovery_window(
+        &self,
+        frame: &super::spot_trades::DeepXWsSpotTradeFrame,
+    ) -> anyhow::Result<(u64, u64)> {
+        let start = self.watermark_ms.ok_or_else(|| {
+            anyhow::anyhow!("DeepX Spot trade recovery has no retained execution boundary")
+        })?;
+        let mut validation = Self {
+            market_name: self.market_name.clone(),
+            pair: self.pair.clone(),
+            capacity: self.capacity,
+            initialized: false,
+            watermark_ms: None,
+            recent: BTreeMap::new(),
+            order: VecDeque::new(),
+        };
+        validation.ingest(frame)?;
+        let end = validation
+            .watermark_ms
+            .ok_or_else(|| anyhow::anyhow!("DeepX fresh Spot trade page is empty"))?;
+        anyhow::ensure!(
+            end >= start,
+            "DeepX fresh Spot trade page precedes recovery boundary"
+        );
+        Ok((u64::try_from(start)?, u64::try_from(end)?))
+    }
+
+    /// Reconciles a bounded REST history with the fresh page before emitting recovered executions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing or conflicting retained identities, invalid bounds, or invalid
+    /// history. Failed reconciliation leaves stream state unchanged.
+    pub(crate) fn reconcile_history(
+        &mut self,
+        history: &[DeepXSpotTrade],
+        fresh: &super::spot_trades::DeepXWsSpotTradeFrame,
+    ) -> anyhow::Result<Vec<DeepXSpotTrade>> {
+        let (start, end) = self.recovery_window(fresh)?;
+        let start = i64::try_from(start)?;
+        let end = i64::try_from(end)?;
+        let mut by_id = BTreeMap::new();
+        for trade in history {
+            anyhow::ensure!(
+                by_id.insert(trade.id, trade).is_none(),
+                "duplicate DeepX Spot recovery trade ID"
+            );
+            let time = spot_trade_time(trade)?;
+            anyhow::ensure!(
+                time >= start && time <= end,
+                "DeepX Spot recovery trade is outside fixed bounds"
+            );
+        }
+        for (id, (time, retained)) in &self.recent {
+            if *time == start {
+                anyhow::ensure!(
+                    by_id.get(id).is_some_and(|trade| **trade == *retained),
+                    "DeepX Spot REST recovery boundary is missing or conflicting"
+                );
+            }
+        }
+        let super::spot_trades::DeepXWsSpotTradeFrame::Data { data, .. } = fresh else {
+            anyhow::bail!("DeepX Spot recovery requires a data frame");
+        };
+        let page: DeepXWsSpotTradePage = serde_json::from_str(data.get())?;
+        for trade in page.items {
+            let time = spot_trade_time(&trade)?;
+            if let Some((_, retained)) = self.recent.get(&trade.id) {
+                anyhow::ensure!(
+                    *retained == trade,
+                    "DeepX fresh Spot page conflicts with a retained execution"
+                );
+            }
+            if time >= start {
+                anyhow::ensure!(
+                    by_id.get(&trade.id).is_some_and(|rest| **rest == trade),
+                    "DeepX fresh Spot trade is missing or conflicting in REST recovery"
+                );
+            }
+        }
+        let mut next = self.clone();
+        let emitted = next.apply_page(history.to_vec())?;
+        *self = next;
+        Ok(emitted)
+    }
+
+    fn apply_page(&mut self, trades: Vec<DeepXSpotTrade>) -> anyhow::Result<Vec<DeepXSpotTrade>> {
+        let mut ids = BTreeSet::new();
+        let mut previous = None;
+        let mut validated = Vec::with_capacity(trades.len());
+        for trade in trades {
+            anyhow::ensure!(
+                trade.id != 0 && trade.height != 0 && ids.insert(trade.id),
+                "DeepX Spot trade identity is invalid or duplicated"
+            );
+            anyhow::ensure!(
+                trade.pair_name == self.market_name && trade.pair.eq_ignore_ascii_case(&self.pair),
+                "DeepX Spot trade identity does not match its market"
+            );
+            anyhow::ensure!(
+                valid_spot_order_id(&trade.sell_id)
+                    && valid_spot_order_id(&trade.buy_id)
+                    && valid_spot_address(&trade.seller)
+                    && valid_spot_address(&trade.buyer),
+                "DeepX Spot trade order or account identity is invalid"
+            );
+            anyhow::ensure!(
+                trade.price > Decimal::ZERO
+                    && trade.base_amount > Decimal::ZERO
+                    && trade.quote_amount > Decimal::ZERO
+                    && trade.token_value >= Decimal::ZERO,
+                "DeepX Spot trade financial values are invalid"
+            );
+            anyhow::ensure!(
+                matches!(trade.taker.as_str(), "Buyer" | "Seller"),
+                "unknown DeepX Spot trade taker"
+            );
+            let time = spot_trade_time(&trade)?;
+            anyhow::ensure!(
+                previous.is_none_or(|previous| time <= previous),
+                "DeepX Spot trade page is not descending"
+            );
+            previous = Some(time);
+            if let Some((_, retained)) = self.recent.get(&trade.id) {
+                anyhow::ensure!(
+                    *retained == trade,
+                    "DeepX Spot trade ID conflicts with retained execution"
+                );
+            } else if self.initialized {
+                anyhow::ensure!(
+                    self.watermark_ms.is_none_or(|watermark| time >= watermark),
+                    "unseen older DeepX Spot trade requires stream recovery"
+                );
+            }
+            validated.push((time, trade));
+        }
+        validated.sort_by_key(|(time, trade)| (*time, trade.id));
+        if validated.is_empty() && !self.initialized {
+            return Ok(Vec::new());
+        }
+        let mut next = self.clone();
+        let mut emitted = Vec::new();
+        for (time, trade) in validated {
+            if next.recent.contains_key(&trade.id) {
+                continue;
+            }
+            let watermark = next
+                .watermark_ms
+                .map_or(time, |watermark| watermark.max(time));
+            next.watermark_ms = Some(watermark);
+            if next.recent.len() == next.capacity.get() {
+                let oldest = *next.order.front().ok_or_else(|| {
+                    anyhow::anyhow!("DeepX Spot trade identity queue is inconsistent")
+                })?;
+                let oldest_time = next
+                    .recent
+                    .get(&oldest)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DeepX Spot retained trade identity is missing")
+                    })?
+                    .0;
+                anyhow::ensure!(
+                    oldest_time < watermark,
+                    "DeepX Spot equal-timestamp identity capacity exhausted"
+                );
+                next.order.pop_front();
+                next.recent.remove(&oldest);
+            }
+            if self.initialized {
+                emitted.push(trade.clone());
+            }
+            next.order.push_back(trade.id);
+            next.recent.insert(trade.id, (time, trade));
+        }
+        next.initialized = true;
+        *self = next;
+        Ok(emitted)
+    }
+}
+
+fn valid_spot_order_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
+}
+
+fn valid_spot_address(value: &str) -> bool {
+    nautilus_core::hex::decode_array::<20>(value.strip_prefix("0x").unwrap_or(value)).is_ok()
+}
+
+fn spot_trade_time(trade: &DeepXSpotTrade) -> anyhow::Result<i64> {
+    let timestamp: jiff::Timestamp = trade.trade_time.parse()?;
+    let time = timestamp.as_millisecond();
+    anyhow::ensure!(
+        time >= 0 && jiff::Timestamp::from_millisecond(time)? == timestamp,
+        "DeepX Spot trade timestamp must be nonnegative and millisecond aligned"
+    );
+    Ok(time)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeepXWsSpotTradePage {
+    items: Vec<DeepXSpotTrade>,
 }
 
 #[cfg(test)]

@@ -58,6 +58,13 @@ impl DeepXWsReadConnection {
         self.send_text(text, "public").await
     }
 
+    pub(crate) async fn send_spot_trade_request(
+        &mut self,
+        request: &super::spot_trades::DeepXWsSpotTradeRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text(), "Spot trade").await
+    }
+
     /// Sends one documented address-scoped account subscription without automatic retry.
     ///
     /// # Errors

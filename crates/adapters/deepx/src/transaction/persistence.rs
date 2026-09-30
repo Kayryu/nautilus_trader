@@ -46,9 +46,10 @@ use crate::{
     config::DeepXValidatedRpcEndpoints,
     rpc::DeepXValidatedRpcMethodCapabilities,
     signing::{
-        DeepXPerpCancelParams, DeepXSpotCancelParams, DeepXSpotPlaceParams, RuntimeSnapshot,
-        SignedPalletExtrinsic, SigningError, derive_signer_account_id,
-        sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel, sign_spot_place_order,
+        DeepXPerpCancelParams, DeepXPerpModifyParams, DeepXPerpPlaceParams, DeepXSpotCancelParams,
+        DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
+        derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel,
+        sign_perp_modify_order, sign_spot_place_order,
     },
 };
 
@@ -556,6 +557,61 @@ where
         Some(framework_order_context),
     )
     .await
+}
+
+/// Allocates and durably creates a perpetual modify with stable framework event identity.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_framework_perp_modify_reservation<S>(
+    store: &S,
+    lease: &S::Lease,
+    allocator: &DeepXTimestampNonceAllocator,
+    local_time_ms: u64,
+    chain_time_ms: u64,
+    client_order_id: ClientOrderId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    runtime: DeepXDirectRuntimeIdentity,
+    submission_scan_checkpoint: super::DeepXSubmissionScanCheckpoint,
+    params: DeepXPerpModifyParams,
+    framework_order_context: DeepXFrameworkOrderContext,
+) -> Result<DeepXPreparedReservation, DeepXReservationPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    if lease.signer() != allocator.signer() {
+        return Err(DeepXTransactionPersistenceError::LeaseMismatch.into());
+    }
+    if params.cancel.fast_cancel
+        || params.cancel.subaccount != params.place.subaccount
+        || params.cancel.market_id != params.place.market_id
+        || framework_order_context.client_order_id() != client_order_id
+        || framework_order_context.instrument_id() != instrument_id
+        || framework_order_context.modify_venue_order_id() != Some(params.cancel.order_id)
+        || framework_order_context.modify_quantity().is_none()
+        || framework_order_context.modify_price().is_none()
+        || !framework_order_context.has_distinct_event_identity()
+    {
+        return Err(DeepXTransactionRecordError::InconsistentFrameworkContext.into());
+    }
+    store.verify_signer_lease(lease).await?;
+    let nonce = allocator.reserve(local_time_ms, chain_time_ms)?;
+    let identity = DeepXTransactionIdentity::new_perp_modify(
+        client_order_id,
+        allocator.signer(),
+        instrument_id,
+        order_side,
+        nonce,
+        runtime,
+        params,
+    );
+    let record = DeepXTransactionRecord::created_with_framework_order_context(
+        identity,
+        submission_scan_checkpoint,
+        framework_order_context,
+    );
+    let committed = store.create_committed(lease, &record).await?;
+    committed.verify(&record)?;
+    Ok(DeepXPreparedReservation { record, committed })
 }
 
 /// Allocates an ordinary Spot cancellation reservation with immutable framework identity.
@@ -1243,6 +1299,190 @@ where
         record: signed_record,
         committed,
     })
+}
+
+/// Signs and commits an acknowledged perpetual modify reservation without submission.
+///
+/// All call arguments and the timestamp nonce come from the durable identity. Exact call
+/// verification precedes the signed-record compare-and-set.
+pub async fn prepare_signed_perp_modify_transaction<S>(
+    store: &S,
+    lease: &S::Lease,
+    committed_created: &DeepXCommittedTransactionRecord,
+    record: &DeepXTransactionRecord,
+    permit: &crate::signing::DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+) -> Result<DeepXPreparedSignedTransaction, DeepXSignedTransactionPreparationError>
+where
+    S: DeepXTransactionStore,
+{
+    verify_signer_lease(lease, record)?;
+    store.verify_signer_lease(lease).await?;
+    committed_created.verify(record)?;
+    if record.lifecycle().state() != DeepXTransactionState::Created {
+        return Err(DeepXSignedTransactionPreparationError::InvalidState);
+    }
+    let identity = record.identity();
+    let params = perp_modify_params(identity)?;
+    let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "sequential account nonce domain remains unproven".to_string(),
+        )
+        .into());
+    };
+    let verifier = DeepXPerpModifyCallVerifier::new(permit.snapshot().clone(), key.clone())?;
+    let signed = sign_perp_modify_order(permit, key, params, nonce)?;
+    let mut signed_record = record.clone();
+    signed_record.record_signed(&signed)?;
+    verifier.verify(
+        identity,
+        signed_record.signed_extrinsic().ok_or_else(|| {
+            DeepXBusinessCallBindingError::Mismatch("signed modify evidence is missing".to_string())
+        })?,
+    )?;
+    let committed = store
+        .compare_and_set_committed(lease, committed_created, &signed_record)
+        .await?;
+    committed.verify(&signed_record)?;
+    Ok(DeepXPreparedSignedTransaction {
+        record: signed_record,
+        committed,
+    })
+}
+
+fn perp_modify_params(
+    identity: &DeepXTransactionIdentity,
+) -> Result<DeepXPerpModifyParams, DeepXBusinessCallBindingError> {
+    let Some(super::DeepXTransactionOperation::PerpModify {
+        subaccount,
+        place_subaccount,
+        cancel_order_id,
+        market_id,
+        place_market_id,
+        fast_cancel,
+        is_long,
+        size,
+        price,
+        order_type,
+        take_profit,
+        stop_loss,
+        reduce_only,
+        post_only,
+    }) = identity.operation()
+    else {
+        return Err(DeepXBusinessCallBindingError::Unsupported(
+            "durable identity is not a perpetual modify operation".to_string(),
+        ));
+    };
+    Ok(DeepXPerpModifyParams {
+        cancel: DeepXPerpCancelParams {
+            subaccount: *subaccount,
+            order_id: *cancel_order_id,
+            market_id: *market_id,
+            fast_cancel: *fast_cancel,
+        },
+        place: DeepXPerpPlaceParams {
+            subaccount: *place_subaccount,
+            market_id: *place_market_id,
+            is_long: *is_long,
+            size: *size,
+            price: *price,
+            order_type: *order_type,
+            take_profit: *take_profit,
+            stop_loss: *stop_loss,
+            reduce_only: *reduce_only,
+            post_only: *post_only,
+        },
+    })
+}
+
+/// Verifies canonical signed bytes for a durable perpetual modify operation.
+#[derive(Clone)]
+pub struct DeepXPerpModifyCallVerifier {
+    snapshot: RuntimeSnapshot,
+    key: DeepXPrivateKey,
+    signer: [u8; 20],
+}
+
+impl DeepXPerpModifyCallVerifier {
+    /// Binds verification to an approved runtime snapshot and signing key.
+    pub fn new(snapshot: RuntimeSnapshot, key: DeepXPrivateKey) -> Result<Self, SigningError> {
+        let signer = derive_signer_account_id(&key)?;
+        Ok(Self {
+            snapshot,
+            key,
+            signer,
+        })
+    }
+}
+
+impl DeepXBusinessCallVerifier for DeepXPerpModifyCallVerifier {
+    fn verify(
+        &self,
+        identity: &DeepXTransactionIdentity,
+        signed_extrinsic: &DeepXDurableSignedExtrinsic,
+    ) -> Result<(), DeepXBusinessCallBindingError> {
+        let actual_hash: [u8; 32] = subxt_core::config::Hasher::hash(
+            &subxt_core::config::substrate::BlakeTwo256,
+            signed_extrinsic.bytes(),
+        )
+        .into();
+        if signed_extrinsic.bytes().is_empty() || actual_hash != signed_extrinsic.extrinsic_hash() {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable perpetual modify has invalid byte or hash integrity".to_string(),
+            ));
+        }
+        if self.signer != identity.signer()
+            || DeepXDirectRuntimeIdentity::from(self.snapshot.identity()) != *identity.runtime()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "perpetual modify verifier signer or runtime differs from reservation".to_string(),
+            ));
+        }
+        let params = perp_modify_params(identity)?;
+        if identity.order_side()
+            != if params.place.is_long {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            }
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "perpetual modify direction differs from reserved order side".to_string(),
+            ));
+        }
+        let DeepXNonceReservation::TimestampOrderId { value: nonce } = identity.nonce() else {
+            return Err(DeepXBusinessCallBindingError::Unsupported(
+                "sequential account nonce domain remains unproven".to_string(),
+            ));
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(self.snapshot.clone());
+        let permit = service.acquire().map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!("runtime permit unavailable: {e}"))
+        })?;
+        let canonical = sign_perp_modify_order(&permit, &self.key, params, nonce).map_err(|e| {
+            DeepXBusinessCallBindingError::Unsupported(format!(
+                "canonical perpetual modify could not be encoded: {e}"
+            ))
+        })?;
+        if canonical.bytes() != signed_extrinsic.bytes()
+            || canonical.extrinsic_hash() != signed_extrinsic.extrinsic_hash()
+        {
+            return Err(DeepXBusinessCallBindingError::Mismatch(
+                "durable bytes are not canonical perpetual modify for this identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DeepXPerpModifyCallVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeepXPerpModifyCallVerifier")
+            .field("snapshot", &self.snapshot.identity())
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Signs and commits an acknowledged Spot cancel reservation without submission.
@@ -3022,6 +3262,96 @@ where
     .await?)
 }
 
+/// Reconciles a submitted perpetual modify from its pre-submission finalized checkpoint.
+///
+/// Exact durable bytes are verified before network access. Finalized inclusion is committed at
+/// the in-block and finalized boundaries, while pending-pool absence preserves unresolved state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recovery binds endpoint, durable store, snapshot, and verifier evidence"
+)]
+pub async fn reconcile_submitted_perp_modify_checkpoint<S>(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    store: &S,
+    lease: &S::Lease,
+    restored: &DeepXRestoredTransactionRecord,
+    max_blocks_per_range: u64,
+    verifier: &DeepXPerpModifyCallVerifier,
+) -> Result<DeepXCommittedObservation, DeepXFinalizedRecoveryCommitError>
+where
+    S: DeepXTransactionStore,
+{
+    let record = restored.record();
+    if !matches!(
+        record.lifecycle().state(),
+        DeepXTransactionState::Submitting | DeepXTransactionState::Accepted
+    ) {
+        return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
+            record.lifecycle().state(),
+        ));
+    }
+    if record.identity().runtime() != &DeepXDirectRuntimeIdentity::from(snapshot.identity()) {
+        return Err(DeepXFinalizedRecoveryCommitError::RuntimeSnapshotMismatch);
+    }
+    let signed_extrinsic = record
+        .signed_extrinsic()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSignedExtrinsic)?;
+    let checkpoint = record
+        .submission_scan_checkpoint()
+        .ok_or(DeepXFinalizedRecoveryCommitError::MissingSubmissionScanCheckpoint)?;
+    verifier.verify(record.identity(), signed_extrinsic)?;
+
+    let collection = super::collect_finalized_perp_modify_recovery_scan(
+        endpoints,
+        capabilities,
+        snapshot,
+        record.identity(),
+        checkpoint.finalized_block_number(),
+        checkpoint.finalized_block_hash(),
+        max_blocks_per_range,
+        signed_extrinsic.extrinsic_hash(),
+    )
+    .await
+    .map_err(|e| *e)?;
+    let decision = match collection {
+        DeepXFinalizedRecoveryCollection::UpToDate(_) => {
+            match observe_submission_pool(endpoints, signed_extrinsic.extrinsic_hash()).await? {
+                super::DeepXPoolObservation::Present => DeepXRecoveryDecision::PoolAccepted,
+                super::DeepXPoolObservation::Absent => {
+                    return Ok(DeepXCommittedObservation {
+                        record: record.clone(),
+                        committed: restored.committed().clone(),
+                    });
+                }
+            }
+        }
+        DeepXFinalizedRecoveryCollection::Scan(scan) => match scan.classify() {
+            DeepXRecoveryDecision::ActionRequired => {
+                return Ok(DeepXCommittedObservation {
+                    record: record.clone(),
+                    committed: restored.committed().clone(),
+                });
+            }
+            decision => decision,
+        },
+    };
+    let committed =
+        commit_recovery_decision(store, lease, restored.committed(), record, decision).await?;
+    if !matches!(decision, DeepXRecoveryDecision::FinalizedInclusion(_)) {
+        return Ok(committed);
+    }
+    Ok(commit_recovery_decision(
+        store,
+        lease,
+        committed.committed(),
+        committed.record(),
+        decision,
+    )
+    .await?)
+}
+
 /// Reconciles a submitted Spot placement from its pre-submission finalized checkpoint.
 ///
 /// Exact durable bytes and Spot call arguments are verified before network access. Successful
@@ -3353,6 +3683,8 @@ pub enum DeepXDurableRecoveryObserver<'a> {
     SpotPlace(&'a DeepXSpotPlaceCallVerifier),
     /// Verifies an ordinary or fast Perp cancel using exact durable bytes.
     PerpCancel(&'a DeepXPerpCancelCallVerifier),
+    /// Verifies transactional perpetual modify calls using canonical durable bytes.
+    PerpModify(&'a DeepXPerpModifyCallVerifier),
     /// Verifies perpetual placement using canonical durable bytes before event observation.
     PerpPlace(&'a DeepXPerpPlaceCallVerifier),
     /// Verifies close canonical signed bytes before observing the generated order.
@@ -3400,6 +3732,9 @@ where
         .absence()
         .ok_or(DeepXFinalizedRecoveryCommitError::MissingAbsenceEvidence)?;
     if let DeepXDurableRecoveryObserver::PerpCancel(verifier) = &observer {
+        verifier.verify(record.identity(), signed_extrinsic)?;
+    }
+    if let DeepXDurableRecoveryObserver::PerpModify(verifier) = &observer {
         verifier.verify(record.identity(), signed_extrinsic)?;
     }
     if let DeepXDurableRecoveryObserver::SpotPlace(verifier) = &observer {
@@ -3473,6 +3808,20 @@ where
         }
         DeepXDurableRecoveryObserver::PerpPlace(_) => {
             super::collect_finalized_perp_place_recovery_scan(
+                endpoints,
+                capabilities,
+                snapshot,
+                record.identity(),
+                absence.finalized_block_number(),
+                absence.finalized_block_hash(),
+                max_blocks_per_range,
+                target_extrinsic_hash,
+            )
+            .await
+            .map_err(|e| *e)?
+        }
+        DeepXDurableRecoveryObserver::PerpModify(_) => {
+            super::collect_finalized_perp_modify_recovery_scan(
                 endpoints,
                 capabilities,
                 snapshot,
@@ -5428,7 +5777,8 @@ mod tests {
         let hash = record.signed_extrinsic().unwrap().extrinsic_hash();
         let order_id = match record.identity().operation().unwrap() {
             DeepXTransactionOperation::PerpPlace { .. }
-            | DeepXTransactionOperation::SpotPlace { .. } => {
+            | DeepXTransactionOperation::SpotPlace { .. }
+            | DeepXTransactionOperation::PerpModify { .. } => {
                 let DeepXNonceReservation::TimestampOrderId { value } = record.identity().nonce()
                 else {
                     unreachable!();
@@ -7164,6 +7514,89 @@ mod tests {
             market_id,
             fast_cancel,
         )
+    }
+
+    fn perp_modify_identity(params: DeepXPerpModifyParams, nonce: u64) -> DeepXTransactionIdentity {
+        DeepXTransactionIdentity::new_perp_modify(
+            ClientOrderId::new("O-19700101-000000-001-001-1"),
+            crate::signing::derive_signer_account_id(&remark_key()).unwrap(),
+            InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+            remark_runtime(),
+            params,
+        )
+    }
+
+    fn perp_modify_params_fixture() -> DeepXPerpModifyParams {
+        DeepXPerpModifyParams {
+            cancel: DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 7,
+                market_id: 100,
+                fast_cancel: false,
+            },
+            place: DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                is_long: true,
+                size: u128::MAX,
+                price: u128::MAX,
+                order_type: crate::signing::DeepXPerpOrderType::Limit(
+                    crate::signing::DeepXTimeInForce::Gtc,
+                ),
+                take_profit: Some(u128::MAX),
+                stop_loss: Some(0),
+                reduce_only: false,
+                post_only: crate::signing::DeepXPostOnlyParam::None,
+            },
+        }
+    }
+
+    #[rstest]
+    fn perp_modify_verifier_binds_exact_durable_operation() {
+        let params = perp_modify_params_fixture();
+        let nonce = 1_725_000_000_125;
+        let identity = perp_modify_identity(params, nonce);
+        let permit = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot())
+            .acquire()
+            .unwrap();
+        let signed =
+            crate::signing::sign_perp_modify_order(&permit, &remark_key(), params, nonce).unwrap();
+        let mut record = DeepXTransactionRecord::created(identity.clone());
+        record.record_signed(&signed).unwrap();
+        let verifier = DeepXPerpModifyCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert_eq!(
+            verifier.verify(&identity, record.signed_extrinsic().unwrap()),
+            Ok(())
+        );
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored, record);
+        assert_eq!(restored.identity().operation(), identity.operation());
+    }
+
+    #[rstest]
+    fn perp_modify_verifier_rejects_mismatched_call_identity() {
+        let params = perp_modify_params_fixture();
+        let nonce = 1_725_000_000_125;
+        let identity = perp_modify_identity(params, nonce);
+        let permit = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot())
+            .acquire()
+            .unwrap();
+        let signed =
+            crate::signing::sign_perp_modify_order(&permit, &remark_key(), params, nonce).unwrap();
+        let mut record = DeepXTransactionRecord::created(identity.clone());
+        record.record_signed(&signed).unwrap();
+        let mut changed_params = params;
+        changed_params.place.price -= 1;
+        let changed_identity = perp_modify_identity(changed_params, nonce);
+        let verifier = DeepXPerpModifyCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+
+        assert!(matches!(
+            verifier.verify(&changed_identity, record.signed_extrinsic().unwrap()),
+            Err(DeepXBusinessCallBindingError::Mismatch(_)),
+        ));
     }
 
     #[rstest]

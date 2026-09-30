@@ -21,8 +21,8 @@ use nautilus_common::messages::{
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderPendingCancel,
-        OrderRejected, OrderSubmitted,
+        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderModifyRejected,
+        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderSubmitted, OrderUpdated,
     },
     identifiers::VenueOrderId,
 };
@@ -37,6 +37,7 @@ use super::{
 
 const FINALIZED_REJECTION_REASON: &str = "DeepX finalized transaction failed";
 const FINALIZED_CANCEL_REJECTION_REASON: &str = "DeepX finalized cancellation failed";
+const FINALIZED_MODIFY_REJECTION_REASON: &str = "DeepX finalized modification failed";
 
 /// Authoritative finalized evidence eligible for one terminal framework order event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +64,18 @@ pub enum DeepXFrameworkOrderTerminalEvidence {
     /// Finalized dispatch or cancellation-event failure proves the cancel command failed.
     CancelRejected {
         /// Canonical finalized inclusion evidence for the failed cancellation.
+        inclusion: DeepXInclusionEvidence,
+    },
+    /// Finalized transactional replacement proves the order update.
+    Updated {
+        /// Replacement venue order ID derived from the modify nonce.
+        venue_order_id: u64,
+        /// Canonical finalized inclusion evidence for the modify.
+        inclusion: DeepXInclusionEvidence,
+    },
+    /// Finalized dispatch failure proves the modification failed.
+    ModifyRejected {
+        /// Canonical finalized inclusion evidence for the failed modify.
         inclusion: DeepXInclusionEvidence,
     },
 }
@@ -190,6 +203,10 @@ pub fn classify_perp_place_framework_order_events(
                 | DeepXTransactionOperation::SpotPlace { .. }
         )
     );
+    let is_modify = matches!(
+        record.identity().operation(),
+        Some(DeepXTransactionOperation::PerpModify { .. })
+    );
     let cancellation_order_id = match record.identity().operation() {
         Some(DeepXTransactionOperation::PerpCancel { order_id, .. }) => Some(*order_id),
         Some(DeepXTransactionOperation::SpotCancel {
@@ -202,7 +219,7 @@ pub fn classify_perp_place_framework_order_events(
         }) => return Err(DeepXFrameworkOrderEventEligibilityError::UnsupportedOperation),
         _ => None,
     };
-    if !is_place && cancellation_order_id.is_none() {
+    if !is_place && !is_modify && cancellation_order_id.is_none() {
         return Err(DeepXFrameworkOrderEventEligibilityError::UnsupportedOperation);
     }
     let DeepXNonceReservation::TimestampOrderId {
@@ -253,6 +270,15 @@ pub fn classify_perp_place_framework_order_events(
                 (false, Some(_), DeepXInclusionOutcome::Failed) => {
                     DeepXFrameworkOrderTerminalEvidence::CancelRejected { inclusion }
                 }
+                (false, None, DeepXInclusionOutcome::Success) if is_modify => {
+                    DeepXFrameworkOrderTerminalEvidence::Updated {
+                        venue_order_id: place_order_id,
+                        inclusion,
+                    }
+                }
+                (false, None, DeepXInclusionOutcome::Failed) if is_modify => {
+                    DeepXFrameworkOrderTerminalEvidence::ModifyRejected { inclusion }
+                }
                 _ => unreachable!("validated operation has a supported terminal result"),
             },
         )
@@ -265,6 +291,8 @@ pub fn classify_perp_place_framework_order_events(
         submitted,
         submitted_payload: if is_place {
             DeepXFrameworkOrderEventPayload::Submitted
+        } else if is_modify {
+            DeepXFrameworkOrderEventPayload::PendingUpdate
         } else {
             DeepXFrameworkOrderEventPayload::PendingCancel
         },
@@ -318,6 +346,12 @@ pub fn stage_perp_framework_order_events(
             }
             DeepXFrameworkOrderTerminalEvidence::CancelRejected { .. } => {
                 DeepXFrameworkOrderEventPayload::CancelRejected
+            }
+            DeepXFrameworkOrderTerminalEvidence::Updated { venue_order_id, .. } => {
+                DeepXFrameworkOrderEventPayload::Updated { venue_order_id }
+            }
+            DeepXFrameworkOrderTerminalEvidence::ModifyRejected { .. } => {
+                DeepXFrameworkOrderEventPayload::ModifyRejected
             }
         };
         changed |= outbox.stage_terminal(DeepXFrameworkOrderEventStage::new(
@@ -459,6 +493,25 @@ pub fn materialize_perp_framework_order_events(
                 event.causation_id = Some(context.command_id());
                 OrderEventAny::PendingCancel(event)
             }
+            DeepXFrameworkOrderEventPayload::PendingUpdate => {
+                let order_id = context
+                    .modify_venue_order_id()
+                    .ok_or(DeepXFrameworkOrderEventMaterializationError::MissingFrameworkContext)?;
+                let mut event = OrderPendingUpdate::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    Some(context.account_id()),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(order_id.to_string())),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::PendingUpdate(event)
+            }
             _ => unreachable!("durable validation rejects terminal payload in submitted slot"),
         };
         events.push(event);
@@ -542,11 +595,61 @@ pub fn materialize_perp_framework_order_events(
                 event.causation_id = Some(context.command_id());
                 OrderEventAny::CancelRejected(event)
             }
+            DeepXFrameworkOrderEventPayload::Updated { venue_order_id } => {
+                let quantity = context
+                    .modify_quantity()
+                    .ok_or(DeepXFrameworkOrderEventMaterializationError::MissingFrameworkContext)?;
+                let price = context
+                    .modify_price()
+                    .ok_or(DeepXFrameworkOrderEventMaterializationError::MissingFrameworkContext)?;
+                let mut event = OrderUpdated::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    quantity,
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(venue_order_id.to_string())),
+                    Some(context.account_id()),
+                    Some(price),
+                    None,
+                    None,
+                    false,
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::Updated(event)
+            }
+            DeepXFrameworkOrderEventPayload::ModifyRejected => {
+                let order_id = context
+                    .modify_venue_order_id()
+                    .ok_or(DeepXFrameworkOrderEventMaterializationError::MissingFrameworkContext)?;
+                let mut event = OrderModifyRejected::new(
+                    context.trader_id(),
+                    context.strategy_id(),
+                    context.instrument_id(),
+                    context.client_order_id(),
+                    FINALIZED_MODIFY_REJECTION_REASON.into(),
+                    stage.event_id(),
+                    stage.ts_event(),
+                    stage.ts_init(),
+                    stage.reconciliation(),
+                    Some(VenueOrderId::new(order_id.to_string())),
+                    Some(context.account_id()),
+                );
+                event.causation_id = Some(context.command_id());
+                OrderEventAny::ModifyRejected(event)
+            }
             DeepXFrameworkOrderEventPayload::Submitted => {
                 unreachable!("durable outbox validation rejects submitted terminal payload")
             }
             DeepXFrameworkOrderEventPayload::PendingCancel => {
                 unreachable!("durable outbox validation rejects pending cancel terminal payload")
+            }
+            DeepXFrameworkOrderEventPayload::PendingUpdate => {
+                unreachable!("durable outbox validation rejects pending update terminal payload")
             }
         };
         events.push(event);

@@ -18,8 +18,9 @@
 use anyhow::Context;
 use nautilus_core::hex;
 use nautilus_deepx::{
-    config::DeepXDataClientConfig, observe_and_validate_rpc_endpoint_identities,
-    observe_and_validate_rpc_method_capabilities, observe_finalized_margin_evidence,
+    config::DeepXDataClientConfig, map_finalized_margin_balance,
+    observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
+    observe_finalized_margin_evidence,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -50,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         evidence.subaccount() == subaccount,
         "finalized margin evidence belongs to another subaccount"
     );
+    let margin = map_finalized_margin_balance(&evidence)?;
 
     let checkpoint = evidence.checkpoint();
     println!(
@@ -71,7 +73,11 @@ async fn main() -> anyhow::Result<()> {
         evidence.maintenance().total_margin_required(),
     );
     println!(
-        "Values are raw runtime quote units; no balances, AccountState, credentials, or transactions were used"
+        "framework_margin initial={} maintenance={} currency={}",
+        margin.initial, margin.maintenance, margin.currency,
+    );
+    println!(
+        "Raw values use DeepX six-decimal USDC quote units; no balances, AccountState, credentials, or transactions were used"
     );
     Ok(())
 }

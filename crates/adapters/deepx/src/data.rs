@@ -13,12 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Read-only REST instrument discovery, historical bars, trades, and funding for DeepX testnet.
+//! Read-only REST instrument discovery, historical bars, Spot/Perpetual trades, and funding.
 
 mod bars;
 mod book;
 mod funding;
 mod live_spot_book;
+mod live_spot_trades;
 mod live_trades;
 mod public_prices;
 mod status;
@@ -143,6 +144,7 @@ pub struct DeepXDataClient {
     sender: Option<UnboundedSender<DataEvent>>,
     connected: bool,
     trade_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
+    spot_trade_subscriptions: BTreeMap<InstrumentId, live_spot_trades::SpotTradeSubscription>,
     book_subscriptions: BTreeMap<InstrumentId, (NonZeroUsize, live_trades::TradeSubscription)>,
     depth10_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
     quote_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
@@ -201,6 +203,7 @@ impl DeepXDataClient {
             sender: None,
             connected: false,
             trade_subscriptions: BTreeMap::new(),
+            spot_trade_subscriptions: BTreeMap::new(),
             book_subscriptions: BTreeMap::new(),
             depth10_subscriptions: BTreeMap::new(),
             quote_subscriptions: BTreeMap::new(),
@@ -388,6 +391,10 @@ impl DeepXDataClient {
             subscription.retire();
         }
         self.trade_subscriptions.clear();
+        for subscription in self.spot_trade_subscriptions.values() {
+            subscription.retire();
+        }
+        self.spot_trade_subscriptions.clear();
         for (_, subscription) in self.book_subscriptions.values() {
             subscription.retire();
         }
@@ -818,7 +825,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn subscribe_trades(&mut self, command: SubscribeTrades) -> anyhow::Result<()> {
-        let (instrument, market_id) = self.history_instrument(
+        let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -830,8 +837,46 @@ impl DataClient for DeepXDataClient {
             command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
             "DeepX subscription venue mismatch"
         );
-        let market_id = u16::try_from(market_id)?;
         self.config.network.ws_connection_url()?;
+        if let DeepXMarketMetadata::Spot(market) = market {
+            if self
+                .spot_trade_subscriptions
+                .get(&command.instrument_id)
+                .is_some_and(live_spot_trades::SpotTradeSubscription::is_active)
+            {
+                return Ok(());
+            }
+            let subscription = self
+                .spot_trade_subscriptions
+                .get(&command.instrument_id)
+                .map_or_else(
+                    live_spot_trades::SpotTradeSubscription::new,
+                    live_spot_trades::SpotTradeSubscription::resume,
+                );
+            let task = live_spot_trades::SpotTradeTask {
+                instrument,
+                market: *market,
+                network: self.config.network.clone(),
+                http: self.http.clone(),
+                proxy_url: self.config.proxy_url.clone(),
+                timeout: Duration::from_secs(self.config.websocket_timeout_secs),
+                sender: self
+                    .sender
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("DeepX data event sender unavailable"))?
+                    .clone(),
+                connection_epoch: Arc::clone(&self.request_epoch),
+                subscription: subscription.clone(),
+            };
+            self.tasks.spawn(task.run())?;
+            self.spot_trade_subscriptions
+                .insert(command.instrument_id, subscription);
+            return Ok(());
+        }
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            anyhow::bail!("DeepX trade subscription market is unsupported");
+        };
+        let market_id = u16::try_from(market.id)?;
         if self
             .trade_subscriptions
             .get(&command.instrument_id)
@@ -869,7 +914,7 @@ impl DataClient for DeepXDataClient {
     }
 
     fn unsubscribe_trades(&mut self, command: &UnsubscribeTrades) -> anyhow::Result<()> {
-        self.history_instrument(
+        self.history_market(
             command.instrument_id,
             command.client_id,
             command
@@ -882,6 +927,9 @@ impl DataClient for DeepXDataClient {
             "DeepX subscription venue mismatch"
         );
         if let Some(subscription) = self.trade_subscriptions.remove(&command.instrument_id) {
+            subscription.retire();
+        }
+        if let Some(subscription) = self.spot_trade_subscriptions.remove(&command.instrument_id) {
             subscription.retire();
         }
         Ok(())

@@ -34,6 +34,7 @@ use super::{
     DeepXSubmissionPoolEvidence, DeepXTransactionIdentity, DeepXTransactionOperation,
     classify_reorganization, plan_missed_block_scan,
 };
+use crate::signing::DeepXPerpModifyParams;
 use crate::{
     config::{DeepXRpcRole, DeepXValidatedRpcEndpoints},
     rpc::{
@@ -782,6 +783,150 @@ pub enum DeepXPerpCancelEventVerificationError {
     InclusionEvidence(#[from] DeepXInclusionEvidenceError),
 }
 
+/// Failures while verifying both legs of a perpetual modify at one extrinsic index.
+#[derive(Debug, Error)]
+pub enum DeepXPerpModifyEventVerificationError {
+    /// The base identity, modify scope, or cancel mode cannot be verified.
+    #[error("unsupported DeepX perpetual modify event identity")]
+    UnsupportedOperation,
+    /// The existing order cancellation event does not match the modify request.
+    #[error(transparent)]
+    Cancel(#[from] DeepXPerpCancelEventVerificationError),
+    /// The replacement order placement event does not match the modify request.
+    #[error(transparent)]
+    Place(#[from] DeepXPerpPlaceEventVerificationError),
+    /// Complete runtime events could not be decoded to verify leg ordering.
+    #[error("DeepX perpetual modify event ordering could not be verified")]
+    MalformedEventBytes,
+    /// The cancel and replacement legs produced conflicting inclusion evidence.
+    #[error("DeepX perpetual modify legs produced conflicting inclusion evidence")]
+    ConflictingEvidence,
+}
+
+/// Verifies exact perpetual cancellation and replacement placement at the same extrinsic index.
+///
+/// The replacement order ID is the timestamp nonce. The supplied base identity must contain the
+/// same reserved signer, instrument, side, nonce and runtime scope used for both leg identities.
+/// Both complete `System.Events` decodes must independently prove dispatch and the expected
+/// business event. This verifies event evidence only; the signed call still requires canonical
+/// `Subaccount.modify_orders` binding before it can be used for durable recovery.
+///
+/// # Errors
+///
+/// Returns an error for unsupported identity/scope, malformed event bytes, conflicting leg
+/// evidence, or a successful dispatch missing either expected business event.
+pub fn verify_perp_modify_inclusion_events(
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    params: DeepXPerpModifyParams,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpModifyEventVerificationError> {
+    use DeepXPerpModifyEventVerificationError as Error;
+
+    if !matches!(
+        identity.nonce(),
+        super::DeepXNonceReservation::TimestampOrderId { .. }
+    ) {
+        return Err(Error::UnsupportedOperation);
+    }
+    let expected_side = if params.place.is_long {
+        nautilus_model::enums::OrderSide::Buy
+    } else {
+        nautilus_model::enums::OrderSide::Sell
+    };
+    if identity.operation().is_some()
+        || identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || identity.order_side() != expected_side
+        || params.cancel.fast_cancel
+        || params.cancel.subaccount != params.place.subaccount
+        || params.cancel.market_id != params.place.market_id
+    {
+        return Err(Error::UnsupportedOperation);
+    }
+
+    let client_order_id =
+        nautilus_model::identifiers::ClientOrderId::new(identity.client_order_id());
+    let cancel_identity = DeepXTransactionIdentity::new_perp_cancel(
+        client_order_id,
+        identity.signer(),
+        identity.instrument_id(),
+        expected_side,
+        identity.nonce(),
+        identity.runtime().clone(),
+        params.cancel.subaccount,
+        params.cancel.order_id,
+        params.cancel.market_id,
+        false,
+    );
+    let place_identity = DeepXTransactionIdentity::new_perp_place(
+        client_order_id,
+        identity.signer(),
+        identity.instrument_id(),
+        expected_side,
+        identity.nonce(),
+        identity.runtime().clone(),
+        params.place,
+    );
+    let cancel_evidence = verify_perp_cancel_inclusion_events(
+        snapshot,
+        &cancel_identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )?;
+    let place_evidence = verify_perp_place_inclusion_events(
+        snapshot,
+        &place_identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )?;
+    if cancel_evidence != place_evidence {
+        return Err(Error::ConflictingEvidence);
+    }
+    if cancel_evidence.outcome() == super::DeepXInclusionOutcome::Success
+        && !perp_modify_events_are_ordered(snapshot, extrinsic_index, event_bytes)?
+    {
+        return Err(Error::ConflictingEvidence);
+    }
+    Ok(cancel_evidence)
+}
+
+fn perp_modify_events_are_ordered(
+    snapshot: &RuntimeSnapshot,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<bool, DeepXPerpModifyEventVerificationError> {
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    let mut cancel_position = None;
+    let mut place_position = None;
+    for (position, event) in events.iter().enumerate() {
+        let event =
+            event.map_err(|_| DeepXPerpModifyEventVerificationError::MalformedEventBytes)?;
+        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
+            || event.pallet_name() != "PerpMarket"
+        {
+            continue;
+        }
+        match event.variant_name() {
+            "OrderCancelled" => cancel_position = Some(position),
+            "OrderPlaced" => place_position = Some(position),
+            _ => {}
+        }
+    }
+    Ok(cancel_position
+        .zip(place_position)
+        .is_some_and(|(cancel, place)| cancel < place))
+}
+
 /// Verifies the expected business event for one durable perpetual cancel operation.
 ///
 /// The event bytes must be the complete SCALE value returned from `System.Events`, including its
@@ -1190,6 +1335,9 @@ pub enum DeepXTransactionWatchError {
     PerpProfitAndLossPointEventVerification(
         #[from] DeepXPerpProfitAndLossPointEventVerificationError,
     ),
+    /// Both perpetual modify legs could not be verified at the exact index.
+    #[error(transparent)]
+    PerpModifyEventVerification(#[from] DeepXPerpModifyEventVerificationError),
     /// A bounded recovery scan could not be planned safely.
     #[error(transparent)]
     ScanPlan(#[from] DeepXRecoveryScanPlanError),
@@ -1741,6 +1889,94 @@ enum CancelEventEvidence<'a> {
     PerpPlace(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
     PerpClose(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
     PerpProfitAndLossPoint(&'a RuntimeSnapshot, &'a DeepXTransactionIdentity),
+    PerpModify(
+        &'a RuntimeSnapshot,
+        &'a DeepXTransactionIdentity,
+        DeepXPerpModifyParams,
+    ),
+}
+
+/// Collects bounded canonical finalized evidence for a perpetual modify operation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches bounded recovery scan inputs"
+)]
+pub async fn collect_finalized_perp_modify_recovery_scan(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    last_scanned_block: u64,
+    last_scanned_block_hash: [u8; 32],
+    max_blocks_per_range: u64,
+    target_extrinsic_hash: [u8; 32],
+) -> Result<DeepXFinalizedRecoveryCollection, Box<DeepXTransactionWatchError>> {
+    if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
+        || !matches!(
+            identity.operation(),
+            Some(DeepXTransactionOperation::PerpModify { .. })
+        )
+        || !matches!(
+            identity.nonce(),
+            super::DeepXNonceReservation::TimestampOrderId { .. }
+        )
+    {
+        return Err(Box::new(
+            DeepXPerpModifyEventVerificationError::UnsupportedOperation.into(),
+        ));
+    }
+    let Some(DeepXTransactionOperation::PerpModify {
+        subaccount,
+        place_subaccount,
+        cancel_order_id,
+        market_id,
+        place_market_id,
+        fast_cancel,
+        is_long,
+        size,
+        price,
+        order_type,
+        take_profit,
+        stop_loss,
+        reduce_only,
+        post_only,
+    }) = identity.operation()
+    else {
+        return Err(Box::new(
+            DeepXPerpModifyEventVerificationError::UnsupportedOperation.into(),
+        ));
+    };
+    let params = DeepXPerpModifyParams {
+        cancel: crate::signing::DeepXPerpCancelParams {
+            subaccount: *subaccount,
+            order_id: *cancel_order_id,
+            market_id: *market_id,
+            fast_cancel: *fast_cancel,
+        },
+        place: crate::signing::DeepXPerpPlaceParams {
+            subaccount: *place_subaccount,
+            market_id: *place_market_id,
+            is_long: *is_long,
+            size: *size,
+            price: *price,
+            order_type: *order_type,
+            take_profit: *take_profit,
+            stop_loss: *stop_loss,
+            reduce_only: *reduce_only,
+            post_only: *post_only,
+        },
+    };
+    collect_finalized_recovery_scan_inner(
+        endpoints,
+        capabilities,
+        last_scanned_block,
+        last_scanned_block_hash,
+        max_blocks_per_range,
+        target_extrinsic_hash,
+        Some(CancelEventEvidence::PerpModify(snapshot, identity, params)),
+    )
+    .await
+    .map_err(Box::new)
 }
 
 /// Collects bounded canonical finalized evidence for a close-generated perpetual order.
@@ -2047,6 +2283,17 @@ async fn collect_finalized_recovery_scan_inner(
                         verify_perp_profit_and_loss_point_inclusion_events(
                             snapshot,
                             identity,
+                            observation.block_hash(),
+                            observation.block_number(),
+                            extrinsic_index,
+                            &event_bytes,
+                        )?
+                    }
+                    CancelEventEvidence::PerpModify(snapshot, identity, params) => {
+                        verify_perp_modify_inclusion_events(
+                            snapshot,
+                            identity,
+                            *params,
                             observation.block_hash(),
                             observation.block_number(),
                             extrinsic_index,
@@ -3084,6 +3331,129 @@ mod tests {
         }
         Vec::<[u8; 32]>::new().encode_to(&mut record);
         record
+    }
+
+    fn perp_modify_params() -> DeepXPerpModifyParams {
+        DeepXPerpModifyParams {
+            cancel: crate::signing::DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 7,
+                market_id: 100,
+                fast_cancel: false,
+            },
+            place: crate::signing::DeepXPerpPlaceParams {
+                subaccount: [0x11; 20],
+                market_id: 100,
+                is_long: true,
+                size: u128::MAX,
+                price: u128::MAX,
+                order_type: crate::signing::DeepXPerpOrderType::Limit(
+                    crate::signing::DeepXTimeInForce::Gtc,
+                ),
+                take_profit: Some(u128::MAX),
+                stop_loss: Some(0),
+                reduce_only: false,
+                post_only: crate::signing::DeepXPostOnlyParam::None,
+            },
+        }
+    }
+
+    fn perp_modify_base_identity() -> DeepXTransactionIdentity {
+        let existing = cancel_identity([0x11; 20], 7, false);
+        DeepXTransactionIdentity::new(
+            ClientOrderId::new(existing.client_order_id()),
+            existing.signer(),
+            existing.instrument_id(),
+            OrderSide::Buy,
+            existing.nonce(),
+            existing.runtime().clone(),
+        )
+    }
+
+    fn perp_modify_event_records(
+        snapshot: &RuntimeSnapshot,
+        index: u32,
+        block_number: u64,
+        params: DeepXPerpModifyParams,
+    ) -> Vec<Vec<u8>> {
+        let base = perp_modify_base_identity();
+        let place_identity = DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new(base.client_order_id()),
+            base.signer(),
+            base.instrument_id(),
+            OrderSide::Buy,
+            base.nonce(),
+            base.runtime().clone(),
+            params.place,
+        );
+        vec![
+            cancel_event_record(
+                snapshot,
+                index,
+                params.cancel.subaccount,
+                params.cancel.order_id,
+                0,
+            ),
+            perp_place_event_record(
+                snapshot,
+                index,
+                &place_identity,
+                &perp_place_order_value(&place_identity, block_number),
+            ),
+            dispatch_event_record(snapshot, index, true),
+        ]
+    }
+
+    #[rstest]
+    fn perp_modify_inclusion_requires_both_events_at_one_index() {
+        let snapshot = runtime_snapshot();
+        let identity = perp_modify_base_identity();
+        let params = perp_modify_params();
+        let events = system_events(&perp_modify_event_records(&snapshot, 4, 42, params));
+
+        let evidence = verify_perp_modify_inclusion_events(
+            &snapshot, &identity, params, [8; 32], 42, 4, &events,
+        )
+        .unwrap();
+
+        assert_eq!(
+            evidence.outcome(),
+            super::super::DeepXInclusionOutcome::Success
+        );
+        assert_eq!(evidence.extrinsic_index(), 4);
+    }
+
+    #[rstest]
+    fn perp_modify_successful_dispatch_without_cancel_event_is_rejected() {
+        let snapshot = runtime_snapshot();
+        let identity = perp_modify_base_identity();
+        let params = perp_modify_params();
+        let records = perp_modify_event_records(&snapshot, 4, 42, params);
+        let events = system_events(&records[1..]);
+
+        assert!(matches!(
+            verify_perp_modify_inclusion_events(
+                &snapshot, &identity, params, [8; 32], 42, 4, &events,
+            ),
+            Err(DeepXPerpModifyEventVerificationError::Cancel(_)),
+        ));
+    }
+
+    #[rstest]
+    fn perp_modify_rejects_replacement_event_before_cancel_event() {
+        let snapshot = runtime_snapshot();
+        let identity = perp_modify_base_identity();
+        let params = perp_modify_params();
+        let mut records = perp_modify_event_records(&snapshot, 4, 42, params);
+        records.swap(0, 1);
+        let events = system_events(&records);
+
+        assert!(matches!(
+            verify_perp_modify_inclusion_events(
+                &snapshot, &identity, params, [8; 32], 42, 4, &events,
+            ),
+            Err(DeepXPerpModifyEventVerificationError::ConflictingEvidence),
+        ));
     }
 
     #[rstest]

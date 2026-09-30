@@ -35,6 +35,57 @@ use crate::{
 
 const DEEPX_QUOTE_PRECISION: u32 = 6;
 
+/// Finalized framework margin with the chain observation that supports it.
+#[derive(Clone, Debug)]
+pub struct DeepXFinalizedMarginBalance {
+    checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    subaccount: [u8; 20],
+    margin: MarginBalance,
+}
+
+impl DeepXFinalizedMarginBalance {
+    /// Returns the finalized checkpoint supporting this margin balance.
+    #[must_use]
+    pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.checkpoint
+    }
+
+    /// Returns the approved runtime identity observed at the checkpoint.
+    #[must_use]
+    pub const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Returns the subaccount whose margin was observed.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns the converted initial and maintenance requirements.
+    #[must_use]
+    pub const fn margin(&self) -> &MarginBalance {
+        &self.margin
+    }
+}
+
+/// Converts finalized margin evidence while retaining its checkpoint and account identity.
+///
+/// # Errors
+///
+/// Returns an error when either required margin exceeds the framework range or precision.
+pub fn map_finalized_margin_balance_with_evidence(
+    evidence: &DeepXFinalizedMarginEvidence,
+) -> Result<DeepXFinalizedMarginBalance, DeepXMarginBalanceError> {
+    Ok(DeepXFinalizedMarginBalance {
+        checkpoint: evidence.checkpoint(),
+        runtime_identity: evidence.runtime_identity().clone(),
+        subaccount: evidence.subaccount(),
+        margin: map_finalized_margin_balance(evidence)?,
+    })
+}
+
 /// Errors raised while converting finalized DeepX margin requirements.
 #[derive(Debug, Error)]
 pub enum DeepXMarginBalanceError {
@@ -86,6 +137,9 @@ pub enum DeepXFlatAccountBalanceError {
     /// A perpetual order is active, so the flat-account boundary does not apply.
     #[error("DeepX finalized account has an active perpetual order")]
     PerpetualOrderActive,
+    /// A Spot order is active, so available balances cannot be proven fully free.
+    #[error("DeepX finalized account has an active Spot order")]
+    SpotOrderActive,
     /// A lending liability is present or its effective amount is contradictory.
     #[error("DeepX finalized lending asset {asset} has a borrow liability")]
     BorrowLiability { asset: String },
@@ -181,10 +235,10 @@ impl DeepXFinalizedFlatAccountBalances {
 
 /// Maps finalized chain evidence into framework balances only for a fully withdrawable flat account.
 ///
-/// The mapping is intentionally unavailable when any margin, perpetual exposure, borrow, or
-/// withdrawal restriction exists. In the accepted state each non-zero effective lending deposit
-/// is independently proven fully withdrawable, so `total == free` and `locked == 0` require no
-/// inferred pending-order or collateral-allocation semantics.
+/// The mapping is intentionally unavailable when any margin, perpetual or Spot exposure, borrow,
+/// or withdrawal restriction exists. In the accepted state each non-zero effective lending
+/// deposit is independently proven fully withdrawable, so `total == free` and `locked == 0`
+/// require no inferred pending-order or collateral-allocation semantics.
 ///
 /// # Errors
 ///
@@ -203,6 +257,9 @@ pub fn map_finalized_flat_account_balances(
     }
     if !evidence.perp_orders().orders().is_empty() {
         return Err(DeepXFlatAccountBalanceError::PerpetualOrderActive);
+    }
+    if !evidence.spot_orders().active_order_ids().is_empty() {
+        return Err(DeepXFlatAccountBalanceError::SpotOrderActive);
     }
 
     let mut observed_assets = HashSet::new();

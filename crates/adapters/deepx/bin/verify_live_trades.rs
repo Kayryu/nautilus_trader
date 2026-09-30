@@ -14,6 +14,8 @@
 
 //! Read-only verification of framework live trade subscriptions and shutdown.
 
+use std::{cell::RefCell, collections::BTreeSet, rc::Rc, time::Duration};
+
 use nautilus_common::{
     cache::Cache,
     clients::DataClient,
@@ -34,7 +36,6 @@ use nautilus_model::{
     data::Data,
     identifiers::{ClientId, InstrumentId},
 };
-use std::{cell::RefCell, collections::BTreeSet, rc::Rc, time::Duration};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -382,6 +383,71 @@ async fn main() -> anyhow::Result<()> {
         );
         println!(
             "DeepX framework depth10 unsubscribe/disconnect verified; no private accounts or transactions"
+        );
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--spot") {
+        let spot_instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        client.subscribe_trades(SubscribeTrades::new(
+            spot_instrument_id,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        let spot_trade_result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut ids = BTreeSet::new();
+            let mut previous = None;
+            while ids.is_empty() {
+                let Some(DataEvent::Data(Data::Trade(tick))) = receiver.recv().await else {
+                    anyhow::bail!("expected a framework Spot TradeTick");
+                };
+                anyhow::ensure!(
+                    tick.instrument_id == spot_instrument_id,
+                    "Spot live trade instrument mismatch"
+                );
+                anyhow::ensure!(
+                    ids.insert(tick.trade_id.to_string()),
+                    "duplicate Spot live trade ID"
+                );
+                anyhow::ensure!(
+                    previous.is_none_or(|time| tick.ts_event >= time),
+                    "Spot live trade timestamps moved backwards"
+                );
+                previous = Some(tick.ts_event);
+                println!(
+                    "DeepX framework live Spot trade ID={} price={} size={}",
+                    tick.trade_id, tick.price, tick.size
+                );
+            }
+            anyhow::Ok(())
+        })
+        .await;
+        client.unsubscribe_trades(&UnsubscribeTrades::new(
+            spot_instrument_id,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        client.disconnect().await?;
+        while receiver.try_recv().is_ok() {}
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "Spot live trade was published after disconnect"
+        );
+        match spot_trade_result {
+            Ok(result) => result?,
+            Err(_) => println!("No novel Spot TradeTick arrived during the observation window"),
+        }
+        println!(
+            "DeepX framework Spot trade unsubscribe/disconnect verified; no private accounts or transactions"
         );
         return Ok(());
     }

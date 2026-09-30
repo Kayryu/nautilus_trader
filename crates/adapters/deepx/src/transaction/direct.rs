@@ -22,13 +22,14 @@ use thiserror::Error;
 use super::{
     DeepXBusinessCallBindingError, DeepXBusinessCallVerifier, DeepXCommittedTransactionRecord,
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXNonceReservation,
-    DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpPlaceCallVerifier,
-    DeepXPerpProfitAndLossPointCallVerifier, DeepXPreparedSignedTransaction,
-    DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
-    DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier, DeepXTransactionIdentity,
-    DeepXTransactionOperation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
-    DeepXTransactionStore, load_verified_committed_for_signer,
-    prepare_signed_perp_cancel_transaction, prepare_signed_perp_close_transaction,
+    DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpModifyCallVerifier,
+    DeepXPerpPlaceCallVerifier, DeepXPerpProfitAndLossPointCallVerifier,
+    DeepXPreparedSignedTransaction, DeepXRestoredTransactionRecord,
+    DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
+    DeepXSpotPlaceCallVerifier, DeepXTransactionIdentity, DeepXTransactionOperation,
+    DeepXTransactionPersistenceError, DeepXTransactionRecord, DeepXTransactionStore,
+    load_verified_committed_for_signer, prepare_signed_perp_cancel_transaction,
+    prepare_signed_perp_close_transaction, prepare_signed_perp_modify_transaction,
     prepare_signed_perp_place_transaction, prepare_signed_perp_profit_and_loss_point_transaction,
     prepare_signed_spot_cancel_transaction, prepare_signed_spot_place_transaction,
 };
@@ -101,6 +102,7 @@ impl DeepXDirectPalletCallVerifier {
             | DeepXTransactionOperation::PerpClose { subaccount, .. }
             | DeepXTransactionOperation::PerpProfitAndLossPoint { subaccount, .. }
             | DeepXTransactionOperation::PerpCancel { subaccount, .. }
+            | DeepXTransactionOperation::PerpModify { subaccount, .. }
             | DeepXTransactionOperation::SpotPlace { subaccount, .. }
             | DeepXTransactionOperation::SpotCancel { subaccount, .. } => subaccount,
         };
@@ -189,6 +191,9 @@ impl DeepXBusinessCallVerifier for DeepXDirectPalletCallVerifier {
             DeepXTransactionOperation::PerpCancel { .. } => {
                 verify_with!(DeepXPerpCancelCallVerifier)
             }
+            DeepXTransactionOperation::PerpModify { .. } => {
+                verify_with!(DeepXPerpModifyCallVerifier)
+            }
             DeepXTransactionOperation::SpotPlace { .. } => verify_with!(DeepXSpotPlaceCallVerifier),
             DeepXTransactionOperation::SpotCancel { .. } => {
                 verify_with!(DeepXSpotCancelCallVerifier)
@@ -242,6 +247,9 @@ where
         }
         DeepXTransactionOperation::PerpCancel { .. } => {
             prepare_with!(prepare_signed_perp_cancel_transaction)
+        }
+        DeepXTransactionOperation::PerpModify { .. } => {
+            prepare_with!(prepare_signed_perp_modify_transaction)
         }
         DeepXTransactionOperation::SpotPlace { .. } => {
             prepare_with!(prepare_signed_spot_place_transaction)

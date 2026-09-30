@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
         let checkpoint = evidence.checkpoint();
         println!(
-            "subaccount=0x{} block={} hash=0x{} timestamp_ms={} initial_margin_required={} maintenance_margin_required={} lending_positions={} perp_positions={} active_perp_orders={}",
+            "subaccount=0x{} block={} hash=0x{} timestamp_ms={} initial_margin_required={} maintenance_margin_required={} lending_positions={} perp_positions={} active_perp_orders={} active_spot_orders={}",
             hex::encode(evidence.subaccount()),
             checkpoint.block_number(),
             hex::encode(checkpoint.block_hash()),
@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
             evidence.lending().positions().len(),
             evidence.perp_positions().positions().len(),
             evidence.perp_orders().orders().len(),
+            evidence.spot_orders().active_order_ids().len(),
         );
         for position in evidence.lending().positions() {
             println!(
@@ -144,6 +145,23 @@ async fn main() -> anyhow::Result<()> {
                 order.status(),
                 order.size_filled(),
                 order.size_remain(),
+                order.create_time(),
+                order.reduce_only(),
+                order.post_only(),
+            );
+        }
+        for order in evidence.spot_orders().orders() {
+            println!(
+                "active_spot_order subaccount=0x{} order_id={} pair=0x{} is_buy={} status={:?} order_type={:?} quote_amount_le=0x{} base_amount_le=0x{} price_le={:?} create_time={} reduce_only={} post_only={:?}",
+                hex::encode(evidence.subaccount()),
+                order.order_id(),
+                hex::encode(order.pair()),
+                order.is_buy(),
+                order.status(),
+                order.order_type(),
+                hex::encode(order.quote_amount()),
+                hex::encode(order.base_amount()),
+                order.price().map(hex::encode),
                 order.create_time(),
                 order.reduce_only(),
                 order.post_only(),

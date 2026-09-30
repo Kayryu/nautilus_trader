@@ -21,6 +21,7 @@ use nautilus_core::{UUID4, UnixNanos, hex};
 use nautilus_model::{
     enums::OrderSide,
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
+    types::{Price, Quantity},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
@@ -33,10 +34,10 @@ use super::{
 use crate::signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic};
 
 /// Version of the durable DeepX transaction record schema.
-pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 7;
+pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 8;
 
 /// Namespace used for DeepX transaction records in the generic cache.
-pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v7:";
+pub const DEEPX_TRANSACTION_CACHE_KEY_PREFIX: &str = "deepx:transaction:v8:";
 
 /// Immutable framework command and event identity retained for crash recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +56,9 @@ pub struct DeepXFrameworkOrderContext {
     causation_id: Option<UUID4>,
     submitted_event_id: UUID4,
     terminal_event_id: UUID4,
+    modify_venue_order_id: Option<u64>,
+    modify_quantity: Option<Quantity>,
+    modify_price: Option<Price>,
 }
 
 impl DeepXFrameworkOrderContext {
@@ -90,7 +94,24 @@ impl DeepXFrameworkOrderContext {
             causation_id,
             submitted_event_id,
             terminal_event_id,
+            modify_venue_order_id: None,
+            modify_quantity: None,
+            modify_price: None,
         }
+    }
+
+    /// Adds the exact framework terms and previous ID for a perpetual modify command.
+    #[must_use]
+    pub const fn with_modify_details(
+        mut self,
+        venue_order_id: u64,
+        quantity: Quantity,
+        price: Price,
+    ) -> Self {
+        self.modify_venue_order_id = Some(venue_order_id);
+        self.modify_quantity = Some(quantity);
+        self.modify_price = Some(price);
+        self
     }
 
     /// Returns the trader which issued the command.
@@ -171,6 +192,24 @@ impl DeepXFrameworkOrderContext {
         self.terminal_event_id
     }
 
+    /// Returns the original venue order ID for a modify command.
+    #[must_use]
+    pub const fn modify_venue_order_id(&self) -> Option<u64> {
+        self.modify_venue_order_id
+    }
+
+    /// Returns the requested absolute quantity for a modify command.
+    #[must_use]
+    pub const fn modify_quantity(&self) -> Option<Quantity> {
+        self.modify_quantity
+    }
+
+    /// Returns the requested price for a modify command.
+    #[must_use]
+    pub const fn modify_price(&self) -> Option<Price> {
+        self.modify_price
+    }
+
     pub(crate) fn has_distinct_event_identity(&self) -> bool {
         self.command_id != self.order_init_id
             && self.command_id != self.submitted_event_id
@@ -195,6 +234,8 @@ pub enum DeepXFrameworkOrderEventPayload {
     Submitted,
     /// A durable cancellation crossed the submission-start boundary.
     PendingCancel,
+    /// A durable modification crossed the submission-start boundary.
+    PendingUpdate,
     /// Finalized business evidence proved venue acceptance.
     Accepted {
         /// Venue order ID proved by the finalized placement event.
@@ -209,6 +250,13 @@ pub enum DeepXFrameworkOrderEventPayload {
     },
     /// Finalized dispatch or business evidence proved the cancellation failed.
     CancelRejected,
+    /// Finalized evidence proved the replacement order update.
+    Updated {
+        /// Replacement venue order ID proved by the modify nonce.
+        venue_order_id: u64,
+    },
+    /// Finalized dispatch failure proved the modification failed.
+    ModifyRejected,
 }
 
 /// One framework order event staged durably before any delivery attempt.
@@ -657,6 +705,41 @@ pub enum DeepXTransactionOperation {
         /// Whether the runtime should use its fast-cancel path.
         fast_cancel: bool,
     },
+    /// Transactional `Subaccount.modify_orders` cancellation and replacement.
+    PerpModify {
+        /// Venue subaccount whose order is canceled and replaced.
+        subaccount: [u8; 20],
+        /// Subaccount specified by the replacement leg.
+        place_subaccount: [u8; 20],
+        /// Existing venue order identifier.
+        cancel_order_id: u64,
+        /// Venue perpetual market identifier.
+        market_id: u16,
+        /// Market specified by the replacement leg.
+        place_market_id: u16,
+        /// Whether the cancellation leg uses the runtime fast-cancel path.
+        fast_cancel: bool,
+        /// Replacement order direction.
+        is_long: bool,
+        /// Exact replacement runtime size.
+        #[serde(with = "perp_close_price")]
+        size: u128,
+        /// Exact replacement runtime price.
+        #[serde(with = "perp_close_price")]
+        price: u128,
+        /// Replacement runtime order type.
+        order_type: crate::signing::DeepXPerpOrderType,
+        /// Optional replacement take-profit point.
+        #[serde(with = "optional_perp_point")]
+        take_profit: Option<u128>,
+        /// Optional replacement stop-loss point.
+        #[serde(with = "optional_perp_point")]
+        stop_loss: Option<u128>,
+        /// Whether the replacement may only reduce a position.
+        reduce_only: bool,
+        /// Replacement runtime post-only behavior.
+        post_only: crate::signing::DeepXPostOnlyParam,
+    },
 }
 
 mod optional_perp_point {
@@ -925,6 +1008,43 @@ impl DeepXTransactionIdentity {
                 order_id,
                 market_id,
                 fast_cancel,
+            }),
+        }
+    }
+
+    /// Creates immutable identity for a proven transactional perpetual modify.
+    #[must_use]
+    pub fn new_perp_modify(
+        client_order_id: ClientOrderId,
+        signer: [u8; 20],
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+        nonce: DeepXNonceReservation,
+        runtime: DeepXDirectRuntimeIdentity,
+        params: crate::signing::DeepXPerpModifyParams,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.to_string(),
+            signer,
+            instrument_id,
+            order_side,
+            nonce,
+            runtime,
+            operation: Some(DeepXTransactionOperation::PerpModify {
+                subaccount: params.cancel.subaccount,
+                place_subaccount: params.place.subaccount,
+                cancel_order_id: params.cancel.order_id,
+                market_id: params.cancel.market_id,
+                place_market_id: params.place.market_id,
+                fast_cancel: params.cancel.fast_cancel,
+                is_long: params.place.is_long,
+                size: params.place.size,
+                price: params.place.price,
+                order_type: params.place.order_type,
+                take_profit: params.place.take_profit,
+                stop_loss: params.place.stop_loss,
+                reduce_only: params.place.reduce_only,
+                post_only: params.place.post_only,
             }),
         }
     }
@@ -1307,6 +1427,19 @@ impl DeepXTransactionRecord {
         )
     }
 
+    /// Returns a stable cache key for one perpetual modification transaction.
+    #[must_use]
+    pub fn perp_modify_cache_key(
+        client_order_id: ClientOrderId,
+        cancel_order_id: u64,
+        nonce: u64,
+    ) -> String {
+        format!(
+            "{DEEPX_TRANSACTION_CACHE_KEY_PREFIX}{}:perp-modify:{cancel_order_id}:{nonce}",
+            hex::encode(client_order_id.as_str().as_bytes()),
+        )
+    }
+
     /// Returns a stable cache key for one Spot cancellation transaction.
     #[must_use]
     pub fn spot_cancel_cache_key(
@@ -1331,6 +1464,19 @@ impl DeepXTransactionRecord {
             return Self::perp_cancel_cache_key(
                 ClientOrderId::new(&self.identity.client_order_id),
                 *order_id,
+                nonce,
+            );
+        }
+        if let (
+            Some(DeepXTransactionOperation::PerpModify {
+                cancel_order_id, ..
+            }),
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+        ) = (self.identity.operation(), self.identity.nonce())
+        {
+            return Self::perp_modify_cache_key(
+                ClientOrderId::new(&self.identity.client_order_id),
+                *cancel_order_id,
                 nonce,
             );
         }
@@ -1464,9 +1610,16 @@ impl DeepXTransactionRecord {
                     DeepXTransactionOperation::PerpPlace { .. }
                         | DeepXTransactionOperation::SpotPlace { .. }
                         | DeepXTransactionOperation::PerpCancel { .. }
+                        | DeepXTransactionOperation::PerpModify { .. }
                         | DeepXTransactionOperation::SpotCancel { .. }
                 )
             ) || !context.matches_identity(&self.identity)
+                || (matches!(
+                    self.identity.operation(),
+                    Some(DeepXTransactionOperation::PerpModify { .. })
+                ) && (context.modify_venue_order_id.is_none()
+                    || context.modify_quantity.is_none()
+                    || context.modify_price.is_none()))
                 || !matches!(
                     self.identity.nonce(),
                     DeepXNonceReservation::TimestampOrderId { .. }
@@ -1489,6 +1642,9 @@ impl DeepXTransactionRecord {
                     DeepXTransactionOperation::PerpCancel { .. }
                     | DeepXTransactionOperation::SpotCancel { .. },
                 ) => DeepXFrameworkOrderEventPayload::PendingCancel,
+                Some(DeepXTransactionOperation::PerpModify { .. }) => {
+                    DeepXFrameworkOrderEventPayload::PendingUpdate
+                }
                 _ => unreachable!("framework context operation was validated above"),
             };
             if outbox.submitted.is_some_and(|stage| {
@@ -1545,6 +1701,23 @@ impl DeepXTransactionRecord {
                                 ),
                                 super::DeepXInclusionOutcome::Failed,
                             ) => DeepXFrameworkOrderEventPayload::CancelRejected,
+                            (
+                                Some(DeepXTransactionOperation::PerpModify { .. }),
+                                super::DeepXInclusionOutcome::Success,
+                            ) => {
+                                let DeepXNonceReservation::TimestampOrderId { value } =
+                                    self.identity.nonce()
+                                else {
+                                    unreachable!("framework context requires timestamp nonce")
+                                };
+                                DeepXFrameworkOrderEventPayload::Updated {
+                                    venue_order_id: value,
+                                }
+                            }
+                            (
+                                Some(DeepXTransactionOperation::PerpModify { .. }),
+                                super::DeepXInclusionOutcome::Failed,
+                            ) => DeepXFrameworkOrderEventPayload::ModifyRejected,
                             _ => unreachable!("framework context operation was validated above"),
                         }
                     })
@@ -1636,6 +1809,7 @@ impl DeepXTransactionRecord {
             Some(
                 DeepXTransactionOperation::PerpPlace { .. }
                     | DeepXTransactionOperation::SpotPlace { .. }
+                    | DeepXTransactionOperation::PerpModify { .. }
             )
         ) && self.submission_scan_checkpoint.is_none()
         {
@@ -2501,7 +2675,7 @@ mod tests {
     fn cache_key_is_stable_ascii_and_client_order_scoped() {
         let key = DeepXTransactionRecord::cache_key(ClientOrderId::new("ORDER:1"));
 
-        assert_eq!(key, "deepx:transaction:v7:4f524445523a31");
+        assert_eq!(key, "deepx:transaction:v8:4f524445523a31");
         assert!(key.is_ascii());
     }
 
@@ -2549,6 +2723,52 @@ mod tests {
             first_cancel.accepts_cache_key(&DeepXTransactionRecord::cache_key(client_order_id,))
         );
         assert!(!placement.accepts_cache_key(&first_cancel.cache_key_for_record()));
+    }
+
+    #[rstest]
+    fn perpetual_modify_records_have_distinct_transaction_keys() {
+        let client_order_id = ClientOrderId::new("O-19700101-000000-001-001-1");
+        let runtime = identity(DeepXNonceReservation::TimestampOrderId { value: 10 })
+            .runtime()
+            .clone();
+        let modify_record = |nonce| {
+            DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_modify(
+                client_order_id,
+                [7; 20],
+                InstrumentId::from_as_ref("ETH-USDC-PERP.DEEPX").unwrap(),
+                OrderSide::Buy,
+                DeepXNonceReservation::TimestampOrderId { value: nonce },
+                runtime.clone(),
+                crate::signing::DeepXPerpModifyParams {
+                    cancel: crate::signing::DeepXPerpCancelParams {
+                        subaccount: [8; 20],
+                        order_id: 42,
+                        market_id: 3,
+                        fast_cancel: false,
+                    },
+                    place: crate::signing::DeepXPerpPlaceParams {
+                        subaccount: [8; 20],
+                        market_id: 3,
+                        is_long: true,
+                        size: 1,
+                        price: 2,
+                        order_type: crate::signing::DeepXPerpOrderType::Limit(
+                            crate::signing::DeepXTimeInForce::Gtc,
+                        ),
+                        take_profit: None,
+                        stop_loss: None,
+                        reduce_only: false,
+                        post_only: crate::signing::DeepXPostOnlyParam::None,
+                    },
+                },
+            ))
+        };
+        let first = modify_record(11);
+        let retry = modify_record(12);
+
+        assert_ne!(first.cache_key_for_record(), retry.cache_key_for_record());
+        assert!(first.cache_key_for_record().contains(":perp-modify:42:11"));
+        assert!(!first.accepts_cache_key(&DeepXTransactionRecord::cache_key(client_order_id)));
     }
 
     #[test]

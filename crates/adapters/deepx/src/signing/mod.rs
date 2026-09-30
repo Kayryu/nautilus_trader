@@ -62,6 +62,9 @@ pub enum SigningError {
     /// The dynamic call or transaction extensions could not be SCALE encoded.
     #[error("unable to encode DeepX pallet extrinsic: {0}")]
     Encode(#[source] Box<subxt_core::Error>),
+    /// The cancel and place legs of a perpetual modify target different runtime scopes.
+    #[error("DeepX perpetual modify legs must target the same subaccount and market")]
+    ModifyScopeMismatch,
 }
 
 impl From<subxt_core::Error> for SigningError {
@@ -197,25 +200,29 @@ pub struct DeepXPerpPlaceParams {
 }
 
 impl DeepXPerpPlaceParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
+    fn into_dynamic_value(self) -> Value {
         let optional_u128 = |value| match value {
             Some(value) => Value::unnamed_variant("Some", [Value::u128(value)]),
             None => Value::unnamed_variant("None", Vec::<Value>::new()),
         };
+        Value::named_composite([
+            ("subaccount", Value::from_bytes(self.subaccount)),
+            ("market_id", Value::u128(u128::from(self.market_id))),
+            ("is_long", Value::bool(self.is_long)),
+            ("size", Value::u128(self.size)),
+            ("price", Value::u128(self.price)),
+            ("order_type", self.order_type.into_dynamic_value()),
+            ("take_profit", optional_u128(self.take_profit)),
+            ("stop_loss", optional_u128(self.stop_loss)),
+            ("reduce_only", Value::bool(self.reduce_only)),
+            ("post_only", self.post_only.into_dynamic_value()),
+        ])
+    }
+
+    fn into_dynamic_arguments(self) -> Vec<Value> {
         vec![Value::named_composite([(
             "params",
-            Value::named_composite([
-                ("subaccount", Value::from_bytes(self.subaccount)),
-                ("market_id", Value::u128(u128::from(self.market_id))),
-                ("is_long", Value::bool(self.is_long)),
-                ("size", Value::u128(self.size)),
-                ("price", Value::u128(self.price)),
-                ("order_type", self.order_type.into_dynamic_value()),
-                ("take_profit", optional_u128(self.take_profit)),
-                ("stop_loss", optional_u128(self.stop_loss)),
-                ("reduce_only", Value::bool(self.reduce_only)),
-                ("post_only", self.post_only.into_dynamic_value()),
-            ]),
+            self.into_dynamic_value(),
         )])]
     }
 }
@@ -339,20 +346,53 @@ pub struct DeepXPerpCancelParams {
 }
 
 impl DeepXPerpCancelParams {
+    fn into_dynamic_value(self) -> Value {
+        Value::named_composite([
+            ("subaccount", Value::from_bytes(self.subaccount)),
+            ("order_id", Value::u128(u128::from(self.order_id))),
+            ("market_id", Value::u128(u128::from(self.market_id))),
+            (
+                "cancel_reason",
+                Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
+            ),
+            ("fast_cancel", Value::bool(self.fast_cancel)),
+        ])
+    }
+
     fn into_dynamic_arguments(self) -> Vec<Value> {
         vec![Value::named_composite([(
             "params",
-            Value::named_composite([
-                ("subaccount", Value::from_bytes(self.subaccount)),
-                ("order_id", Value::u128(u128::from(self.order_id))),
-                ("market_id", Value::u128(u128::from(self.market_id))),
-                (
-                    "cancel_reason",
-                    Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
-                ),
-                ("fast_cancel", Value::bool(self.fast_cancel)),
-            ]),
+            self.into_dynamic_value(),
         )])]
+    }
+}
+
+/// Exact arguments for a transactional perpetual cancel-and-place modification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpModifyParams {
+    /// Existing order to cancel.
+    pub cancel: DeepXPerpCancelParams,
+    /// Replacement order to place using the modify extrinsic nonce as its order ID.
+    pub place: DeepXPerpPlaceParams,
+}
+
+impl DeepXPerpModifyParams {
+    fn into_dynamic_arguments(self) -> Vec<Value> {
+        let cancel = Value::unnamed_variant(
+            "Cancel",
+            [Value::unnamed_variant(
+                "Perp",
+                [self.cancel.into_dynamic_value()],
+            )],
+        );
+        let place = Value::unnamed_variant(
+            "Place",
+            [Value::unnamed_variant(
+                "Perp",
+                [self.place.into_dynamic_value()],
+            )],
+        );
+        vec![Value::unnamed_composite([cancel, place])]
     }
 }
 
@@ -529,6 +569,37 @@ pub fn sign_perp_cancel(
         key,
         "PerpMarket",
         "cancel_order",
+        params.into_dynamic_arguments(),
+        nonce,
+    )
+}
+
+/// Signs a perpetual order modification as one transactional cancel-and-place call.
+///
+/// The cancel and replacement must target the same subaccount and market. The caller supplies an
+/// explicit nonce, which the runtime uses as the replacement order ID. This function performs no
+/// nonce allocation, persistence, authorization, submission, or event recovery.
+///
+/// # Errors
+///
+/// Returns an error when the operation scopes differ, the key is invalid, or the approved
+/// runtime snapshot cannot encode `Subaccount.modify_orders`.
+pub fn sign_perp_modify_order(
+    snapshot_permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXPerpModifyParams,
+    nonce: u64,
+) -> Result<SignedPalletExtrinsic, SigningError> {
+    if params.cancel.subaccount != params.place.subaccount
+        || params.cancel.market_id != params.place.market_id
+    {
+        return Err(SigningError::ModifyScopeMismatch);
+    }
+    sign_dynamic_pallet_call(
+        snapshot_permit,
+        key,
+        "Subaccount",
+        "modify_orders",
         params.into_dynamic_arguments(),
         nonce,
     )
@@ -1437,6 +1508,89 @@ mod tests {
                 && place.has_valid_hash()
                 && cancel.has_valid_hash()
         );
+    }
+
+    #[rstest]
+    fn perp_modify_signs_the_metadata_defined_transactional_call() {
+        let snapshot = snapshot();
+        let pallet = snapshot.metadata().pallet_by_name("Subaccount").unwrap();
+        let call = pallet.call_variant_by_name("modify_orders").unwrap();
+        assert_eq!(call.fields.len(), 1);
+        assert_eq!(call.fields[0].name.as_deref(), Some("ops"));
+
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let signed = sign_perp_modify_order(
+            &permit,
+            &key(),
+            DeepXPerpModifyParams {
+                cancel: DeepXPerpCancelParams {
+                    subaccount: [0x11; 20],
+                    order_id: 123,
+                    market_id: 7,
+                    fast_cancel: false,
+                },
+                place: DeepXPerpPlaceParams {
+                    subaccount: [0x11; 20],
+                    market_id: 7,
+                    is_long: true,
+                    size: 1_000_000,
+                    price: 2_500_000_000,
+                    order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                    take_profit: None,
+                    stop_loss: None,
+                    reduce_only: false,
+                    post_only: DeepXPostOnlyParam::None,
+                },
+            },
+            456,
+        )
+        .unwrap();
+
+        assert_eq!(signed.nonce(), 456);
+        assert!(signed.has_valid_hash());
+        assert_eq!(
+            hex::encode(signed.bytes()),
+            "f90284fcad0b19bb29d4674531d6f115237e16afce377c97c9295eba3f392e4c9dee063c7169e2192aca3e17ebb55ae41237398246dd727e144de8af8c21c0213de9ecadc21402dcdcb158b20d0ecd2a41f512ee8d87430000210700131e08010111111111111111111111111111111111111111117b00000000000000070000000001111111111111111111111111111111111111111107000140420f0000000000000000000000000000f90295000000000000000000000000000000000000",
+        );
+    }
+
+    #[rstest]
+    #[case([0x11; 20], 8)]
+    #[case([0x22; 20], 7)]
+    fn perp_modify_rejects_mixed_market_or_subaccount_before_signing(
+        #[case] place_subaccount: [u8; 20],
+        #[case] place_market_id: u16,
+    ) {
+        let service = DeepXRuntimeSnapshotService::new(snapshot());
+        let permit = service.acquire().unwrap();
+        let result = sign_perp_modify_order(
+            &permit,
+            &key(),
+            DeepXPerpModifyParams {
+                cancel: DeepXPerpCancelParams {
+                    subaccount: [0x11; 20],
+                    order_id: 123,
+                    market_id: 7,
+                    fast_cancel: false,
+                },
+                place: DeepXPerpPlaceParams {
+                    subaccount: place_subaccount,
+                    market_id: place_market_id,
+                    is_long: true,
+                    size: 1_000_000,
+                    price: 2_500_000_000,
+                    order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                    take_profit: None,
+                    stop_loss: None,
+                    reduce_only: false,
+                    post_only: DeepXPostOnlyParam::None,
+                },
+            },
+            456,
+        );
+
+        assert!(matches!(result, Err(SigningError::ModifyScopeMismatch)));
     }
 
     #[rstest]

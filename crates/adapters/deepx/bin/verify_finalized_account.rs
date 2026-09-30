@@ -18,8 +18,8 @@ use anyhow::Context;
 use nautilus_core::hex;
 use nautilus_deepx::{
     config::DeepXDataClientConfig, map_finalized_flat_account_balances,
-    observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-    observe_finalized_account_evidence,
+    map_finalized_margin_balance_with_evidence, observe_and_validate_rpc_endpoint_identities,
+    observe_and_validate_rpc_method_capabilities, observe_finalized_account_evidence,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -50,6 +50,13 @@ async fn main() -> anyhow::Result<()> {
         evidence.subaccount() == subaccount,
         "finalized account evidence belongs to another subaccount"
     );
+    let margin = map_finalized_margin_balance_with_evidence(evidence.margin())?;
+    anyhow::ensure!(
+        margin.subaccount() == evidence.subaccount()
+            && margin.checkpoint() == evidence.checkpoint()
+            && margin.runtime_identity() == evidence.runtime_identity(),
+        "mapped framework margin provenance differs from complete account evidence",
+    );
 
     let checkpoint = evidence.checkpoint();
     println!(
@@ -69,11 +76,19 @@ async fn main() -> anyhow::Result<()> {
         evidence.margin().maintenance().total_margin_required(),
     );
     println!(
-        "lending_positions={} perp_positions={} runtime_max_perp_positions={} active_perp_orders={}",
+        "framework_margin initial={} maintenance={} currency={} block={}",
+        margin.margin().initial,
+        margin.margin().maintenance,
+        margin.margin().currency,
+        margin.checkpoint().block_number(),
+    );
+    println!(
+        "lending_positions={} perp_positions={} runtime_max_perp_positions={} active_perp_orders={} active_spot_orders={}",
         evidence.lending().positions().len(),
         evidence.perp_positions().positions().len(),
         evidence.perp_positions().runtime_max_positions(),
         evidence.perp_orders().orders().len(),
+        evidence.spot_orders().active_order_ids().len(),
     );
     for position in evidence.lending().positions() {
         println!(
@@ -111,6 +126,22 @@ async fn main() -> anyhow::Result<()> {
             order.status(),
             order.size_filled(),
             order.size_remain(),
+        );
+    }
+    for order in evidence.spot_orders().orders() {
+        println!(
+            "active_spot_order order_id={} pair=0x{} is_buy={} status={:?} order_type={:?} quote_amount_le=0x{} base_amount_le=0x{} price_le={:?} create_time={} reduce_only={} post_only={:?}",
+            order.order_id(),
+            hex::encode(order.pair()),
+            order.is_buy(),
+            order.status(),
+            order.order_type(),
+            hex::encode(order.quote_amount()),
+            hex::encode(order.base_amount()),
+            order.price().map(hex::encode),
+            order.create_time(),
+            order.reduce_only(),
+            order.post_only(),
         );
     }
     match map_finalized_flat_account_balances(&evidence) {

@@ -1236,8 +1236,7 @@ impl DeepXFinalizedLendingEvidence {
 /// Complete raw account evidence pinned to one finalized runtime checkpoint.
 ///
 /// This groups the independently validated chain time, margin, lending, perpetual-position, and
-/// active-order evidence without assigning framework balance, position-lifecycle, or
-/// order-lifecycle semantics.
+/// perpetual and Spot active-order evidence without assigning framework lifecycle semantics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXFinalizedAccountEvidence {
     checkpoint: DeepXFinalizedCheckpoint,
@@ -1248,6 +1247,7 @@ pub struct DeepXFinalizedAccountEvidence {
     lending: DeepXFinalizedLendingEvidence,
     perp_positions: DeepXFinalizedPerpPositionsEvidence,
     perp_orders: DeepXFinalizedPerpOrdersEvidence,
+    spot_orders: DeepXFinalizedSpotOrderStorageBatchEvidence,
 }
 
 impl DeepXFinalizedAccountEvidence {
@@ -1297,6 +1297,12 @@ impl DeepXFinalizedAccountEvidence {
     #[must_use]
     pub const fn perp_orders(&self) -> &DeepXFinalizedPerpOrdersEvidence {
         &self.perp_orders
+    }
+
+    /// Returns finalized Spot order-index observations.
+    #[must_use]
+    pub const fn spot_orders(&self) -> &DeepXFinalizedSpotOrderStorageBatchEvidence {
+        &self.spot_orders
     }
 }
 
@@ -1662,6 +1668,9 @@ pub enum DeepXFinalizedAccountError {
     /// Finalized active perpetual-order collection failed.
     #[error(transparent)]
     PerpOrders(#[from] Box<DeepXFinalizedPerpOrdersError>),
+    /// Finalized active Spot-order collection failed.
+    #[error(transparent)]
+    SpotOrders(#[from] Box<DeepXFinalizedSpotOrdersError>),
 }
 
 /// Collects the genesis hash directly from the configured endpoint for `role`.
@@ -3320,6 +3329,20 @@ async fn collect_finalized_account_evidence(
     let perp_orders = observe_finalized_perp_orders_at(watch_url, checkpoint, subaccount)
         .await
         .map_err(|source| DeepXFinalizedAccountError::PerpOrders(Box::new(source)))?;
+    let mut spot_orders =
+        observe_finalized_spot_orders_by_id_at(watch_url, checkpoint, subaccount, &[])
+            .await
+            .map_err(|source| DeepXFinalizedAccountError::SpotOrders(Box::new(source)))?;
+    if !spot_orders.1.is_empty() {
+        spot_orders = observe_finalized_spot_orders_by_id_at(
+            watch_url,
+            checkpoint,
+            subaccount,
+            &spot_orders.1,
+        )
+        .await
+        .map_err(|source| DeepXFinalizedAccountError::SpotOrders(Box::new(source)))?;
+    }
 
     let runtime_identity = runtime_identity.clone();
     Ok(DeepXFinalizedAccountEvidence {
@@ -3349,9 +3372,17 @@ async fn collect_finalized_account_evidence(
         },
         perp_orders: DeepXFinalizedPerpOrdersEvidence {
             checkpoint,
-            runtime_identity,
+            runtime_identity: runtime_identity.clone(),
             subaccount,
             orders: perp_orders,
+        },
+        spot_orders: DeepXFinalizedSpotOrderStorageBatchEvidence {
+            checkpoint,
+            runtime_identity,
+            subaccount,
+            orders: spot_orders.0,
+            active_order_ids: spot_orders.1,
+            active_order_pairs: spot_orders.2,
         },
     })
 }
@@ -4222,9 +4253,17 @@ mod tests {
             },
             perp_orders: DeepXFinalizedPerpOrdersEvidence {
                 checkpoint,
+                runtime_identity: runtime_identity.clone(),
+                subaccount,
+                orders: Vec::new(),
+            },
+            spot_orders: DeepXFinalizedSpotOrderStorageBatchEvidence {
+                checkpoint,
                 runtime_identity,
                 subaccount,
                 orders: Vec::new(),
+                active_order_ids: Vec::new(),
+                active_order_pairs: Vec::new(),
             },
         }
     }
@@ -4288,6 +4327,13 @@ mod tests {
         assert!(matches!(
             map_finalized_flat_account_balances(&evidence),
             Err(DeepXFlatAccountBalanceError::PerpetualOrderActive),
+        ));
+
+        let mut evidence = flat_account_evidence();
+        evidence.spot_orders.active_order_ids = vec![42];
+        assert!(matches!(
+            map_finalized_flat_account_balances(&evidence),
+            Err(DeepXFlatAccountBalanceError::SpotOrderActive),
         ));
 
         let mut evidence = flat_account_evidence();
@@ -4394,6 +4440,27 @@ mod tests {
             stop_loss: None,
             reduce_only: false,
             post_only: DeepXStoredPostOnlyParam::MustPostOnly,
+        }
+    }
+
+    fn spot_order(
+        subaccount: [u8; 20],
+        pair: [u8; 32],
+        order_id: u64,
+    ) -> DeepXSpotOrderStorageEvidence {
+        DeepXSpotOrderStorageEvidence {
+            order_id,
+            owner: subaccount,
+            pair,
+            price: Some([0x11; 32]),
+            quote_amount: [0x33; 32],
+            base_amount: [0x44; 32],
+            create_time: 42,
+            status: DeepXStoredOrderStatus::Open,
+            order_type: DeepXStoredSpotOrderType::Limit(DeepXStoredTimeInForce::Gtc),
+            post_only: DeepXStoredPostOnlyParam::None,
+            reduce_only: false,
+            is_buy: true,
         }
     }
 
@@ -5643,12 +5710,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spec_371_read_only_snapshot_corroborates_finalized_spot_orders() {
+        let subaccount = [0x11; 20];
+        let pair = [0x22; 32];
+        let order = spot_order(subaccount, pair, 42);
+        let index_key = active_spot_orders_storage_key(subaccount);
+        let order_key = spot_order_info_storage_key(subaccount, order.order_id);
+        let encoded_index = format!(
+            "0x{}",
+            hex::encode(BTreeMap::from([(pair, vec![(order.order_id, order.is_buy)])]).encode()),
+        );
+        let encoded_order = format!("0x{}", hex::encode(order.encode()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let calls = Arc::clone(&server_calls);
+                let index_key = index_key.clone();
+                let order_key = order_key.clone();
+                let encoded_index = encoded_index.clone();
+                let encoded_order = encoded_order.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
+                        "chain_getFinalizedHead" => {
+                            serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap()
+                        }
+                        "chain_getHeader" => json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "number": "0x2a" },
+                        }),
+                        "state_getRuntimeVersion" => {
+                            let mut response: Value =
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+                            response["result"]["specVersion"] = json!(371);
+                            response
+                        }
+                        "state_getMetadata" => {
+                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                        }
+                        "state_queryStorageAt" => {
+                            assert_eq!(request["params"][1], FINALIZED_HASH);
+                            let keys = request["params"][0].as_array().unwrap();
+                            let changes = if keys == &[json!(index_key.clone())] {
+                                vec![json!([index_key, encoded_index])]
+                            } else {
+                                assert_eq!(
+                                    keys,
+                                    &[json!(index_key.clone()), json!(order_key.clone())],
+                                );
+                                vec![
+                                    json!([index_key, encoded_index]),
+                                    json!([order_key, encoded_order]),
+                                ]
+                            };
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": [{
+                                    "block": FINALIZED_HASH,
+                                    "changes": changes,
+                                }],
+                            })
+                        }
+                        _ => panic!("unexpected read-only finalized Spot order request"),
+                    };
+                    Json(response)
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let evidence = observe_finalized_spot_orders_by_id_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            subaccount,
+            &[42],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence.runtime_identity().spec_version, 371);
+        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(evidence.orders().len(), 1);
+        assert_eq!(evidence.active_order_ids(), &[42]);
+        assert_eq!(evidence.orders()[0].owner(), subaccount);
+        assert_eq!(evidence.orders()[0].pair(), pair);
+        assert_eq!(evidence.orders()[0].is_buy(), order.is_buy());
+        assert_eq!(evidence.orders()[0].quote_amount(), order.quote_amount());
+        assert_eq!(evidence.orders()[0].base_amount(), order.base_amount());
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
     async fn spec_371_read_only_snapshot_pins_complete_account_evidence_to_one_checkpoint() {
         let subaccount = [0x11; 20];
         let timestamp_ms = 1_700_000_000_123_u64;
         let maximum_key = subaccount_max_perp_positions_storage_key();
         let positions_key = user_perp_positions_storage_key(subaccount);
         let orders_key = active_perp_orders_storage_key(subaccount);
+        let spot_orders_key = active_spot_orders_storage_key(subaccount);
+        let spot_active_order = spot_order(subaccount, [0x22; 32], 77);
+        let spot_order_key = spot_order_info_storage_key(subaccount, spot_active_order.order_id);
+        let spot_order_index = format!(
+            "0x{}",
+            hex::encode(
+                BTreeMap::from([(
+                    spot_active_order.pair,
+                    vec![(spot_active_order.order_id, spot_active_order.is_buy)],
+                )])
+                .encode(),
+            ),
+        );
+        let spot_order_detail = format!("0x{}", hex::encode(spot_active_order.encode()));
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
         let router = Router::new().route(
@@ -5658,6 +5839,10 @@ mod tests {
                 let maximum_key = maximum_key.clone();
                 let positions_key = positions_key.clone();
                 let orders_key = orders_key.clone();
+                let spot_orders_key = spot_orders_key.clone();
+                let spot_order_key = spot_order_key.clone();
+                let spot_order_index = spot_order_index.clone();
+                let spot_order_detail = spot_order_detail.clone();
                 async move {
                     calls.fetch_add(1, Ordering::Relaxed);
                     let response = match request["method"].as_str().unwrap() {
@@ -5729,9 +5914,22 @@ mod tests {
                                     json!([maximum_key, Value::Null]),
                                     json!([positions_key, Value::Null]),
                                 ]
-                            } else {
-                                assert_eq!(keys, &[json!(orders_key.clone())]);
+                            } else if keys == &[json!(orders_key.clone())] {
                                 vec![json!([orders_key, Value::Null])]
+                            } else if keys == &[json!(spot_orders_key.clone())] {
+                                vec![json!([spot_orders_key, spot_order_index])]
+                            } else {
+                                assert_eq!(
+                                    keys,
+                                    &[
+                                        json!(spot_orders_key.clone()),
+                                        json!(spot_order_key.clone()),
+                                    ],
+                                );
+                                vec![
+                                    json!([spot_orders_key, spot_order_index]),
+                                    json!([spot_order_key, spot_order_detail]),
+                                ]
                             };
                             json!({
                                 "jsonrpc": "2.0",
@@ -5773,6 +5971,7 @@ mod tests {
             evidence.checkpoint()
         );
         assert_eq!(evidence.perp_orders().checkpoint(), evidence.checkpoint());
+        assert_eq!(evidence.spot_orders().checkpoint(), evidence.checkpoint());
         assert_eq!(evidence.margin().initial().total_collateral(), 1_000_000);
         assert_eq!(
             evidence.margin().maintenance().total_margin_required(),
@@ -5782,7 +5981,11 @@ mod tests {
         assert_eq!(evidence.perp_positions().runtime_max_positions(), 8);
         assert!(evidence.perp_positions().positions().is_empty());
         assert!(evidence.perp_orders().orders().is_empty());
-        assert_eq!(calls.load(Ordering::Relaxed), 11);
+        assert_eq!(evidence.spot_orders().active_order_ids(), &[77]);
+        assert_eq!(evidence.spot_orders().orders().len(), 1);
+        assert_eq!(evidence.spot_orders().orders()[0].pair(), [0x22; 32]);
+        assert_eq!(evidence.spot_orders().orders()[0].owner(), subaccount);
+        assert_eq!(calls.load(Ordering::Relaxed), 13);
     }
 
     #[tokio::test]
