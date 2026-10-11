@@ -45,6 +45,50 @@ pub(super) async fn request_book_snapshot(
     depth: NonZeroUsize,
     instrument: InstrumentAny,
 ) -> anyhow::Result<OrderBook> {
+    let (snapshot, ts_init) = request_raw_book_snapshot(
+        network,
+        proxy_url,
+        timeout,
+        market_id,
+        depth,
+        instrument.price_increment().as_decimal(),
+    )
+    .await?;
+    let deltas = parse_book_deltas(None, &snapshot, &instrument, ts_init)?
+        .ok_or_else(|| anyhow::anyhow!("DeepX book snapshot conversion was empty"))?;
+    let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
+    book.apply_deltas(&deltas)?;
+    Ok(book)
+}
+
+pub(super) async fn request_book_depth10(
+    network: DeepXNetworkConfig,
+    proxy_url: Option<String>,
+    timeout: Duration,
+    market_id: u16,
+    depth: NonZeroUsize,
+    instrument: InstrumentAny,
+) -> anyhow::Result<OrderBookDepth10> {
+    let (snapshot, ts_init) = request_raw_book_snapshot(
+        network,
+        proxy_url,
+        timeout,
+        market_id,
+        depth,
+        instrument.price_increment().as_decimal(),
+    )
+    .await?;
+    parse_book_depth10(&snapshot, &instrument, ts_init)
+}
+
+async fn request_raw_book_snapshot(
+    network: DeepXNetworkConfig,
+    proxy_url: Option<String>,
+    timeout: Duration,
+    market_id: u16,
+    depth: NonZeroUsize,
+    price_increment: rust_decimal::Decimal,
+) -> anyhow::Result<(DeepXWsBookSnapshot, UnixNanos)> {
     let mut connection = DeepXWsPublicConnection::connect(
         &network,
         proxy_url.as_deref(),
@@ -54,7 +98,7 @@ pub(super) async fn request_book_snapshot(
     .await?;
     let result = async {
         connection
-            .subscribe_book(market_id, depth, instrument.price_increment().as_decimal())
+            .subscribe_book(market_id, depth, price_increment)
             .await?;
         let capacity = NonZeroUsize::new(depth.get() * 2).expect("nonzero book capacity");
         let mut stream = DeepXWsBookStream::new(market_id, capacity);
@@ -87,11 +131,7 @@ pub(super) async fn request_book_snapshot(
                     "DeepX book snapshot exceeds requested per-side depth"
                 );
                 let ts_init = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
-                let deltas = parse_book_deltas(None, snapshot, &instrument, ts_init)?
-                    .ok_or_else(|| anyhow::anyhow!("DeepX book snapshot conversion was empty"))?;
-                let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
-                book.apply_deltas(&deltas)?;
-                return Ok(book);
+                return Ok((snapshot.clone(), ts_init));
             }
         })
         .await
@@ -99,7 +139,7 @@ pub(super) async fn request_book_snapshot(
     }
     .await;
     let close = connection.close().await;
-    result.and_then(|book| close.map(|()| book))
+    result.and_then(|snapshot| close.map(|()| snapshot))
 }
 
 pub(super) fn parse_spot_order_book(
@@ -256,7 +296,7 @@ pub(super) fn parse_spot_rpc_book_deltas(
     if let Some(last) = deltas.last_mut() {
         last.flags |= RecordFlag::F_LAST as u8;
     }
-    OrderBookDeltas::new_checked(instrument.id(), deltas).map_err(Into::into)
+    OrderBookDeltas::new_checked(instrument.id(), deltas)
 }
 
 pub(super) fn parse_spot_rpc_book_depth10(
@@ -334,7 +374,7 @@ pub(super) fn parse_spot_rpc_quote_tick(
     )?))
 }
 
-fn spot_rpc_pair<'a>(
+pub(super) fn spot_rpc_pair<'a>(
     snapshot: &'a DeepXOrderbookRpcSnapshot,
     market: &DeepXSpotMarket,
 ) -> anyhow::Result<&'a crate::websocket::orderbook_rpc::DeepXOrderbookRpcSide> {
@@ -752,10 +792,10 @@ mod tests {
         let mut book = snapshot();
         match mutation {
             "price" => {
-                book.asks.first_entry().unwrap().get_mut().price = "1792.801".parse().unwrap()
+                book.asks.first_entry().unwrap().get_mut().price = "1792.801".parse().unwrap();
             }
             "quantity" => {
-                book.asks.first_entry().unwrap().get_mut().qty = "0.00001".parse().unwrap()
+                book.asks.first_entry().unwrap().get_mut().qty = "0.00001".parse().unwrap();
             }
             _ => book.engine_time = u64::MAX,
         }
@@ -793,10 +833,10 @@ mod tests {
         let mut book = snapshot();
         match mutation {
             "price" => {
-                book.bids.last_entry().unwrap().get_mut().price = "1792.601".parse().unwrap()
+                book.bids.last_entry().unwrap().get_mut().price = "1792.601".parse().unwrap();
             }
             "quantity" => {
-                book.asks.first_entry().unwrap().get_mut().qty = "0.00001".parse().unwrap()
+                book.asks.first_entry().unwrap().get_mut().qty = "0.00001".parse().unwrap();
             }
             _ => book.engine_time = u64::MAX,
         }

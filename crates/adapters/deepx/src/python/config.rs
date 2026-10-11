@@ -144,12 +144,14 @@ impl DeepXDataClientConfig {
         proxy_url = None,
         http_timeout_secs = None,
         websocket_timeout_secs = None,
+        perpetual_only = None,
     ))]
     fn py_new(
         network: Option<DeepXNetworkConfig>,
         proxy_url: Option<String>,
         http_timeout_secs: Option<u64>,
         websocket_timeout_secs: Option<u64>,
+        perpetual_only: Option<bool>,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -158,6 +160,7 @@ impl DeepXDataClientConfig {
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             websocket_timeout_secs: websocket_timeout_secs
                 .unwrap_or(defaults.websocket_timeout_secs),
+            perpetual_only: perpetual_only.unwrap_or(defaults.perpetual_only),
         };
         config.validate().map_err(to_pyvalue_err)?;
         Ok(config)
@@ -177,6 +180,7 @@ nautilus_core::impl_pyo3_config_getters!(DeepXDataClientConfig {
     network: DeepXNetworkConfig,
     http_timeout_secs: u64,
     websocket_timeout_secs: u64,
+    perpetual_only: bool,
 });
 
 #[pymethods]
@@ -198,6 +202,7 @@ impl DeepXExecutionClientConfig {
         network = None,
         fast_perp_cancel = None,
     ))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         account_id: Option<AccountId>,
         subaccount_id: Option<String>,
@@ -307,8 +312,6 @@ mod tests {
         Python::initialize();
         let error = DeepXNetworkConfig::py_new(
             Some("mainnet".to_string()),
-            None,
-            None,
             None,
             None,
             None,

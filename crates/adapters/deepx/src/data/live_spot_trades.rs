@@ -111,7 +111,7 @@ impl SpotTradeTask {
             else {
                 return;
             };
-            if self.subscription.cancellation.is_cancelled() {
+            if self.subscription.cancellation.is_cancelled() || self.sender.is_closed() {
                 return;
             }
             if !retry_transport || attempt == 5 {
@@ -124,6 +124,7 @@ impl SpotTradeTask {
             tokio::select! {
                 biased;
                 () = self.subscription.cancellation.cancelled() => return,
+                () = self.sender.closed() => return,
                 () = tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))) => {},
             }
         }
@@ -139,6 +140,7 @@ impl SpotTradeTask {
         let mut connection = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(()),
+            () = self.sender.closed() => return Ok(()),
             result = DeepXWsSpotTradeConnection::connect(
                 &self.network,
                 self.proxy_url.as_deref(),
@@ -153,6 +155,7 @@ impl SpotTradeTask {
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Ok(()),
+            () = self.sender.closed() => Ok(()),
             result = async {
                 let mut first_data_frame = true;
                 let snapshot_deadline = tokio::time::Instant::now() + self.timeout;

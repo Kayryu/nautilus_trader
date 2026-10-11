@@ -13,11 +13,17 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Exact conversion helpers for DeepX discrete financial values.
+//! Exact conversion helpers for DeepX discrete financial values and identifiers.
 
 use rust_decimal::Decimal;
 
 use super::error::{DeepXError, Result};
+
+/// Parses the unique decimal spelling of a runtime `u64` order ID, including zero.
+pub(crate) fn parse_canonical_order_id(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
 
 /// Converts a scaled integer into a [`Decimal`] without floating-point arithmetic.
 ///
@@ -98,5 +104,17 @@ mod tests {
             scaled_i128_to_decimal(1, Decimal::MAX_SCALE + 1),
             Err(DeepXError::DecimalOverflow(_)),
         ));
+    }
+
+    #[rstest]
+    #[case("0", Some(0))]
+    #[case("1", Some(1))]
+    #[case("18446744073709551615", Some(u64::MAX))]
+    #[case("00", None)]
+    #[case("01", None)]
+    #[case("+1", None)]
+    #[case("18446744073709551616", None)]
+    fn order_ids_have_one_decimal_spelling(#[case] value: &str, #[case] expected: Option<u64>) {
+        assert_eq!(parse_canonical_order_id(value), expected);
     }
 }

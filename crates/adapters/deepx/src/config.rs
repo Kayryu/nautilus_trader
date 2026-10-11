@@ -144,6 +144,9 @@ pub struct DeepXDataClientConfig {
     /// WebSocket operation timeout in seconds.
     #[builder(default = 30)]
     pub websocket_timeout_secs: u64,
+    /// Loads only public perpetual markets and instruments, without Spot discovery.
+    #[builder(default = false)]
+    pub perpetual_only: bool,
 }
 
 impl Default for DeepXDataClientConfig {
@@ -911,6 +914,7 @@ mod tests {
         assert_eq!(config.network.environment, DeepXEnvironment::Testnet);
         assert_eq!(config.http_timeout_secs, 30);
         assert_eq!(config.websocket_timeout_secs, 30);
+        assert!(!config.perpetual_only);
         assert!(config.validate().is_ok());
     }
 

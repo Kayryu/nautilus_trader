@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let wallet = args
         .next()
-        .context("usage: deepx-verify-rest-wallet-trades <wallet-account-id20> [market-id]")?;
+        .context("usage: deepx-verify-rest-wallet-trades <wallet-account-id20> [market-id [subaccount max-pages]]")?;
     let market_id = args
         .next()
         .map(|value| {
@@ -40,7 +40,24 @@ async fn main() -> anyhow::Result<()> {
                 .context("market-id must be an unsigned integer")
         })
         .transpose()?;
+    let subaccount = args.next();
+    let max_pages = args
+        .next()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("max-pages must be a positive integer")
+        })
+        .transpose()?;
     anyhow::ensure!(args.next().is_none(), "unexpected extra argument");
+    anyhow::ensure!(
+        subaccount.is_some() == max_pages.is_some(),
+        "subaccount and max-pages must be supplied together"
+    );
+    anyhow::ensure!(
+        subaccount.is_none() || market_id.is_some(),
+        "subaccount pagination requires a market ID"
+    );
 
     let config = DeepXDataClientConfig::default();
     let client = DeepXHttpClient::from_network_config(
@@ -48,18 +65,17 @@ async fn main() -> anyhow::Result<()> {
         Some(config.http_timeout_secs),
         config.proxy_url,
     )?;
-    let groups = client
-        .get_perp_wallet_trades(&DeepXPerpWalletTradesRequest {
-            wallet: wallet.clone(),
-            market_name: None,
-            market_id,
-            cursor: None,
-            sort: DeepXAccountSortOrder::Descending,
-            start_ms: None,
-            end_ms: None,
-            page_size: Some(PAGE_SIZE),
-        })
-        .await?;
+    let request = DeepXPerpWalletTradesRequest {
+        wallet: wallet.clone(),
+        market_name: None,
+        market_id,
+        cursor: None,
+        sort: DeepXAccountSortOrder::Descending,
+        start_ms: None,
+        end_ms: None,
+        page_size: Some(PAGE_SIZE),
+    };
+    let groups = client.get_perp_wallet_trades(&request).await?;
     anyhow::ensure!(!groups.is_empty(), "wallet trade snapshot is empty");
 
     let markets = groups.len();
@@ -112,8 +128,32 @@ async fn main() -> anyhow::Result<()> {
         continuation_cursors.len(),
         PAGE_SIZE,
     );
-    println!(
-        "DeepX wallet trade verification completed; no credentials, pagination, or transactions sent"
-    );
+    if let (Some(subaccount), Some(max_pages)) = (subaccount, max_pages) {
+        let mut pagination_request = request.clone();
+        pagination_request.page_size = Some(100);
+        let expected_market_name = groups
+            .iter()
+            .find(|group| Some(group.market_id) == market_id)
+            .context("selected wallet trade market is absent")?
+            .market_name
+            .as_str();
+        let pages = client
+            .get_perp_wallet_trade_pages_for_subaccount(
+                &pagination_request,
+                &subaccount,
+                expected_market_name,
+                max_pages,
+            )
+            .await?;
+        let count = pages.iter().map(|page| page.items.len()).sum::<usize>();
+        println!(
+            "DeepX wallet trade continuation verified subaccount={} pages={} trades={} terminal={} page_size=100",
+            subaccount,
+            pages.len(),
+            count,
+            pages.last().is_some_and(|page| !page.has_next),
+        );
+    }
+    println!("DeepX wallet trade verification completed; no credentials or transactions sent");
     Ok(())
 }

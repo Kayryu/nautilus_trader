@@ -15,14 +15,54 @@
 
 //! Wire models for verified DeepX public market responses.
 
-use std::str::FromStr;
-
 use rust_decimal::Decimal;
 use serde::{Deserialize, de::Error as _};
 use serde_json::value::RawValue;
 
-fn parse_decimal(raw: &str) -> Result<Decimal, rust_decimal::Error> {
-    Decimal::from_str(raw).or_else(|_| Decimal::from_scientific(raw))
+fn parse_decimal(raw: &str) -> Result<Decimal, String> {
+    let Some((mantissa, exponent)) = raw.split_once(['e', 'E']) else {
+        return Decimal::from_str_exact(raw).map_err(|e| e.to_string());
+    };
+    let exponent = exponent.parse::<i32>().map_err(|e| e.to_string())?;
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let (whole, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|digit| digit.is_ascii_digit())
+        || !fractional.bytes().all(|digit| digit.is_ascii_digit())
+        || (mantissa.contains('.') && fractional.is_empty())
+    {
+        return Err("invalid scientific decimal mantissa".to_string());
+    }
+    let digits = format!("{whole}{fractional}");
+    let Some(first_nonzero) = digits.bytes().position(|digit| digit != b'0') else {
+        return Ok(Decimal::ZERO);
+    };
+    let significant = digits[first_nonzero..].trim_end_matches('0');
+    let point = i64::try_from(whole.len())
+        .ok()
+        .and_then(|whole_len| whole_len.checked_add(i64::from(exponent)))
+        .and_then(|point| point.checked_sub(i64::try_from(first_nonzero).ok()?))
+        .ok_or_else(|| "scientific decimal exponent is out of range".to_string())?;
+    let length = i64::try_from(significant.len())
+        .map_err(|_| "scientific decimal mantissa is out of range".to_string())?;
+    if point > 29 || length - point > 28 {
+        return Err("scientific decimal is not exactly representable".to_string());
+    }
+    let mut plain = String::from(if raw.starts_with('-') { "-" } else { "" });
+    if point <= 0 {
+        plain.push_str("0.");
+        plain.extend(std::iter::repeat_n('0', (-point) as usize));
+        plain.push_str(significant);
+    } else if point >= length {
+        plain.push_str(significant);
+        plain.extend(std::iter::repeat_n('0', (point - length) as usize));
+    } else {
+        let split = point as usize;
+        plain.push_str(&significant[..split]);
+        plain.push('.');
+        plain.push_str(&significant[split..]);
+    }
+    Decimal::from_str_exact(&plain).map_err(|e| e.to_string())
 }
 
 pub(crate) mod exact_decimal {
@@ -282,6 +322,14 @@ pub struct DeepXOpenInterestPage {
 /// One lending pool asset identity exposed by the public market directory.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXLendingAsset {
     /// Deployment-provided lending market ID.
     pub market_id: u64,
@@ -295,6 +343,14 @@ pub struct DeepXLendingAsset {
 
 /// Exact borrow-rate curve parameters for one lending pool asset.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXLendingInterestRateParams {
     /// Deployment-provided lending market ID.
     pub market_id: u64,
@@ -343,6 +399,14 @@ pub struct DeepXLendingInterestRateParams {
 
 /// One exact lending supply and borrow APR observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXLendingInterestRateRecord {
     /// Deployment-provided lending market ID.
     pub market_id: u64,
@@ -367,6 +431,14 @@ pub struct DeepXLendingInterestRateHistory {
 
 /// One exact lending pool status observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXLendingStatusRecord {
     /// Deployment-provided lending market ID.
     pub market_id: u64,
@@ -557,6 +629,14 @@ pub struct DeepXSubaccountDirectoryRecord {
 
 /// Wallet-owned subaccounts returned by the account directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXWalletSubaccounts {
     /// Wallet address used for the directory query.
     wallet: String,
@@ -605,6 +685,14 @@ impl DeepXDelegateMode {
 /// One wallet-level delegate configuration in the observed REST wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXDelegateAccount {
     /// Delegate AccountId20.
     pub delegate_address: String,
@@ -622,6 +710,14 @@ pub struct DeepXDelegateAccount {
 
 /// Request-scoped delegate configurations for one wallet.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXWalletDelegateAccounts {
     /// Wallet address used for the delegate-directory query.
     wallet: String,
@@ -643,6 +739,14 @@ impl DeepXWalletDelegateAccounts {
 
 /// Request-scoped wallets bound to one delegate account.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXDelegateWallets {
     /// Delegate address used for the reverse-directory query.
     delegate: String,
@@ -664,6 +768,14 @@ impl DeepXDelegateWallets {
 
 /// One fully validated point-in-time subaccount snapshot.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountSnapshot {
     /// Subaccount profile bound to the requested wallet authority.
     pub profile: DeepXSubaccountProfile,
@@ -681,16 +793,72 @@ pub struct DeepXSubaccountSnapshot {
 /// snapshot. Failure atomicity means callers receive either every locally validated response or
 /// an error, never a partial collection.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXWalletAccountSnapshot {
     /// Validated wallet directory in venue response order.
     pub directory: DeepXWalletSubaccounts,
+    /// Validated wallet statistics with a subaccount set matching the directory.
+    pub stats: DeepXUserStats,
     /// Validated subaccount snapshots in the same order as `directory.addresses`.
     pub subaccounts: Vec<DeepXSubaccountSnapshot>,
+}
+
+/// Validated position lifecycle pages for one wallet-owned subaccount.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
+pub struct DeepXSubaccountPerpPositions {
+    /// Profile whose authority matches the requested wallet.
+    pub profile: DeepXSubaccountProfile,
+    /// Validated position pages in venue cursor order.
+    pub pages: Vec<DeepXAccountPage<DeepXPerpPositionRecord>>,
+}
+
+/// Bounded, failure-atomic wallet position lifecycle observations.
+///
+/// The constituent REST reads are mutable and do not form a block-pinned snapshot.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
+pub struct DeepXWalletPerpPositions {
+    /// Validated wallet directory in venue response order.
+    pub directory: DeepXWalletSubaccounts,
+    /// Validated statistics whose subaccount set matches the directory.
+    pub stats: DeepXUserStats,
+    /// Position pages in the same order as `directory.addresses`.
+    pub subaccounts: Vec<DeepXSubaccountPerpPositions>,
 }
 
 /// One subaccount profile in the observed account-info wire form.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountProfile {
     /// Wallet authority that owns the subaccount.
     pub authority: String,
@@ -717,6 +885,14 @@ pub struct DeepXSubaccountProfile {
 /// One lending asset balance in the observed account-balance wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountBalanceAsset {
     /// Venue asset symbol.
     pub symbol: String,
@@ -748,6 +924,14 @@ pub struct DeepXSubaccountBalanceAsset {
 /// Exact lending balances for one subaccount.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountBalances {
     /// Subaccount address.
     pub address: String,
@@ -758,6 +942,14 @@ pub struct DeepXSubaccountBalances {
 /// Exact equity summary for one subaccount.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountEquity {
     /// Subaccount address.
     pub subaccount: String,
@@ -775,27 +967,64 @@ pub struct DeepXSubaccountEquity {
     pub equity_usd: Decimal,
 }
 
-/// Exact account-wide collateral and margin requirement observation.
-///
-/// The response does not identify whether `margin_required` uses initial or maintenance weights,
-/// so this model is not a framework [`nautilus_model::types::MarginBalance`] conversion.
+/// Exact account-wide collateral and maintenance requirement from the current REST response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct DeepXExactMargin {
+    /// Exact collateral in USDC.
+    #[serde(deserialize_with = "exact_decimal::deserialize")]
+    pub total_collateral: Decimal,
+    /// Exact maintenance margin requirement in USDC.
+    #[serde(deserialize_with = "exact_decimal::deserialize")]
+    pub maint_margin_req: Decimal,
+    /// Collateral divided by maintenance requirement, truncated by the venue to eight places.
+    #[serde(
+        rename = "uniMMR",
+        deserialize_with = "optional_exact_decimal::deserialize"
+    )]
+    pub uni_mmr: Option<Decimal>,
+}
+
+/// Account-wide margin displays and the exact values supplied by current REST responses.
+///
+/// The legacy numeric fields are rounded displays and must not be used for financial decisions.
+/// Historical responses lack `exact_margin`; the live reader rejects them.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSubaccountMarginRatio {
-    /// Account collateral value in the endpoint's USD unit.
+    /// Rounded legacy collateral display in USDC.
     #[serde(deserialize_with = "exact_decimal::deserialize")]
     pub collateral: Decimal,
-    /// Account-wide margin requirement in the endpoint's USD unit.
+    /// Rounded legacy margin requirement display in USDC.
     #[serde(deserialize_with = "exact_decimal::deserialize")]
     pub margin_required: Decimal,
-    /// Venue margin ratio, absent when the venue reports no applicable ratio.
+    /// Rounded legacy percentage display, absent when the venue reports no applicable ratio.
     #[serde(deserialize_with = "optional_exact_decimal::deserialize")]
     pub margin_ratio: Option<Decimal>,
+    /// Exact collateral, maintenance requirement, and dimensionless ratio when supplied.
+    #[serde(default)]
+    pub exact_margin: Option<DeepXExactMargin>,
 }
 
 /// Optional position identity attached to a balance change.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXBalanceChangePosition {
     /// Venue position lifecycle ID.
     pub id: u64,
@@ -808,6 +1037,14 @@ pub struct DeepXBalanceChangePosition {
 /// One exact account balance-change record.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXBalanceChangeRecord {
     /// Stable venue record ID.
     pub id: u64,
@@ -841,6 +1078,14 @@ pub struct DeepXBalanceChangeRecord {
 /// One account liquidation record with exact raw chain integer values.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXLiquidationRecord {
     /// Stable backend record ID.
     pub id: u64,
@@ -940,6 +1185,14 @@ pub struct DeepXInvitationStatus {
 /// Aggregated wallet directory counters returned by the user-stats endpoint.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXUserStats {
     /// Subaccounts reported for the queried wallet in venue response order.
     pub subaccounts: Vec<String>,
@@ -955,6 +1208,14 @@ pub struct DeepXUserStats {
 /// Exact wallet-level trading-volume and quota aggregate.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXQuotaSummary {
     /// Wallet that owns the aggregate.
     pub owner: String,
@@ -992,6 +1253,14 @@ pub struct DeepXQuotaSummary {
 /// One chain-confirmed wallet quota-history record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXQuotaHistoryRecord {
     /// Stable venue record identity.
     pub id: String,
@@ -1020,6 +1289,14 @@ pub struct DeepXQuotaHistoryRecord {
 /// Nullable liquidation-price observation for one subaccount and perpetual market.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpLiquidationPrice {
     /// Queried subaccount address.
     pub address: String,
@@ -1035,6 +1312,14 @@ pub struct DeepXPerpLiquidationPrice {
 /// One perpetual order in the observed account-history wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpOrderRecord {
     /// Exact decimal venue order ID.
     pub order_id: String,
@@ -1101,6 +1386,14 @@ pub struct DeepXPerpOrderRecord {
 
 /// One Spot order in the observed account-history wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotOrderRecord {
     /// Deployment-provided bytes32 pair identity.
@@ -1163,6 +1456,14 @@ pub struct DeepXSpotOrderRecord {
 
 /// One Spot execution in the observed account-trade wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotAccountTradeRecord {
     /// Venue trade identity.
@@ -1198,6 +1499,14 @@ pub struct DeepXSpotAccountTradeRecord {
 
 /// Spot orders for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotWalletSubaccountOrders {
     /// Subaccount identity reported for this group.
@@ -1208,6 +1517,14 @@ pub struct DeepXSpotWalletSubaccountOrders {
 
 /// One market group in a wallet-scoped Spot order response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotWalletOrderMarket {
     /// Deployment-provided bytes32 pair identity.
@@ -1220,6 +1537,14 @@ pub struct DeepXSpotWalletOrderMarket {
 
 /// One normalized globally paginated Spot wallet-order response page.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSpotWalletOrdersPage {
     /// Market and subaccount groups in venue response order.
     pub markets: Vec<DeepXSpotWalletOrderMarket>,
@@ -1231,6 +1556,14 @@ pub struct DeepXSpotWalletOrdersPage {
 
 /// Spot trades for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotWalletSubaccountTrades {
     /// Subaccount identity reported for this group.
@@ -1241,6 +1574,14 @@ pub struct DeepXSpotWalletSubaccountTrades {
 
 /// One market group in a wallet-scoped Spot trade response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXSpotWalletTradeMarket {
     /// Deployment-provided bytes32 pair identity.
@@ -1253,6 +1594,14 @@ pub struct DeepXSpotWalletTradeMarket {
 
 /// One normalized globally paginated Spot wallet-trade response page.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXSpotWalletTradesPage {
     /// Market and subaccount groups in venue response order.
     pub markets: Vec<DeepXSpotWalletTradeMarket>,
@@ -1264,6 +1613,14 @@ pub struct DeepXSpotWalletTradesPage {
 
 /// One perpetual funding-fee record in the observed account-history wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXPerpFundingFeeRecord {
     /// Owning subaccount address.
@@ -1296,6 +1653,14 @@ pub struct DeepXPerpFundingFeeRecord {
 /// The adapter preserves these values without assigning token precision or converting them into
 /// framework money, PnL, or account-state events.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXHourlyUnsettledFundingRecord {
     /// Subaccount whose position was observed at the boundary.
@@ -1335,6 +1700,14 @@ pub struct DeepXHourlyUnsettledFundingRecord {
 /// One perpetual execution in the observed account-trade wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpAccountTradeRecord {
     /// Venue trade ID.
     pub id: u64,
@@ -1369,6 +1742,14 @@ pub struct DeepXPerpAccountTradeRecord {
 /// Perpetual trades for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpWalletSubaccountTrades {
     /// Subaccount identity reported for this group.
     pub subaccount: String,
@@ -1379,6 +1760,14 @@ pub struct DeepXPerpWalletSubaccountTrades {
 /// One market group in a wallet-scoped perpetual trade response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpWalletTradeMarket {
     /// Deployment-provided perpetual market ID.
     pub market_id: u64,
@@ -1391,6 +1780,14 @@ pub struct DeepXPerpWalletTradeMarket {
 /// Perpetual orders for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpWalletSubaccountOrders {
     /// Subaccount identity reported for this group.
     pub subaccount: String,
@@ -1401,6 +1798,14 @@ pub struct DeepXPerpWalletSubaccountOrders {
 /// One market group in a wallet-scoped perpetual order response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpWalletOrderMarket {
     /// Deployment-provided perpetual market ID.
     pub market_id: u64,
@@ -1412,6 +1817,14 @@ pub struct DeepXPerpWalletOrderMarket {
 
 /// One normalized globally paginated wallet-order response page.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpWalletOrdersPage {
     /// Market and subaccount groups in venue response order.
     pub markets: Vec<DeepXPerpWalletOrderMarket>,
@@ -1424,6 +1837,14 @@ pub struct DeepXPerpWalletOrdersPage {
 /// One perpetual position lifecycle in the observed account-position wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.deepx", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
+)]
 pub struct DeepXPerpPositionRecord {
     /// Venue position lifecycle ID.
     pub id: u64,
@@ -2126,6 +2547,10 @@ mod tests {
         include_str!("../../test_data/http/testnet/subaccount_equity.json");
     const SUBACCOUNT_MARGIN_RATIO_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/subaccount_margin_ratio.json");
+    const SUBACCOUNT_MARGIN_RATIO_EXACT_RESPONSE: &str =
+        include_str!("../../test_data/http/testnet/subaccount_margin_ratio_exact.json");
+    const SUBACCOUNT_MARGIN_RATIO_EXACT_MANIFEST: &str =
+        include_str!("../../test_data/http/testnet/subaccount_margin_ratio_exact.manifest.json");
     const WALLET_BALANCE_CHANGES_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/wallet_balance_changes_page_2.json");
     const WALLET_LIQUIDATION_RECORDS_RESPONSE: &str =
@@ -2273,6 +2698,30 @@ mod tests {
             value.price,
             "2453.980000000000001".parse::<Decimal>().unwrap()
         );
+    }
+
+    #[rstest]
+    #[case("1.2867e1", "12.867")]
+    #[case("1.2127547341372958e-6", "0.0000012127547341372958")]
+    #[case("1e-28", "0.0000000000000000000000000001")]
+    #[case("1.00e-28", "0.0000000000000000000000000001")]
+    #[case("7.9228162514264337593543950335e28", "79228162514264337593543950335")]
+    fn parses_exact_scientific_decimal(#[case] raw: &str, #[case] expected: &str) {
+        assert_eq!(
+            parse_decimal(raw).unwrap(),
+            Decimal::from_str_exact(expected).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("12.867999999999999999999999999999")]
+    #[case("1.2867999999999999999999999999999e1")]
+    #[case("1e-29")]
+    #[case("1e29")]
+    #[case("1e2147483647")]
+    #[case("1e-2147483648")]
+    fn rejects_inexact_or_out_of_range_decimal(#[case] raw: &str) {
+        assert!(parse_decimal(raw).is_err());
     }
 
     #[rstest]
@@ -3298,6 +3747,7 @@ mod tests {
         assert_eq!(margin.data.collateral, Decimal::new(97_096, 2));
         assert_eq!(margin.data.margin_required, Decimal::ZERO);
         assert_eq!(margin.data.margin_ratio, None);
+        assert!(margin.data.exact_margin.is_none());
         assert_eq!(changes.data.items.len(), 2);
         assert_eq!(changes.data.items[0].balance_change, Decimal::new(-17, 5));
         assert_eq!(
@@ -3317,6 +3767,33 @@ mod tests {
             Some("MTc4OTQ5ODIxMTExNToxODY3Mjg3MTcwMDAyMDAw")
         );
         assert!(changes.data.has_next);
+    }
+
+    #[rstest]
+    fn decodes_current_exact_margin_without_legacy_rounding() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(SUBACCOUNT_MARGIN_RATIO_EXACT_MANIFEST).unwrap();
+        let digest = aws_lc_rs::digest::digest(
+            &aws_lc_rs::digest::SHA256,
+            SUBACCOUNT_MARGIN_RATIO_EXACT_RESPONSE.as_bytes(),
+        );
+        assert_eq!(
+            manifest["request"]["path"],
+            "/internal/v1/account/margin-ratio"
+        );
+        assert_eq!(manifest["runtime_identity"], serde_json::Value::Null);
+        assert_eq!(
+            nautilus_core::hex::encode(digest.as_ref()),
+            manifest["response"]["payload_sha256"]
+        );
+
+        let response: DeepXApiResponse<DeepXSubaccountMarginRatio> =
+            serde_json::from_str(SUBACCOUNT_MARGIN_RATIO_EXACT_RESPONSE).unwrap();
+        let exact = response.data.exact_margin.unwrap();
+        assert_eq!(response.data.collateral, Decimal::new(97_096, 2));
+        assert_eq!(exact.total_collateral, Decimal::new(970_964_181, 6));
+        assert_eq!(exact.maint_margin_req, Decimal::ZERO);
+        assert_eq!(exact.uni_mmr, None);
     }
 
     #[rstest]

@@ -757,10 +757,12 @@ mod tests {
                 value: ORDER_ID + 1,
             },
             DeepXDirectRuntimeIdentity::from(&runtime),
-            [7; 20],
-            42,
-            3,
-            false,
+            crate::signing::DeepXPerpCancelParams {
+                subaccount: [7; 20],
+                order_id: 42,
+                market_id: 3,
+                fast_cancel: false,
+            },
         );
         DeepXTransactionRecord::created_with_framework_order_context(
             identity,

@@ -78,6 +78,111 @@ impl DeepXWsReadConnection {
         self.send_text(text, "account").await
     }
 
+    /// Sends one read-only account summary subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_account_metrics_request(
+        &mut self,
+        request: &super::account_metrics::DeepXWsAccountMetricsRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text(), "account summary").await
+    }
+
+    /// Sends one read-only perpetual open-order subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request, terminal connection, or bounded send failure.
+    pub async fn send_perp_open_orders_request(
+        &mut self,
+        request: &super::account_orders::DeepXWsPerpOpenOrdersRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text()?, "perpetual open orders")
+            .await
+    }
+
+    /// Sends one read-only perpetual trade-history subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_perp_trade_history_request(
+        &mut self,
+        request: &super::account_trades::DeepXWsPerpTradeHistoryRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text()?, "perpetual trade history")
+            .await
+    }
+
+    pub(crate) async fn send_order_history_request(&mut self, text: String) -> anyhow::Result<()> {
+        self.send_text(text, "order history").await
+    }
+
+    /// Sends one read-only aggregate lending-rate subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_lending_rates_request(
+        &mut self,
+        request: &super::lending_rates::DeepXWsLendingRatesRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text(), "lending rates").await
+    }
+
+    /// Sends one read-only Spot open-order subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_spot_open_orders_request(
+        &mut self,
+        request: &super::account_spot_orders::DeepXWsSpotOpenOrdersRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text(), "Spot open orders").await
+    }
+
+    /// Sends one read-only Spot trade-history subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_spot_trade_history_request(
+        &mut self,
+        request: &super::account_spot_trades::DeepXWsSpotTradeHistoryRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text(), "Spot trade history")
+            .await
+    }
+
+    /// Sends one read-only perpetual open-position subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request, terminal connection, or bounded send failure.
+    pub async fn send_perp_open_positions_request(
+        &mut self,
+        request: &super::account_positions::DeepXWsPerpOpenPositionsRequest,
+    ) -> anyhow::Result<()> {
+        self.send_text(request.to_text()?, "perpetual open positions")
+            .await
+    }
+
+    /// Sends one read-only perpetual candle subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a terminal connection or bounded send failure.
+    pub async fn send_candle_request(
+        &mut self,
+        stream: &super::candles::DeepXWsCandleStream,
+    ) -> anyhow::Result<()> {
+        self.send_text(stream.subscription_text()?, "perpetual candles")
+            .await
+    }
+
     pub(crate) async fn send_json_rpc_text(&mut self, text: String) -> anyhow::Result<()> {
         self.send_text(text, "JSON-RPC").await
     }

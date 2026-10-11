@@ -39,6 +39,8 @@ pub enum DeepXWsPublicChannel {
     MarkPrice,
     /// Funding rate observations.
     FundingRate,
+    /// Public open-interest observations.
+    OpenInterest,
 }
 
 /// Read-only application commands, deliberately excluding private account subscriptions.

@@ -18,6 +18,7 @@
 mod bars;
 mod book;
 mod funding;
+mod live_bars;
 mod live_spot_book;
 mod live_spot_trades;
 mod live_trades;
@@ -45,27 +46,31 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse,
         data::{
-            BarsResponse, BookResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth,
-            RequestBookSnapshot, RequestCustomData, RequestForwardPrices, RequestFundingRates,
-            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
-            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse,
-            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCustomData,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-            UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            BarsResponse, BookDepthResponse, BookResponse, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, QuotesResponse, RequestBars,
+            RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCustomData,
+            RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
+            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
+            UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+            UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionGreeks,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     providers::InstrumentProvider,
 };
 use nautilus_core::{
-    MUTEX_POISONED, datetime::try_datetime_to_unix_nanos, time::get_atomic_clock_realtime,
+    MUTEX_POISONED,
+    datetime::{NANOSECONDS_IN_MILLISECOND, try_datetime_to_unix_nanos},
+    time::get_atomic_clock_realtime,
 };
 use nautilus_live::task::TaskGroup;
 use nautilus_model::{
+    data::BarType,
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
@@ -75,9 +80,9 @@ use crate::{
     common::{DeepXError, consts::DEEPX_VENUE},
     config::DeepXDataClientConfig,
     http::{
-        DeepXAccountSortOrder, DeepXFundingRateRequest, DeepXHttpClient, DeepXPerpCandlesRequest,
-        DeepXPerpTradesHistoryRequest, DeepXSpotCandlesRequest, DeepXSpotOrderBookRequest,
-        DeepXSpotTradesRequest,
+        DeepXAccountSortOrder, DeepXFundingRateRequest, DeepXHttpClient, DeepXPerpCandleInterval,
+        DeepXPerpCandlesRequest, DeepXPerpTradesHistoryRequest, DeepXSpotCandlesRequest,
+        DeepXSpotOrderBookRequest, DeepXSpotTradesRequest,
     },
     providers::{DeepXInstrumentProvider, DeepXMarketMetadata, DeepXMarketProvider},
 };
@@ -126,7 +131,7 @@ macro_rules! unsupported_requests {
 /// subscriptions publish atomic delta batches or complete depth-10 snapshots and request fresh
 /// snapshots on bounded recovery. Spot quote requests and live book subscriptions use verified
 /// current order-book snapshots.
-/// Historical perpetual bars preserve venue timestamps and require exact instrument precision.
+/// Historical perpetual bars preserve venue timestamps and require exact precision and increments.
 /// Historical perpetual trades are delivered as bounded correlated framework responses.
 /// Historical funding samples preserve minute bucket times without inferring a payment schedule.
 /// Live mark, index, and funding observations preserve venue values and envelope timestamps.
@@ -144,6 +149,7 @@ pub struct DeepXDataClient {
     sender: Option<UnboundedSender<DataEvent>>,
     connected: bool,
     trade_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
+    bar_subscriptions: BTreeMap<BarType, live_trades::TradeSubscription>,
     spot_trade_subscriptions: BTreeMap<InstrumentId, live_spot_trades::SpotTradeSubscription>,
     book_subscriptions: BTreeMap<InstrumentId, (NonZeroUsize, live_trades::TradeSubscription)>,
     depth10_subscriptions: BTreeMap<InstrumentId, live_trades::TradeSubscription>,
@@ -187,10 +193,12 @@ impl DeepXDataClient {
             Some(config.http_timeout_secs),
             config.proxy_url.clone(),
         )?;
-        let provider = DeepXInstrumentProvider::with_network(
-            DeepXMarketProvider::new(http.clone()),
-            config.network.clone(),
-        );
+        let catalog = DeepXMarketProvider::new(http.clone());
+        let provider = if config.perpetual_only {
+            DeepXInstrumentProvider::perpetual_only(catalog)
+        } else {
+            DeepXInstrumentProvider::with_network(catalog, config.network.clone())
+        };
         Ok(Self {
             client_id,
             config,
@@ -203,6 +211,7 @@ impl DeepXDataClient {
             sender: None,
             connected: false,
             trade_subscriptions: BTreeMap::new(),
+            bar_subscriptions: BTreeMap::new(),
             spot_trade_subscriptions: BTreeMap::new(),
             book_subscriptions: BTreeMap::new(),
             depth10_subscriptions: BTreeMap::new(),
@@ -246,13 +255,13 @@ impl DeepXDataClient {
         Ok(())
     }
 
-    fn send(&self, event: DataEvent) -> anyhow::Result<()> {
-        self.require_connected()?;
-        self.sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DeepX data event sender is unavailable"))?
-            .send(event)
-            .map_err(|_| anyhow::anyhow!("DeepX data event receiver is unavailable"))
+    fn fresh_instrument_provider(&self) -> DeepXInstrumentProvider {
+        let catalog = self.provider.catalog().clone();
+        if self.config.perpetual_only {
+            DeepXInstrumentProvider::perpetual_only(catalog)
+        } else {
+            DeepXInstrumentProvider::with_network(catalog, self.config.network.clone())
+        }
     }
 
     fn validate_request(
@@ -336,8 +345,15 @@ impl DeepXDataClient {
     {
         let sender = self.sender.as_ref().expect("connected sender").clone();
         let epoch = Arc::clone(&self.request_epoch);
+        let cancellation = self.tasks.cancellation_token();
         self.tasks.spawn(async move {
-            match future.await {
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                () = sender.closed() => return,
+                result = future => result,
+            };
+            match result {
                 Ok(response) => {
                     // Serialize emission with epoch retirement, including on another worker thread.
                     let active = epoch.lock().expect(MUTEX_POISONED);
@@ -352,7 +368,7 @@ impl DeepXDataClient {
     }
 
     fn spawn_spot_book_task(
-        &mut self,
+        &self,
         instrument: InstrumentAny,
         market: Box<crate::http::DeepXSpotMarket>,
         depth: NonZeroUsize,
@@ -391,6 +407,10 @@ impl DeepXDataClient {
             subscription.retire();
         }
         self.trade_subscriptions.clear();
+        for subscription in self.bar_subscriptions.values() {
+            subscription.retire();
+        }
+        self.bar_subscriptions.clear();
         for subscription in self.spot_trade_subscriptions.values() {
             subscription.retire();
         }
@@ -1070,10 +1090,7 @@ impl DataClient for DeepXDataClient {
             !sender.is_closed(),
             "DeepX data event receiver is unavailable"
         );
-        let mut provider = DeepXInstrumentProvider::with_network(
-            self.provider.catalog().clone(),
-            self.config.network.clone(),
-        );
+        let mut provider = self.fresh_instrument_provider();
         provider.load_all(None).await?;
         let instruments = provider.store().list_all();
         anyhow::ensure!(
@@ -1121,15 +1138,32 @@ impl DataClient for DeepXDataClient {
             limit.get() <= 10_000,
             "DeepX trade request limit exceeds 10000"
         );
-        let http = self.http.clone();
+        let rest_start_ms = lower.as_u64().div_ceil(NANOSECONDS_IN_MILLISECOND);
+        let rest_end_ms = upper.as_millis();
         let client_id = self.client_id;
+        if rest_start_ms > rest_end_ms {
+            return self.spawn_data_request("historical trades", async move {
+                let ts_init = get_atomic_clock_realtime().get_time_ns();
+                Ok(DataResponse::Trades(TradesResponse::new(
+                    request.request_id,
+                    client_id,
+                    instrument.id(),
+                    Vec::new(),
+                    start,
+                    end,
+                    ts_init,
+                    request.params,
+                )))
+            });
+        }
+        let http = self.http.clone();
         match market {
             DeepXMarketMetadata::Perpetual(market) => {
                 let market_id = market.id;
                 let history = DeepXPerpTradesHistoryRequest {
                     market_id,
-                    start_ms: lower.as_millis(),
-                    end_ms: upper.as_millis(),
+                    start_ms: rest_start_ms,
+                    end_ms: rest_end_ms,
                     page_size: 100,
                     max_pages: 100,
                 };
@@ -1164,8 +1198,8 @@ impl DataClient for DeepXDataClient {
                     name: Some(market.name.clone()),
                     pair: None,
                     wallet: None,
-                    start_ms: Some(lower.as_millis()),
-                    end_ms: Some(upper.as_millis()),
+                    start_ms: Some(rest_start_ms),
+                    end_ms: Some(rest_end_ms),
                     cursor: None,
                     sort: DeepXAccountSortOrder::Descending,
                     page_size: Some(100),
@@ -1276,6 +1310,11 @@ impl DataClient for DeepXDataClient {
         let lower = start.unwrap_or_default();
         let upper = end.unwrap_or_else(|| self.clock.borrow().timestamp_ns());
         anyhow::ensure!(lower <= upper, "DeepX candle request start exceeds end");
+        let rest_start_ms = lower.as_u64().div_ceil(NANOSECONDS_IN_MILLISECOND);
+        let rest_end_ms = upper
+            .as_millis()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("DeepX candle end overflows"))?;
         let limit = request.limit.map(|limit| limit.get());
         anyhow::ensure!(
             limit.is_none_or(|limit| limit <= 5_000),
@@ -1288,8 +1327,8 @@ impl DataClient for DeepXDataClient {
                 let history = DeepXPerpCandlesRequest {
                     market_id: market.id,
                     interval,
-                    start_ms: lower.as_millis(),
-                    end_ms: Some(upper.as_millis()),
+                    start_ms: rest_start_ms,
+                    end_ms: Some(rest_end_ms),
                     limit: limit.map(u32::try_from).transpose()?,
                 };
                 history.validate()?;
@@ -1327,8 +1366,8 @@ impl DataClient for DeepXDataClient {
                     name: Some(market.name.clone()),
                     pair: None,
                     interval,
-                    start_ms: lower.as_millis(),
-                    end_ms: Some(upper.as_millis()),
+                    start_ms: rest_start_ms,
+                    end_ms: Some(rest_end_ms),
                     limit: limit.map(u32::try_from).transpose()?,
                 };
                 history.validate()?;
@@ -1440,6 +1479,78 @@ impl DataClient for DeepXDataClient {
         }
     }
 
+    fn request_book_depth(&self, request: RequestBookDepth) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            request.start.is_none() && request.end.is_none(),
+            "DeepX depth requests only support a current snapshot"
+        );
+        anyhow::ensure!(
+            request.limit.is_none_or(|limit| limit.get() == 1),
+            "DeepX current depth request limit must be one"
+        );
+        anyhow::ensure!(
+            request.depth.is_none_or(|depth| depth.get() <= 10),
+            "DeepX depth request exceeds ten levels"
+        );
+        let (instrument, market) = self.history_market(
+            request.instrument_id,
+            request.client_id,
+            request
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
+        let network = self.config.network.clone();
+        let proxy_url = self.config.proxy_url.clone();
+        let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
+        let client_id = self.client_id;
+        let depth = request
+            .depth
+            .unwrap_or(NonZeroUsize::new(10).expect("nonzero"));
+        match market {
+            DeepXMarketMetadata::Spot(market) => {
+                self.spawn_data_request("Spot depth snapshot", async move {
+                    let depth = live_spot_book::request_spot_book_depth10(
+                        network, proxy_url, timeout, *market, instrument, depth,
+                    )
+                    .await?;
+                    let ts_init = depth.ts_init;
+                    Ok(DataResponse::BookDepth(BookDepthResponse::new(
+                        request.request_id,
+                        client_id,
+                        request.instrument_id,
+                        vec![depth],
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+            DeepXMarketMetadata::Perpetual(market) => {
+                let market_id = u16::try_from(market.id)?;
+                network.ws_connection_url()?;
+                self.spawn_data_request("Perpetual depth snapshot", async move {
+                    let depth = book::request_book_depth10(
+                        network, proxy_url, timeout, market_id, depth, instrument,
+                    )
+                    .await?;
+                    let ts_init = depth.ts_init;
+                    Ok(DataResponse::BookDepth(BookDepthResponse::new(
+                        request.request_id,
+                        client_id,
+                        request.instrument_id,
+                        vec![depth],
+                        None,
+                        None,
+                        ts_init,
+                        request.params,
+                    )))
+                })
+            }
+        }
+    }
+
     fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
         let (instrument, market) = self.history_market(
             request.instrument_id,
@@ -1536,25 +1647,22 @@ impl DataClient for DeepXDataClient {
                 .as_ref()
                 .is_some_and(|params| !params.is_empty()),
         )?;
-        let instruments = self
-            .provider
-            .store()
-            .list_all()
-            .into_iter()
-            .cloned()
-            .collect();
-        self.send(DataEvent::Response(DataResponse::Instruments(
-            InstrumentsResponse::new(
+        let provider = self.fresh_instrument_provider();
+        let client_id = self.client_id;
+        let ts_init = self.clock.borrow().timestamp_ns();
+        self.spawn_data_request("instrument definitions", async move {
+            let (_, instruments) = provider.fetch_instruments().await?;
+            Ok(DataResponse::Instruments(InstrumentsResponse::new(
                 request.request_id,
-                self.client_id,
+                client_id,
                 *DEEPX_VENUE,
                 instruments,
                 None,
                 None,
-                self.clock.borrow().timestamp_ns(),
+                ts_init,
                 request.params,
-            ),
-        )))
+            )))
+        })
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
@@ -1567,35 +1675,112 @@ impl DataClient for DeepXDataClient {
                 .as_ref()
                 .is_some_and(|params| !params.is_empty()),
         )?;
-        let instrument = self
-            .provider
-            .store()
-            .find(&request.instrument_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DeepX instrument is unknown or unsupported: {}",
-                    request.instrument_id
-                )
-            })?;
-        self.send(DataEvent::Response(DataResponse::Instrument(Box::new(
-            InstrumentResponse::new(
+        let provider = self.fresh_instrument_provider();
+        let client_id = self.client_id;
+        let ts_init = self.clock.borrow().timestamp_ns();
+        self.spawn_data_request("instrument definition", async move {
+            let (_, instruments) = provider.fetch_instruments().await?;
+            let instrument = instruments
+                .into_iter()
+                .find(|instrument| instrument.id() == request.instrument_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "DeepX instrument is unknown or unsupported: {}",
+                        request.instrument_id
+                    )
+                })?;
+            Ok(DataResponse::Instrument(Box::new(InstrumentResponse::new(
                 request.request_id,
-                self.client_id,
+                client_id,
                 request.instrument_id,
-                instrument.clone(),
+                instrument,
                 None,
                 None,
-                self.clock.borrow().timestamp_ns(),
+                ts_init,
                 request.params,
-            ),
-        ))))
+            ))))
+        })
+    }
+
+    fn subscribe_bars(&mut self, command: SubscribeBars) -> anyhow::Result<()> {
+        let bar_type = command.bar_type;
+        anyhow::ensure!(
+            bar_type.is_standard() && bar_type.is_externally_aggregated(),
+            "DeepX live candles require standard externally aggregated bars"
+        );
+        anyhow::ensure!(
+            bars::candle_interval(bar_type.spec())? == DeepXPerpCandleInterval::OneMinute,
+            "DeepX live candles only support one-minute bars"
+        );
+        let (instrument, market) = self.history_market(
+            bar_type.instrument_id(),
+            command.client_id,
+            command
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
+        anyhow::ensure!(
+            command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
+            "DeepX subscription venue mismatch"
+        );
+        let DeepXMarketMetadata::Perpetual(market) = market else {
+            anyhow::bail!("DeepX live candles only support perpetual markets");
+        };
+        let market_id = u16::try_from(market.id)?;
+        self.config.network.ws_connection_url()?;
+        if self
+            .bar_subscriptions
+            .get(&bar_type)
+            .is_some_and(live_trades::TradeSubscription::is_active)
+        {
+            return Ok(());
+        }
+        let subscription = live_trades::TradeSubscription::new();
+        let task = live_bars::BarTask {
+            instrument,
+            bar_type,
+            market_id,
+            pair: market.name,
+            network: self.config.network.clone(),
+            proxy_url: self.config.proxy_url.clone(),
+            timeout: Duration::from_secs(self.config.websocket_timeout_secs),
+            sender: self
+                .sender
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("DeepX data event sender unavailable"))?
+                .clone(),
+            connection_epoch: Arc::clone(&self.request_epoch),
+            subscription: subscription.clone(),
+        };
+        self.tasks.spawn(task.run())?;
+        self.bar_subscriptions.insert(bar_type, subscription);
+        Ok(())
+    }
+
+    fn unsubscribe_bars(&mut self, command: &UnsubscribeBars) -> anyhow::Result<()> {
+        self.history_market(
+            command.bar_type.instrument_id(),
+            command.client_id,
+            command
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
+        anyhow::ensure!(
+            command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
+            "DeepX subscription venue mismatch"
+        );
+        if let Some(subscription) = self.bar_subscriptions.remove(&command.bar_type) {
+            subscription.retire();
+        }
+        Ok(())
     }
 
     unsupported_owned_commands! {
         subscribe(command: SubscribeCustomData) => "custom data subscriptions";
         subscribe_instruments(command: SubscribeInstruments) => "instrument subscriptions";
         subscribe_instrument(command: SubscribeInstrument) => "instrument subscriptions";
-        subscribe_bars(command: SubscribeBars) => "bar subscriptions";
         subscribe_instrument_close(command: SubscribeInstrumentClose) => "instrument close subscriptions";
         subscribe_option_greeks(command: SubscribeOptionGreeks) => "option greeks subscriptions";
     }
@@ -1604,7 +1789,6 @@ impl DataClient for DeepXDataClient {
         unsubscribe(command: UnsubscribeCustomData) => "custom data subscriptions";
         unsubscribe_instruments(command: UnsubscribeInstruments) => "instrument subscriptions";
         unsubscribe_instrument(command: UnsubscribeInstrument) => "instrument subscriptions";
-        unsubscribe_bars(command: UnsubscribeBars) => "bar subscriptions";
         unsubscribe_instrument_close(command: UnsubscribeInstrumentClose) => "instrument close subscriptions";
         unsubscribe_option_greeks(command: UnsubscribeOptionGreeks) => "option greeks subscriptions";
     }
@@ -1612,7 +1796,6 @@ impl DataClient for DeepXDataClient {
     unsupported_requests! {
         request_data(request: RequestCustomData) => "custom data requests";
         request_forward_prices(request: RequestForwardPrices) => "forward price requests";
-        request_book_depth(request: RequestBookDepth) => "order book depth requests";
         request_book_deltas(request: RequestBookDeltas) => "order book delta requests";
     }
 
@@ -1620,11 +1803,18 @@ impl DataClient for DeepXDataClient {
         &mut self,
         command: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
-        self.require_connected()?;
         let instrument_id = command.instrument_id;
+        self.history_market(
+            instrument_id,
+            command.client_id,
+            command
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
         anyhow::ensure!(
-            self.provider.catalog().market(&instrument_id).is_some(),
-            "DeepX instrument status subscription requires a loaded market"
+            command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
+            "DeepX subscription venue mismatch"
         );
         self.instrument_status_subscriptions
             .lock()
@@ -1664,6 +1854,18 @@ impl DataClient for DeepXDataClient {
         &mut self,
         command: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
+        self.history_market(
+            command.instrument_id,
+            command.client_id,
+            command
+                .params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty()),
+        )?;
+        anyhow::ensure!(
+            command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
+            "DeepX subscription venue mismatch"
+        );
         self.instrument_status_subscriptions
             .lock()
             .expect(MUTEX_POISONED)
@@ -1686,7 +1888,7 @@ impl Drop for DeepXDataClient {
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use axum::{Router, routing::get};
@@ -1711,6 +1913,7 @@ mod tests {
     use super::*;
 
     const SPOT: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+    const EMPTY_SPOT: &str = r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
     const SPOT_TRADES: &str =
         include_str!("../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
     const SPOT_CANDLES: &str =
@@ -1724,7 +1927,19 @@ mod tests {
 
     struct Server {
         task: JoinHandle<()>,
+        spot_enabled: Arc<AtomicBool>,
+        perp_response: Arc<Mutex<serde_json::Value>>,
         _data_event_sender_guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Server {
+        fn enable_spot(&self) {
+            self.spot_enabled.store(true, Ordering::Relaxed);
+        }
+
+        fn set_perp_response(&self, response: serde_json::Value) {
+            *self.perp_response.lock().unwrap() = response;
+        }
     }
 
     impl Drop for Server {
@@ -1756,13 +1971,23 @@ mod tests {
         let data_event_sender_guard = DATA_EVENT_SENDER_LOCK.lock().await;
         let requests = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&requests);
+        let perp_response = Arc::new(Mutex::new(perp_response));
+        let serve_perp = Arc::clone(&perp_response);
+        let spot_enabled = Arc::new(AtomicBool::new(false));
+        let serve_spot = Arc::clone(&spot_enabled);
         let router = Router::new()
-            .route("/internal/v1/market/spot/markets", get(|| async { SPOT }))
+            .route(
+                "/internal/v1/market/spot/markets",
+                get(move || {
+                    let enabled = serve_spot.load(Ordering::Relaxed);
+                    async move { if enabled { SPOT } else { EMPTY_SPOT } }
+                }),
+            )
             .route(
                 "/internal/v1/market/perp/markets",
                 get(move || {
                     count.fetch_add(1, Ordering::Relaxed);
-                    let response = perp_response.clone();
+                    let response = serve_perp.lock().unwrap().clone();
                     async move { axum::Json(response) }
                 }),
             )
@@ -1773,6 +1998,8 @@ mod tests {
             task: tokio::spawn(async move {
                 axum::serve(listener, router).await.unwrap();
             }),
+            spot_enabled,
+            perp_response,
             _data_event_sender_guard: data_event_sender_guard,
         };
         let clock = Rc::new(RefCell::new(TestClock::new()));
@@ -1857,10 +2084,12 @@ mod tests {
             "/internal/v1/market/spot/trades",
             get(|| async { SPOT_TRADES }),
         );
-        let (mut client, mut receiver, _, _server) =
+        let (mut client, mut receiver, _, server) =
             client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
         client.provider.store_mut().add(spot_instrument());
         let raw: crate::http::DeepXApiResponse<crate::http::DeepXSpotTradesPage> =
             serde_json::from_str(SPOT_TRADES).unwrap();
@@ -1901,23 +2130,42 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case(false, 3)]
+    #[case(true, 2)]
     #[tokio::test]
-    async fn spot_candle_history_emits_correlated_bars() {
+    async fn spot_candle_history_emits_correlated_bars(
+        #[case] fractional_start: bool,
+        #[case] expected_count: usize,
+    ) {
         let mut fixture: serde_json::Value = serde_json::from_str(SPOT_CANDLES).unwrap();
         for candle in fixture["data"]["details"].as_array_mut().unwrap() {
             candle["volume"] = serde_json::json!("1.2345");
         }
         let router = Router::new().route(
             "/internal/v1/market/spot/candles",
-            get(move || {
-                let fixture = fixture.clone();
-                async move { axum::Json(fixture) }
-            }),
+            get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let mut fixture = fixture.clone();
+                    async move {
+                        let start: u64 = query["start"].parse().unwrap();
+                        let limit: usize = query["limit"].parse().unwrap();
+                        let details = fixture["data"]["details"].as_array_mut().unwrap();
+                        details.retain(|candle| candle["time"].as_u64().unwrap() >= start);
+                        details.truncate(limit);
+                        axum::Json(fixture)
+                    }
+                },
+            ),
         );
-        let (mut client, mut receiver, _, _server) =
+        let (mut client, mut receiver, _, server) =
             client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
         client.provider.store_mut().add(spot_instrument());
         let fixture: crate::http::DeepXApiResponse<crate::http::DeepXSpotCandlesPage> =
             serde_json::from_str(SPOT_CANDLES).unwrap();
@@ -1933,9 +2181,14 @@ mod tests {
         client
             .request_bars(RequestBars::new(
                 bar_type,
-                Some(jiff::Timestamp::from_millisecond(first as i64).unwrap()),
+                Some(
+                    jiff::Timestamp::from_nanosecond(
+                        (first * NANOSECONDS_IN_MILLISECOND + u64::from(fractional_start)) as i128,
+                    )
+                    .unwrap(),
+                ),
                 Some(jiff::Timestamp::from_millisecond(last as i64).unwrap()),
-                NonZeroUsize::new(3),
+                NonZeroUsize::new(expected_count),
                 Some(client.client_id()),
                 request_id,
                 UnixNanos::default(),
@@ -1948,12 +2201,19 @@ mod tests {
             panic!("expected Spot bars response");
         };
         assert_eq!(response.correlation_id, request_id);
-        assert_eq!(response.data.len(), 3);
+        assert_eq!(response.data.len(), expected_count);
         assert_eq!(
             response.data[0].volume.as_decimal(),
             rust_decimal::Decimal::new(12_345, 4)
         );
-        assert_eq!(response.data[0].ts_event.as_millis(), first);
+        assert_eq!(
+            response.data[0].ts_event.as_millis(),
+            if fractional_start {
+                fixture.data.details[1].time
+            } else {
+                first
+            }
+        );
     }
 
     #[tokio::test]
@@ -1962,10 +2222,12 @@ mod tests {
             "/internal/v1/market/spot/order-books",
             get(|| async { SPOT_BOOK }),
         );
-        let (mut client, mut receiver, _, _server) =
+        let (mut client, mut receiver, _, server) =
             client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
         client.provider.store_mut().add(spot_instrument());
         let request_id = UUID4::new();
 
@@ -1998,15 +2260,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spot_depth_request_emits_correlated_counted_snapshot() {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+
+        let spot_response: crate::http::DeepXApiResponse<Vec<crate::http::DeepXSpotMarket>> =
+            serde_json::from_str(SPOT).unwrap();
+        let pair = spot_response
+            .data
+            .iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap()
+            .pair
+            .clone();
+        let app = Router::new().route(
+            "/rpc",
+            get(move |upgrade: WebSocketUpgrade| {
+                let pair = pair.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(Message::Text(request))) = socket.recv().await else {
+                            return;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                        assert_eq!(request["method"], "orderbook_subscribe");
+                        assert_eq!(request["params"][0][0], pair);
+                        assert_eq!(request["params"][2], 1);
+                        let ack = serde_json::json!({"jsonrpc":"2.0","id":1,"result":"book-1"});
+                        let snapshot = serde_json::json!({
+                            "jsonrpc":"2.0",
+                            "method":"orderbook_subscribe",
+                            "params":{
+                                "subscription":"book-1",
+                                "result":{
+                                    "spot":{
+                                        (pair):{
+                                            "bids":[{"price":"0x912d5ff0","amount":"0xc8819b7382d8000","order_count":3}],
+                                            "asks":[{"price":"0x912fa9e0","amount":"0x1647e1be62e3c000","order_count":4}]
+                                        }
+                                    },
+                                    "perp":{}
+                                }
+                            }
+                        });
+                        for value in [ack, snapshot] {
+                            socket
+                                .send(Message::Text(value.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    })
+                }
+            }),
+        );
+        let (mut client, mut receiver, _, server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), app).await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
+        client.provider.store_mut().add(spot_instrument());
+        client.config.network.base_url_rpc_watch = Some(format!("{}/rpc", client.http.base_url()));
+        let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        let request_id = UUID4::new();
+        client
+            .request_book_depth(RequestBookDepth::new(
+                instrument_id,
+                None,
+                None,
+                NonZeroUsize::new(1),
+                NonZeroUsize::new(1),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+        let DataEvent::Response(DataResponse::BookDepth(response)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected Spot depth response");
+        };
+        assert_eq!(response.correlation_id, request_id);
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].bid_counts[0], 3);
+        assert_eq!(response.data[0].ask_counts[0], 4);
+        assert_eq!(response.data[0].bids[0].price, Price::from("2435.67"));
+        assert_eq!(response.data[0].asks[0].price, Price::from("2435.82"));
+    }
+
+    #[tokio::test]
+    async fn depth_request_rejects_history_and_more_than_ten_levels() {
+        let (mut client, _receiver, _, _server) = client(serde_json::from_str(PERP).unwrap()).await;
+        client.connect().await.unwrap();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let start = jiff::Timestamp::from_millisecond(1_000).unwrap();
+        for (start, depth) in [(Some(start), None), (None, NonZeroUsize::new(11))] {
+            assert!(
+                client
+                    .request_book_depth(RequestBookDepth::new(
+                        instrument_id,
+                        start,
+                        None,
+                        None,
+                        depth,
+                        Some(client.client_id()),
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                    ))
+                    .is_err()
+            );
+        }
+        assert!(client.tasks.is_empty());
+        client.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn spot_quote_request_emits_one_correlated_top_of_book_tick() {
         let router = Router::new().route(
             "/internal/v1/market/spot/order-books",
             get(|| async { SPOT_BOOK }),
         );
-        let (mut client, mut receiver, _, _server) =
+        let (mut client, mut receiver, _, server) =
             client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
         client.provider.store_mut().add(spot_instrument());
         let request_id = UUID4::new();
 
@@ -2155,8 +2535,9 @@ mod tests {
                 }
             }),
         );
-        let (mut client, mut receiver, _, _server) =
+        let (mut client, mut receiver, _, server) =
             client_with_history(serde_json::from_str(PERP).unwrap(), app).await;
+        server.enable_spot();
         client.provider.catalog_mut().load_all().await.unwrap();
         client.provider.store_mut().add(spot_instrument());
         client.tasks.abort();
@@ -2297,11 +2678,10 @@ mod tests {
                         let end: u64 = query["end"].parse().unwrap();
                         let limit = query
                             .get("limit")
-                            .map(|limit| limit.parse().unwrap())
-                            .unwrap_or(5_000);
+                            .map_or(5_000, |limit| limit.parse().unwrap());
                         let mut details = [60_000, 120_000, 180_000]
                             .into_iter()
-                            .filter(|time| *time >= start && *time <= end)
+                            .filter(|time| *time >= start && *time < end)
                             .take(limit)
                             .map(|time| {
                                 serde_json::json!({
@@ -2327,6 +2707,12 @@ mod tests {
                                 "volume-precision" => {
                                     candle["volume"] = serde_json::json!("0.00401");
                                 }
+                                "price-grid" => {
+                                    candle["open"] = serde_json::json!("1792.6001");
+                                }
+                                "volume-grid" => {
+                                    candle["volume"] = serde_json::json!("0.0041");
+                                }
                                 "nonpositive-price" => {
                                     candle["low"] = serde_json::json!("0");
                                 }
@@ -2351,6 +2737,7 @@ mod tests {
     #[rstest]
     #[case("full", 3)]
     #[case("precise-bounds", 1)]
+    #[case("fractional-start-limited", 2)]
     #[case("empty-params", 3)]
     #[case("no-limit", 3)]
     #[tokio::test]
@@ -2371,6 +2758,10 @@ mod tests {
             "precise-bounds" => {
                 request.start = Some(jiff::Timestamp::from_nanosecond(60_000_000_001).unwrap());
                 request.end = Some(jiff::Timestamp::from_nanosecond(179_999_999_999).unwrap());
+            }
+            "fractional-start-limited" => {
+                request.start = Some(jiff::Timestamp::from_nanosecond(60_000_000_001).unwrap());
+                request.limit = NonZeroUsize::new(2);
             }
             "empty-params" => request.params = Some(nautilus_core::Params::new()),
             "no-limit" => request.limit = None,
@@ -2433,6 +2824,8 @@ mod tests {
     #[case("foreign-pair")]
     #[case("price-precision")]
     #[case("volume-precision")]
+    #[case("price-grid")]
+    #[case("volume-grid")]
     #[case("nonpositive-price")]
     #[case("out-of-range")]
     #[tokio::test]
@@ -2838,6 +3231,9 @@ mod tests {
                     assert_eq!(query["sort"], "DESC");
                     let start: i64 = query["start"].parse().unwrap();
                     let end: i64 = query["end"].parse().unwrap();
+                    if scenario == "nanosecond-bounds" {
+                        assert_eq!(start, 1_501);
+                    }
                     let page_size: usize = query["pageSize"].parse().unwrap();
                     let offset: usize = query.get("cursor").map_or(0, |cursor| cursor.parse().unwrap());
                     let rows = [3_000, 2_000, 1_500, 1_000].into_iter().enumerate()
@@ -2970,7 +3366,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .unwrap();
-        if scenario != "empty" {
+        if scenario == "empty" {
+            assert!(receiver.try_recv().is_err());
+        } else {
             let DataEvent::Data(Data::Quote(initial)) =
                 tokio::time::timeout(Duration::from_secs(2), receiver.recv())
                     .await
@@ -2988,8 +3386,6 @@ mod tests {
                 "1792.80".parse::<rust_decimal::Decimal>().unwrap()
             );
             assert_eq!(initial.ts_event.as_millis(), 1000);
-        } else {
-            assert!(receiver.try_recv().is_err());
         }
         release.notify_one();
         let DataEvent::Data(Data::Quote(next)) =
@@ -3535,7 +3931,9 @@ mod tests {
                                 {"price":"1792.40","qty":"0.008","value":"14.3392"}
                             ));
                         }
-                        bids.as_array_mut().unwrap().truncate(expected_depth);
+                        if scenario != "side-depth" {
+                            bids.as_array_mut().unwrap().truncate(expected_depth);
+                        }
                         let mut asks = serde_json::json!([
                             {"price":"1792.80","qty":"0.006","value":"10.7568"},
                             {"price":"1792.90","qty":"0.007","value":"12.5503"}
@@ -3623,6 +4021,77 @@ mod tests {
         assert!(response.params.unwrap().is_empty());
         finish_requests(&client).await;
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case("valid")]
+    #[case("delta")]
+    #[case("side-depth")]
+    #[case("precision")]
+    #[tokio::test]
+    async fn perpetual_depth_request_requires_valid_snapshot(#[case] scenario: &'static str) {
+        use nautilus_model::enums::RecordFlag;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            book_snapshot_router(
+                scenario,
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::clone(&calls),
+                2,
+            ),
+        )
+        .await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let request_id = UUID4::new();
+        client
+            .request_book_depth(RequestBookDepth::new(
+                instrument_id,
+                None,
+                None,
+                NonZeroUsize::new(1),
+                NonZeroUsize::new(2),
+                Some(client.client_id()),
+                request_id,
+                UnixNanos::default(),
+                None,
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        release.notify_one();
+        finish_requests(&client).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        if scenario == "valid" {
+            let DataEvent::Response(DataResponse::BookDepth(response)) =
+                receiver.try_recv().unwrap()
+            else {
+                panic!("expected Perpetual depth response");
+            };
+            assert_eq!(response.correlation_id, request_id);
+            assert_eq!(response.instrument_id, instrument_id);
+            assert_eq!(response.data.len(), 1);
+            let depth = &response.data[0];
+            assert_eq!(depth.bids[0].price.to_string(), "1792.6000");
+            assert_eq!(depth.bids[1].price.to_string(), "1792.5000");
+            assert_eq!(depth.asks[0].price.to_string(), "1792.8000");
+            assert_eq!(depth.bid_counts[..2], [1, 1]);
+            assert_eq!(depth.ask_counts[..2], [1, 1]);
+            assert!(depth.bids[2..].iter().all(|order| order.price.is_zero()));
+            assert_eq!(depth.sequence, 10);
+            assert_eq!(depth.ts_event.as_millis(), 2000);
+            assert!(RecordFlag::F_SNAPSHOT.matches(depth.flags));
+        }
         assert!(receiver.try_recv().is_err());
     }
 
@@ -3912,8 +4381,12 @@ mod tests {
                     assert_eq!(query["marketId"], "3"); assert_eq!(query["sort"], "DESC");
                     if call == 0 { entered.notify_one(); release.notified().await; }
                     let cursor = query.get("cursor");
-                    let mut rows = if cursor.is_none() { vec![live_trade(5,5000),live_trade(4,4000)] }
-                        else { assert_eq!(cursor.unwrap(), "second"); vec![live_trade(3,3000),live_trade(2,2000)] };
+                    let mut rows = if let Some(cursor) = cursor {
+                        assert_eq!(cursor, "second");
+                        vec![live_trade(3,3000),live_trade(2,2000)]
+                    } else {
+                        vec![live_trade(5,5000),live_trade(4,4000)]
+                    };
                     if cursor.is_some() {
                         if scenario == "missing" || (scenario == "readmit" && call < 2) { rows.pop(); }
                         if scenario == "precision" { rows[0]["size"] = serde_json::json!("0.000000001"); }
@@ -4101,6 +4574,377 @@ mod tests {
                 let _ = tokio::time::timeout(Duration::from_secs(2), socket.recv()).await;
             }) }
         }))
+    }
+
+    fn live_bar_router(
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        scenario: &'static str,
+    ) -> Router {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+
+        Router::new().route(
+            "/internal/v1/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(Message::Text(request))) = socket.recv().await else {
+                            return;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                        assert_eq!(request["market"], serde_json::json!({"type":"perp","id":3}));
+                        assert_eq!(
+                            request["subscriptions"],
+                            serde_json::json!([
+                                {"channel":"candles","time_frame":"1m"}
+                            ])
+                        );
+                        let ack = serde_json::json!({"type":"subscribed",
+                        "market":{"type":"perp","id":3},
+                        "subscriptions":[{"time_frame":"1m"}]});
+                        if socket
+                            .send(Message::Text(ack.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let frame = |time, volume: &str| {
+                            serde_json::json!({
+                                "type":"data", "market":{"type":"perp","id":3},
+                                "channel":"candles", "interval":"1m", "timestamp":time,
+                                "data":{"pair":"ETH-USDC","details":[{
+                                    "time":time,"open":"1792.60","high":"1792.70",
+                                    "low":"1792.50","close":"1792.65","volume":volume
+                                }]}
+                            })
+                            .to_string()
+                        };
+                        let first = frame(
+                            120_000,
+                            if scenario == "malformed" {
+                                "0.00001"
+                            } else {
+                                "0.004"
+                            },
+                        );
+                        if socket.send(Message::Text(first.into())).await.is_err() {
+                            return;
+                        }
+                        entered.notify_one();
+                        release.notified().await;
+                        let next = match scenario {
+                            "gap" => frame(240_000, "0.005"),
+                            "malformed" => frame(180_000, "0.005"),
+                            _ => frame(180_000, "0.005"),
+                        };
+                        if socket.send(Message::Text(next.into())).await.is_err() {
+                            return;
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(2), socket.recv()).await;
+                    })
+                }
+            }),
+        )
+    }
+
+    fn live_bar_subscribe() -> SubscribeBars {
+        SubscribeBars::new(
+            BarType::new(
+                InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+                BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+                AggregationSource::External,
+            ),
+            None,
+            Some(*DEEPX_VENUE),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    fn status_subscribe() -> SubscribeInstrumentStatus {
+        SubscribeInstrumentStatus::new(
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            Some(ClientId::from("DEEPX-DATA")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    #[rstest]
+    #[case("client")]
+    #[case("venue")]
+    #[case("params")]
+    #[case("instrument")]
+    #[case("disconnected")]
+    #[tokio::test]
+    async fn invalid_status_subscription_creates_no_task(#[case] scenario: &str) {
+        let (mut client, _receiver, _, _server) = client(serde_json::from_str(PERP).unwrap()).await;
+        if scenario != "disconnected" {
+            client.connect().await.unwrap();
+        }
+        let mut command = status_subscribe();
+        match scenario {
+            "client" => command.client_id = Some(ClientId::from("OTHER")),
+            "venue" => command.venue = Some(Venue::from("OTHER")),
+            "params" => {
+                let mut params = nautilus_core::Params::new();
+                params.insert("unsupported".into(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            "instrument" => command.instrument_id = InstrumentId::from("UNKNOWN.DEEPX"),
+            "disconnected" => {}
+            _ => unreachable!(),
+        }
+        assert!(client.subscribe_instrument_status(command).is_err());
+        assert!(
+            client
+                .instrument_status_subscriptions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!client.instrument_status_poll_started);
+        assert!(client.tasks.is_empty());
+    }
+
+    #[rstest]
+    #[case("client")]
+    #[case("venue")]
+    #[case("params")]
+    #[tokio::test]
+    async fn foreign_status_unsubscribe_preserves_subscription(#[case] scenario: &str) {
+        let (mut client, _receiver, _, _server) = client(serde_json::from_str(PERP).unwrap()).await;
+        client.connect().await.unwrap();
+        let subscribe = status_subscribe();
+        client
+            .subscribe_instrument_status(subscribe.clone())
+            .unwrap();
+        let mut unsubscribe = UnsubscribeInstrumentStatus::new(
+            subscribe.instrument_id,
+            subscribe.client_id,
+            subscribe.venue,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        match scenario {
+            "client" => unsubscribe.client_id = Some(ClientId::from("OTHER")),
+            "venue" => unsubscribe.venue = Some(Venue::from("OTHER")),
+            "params" => {
+                let mut params = nautilus_core::Params::new();
+                params.insert("unsupported".into(), serde_json::json!(true));
+                unsubscribe.params = Some(params);
+            }
+            _ => unreachable!(),
+        }
+        assert!(client.unsubscribe_instrument_status(&unsubscribe).is_err());
+        assert!(
+            client
+                .instrument_status_subscriptions
+                .lock()
+                .unwrap()
+                .contains(&subscribe.instrument_id)
+        );
+        client
+            .unsubscribe_instrument_status(&UnsubscribeInstrumentStatus::new(
+                subscribe.instrument_id,
+                subscribe.client_id,
+                subscribe.venue,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert!(
+            client
+                .instrument_status_subscriptions
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        client.disconnect().await.unwrap();
+    }
+
+    #[rstest]
+    #[case("normal", true)]
+    #[case("gap", true)]
+    #[case("malformed", false)]
+    #[tokio::test]
+    async fn live_bar_publishes_only_superseded_valid_bucket(
+        #[case] scenario: &'static str,
+        #[case] expected_bar: bool,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            live_bar_router(Arc::clone(&entered), Arc::clone(&release), scenario),
+        )
+        .await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        let command = live_bar_subscribe();
+        client.subscribe_bars(command.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        release.notify_one();
+        if expected_bar {
+            let DataEvent::Data(nautilus_model::data::Data::Bar(bar)) =
+                tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected one-minute bar");
+            };
+            assert_eq!(bar.bar_type, command.bar_type);
+            assert_eq!(bar.ts_event.as_millis(), 120_000);
+            assert_eq!(
+                bar.open.as_decimal(),
+                rust_decimal::Decimal::new(179_260, 2)
+            );
+            assert_eq!(bar.volume.as_decimal(), rust_decimal::Decimal::new(4, 3));
+        }
+        if scenario != "normal" {
+            finish_requests(&client).await;
+            assert!(!client.bar_subscriptions[&command.bar_type].is_active());
+            assert!(receiver.try_recv().is_err());
+        }
+        client
+            .unsubscribe_bars(&UnsubscribeBars::new(
+                command.bar_type,
+                None,
+                Some(*DEEPX_VENUE),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        finish_requests(&client).await;
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case("interval")]
+    #[case("spot")]
+    #[case("client")]
+    #[case("venue")]
+    #[case("params")]
+    #[case("disconnected")]
+    #[tokio::test]
+    async fn invalid_live_bar_admission_never_creates_tasks(#[case] scenario: &str) {
+        let (mut client, _receiver, _, server) = client(serde_json::from_str(PERP).unwrap()).await;
+        if scenario != "disconnected" {
+            client.connect().await.unwrap();
+        }
+        if scenario == "spot" {
+            server.enable_spot();
+            client.provider.catalog_mut().load_all().await.unwrap();
+            client.provider.store_mut().add(spot_instrument());
+        }
+        let mut command = live_bar_subscribe();
+        match scenario {
+            "interval" => {
+                command.bar_type = BarType::new(
+                    command.bar_type.instrument_id(),
+                    BarSpecification::new(5, BarAggregation::Minute, PriceType::Last),
+                    AggregationSource::External,
+                );
+            }
+            "spot" => {
+                command.bar_type = BarType::new(
+                    InstrumentId::from("ETH-USDC.DEEPX"),
+                    BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+                    AggregationSource::External,
+                );
+            }
+            "client" => command.client_id = Some(ClientId::from("OTHER")),
+            "venue" => command.venue = Some(Venue::from("OTHER")),
+            "params" => {
+                let mut params = nautilus_core::Params::new();
+                params.insert("unsupported".into(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            "disconnected" => {}
+            _ => unreachable!(),
+        }
+        assert!(client.subscribe_bars(command).is_err());
+        assert!(client.bar_subscriptions.is_empty());
+        assert!(client.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_bar_unsubscribe_fences_pending_bucket() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            live_bar_router(Arc::clone(&entered), Arc::clone(&release), "normal"),
+        )
+        .await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        let command = live_bar_subscribe();
+        client.subscribe_bars(command.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        client
+            .unsubscribe_bars(&UnsubscribeBars::new(
+                command.bar_type,
+                None,
+                Some(*DEEPX_VENUE),
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        release.notify_one();
+        finish_requests(&client).await;
+        assert!(client.bar_subscriptions.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn live_bar_receiver_closure_retires_pending_bucket() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            live_bar_router(Arc::clone(&entered), release, "normal"),
+        )
+        .await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        let command = live_bar_subscribe();
+        client.subscribe_bars(command.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        drop(receiver);
+        finish_requests(&client).await;
+        assert!(!client.bar_subscriptions[&command.bar_type].is_active());
     }
 
     fn live_subscribe() -> SubscribeTrades {
@@ -4584,6 +5428,125 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::trades(false)]
+    #[case::book(true)]
+    #[tokio::test]
+    async fn public_subscription_stops_when_receiver_closes(#[case] book: bool) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = if book {
+            live_book_router(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::new(AtomicUsize::new(0)),
+                "normal",
+                20,
+            )
+        } else {
+            live_trade_router(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+            )
+        };
+        let (mut client, mut receiver, _, _server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), router).await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        if book {
+            client.subscribe_book_deltas(book_subscribe()).unwrap();
+        } else {
+            client.subscribe_trades(live_subscribe()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        drop(receiver);
+        finish_requests(&client).await;
+        assert!(client.is_disconnected());
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn spot_trade_subscription_stops_when_receiver_closes() {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+
+        let spot_response: crate::http::DeepXApiResponse<Vec<crate::http::DeepXSpotMarket>> =
+            serde_json::from_str(SPOT).unwrap();
+        let pair = spot_response
+            .data
+            .iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap()
+            .pair
+            .clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/internal/v1/ws",
+            get({
+                let entered = Arc::clone(&entered);
+                move |upgrade: WebSocketUpgrade| {
+                    let pair = pair.clone();
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        upgrade.on_upgrade(move |mut socket| async move {
+                            let Some(Ok(Message::Text(request))) = socket.recv().await else {
+                                return;
+                            };
+                            let request: serde_json::Value =
+                                serde_json::from_str(&request).unwrap();
+                            assert_eq!(request["market"]["name"], "ETH/USDC");
+                            assert_eq!(request["subscriptions"], serde_json::json!(["trades"]));
+                            let ack = serde_json::json!({
+                                "type": "subscribed",
+                                "market": {"type": "spot", "name": "ETH/USDC", "pair": pair},
+                                "subscriptions": ["trades"],
+                            });
+                            socket
+                                .send(Message::Text(ack.to_string().into()))
+                                .await
+                                .unwrap();
+                            entered.notify_one();
+                            while socket.recv().await.is_some() {}
+                        })
+                    }
+                }
+            }),
+        );
+        let (mut client, mut receiver, _, server) =
+            client_with_history(serde_json::from_str(PERP).unwrap(), app).await;
+        client.config.network.base_url_ws =
+            Some(client.http.base_url().replacen("http://", "ws://", 1));
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        server.enable_spot();
+        client.provider.catalog_mut().load_all().await.unwrap();
+        client.provider.store_mut().add(spot_instrument());
+        let mut command = live_subscribe();
+        command.instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        client.subscribe_trades(command).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        drop(receiver);
+        finish_requests(&client).await;
+        assert!(client.is_disconnected());
+        assert!(
+            !client
+                .spot_trade_subscriptions
+                .values()
+                .next()
+                .unwrap()
+                .is_active()
+        );
+    }
+
     async fn finish_requests(client: &DeepXDataClient) {
         tokio::time::timeout(Duration::from_secs(5), async {
             while !client.tasks.is_empty() {
@@ -4598,19 +5561,20 @@ mod tests {
     #[case("full", 4, 2)]
     #[case("limited", 1, 1)]
     #[case("nanosecond-bounds", 1, 1)]
+    #[case("submillisecond-window", 0, 0)]
     #[case("empty", 0, 1)]
     #[case("default-bounds", 0, 1)]
     #[case("empty-params", 4, 2)]
     #[tokio::test]
     async fn historical_trade_response_is_correlated_and_chronological(
-        #[case] scenario: &str,
+        #[case] scenario: &'static str,
         #[case] count: usize,
         #[case] pages: usize,
     ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let (mut client, mut receiver, _, _server) = client_with_history(
             serde_json::from_str(PERP).unwrap(),
-            history_router("valid", Arc::clone(&calls), None),
+            history_router(scenario, Arc::clone(&calls), None),
         )
         .await;
         client.connect().await.unwrap();
@@ -4621,6 +5585,10 @@ mod tests {
             "nanosecond-bounds" => {
                 request.start = Some(jiff::Timestamp::from_nanosecond(1_500_000_001).unwrap());
                 request.end = Some(jiff::Timestamp::from_nanosecond(2_999_999_999).unwrap());
+            }
+            "submillisecond-window" => {
+                request.start = Some(jiff::Timestamp::from_nanosecond(1_000_000_001).unwrap());
+                request.end = Some(jiff::Timestamp::from_nanosecond(1_000_000_999).unwrap());
             }
             "empty" => {
                 request.start = Some(jiff::Timestamp::from_millisecond(4_000).unwrap());
@@ -4839,6 +5807,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_receiver_cancels_pending_data_request() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (mut client, mut receiver, _, _server) = client_with_history(
+            serde_json::from_str(PERP).unwrap(),
+            history_router(
+                "valid",
+                Arc::new(AtomicUsize::new(0)),
+                Some((Arc::clone(&entered), Arc::clone(&release))),
+            ),
+        )
+        .await;
+        client.connect().await.unwrap();
+        while receiver.try_recv().is_ok() {}
+        client.request_trades(trade_request()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+
+        drop(receiver);
+        finish_requests(&client).await;
+        assert!(client.is_disconnected());
+        release.notify_one();
+    }
+
+    #[tokio::test]
     async fn captured_spec369_markets_load_and_publish_every_perpetual() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../test_data/http/testnet/perp_markets_spec369.manifest.json"
@@ -4878,6 +5872,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perpetual_only_connect_ignores_spot_finality_rpc() {
+        let (mut client, mut receiver, _, server) =
+            client(serde_json::from_str(PERP).unwrap()).await;
+        server.enable_spot();
+        client.config.perpetual_only = true;
+        client.config.network.base_url_rpc = Some("http://127.0.0.1:1".to_string());
+
+        client.connect().await.unwrap();
+
+        assert!(client.is_connected());
+        assert_eq!(client.provider.catalog().markets().len(), 1);
+        assert!(
+            client
+                .provider
+                .catalog()
+                .spot_instrument_id(
+                    "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
+                )
+                .is_none()
+        );
+        assert!(matches!(receiver.try_recv(), Ok(DataEvent::Instrument(_))));
+        assert!(receiver.try_recv().is_err());
+        client
+            .request_instrument(one_request(&client, "ETH-USDC.DEEPX"))
+            .unwrap();
+        finish_requests(&client).await;
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn rest_connect_and_instrument_requests_reach_framework() {
         let (mut client, mut receiver, requests, _server) =
             client(serde_json::from_str(PERP).unwrap()).await;
@@ -4897,6 +5921,7 @@ mod tests {
         let request = all_request(&client);
         let id = request.request_id;
         client.request_instruments(request).unwrap();
+        finish_requests(&client).await;
         let DataEvent::Response(DataResponse::Instruments(response)) = receiver.try_recv().unwrap()
         else {
             panic!("expected instruments response")
@@ -4912,6 +5937,7 @@ mod tests {
         let request = one_request(&client, "ETH-USDC-PERP.DEEPX");
         let id = request.request_id;
         client.request_instrument(request).unwrap();
+        finish_requests(&client).await;
         let DataEvent::Response(DataResponse::Instrument(response)) = receiver.try_recv().unwrap()
         else {
             panic!("expected instrument response")
@@ -4920,7 +5946,56 @@ mod tests {
         assert_eq!(response.instrument_id, instrument.id());
         assert_eq!(response.data, instrument);
         assert_eq!(response.ts_init, UnixNanos::from(123u64));
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn instrument_requests_read_fresh_catalog_and_reject_partial_refresh() {
+        let (mut client, mut receiver, requests, server) =
+            client(serde_json::from_str(PERP).unwrap()).await;
+        client.connect().await.unwrap();
+        receiver.try_recv().unwrap();
+
+        let mut changed: serde_json::Value = serde_json::from_str(PERP).unwrap();
+        changed["data"][0]["orderSpecTickSize"] = serde_json::json!("0.0200");
+        server.set_perp_response(changed.clone());
+        client.request_instruments(all_request(&client)).unwrap();
+        finish_requests(&client).await;
+        let DataEvent::Response(DataResponse::Instruments(response)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected fresh instrument list");
+        };
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(
+            response.data[0].price_increment().as_decimal(),
+            rust_decimal::Decimal::new(2, 2)
+        );
+        assert_eq!(
+            client.provider.store().list_all()[0]
+                .price_increment()
+                .as_decimal(),
+            rust_decimal::Decimal::new(1, 2)
+        );
+
+        client
+            .request_instrument(one_request(&client, "ETH-USDC-PERP.DEEPX"))
+            .unwrap();
+        finish_requests(&client).await;
+        let DataEvent::Response(DataResponse::Instrument(response)) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected fresh instrument");
+        };
+        assert_eq!(
+            response.data.price_increment().as_decimal(),
+            rust_decimal::Decimal::new(2, 2)
+        );
+
+        changed["data"][0]["orderSpecStepSize"] = serde_json::json!("0");
+        server.set_perp_response(changed);
+        client.request_instruments(all_request(&client)).unwrap();
+        finish_requests(&client).await;
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
 
     #[rstest]
@@ -4982,10 +6057,14 @@ mod tests {
             } else {
                 "BTC-USDC-PERP.DEEPX"
             };
-            assert!(client.request_instrument(one_request(&client, id)).is_err());
+            client.request_instrument(one_request(&client, id)).unwrap();
+            finish_requests(&client).await;
         }
         assert!(receiver.try_recv().is_err());
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            if mutation < 4 { 1 } else { 2 }
+        );
     }
 
     #[rstest]

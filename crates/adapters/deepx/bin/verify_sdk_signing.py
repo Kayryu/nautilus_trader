@@ -1,20 +1,23 @@
 """Verify pinned DeepX SDK signing against captured runtime and Rust regression bytes.
 
-No RPC, submission, or user credentials are used. The source input is the GitHub
-contents API response for src/deepx_sdk/_native_py.py at the pinned blob below.
+No RPC, submission, or user credentials are used. Inputs are raw SDK Python files
+or GitHub contents API responses at the pinned blobs below.
 """
 
 import argparse
 import ast
 import base64
+import copy
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from substrateinterface import Keypair, KeypairType, SubstrateInterface
 
-SDK_BLOB = "cc85676dee70db35bbd996b560938597c3715558"
+SDK_BLOB = "0108f89d79366f13e747ef59c75ce73a543dc404"
+COMPAT_BLOB = "06b2e9fc84cc36c647452027b9c5b2cbbfcafb8c"
 TEST_KEY = "0123456789abcdef" * 4
 FIXTURES = Path(__file__).resolve().parents[1] / "test_data/runtime/testnet"
 SNAPSHOT = FIXTURES / "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1"
@@ -61,16 +64,50 @@ class OfflineSubstrate(SubstrateInterface):
         raise AssertionError(f"Unexpected offline RPC request: {method}")
 
 
-def load_sdk_builder(source_response: Path):
-    response = json.loads(source_response.read_text())
-    source = base64.b64decode(response["content"])
+def load_pinned_source(path: Path, expected_blob: str) -> bytes:
+    if path.suffix == ".json":
+        response = json.loads(path.read_text())
+        source = base64.b64decode(
+            response["content"].replace("\r", "").replace("\n", ""), validate=True
+        )
+        if response["sha"] != expected_blob:
+            raise ValueError("SDK source response has an unexpected GitHub blob")
+    else:
+        source = path.read_bytes()
     blob = hashlib.sha1(
         b"blob " + str(len(source)).encode() + b"\0" + source
     ).hexdigest()
-    if response["sha"] != SDK_BLOB or blob != SDK_BLOB:
+    if blob != expected_blob:
         raise ValueError("SDK source is not the reviewed pinned GitHub blob")
-    # Execute only the exact upstream builder and key constructor, not SDK imports
-    # or network helpers. The only substituted boundary is offline RPC transport.
+    return source
+
+
+def load_sdk_builder(sdk_source: Path, compat_source: Path):
+    source = load_pinned_source(sdk_source, SDK_BLOB)
+    compatibility = load_pinned_source(compat_source, COMPAT_BLOB)
+    compat_tree = ast.parse(compatibility)
+    compat_items = [
+        item
+        for item in compat_tree.body
+        if (isinstance(item, ast.ClassDef) and item.name == "_ImmortalMetadata")
+        or (
+            isinstance(item, ast.FunctionDef) and item.name == "create_signed_extrinsic"
+        )
+    ]
+    if {item.name for item in compat_items} != {
+        "_ImmortalMetadata",
+        "create_signed_extrinsic",
+    } or len(compat_items) != 2:
+        raise ValueError("Pinned SDK compatibility functions are missing")
+    compat_namespace = {"Any": Any, "copy": copy}
+    exec(  # noqa: S102 - exact reviewed blob and selected definitions only
+        compile(
+            ast.Module(body=compat_items, type_ignores=[]), str(compat_source), "exec"
+        ),
+        compat_namespace,
+    )
+
+    # Execute only the reviewed builder and key constructor with offline transport.
     selected = {"build_signed_pallet_call_extrinsic", "_create_ecdsa_keypair"}
     tree = ast.parse(source)
     functions = [
@@ -86,19 +123,170 @@ def load_sdk_builder(source_response: Path):
         "_get_substrate_interface_cls": lambda: OfflineSubstrate,
         "_get_substrate_keypair_libs": lambda: (Keypair, KeypairType),
         "_create_substrate": lambda cls, endpoint: cls(),
+        "create_signed_extrinsic": compat_namespace["create_signed_extrinsic"],
     }
     exec(  # noqa: S102 - exact reviewed blob and two selected functions only
-        compile(
-            ast.Module(body=functions, type_ignores=[]), str(source_response), "exec"
-        ),
+        compile(ast.Module(body=functions, type_ignores=[]), str(sdk_source), "exec"),
         namespace,
     )
     return namespace["build_signed_pallet_call_extrinsic"]
 
 
+def load_sdk_evm_builder(sdk_source: Path):
+    source = load_pinned_source(sdk_source, SDK_BLOB)
+    tree = ast.parse(source)
+    selected = {
+        "build_signed_tx",
+        "_parse_account",
+        "_normalize_address",
+        "_decode_hex_bytes",
+    }
+    items = [
+        item
+        for item in tree.body
+        if (isinstance(item, ast.FunctionDef) and item.name in selected)
+        or (isinstance(item, ast.ClassDef) and item.name == "SignedTxPayload")
+    ]
+    if {item.name for item in items} != selected | {"SignedTxPayload"}:
+        raise ValueError("Pinned SDK EVM signing functions are missing")
+
+    from eth_account import Account
+    from eth_utils import keccak, to_canonical_address, to_checksum_address
+
+    def offline_rpc(*_args, **_kwargs):
+        raise AssertionError("Offline EVM signing attempted an RPC request")
+
+    namespace = {
+        "Any": Any,
+        "Optional": Optional,
+        "dataclass": dataclass,
+        "_get_signing_libs": lambda: (
+            Account,
+            keccak,
+            to_canonical_address,
+            to_checksum_address,
+        ),
+        "_rpc_get_chain_id": offline_rpc,
+        "_get_native_account_nonce": offline_rpc,
+        "_rpc_estimate_gas": offline_rpc,
+    }
+    exec(  # noqa: S102 - exact reviewed blob and selected definitions only
+        compile(ast.Module(body=items, type_ignores=[]), str(sdk_source), "exec"),
+        namespace,
+    )
+    return namespace["build_signed_tx"]
+
+
+def load_sdk_evm_wrapper(sdk_source: Path):
+    source = load_pinned_source(sdk_source, SDK_BLOB)
+    selected = {
+        "build_ethereum_transact_extrinsic",
+        "_decode_signed_rlp_bytes_to_transaction_v2",
+        "_map_legacy_tx",
+        "_map_eip1559_tx",
+        "_map_eip2930_tx",
+        "_map_access_list",
+        "_map_action",
+        "_legacy_recovery_id",
+        "_u256_to_h256_hex",
+        "_bytes_to_hex",
+        "_bytes_to_h160_hex",
+        "_bytes_to_h256_hex",
+        "_normalize_h160_hex",
+        "_decode_hex_bytes",
+        "_compose_ethereum_transact_call",
+    }
+    items = [
+        item
+        for item in ast.parse(source).body
+        if isinstance(item, ast.FunctionDef) and item.name in selected
+    ]
+    if {item.name for item in items} != selected:
+        raise ValueError("Pinned SDK EVM wrapper functions are missing")
+
+    from eth_utils import to_canonical_address
+
+    namespace = {
+        "Any": Any,
+        "Optional": Optional,
+        "_get_signing_libs": lambda: (None, None, to_canonical_address, None),
+        "_get_substrate_interface_cls": lambda: OfflineSubstrate,
+        "_create_substrate": lambda cls, endpoint: cls(),
+    }
+    exec(  # noqa: S102 - exact reviewed blob and selected definitions only
+        compile(ast.Module(body=items, type_ignores=[]), str(sdk_source), "exec"),
+        namespace,
+    )
+    return namespace["build_ethereum_transact_extrinsic"]
+
+
+def verify_evm_vectors(sdk_source: Path):
+    builder = load_sdk_evm_builder(sdk_source)
+    wrapper_builder = load_sdk_evm_wrapper(sdk_source)
+    from eth_abi import encode as abi_encode
+    from eth_utils import keccak
+
+    rust_source = (
+        Path(__file__).resolve().parents[1] / "src/signing/evm.rs"
+    ).read_text()
+    signature = "setProfitAndLossPoint(address,uint16,uint128,uint128)"
+    pnl_calldata = keccak(text=signature)[:4] + abi_encode(
+        ["address", "uint16", "uint128", "uint128"],
+        ["0x" + "11" * 20, 7, 123, 456],
+    )
+    for use_legacy in (False, True):
+        payload = builder(
+            evm_rpc_url="http://offline.invalid",
+            private_key=TEST_KEY,
+            precompile_address="0x" + "11" * 20,
+            data_hex="0x12345678",
+            value=0,
+            chain_id=0x12EE,
+            gas_limit=500_000,
+            use_legacy=use_legacy,
+            nonce_ms=1_725_000_000_140,
+        )
+        for value in (payload.signed_tx[2:], payload.tx_hash[2:], payload.signer[2:]):
+            if f'"{value}"' not in rust_source:
+                raise AssertionError("SDK/Rust offline EVM vector mismatch")
+        mode = "legacy" if use_legacy else "EIP-1559"
+        print(f"SDK/Rust complete offline EVM envelope parity: {mode}")
+        wrapper = wrapper_builder(
+            substrate_ws="ws://offline.invalid",
+            signed_tx_hex=payload.signed_tx,
+            signer=payload.signer,
+        )
+        if f'"{wrapper[2:]}"' not in rust_source:
+            raise AssertionError("SDK/Rust offline EVM wrapper vector mismatch")
+        print(f"SDK/Rust complete unsigned Ethereum.transact parity: {mode}")
+
+        pnl = builder(
+            evm_rpc_url="http://offline.invalid",
+            private_key=TEST_KEY,
+            precompile_address="0x" + "00" * 18 + "044e",
+            data_hex="0x" + pnl_calldata.hex(),
+            value=0,
+            chain_id=0x12EE,
+            gas_limit=500_000,
+            use_legacy=use_legacy,
+            nonce_ms=1_725_000_000_140,
+        )
+        pnl_wrapper = wrapper_builder(
+            substrate_ws="ws://offline.invalid",
+            signed_tx_hex=pnl.signed_tx,
+            signer=pnl.signer,
+        )
+        wrapper_hash = hashlib.blake2b(bytes.fromhex(pnl_wrapper[2:]), digest_size=32)
+        for value in (pnl.tx_hash[2:], wrapper_hash.hexdigest()):
+            if f'"{value}"' not in rust_source:
+                raise AssertionError("SDK/Rust Perp precompile vector mismatch")
+        print(f"SDK/Rust Perp profit/loss-point precompile hashes: {mode}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("sdk_contents_response", type=Path)
+    parser.add_argument("sdk_source", type=Path)
+    parser.add_argument("compat_source", type=Path)
     parser.add_argument(
         "--spec-version", type=int, choices=(366, 369, 371), default=366
     )
@@ -114,10 +302,48 @@ def main():
             FIXTURES
             / "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda"
         )
-    builder = load_sdk_builder(args.sdk_contents_response)
+    builder = load_sdk_builder(args.sdk_source, args.compat_source)
     source = (Path(__file__).resolve().parents[1] / "src/signing/mod.rs").read_text()
     vectors = [
         ("Subaccount", "no_op", {}, 1_725_000_000_124),
+        (
+            "Subaccount",
+            "rename_subaccount",
+            {
+                "subaccount": "0x" + "11" * 20,
+                "new_name": "0x" + b"Desk B".hex(),
+            },
+            1_725_000_000_142,
+        ),
+        (
+            "Subaccount",
+            "set_spot_margin",
+            {
+                "address": "0x" + "11" * 20,
+                "enable_spot_margin": True,
+            },
+            1_725_000_000_138,
+        ),
+        (
+            "Lending",
+            "buy_quota",
+            {
+                "address": "0x" + "11" * 20,
+                "quota": 100,
+                "from_subaccount": None,
+            },
+            1_725_000_000_150,
+        ),
+        (
+            "Lending",
+            "buy_quota",
+            {
+                "address": "0x" + "11" * 20,
+                "quota": 100,
+                "from_subaccount": "0x" + "22" * 20,
+            },
+            1_725_000_000_150,
+        ),
         (
             "System",
             "remark",
@@ -214,10 +440,197 @@ def main():
             },
             1_725_000_000_125,
         ),
+        (
+            "PerpMarket",
+            "cancel_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "order_id": 1_725_000_000_001,
+                    "market_id": 7,
+                    "cancel_reason": "UserCanceled",
+                    "fast_cancel": True,
+                }
+            },
+            1_725_000_000_125,
+        ),
+        (
+            "PerpMarket",
+            "close_position",
+            {
+                "subaccount": "0x" + "11" * 20,
+                "market_id": 7,
+                "price": 123,
+                "slippage": None,
+            },
+            1_725_000_000_127,
+        ),
+        (
+            "PerpMarket",
+            "close_position",
+            {
+                "subaccount": "0x" + "11" * 20,
+                "market_id": 7,
+                "price": 123,
+                "slippage": 50,
+            },
+            1_725_000_000_143,
+        ),
+        (
+            "PerpMarket",
+            "set_profit_and_loss_point",
+            {
+                "subaccount": "0x" + "11" * 20,
+                "market_id": 7,
+                "take_profit_point": 123,
+                "stop_loss_point": 456,
+            },
+            1_725_000_000_130,
+        ),
+        (
+            "SpotMarket",
+            "cancel_order",
+            {
+                "params": {
+                    "subaccount": "0x" + "11" * 20,
+                    "pair": "0x" + "22" * 32,
+                    "order_id": 1_725_000_000_128,
+                    "is_buy": False,
+                    "cancel_reason": "UserCanceled",
+                    "fast_cancel": False,
+                }
+            },
+            1_725_000_000_129,
+        ),
+        (
+            "Subaccount",
+            "modify_orders",
+            {
+                "ops": [
+                    {
+                        "Cancel": {
+                            "Perp": {
+                                "subaccount": "0x" + "11" * 20,
+                                "order_id": 123,
+                                "market_id": 7,
+                                "cancel_reason": "UserCanceled",
+                                "fast_cancel": False,
+                            }
+                        }
+                    },
+                    {
+                        "Place": {
+                            "Perp": {
+                                "subaccount": "0x" + "11" * 20,
+                                "market_id": 7,
+                                "is_long": True,
+                                "size": 1_000_000,
+                                "price": 2_500_000_000,
+                                "order_type": {"Limit": "GTC"},
+                                "take_profit": None,
+                                "stop_loss": None,
+                                "reduce_only": False,
+                                "post_only": "None",
+                            }
+                        }
+                    },
+                ]
+            },
+            456,
+        ),
+        (
+            "Subaccount",
+            "remove_delegate_account",
+            {"delegate": "0x" + "22" * 20},
+            1_725_000_000_132,
+        ),
+        (
+            "Subaccount",
+            "set_delegate_account",
+            {
+                "delegate": "0x" + "22" * 20,
+                "name": "0x" + b"Desk A".hex(),
+                "valid_until": 1_900_000_000_000,
+            },
+            1_725_000_000_133,
+        ),
+        (
+            "Subaccount",
+            "update_delegate_mode",
+            {
+                "address": "0x" + "22" * 20,
+                "new_mode": "PlaceOrCancelOrder",
+            },
+            1_725_000_000_138,
+        ),
+        (
+            "Subaccount",
+            "update_delegate_mode",
+            {"address": "0x" + "22" * 20, "new_mode": "Disable"},
+            1_725_000_000_139,
+        ),
     ]
+    if args.spec_version in (369, 371):
+        vectors.extend(
+            [
+                (
+                    "SpotMarket",
+                    "place_order",
+                    {
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "is_buy": True,
+                            "quote_amount": int.from_bytes(
+                                bytes([0x33]) * 32, "little"
+                            ),
+                            "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
+                            "order_type": {"Limit": "IOC"},
+                            "post_only": "None",
+                            "reduce_only": False,
+                        }
+                    },
+                    1_725_000_000_133,
+                ),
+                (
+                    "SpotMarket",
+                    "place_order",
+                    {
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "is_buy": True,
+                            "quote_amount": int.from_bytes(
+                                bytes([0x33]) * 32, "little"
+                            ),
+                            "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
+                            "order_type": {"Market": None},
+                            "post_only": "None",
+                            "reduce_only": False,
+                        }
+                    },
+                    1_725_000_000_135,
+                ),
+            ]
+        )
     if args.spec_version == 371:
         vectors.extend(
             [
+                (
+                    "SpotMarket",
+                    "cancel_order",
+                    {
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "order_id": 1_725_000_000_128,
+                            "is_buy": False,
+                            "cancel_reason": "UserCanceled",
+                            "fast_cancel": True,
+                        }
+                    },
+                    1_725_000_000_129,
+                ),
                 (
                     "SpotMarket",
                     "place_order",
@@ -238,41 +651,48 @@ def main():
                     1_725_000_000_126,
                 ),
                 (
-                    "PerpMarket",
-                    "close_position",
-                    {
-                        "subaccount": "0x" + "11" * 20,
-                        "market_id": 7,
-                        "price": 123,
-                        "slippage": None,
-                    },
-                    1_725_000_000_127,
-                ),
-                (
                     "SpotMarket",
-                    "cancel_order",
+                    "place_order",
                     {
                         "params": {
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
-                            "order_id": 1_725_000_000_128,
                             "is_buy": False,
-                            "cancel_reason": "UserCanceled",
-                            "fast_cancel": False,
+                            "quote_amount": int.from_bytes(
+                                bytes([0x33]) * 32, "little"
+                            ),
+                            "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
+                            "order_type": {"Limit": "IOC"},
+                            "post_only": "None",
+                            "reduce_only": False,
                         }
                     },
-                    1_725_000_000_129,
+                    1_725_000_000_134,
                 ),
                 (
-                    "PerpMarket",
-                    "set_profit_and_loss_point",
+                    "SpotMarket",
+                    "place_order",
                     {
-                        "subaccount": "0x" + "11" * 20,
-                        "market_id": 7,
-                        "take_profit_point": 123,
-                        "stop_loss_point": 456,
+                        "params": {
+                            "subaccount": "0x" + "11" * 20,
+                            "pair": "0x" + "22" * 32,
+                            "is_buy": False,
+                            "quote_amount": int.from_bytes(
+                                bytes([0x33]) * 32, "little"
+                            ),
+                            "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
+                            "order_type": {"Market": 50},
+                            "post_only": "None",
+                            "reduce_only": False,
+                        }
                     },
-                    1_725_000_000_130,
+                    1_725_000_000_136,
+                ),
+                (
+                    "Subaccount",
+                    "initialize_subaccount",
+                    {"name": "0x" + b"Desk A".hex()},
+                    1_725_000_000_137,
                 ),
                 (
                     "Subaccount",
@@ -281,10 +701,20 @@ def main():
                     1_725_000_000_131,
                 ),
                 (
-                    "Subaccount",
-                    "remove_delegate_account",
-                    {"delegate": "0x" + "22" * 20},
-                    1_725_000_000_132,
+                    "PerpMarket",
+                    "set_global_leverage",
+                    {"subaccount": "0x" + "11" * 20, "max_leverage": None},
+                    1_725_000_000_140,
+                ),
+                (
+                    "PerpMarket",
+                    "set_per_market_leverage",
+                    {
+                        "subaccount": "0x" + "11" * 20,
+                        "market_id": 3,
+                        "max_leverage": 20_000,
+                    },
+                    1_725_000_000_141,
                 ),
             ]
         )
@@ -297,12 +727,16 @@ def main():
             call_params=params,
             nonce_ms=nonce,
         )
-        if encoded.removeprefix("0x") not in source:
+        expected_literal = f'"{encoded.removeprefix("0x")}"'
+        if expected_literal not in source:
             raise AssertionError(
                 f"SDK/Rust signed extrinsic mismatch: {pallet}.{call}: {encoded}"
             )
         print(f"SDK/Rust complete extrinsic parity: {pallet}.{call}")
-    print(f"SDK blob: {SDK_BLOB}; spec{args.spec_version}/tx1; offline only")
+    verify_evm_vectors(args.sdk_source)
+    print(
+        f"SDK blobs: {SDK_BLOB}, {COMPAT_BLOB}; spec{args.spec_version}/tx1; offline only"
+    )
 
 
 if __name__ == "__main__":

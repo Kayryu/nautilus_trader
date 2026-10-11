@@ -44,7 +44,6 @@ async fn main() -> anyhow::Result<()> {
         config.proxy_url,
     )?;
     let snapshot = client.get_wallet_account_snapshot(&wallet).await?;
-    let stats = client.get_user_stats(&wallet).await?;
     let invitation = client.get_invitation_status(&wallet).await?;
     let quota = client.get_quota_summary(&wallet).await?;
     let delegates = client.get_delegate_accounts(&wallet).await?;
@@ -56,8 +55,8 @@ async fn main() -> anyhow::Result<()> {
         "DeepX wallet account directory verified wallet={} subaccounts={} created={} if_staked_quote_asset_amount={}",
         snapshot.directory.wallet(),
         snapshot.subaccounts.len(),
-        stats.number_of_sub_accounts_created,
-        stats.if_staked_quote_asset_amount,
+        snapshot.stats.number_of_sub_accounts_created,
+        snapshot.stats.if_staked_quote_asset_amount,
     );
     println!(
         "DeepX wallet invitation status verified wallet={} is_bound={}",
@@ -99,8 +98,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     for subaccount in snapshot.subaccounts {
+        let exact = subaccount
+            .margin_ratio
+            .exact_margin
+            .as_ref()
+            .context("validated margin ratio lacks exact values")?;
         println!(
-            "DeepX subaccount verified address={} name={} status={} height={} assets={} deposits_usd={} borrows_usd={} unrealized_pnl_usd={} equity_usd={} collateral={} margin_required={} margin_ratio={:?}",
+            "DeepX subaccount verified address={} name={} status={} height={} assets={} deposits_usd={} borrows_usd={} unrealized_pnl_usd={} equity_usd={} exact_collateral_usdc={} exact_maintenance_margin_required_usdc={} exact_uni_mmr={:?} collateral_display={} margin_required_display={} margin_ratio_display={:?}",
             subaccount.profile.address,
             subaccount.profile.name,
             subaccount.profile.status,
@@ -110,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
             subaccount.equity.total_borrows_usd,
             subaccount.equity.unrealized_pnl_usd,
             subaccount.equity.equity_usd,
+            exact.total_collateral,
+            exact.maint_margin_req,
+            exact.uni_mmr,
             subaccount.margin_ratio.collateral,
             subaccount.margin_ratio.margin_required,
             subaccount.margin_ratio.margin_ratio,

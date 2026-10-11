@@ -89,6 +89,7 @@ pub use rest_status::{
     poll_rest_transaction_status,
 };
 use serde::{Deserialize, Serialize};
+pub(crate) use submission::submit_once_with_runtime_guard;
 pub use submission::{
     DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError, DeepXSubmissionAttemptFailure,
     DeepXSubmissionAttemptOutcome, DeepXSubmissionError, DeepXSubmissionRetryError,
@@ -97,24 +98,45 @@ pub use submission::{
     submit_with_bounded_ambiguity_retry, verify_submission_hash,
 };
 use thiserror::Error;
-pub(crate) use watch::collect_finalized_recovery_scan_with_event_evidence;
 pub use watch::{
-    DeepXCanonicalBlockObservation, DeepXFinalityObservation, DeepXFinalizedRecoveryCheckpoint,
-    DeepXFinalizedRecoveryCollection, DeepXFinalizedTransactionLocation,
-    DeepXFinalizedTransactionLocationObservation, DeepXPerpCancelEventVerificationError,
+    DeepXCanonicalBlockObservation, DeepXDelegateAccountChangeKind, DeepXDelegateAccountEventError,
+    DeepXDelegateAccountVerificationError, DeepXDelegateModeEventError,
+    DeepXDelegateModeVerificationError, DeepXFinalityObservation,
+    DeepXFinalizedDelegateAccountChange, DeepXFinalizedDelegateModeChange,
+    DeepXFinalizedDelegateObservationError, DeepXFinalizedPerpTrade,
+    DeepXFinalizedPerpTradeObservationError, DeepXFinalizedRecoveryCheckpoint,
+    DeepXFinalizedRecoveryCollection, DeepXFinalizedSpotTrade,
+    DeepXFinalizedSpotTradeObservationError, DeepXFinalizedTransactionLocation,
+    DeepXFinalizedTransactionLocationObservation, DeepXFinalizedWalletPerpTradeMatch,
+    DeepXFinalizedWalletPerpTradeMatchError, DeepXPerpCancelEventVerificationError,
     DeepXPerpCloseEventVerificationError, DeepXPerpModifyEventVerificationError,
     DeepXPerpPlaceEventVerificationError, DeepXPerpProfitAndLossPointEventVerificationError,
-    DeepXPoolObservation, DeepXSpotCancelEventVerificationError,
-    DeepXSpotPlaceEventVerificationError, DeepXTransactionWatchError,
-    collect_finalized_perp_close_recovery_scan, collect_finalized_perp_modify_recovery_scan,
-    collect_finalized_perp_place_recovery_scan,
+    DeepXPerpTradeEventError, DeepXPerpTradeMatchError, DeepXPoolObservation,
+    DeepXSignedDelegateAccountObservation, DeepXSignedDelegateAccountObservationError,
+    DeepXSignedDelegateAccountOperation, DeepXSignedDelegateAccountQuery,
+    DeepXSignedDelegateModeObservation, DeepXSignedDelegateModeObservationError,
+    DeepXSignedDelegateModeQuery, DeepXSpotCancelEventVerificationError,
+    DeepXSpotPlaceEventVerificationError, DeepXSpotTradeEventError, DeepXSpotTradeMatchError,
+    DeepXTransactionWatchError, collect_finalized_perp_close_recovery_scan,
+    collect_finalized_perp_modify_recovery_scan, collect_finalized_perp_place_recovery_scan,
     collect_finalized_perp_profit_and_loss_point_recovery_scan, collect_finalized_recovery_scan,
     collect_finalized_spot_cancel_recovery_scan, collect_finalized_spot_place_recovery_scan,
-    observe_canonical_block, observe_finality, observe_finalized_transaction_location,
-    observe_reorganization, observe_submission_pool, verify_perp_cancel_business_event,
+    decode_finalized_delegate_account_changes, decode_finalized_delegate_mode_changes,
+    decode_finalized_perp_trade_events, decode_finalized_spot_trade_events,
+    match_finalized_perp_account_trade, match_finalized_spot_account_trade,
+    match_finalized_wallet_perp_trades, observe_canonical_block, observe_finality,
+    observe_finalized_delegate_account_change_at, observe_finalized_delegate_mode_change_at,
+    observe_finalized_perp_trades_at, observe_finalized_spot_trades_at,
+    observe_finalized_transaction_location, observe_reorganization,
+    observe_signed_delegate_account_change_at, observe_signed_delegate_mode_change_at,
+    observe_submission_pool, verify_finalized_delegate_account_change_events,
+    verify_finalized_delegate_mode_change_events, verify_perp_cancel_business_event,
     verify_perp_close_inclusion_events, verify_perp_modify_inclusion_events,
     verify_perp_place_inclusion_events, verify_perp_profit_and_loss_point_inclusion_events,
     verify_spot_cancel_inclusion_events, verify_spot_place_inclusion_events,
+};
+pub(crate) use watch::{
+    collect_finalized_recovery_scan_with_event_evidence, perp_modify_sizing_event_supported,
 };
 
 /// The fail-closed action required after restoring a durable transaction record.

@@ -23,17 +23,20 @@ use nautilus_common::{
     messages::{
         DataEvent, DataResponse,
         data::{
-            RequestBookSnapshot, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeFundingRates,
-            UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+            RequestBookDepth, RequestBookSnapshot, SubscribeBars, SubscribeBookDeltas,
+            SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeInstrumentStatus, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrumentStatus,
+            UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_deepx::{config::DeepXDataClientConfig, data::DeepXDataClient};
 use nautilus_model::{
-    data::Data,
+    data::{BarSpecification, BarType, Data},
+    enums::{AggregationSource, BarAggregation, MarketStatusAction, PriceType, RecordFlag},
     identifiers::{ClientId, InstrumentId},
 };
 
@@ -43,12 +46,161 @@ async fn main() -> anyhow::Result<()> {
     set_data_event_sender(sender);
     let mut client = DeepXDataClient::new(
         ClientId::from("DEEPX-LIVE-TRADE-CHECK"),
-        DeepXDataClientConfig::default(),
+        DeepXDataClientConfig::builder()
+            .perpetual_only(!std::env::args().any(|arg| arg == "--spot"))
+            .build(),
         Rc::new(RefCell::new(Cache::default())).into(),
         Rc::new(RefCell::new(LiveClock::default())),
     )?;
     client.connect().await?;
     while receiver.try_recv().is_ok() {}
+    if std::env::args().any(|arg| arg == "--status") {
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        client.subscribe_instrument_status(SubscribeInstrumentStatus::new(
+            instrument_id,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        let event = tokio::time::timeout(Duration::from_secs(45), receiver.recv())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("framework event channel closed"))?;
+        let DataEvent::InstrumentStatus(status) = event else {
+            anyhow::bail!("expected framework instrument status, received {event:?}");
+        };
+        let trading = matches!(status.action, MarketStatusAction::Trading);
+        anyhow::ensure!(
+            status.instrument_id == instrument_id
+                && status.ts_event.as_u64() > 0
+                && status.ts_event == status.ts_init
+                && status.is_trading == Some(trading)
+                && status.is_quoting == Some(trading),
+            "framework instrument status identity or state mismatch"
+        );
+        println!(
+            "DeepX framework instrument status action={} is_trading={} timestamp={}",
+            status.action, trading, status.ts_event,
+        );
+        client.unsubscribe_instrument_status(&UnsubscribeInstrumentStatus::new(
+            instrument_id,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        client.disconnect().await?;
+        while receiver.try_recv().is_ok() {}
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "instrument status was published after unsubscribe/disconnect"
+        );
+        println!(
+            "DeepX framework status subscription retired; no credentials or transactions sent"
+        );
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--bars") {
+        let bar_type = BarType::new(
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+        client.subscribe_bars(SubscribeBars::new(
+            bar_type,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        let event = tokio::time::timeout(Duration::from_secs(180), receiver.recv())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("framework event channel closed"))?;
+        let DataEvent::Data(Data::Bar(bar)) = event else {
+            anyhow::bail!("expected framework one-minute bar, received {event:?}");
+        };
+        anyhow::ensure!(
+            bar.bar_type == bar_type && bar.ts_event.as_millis().is_multiple_of(60_000),
+            "framework bar identity or bucket timestamp mismatch"
+        );
+        println!(
+            "DeepX framework one-minute bar time={} open={} high={} low={} close={} volume={}",
+            bar.ts_event, bar.open, bar.high, bar.low, bar.close, bar.volume,
+        );
+        client.unsubscribe_bars(&UnsubscribeBars::new(
+            bar_type,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))?;
+        client.disconnect().await?;
+        while receiver.try_recv().is_ok() {}
+        anyhow::ensure!(
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "bar was published after unsubscribe/disconnect"
+        );
+        println!("DeepX framework bar subscription retired; no credentials or transactions sent");
+        return Ok(());
+    }
+    if std::env::args().any(|arg| arg == "--depth-request") {
+        let instrument_id = InstrumentId::from("BTC-USDC-PERP.DEEPX");
+        let request_id = UUID4::new();
+        client.request_book_depth(RequestBookDepth::new(
+            instrument_id,
+            None,
+            None,
+            std::num::NonZeroUsize::new(1),
+            std::num::NonZeroUsize::new(10),
+            Some(client.client_id()),
+            request_id,
+            UnixNanos::default(),
+            None,
+        ))?;
+        let response = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("framework event channel closed"))?;
+        let DataEvent::Response(DataResponse::BookDepth(response)) = response else {
+            anyhow::bail!("expected framework book depth response");
+        };
+        anyhow::ensure!(
+            response.correlation_id == request_id
+                && response.instrument_id == instrument_id
+                && response.data.len() == 1,
+            "book depth response identity mismatch"
+        );
+        let depth = &response.data[0];
+        anyhow::ensure!(
+            depth.sequence > 0
+                && depth.ts_event.as_u64() > 0
+                && !depth.bids[0].price.is_zero()
+                && !depth.asks[0].price.is_zero()
+                && depth.bid_counts[0] == 1
+                && depth.ask_counts[0] == 1
+                && depth.bid_counts.iter().all(|count| *count <= 1)
+                && depth.ask_counts.iter().all(|count| *count <= 1)
+                && RecordFlag::F_SNAPSHOT.matches(depth.flags),
+            "book depth snapshot metadata is invalid"
+        );
+        println!(
+            "DeepX framework depth request sequence={} timestamp={} bid={} ask={}; no private accounts or transactions",
+            depth.sequence, depth.ts_event, depth.bids[0].price, depth.asks[0].price,
+        );
+        client.disconnect().await?;
+        return Ok(());
+    }
     if std::env::args().any(|arg| arg == "--snapshot") {
         let instrument_id = InstrumentId::from("BTC-USDC-PERP.DEEPX");
         client.request_book_snapshot(RequestBookSnapshot::new(

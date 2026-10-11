@@ -991,10 +991,7 @@ impl DeepXTransactionIdentity {
         order_side: OrderSide,
         nonce: DeepXNonceReservation,
         runtime: DeepXDirectRuntimeIdentity,
-        subaccount: [u8; 20],
-        order_id: u64,
-        market_id: u16,
-        fast_cancel: bool,
+        params: crate::signing::DeepXPerpCancelParams,
     ) -> Self {
         Self {
             client_order_id: client_order_id.to_string(),
@@ -1004,10 +1001,10 @@ impl DeepXTransactionIdentity {
             nonce,
             runtime,
             operation: Some(DeepXTransactionOperation::PerpCancel {
-                subaccount,
-                order_id,
-                market_id,
-                fast_cancel,
+                subaccount: params.subaccount,
+                order_id: params.order_id,
+                market_id: params.market_id,
+                fast_cancel: params.fast_cancel,
             }),
         }
     }
@@ -2696,10 +2693,12 @@ mod tests {
                 OrderSide::Buy,
                 DeepXNonceReservation::TimestampOrderId { value: nonce },
                 runtime.clone(),
-                [8; 20],
-                42,
-                3,
-                false,
+                crate::signing::DeepXPerpCancelParams {
+                    subaccount: [8; 20],
+                    order_id: 42,
+                    market_id: 3,
+                    fast_cancel: false,
+                },
             );
             DeepXTransactionRecord::created(identity)
         };

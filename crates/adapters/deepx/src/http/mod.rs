@@ -44,9 +44,9 @@ pub use models::{
     DeepXSpotWalletOrderMarket, DeepXSpotWalletOrdersPage, DeepXSpotWalletSubaccountOrders,
     DeepXSpotWalletSubaccountTrades, DeepXSpotWalletTradeMarket, DeepXSpotWalletTradesPage,
     DeepXSubaccountBalanceAsset, DeepXSubaccountBalances, DeepXSubaccountDirectoryRecord,
-    DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountProfile,
-    DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
-    DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
+    DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountPerpPositions,
+    DeepXSubaccountProfile, DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
+    DeepXWalletDelegateAccounts, DeepXWalletPerpPositions, DeepXWalletSubaccounts,
 };
 pub use pagination::{CursorPagination, PaginationDecision};
 pub use query::{

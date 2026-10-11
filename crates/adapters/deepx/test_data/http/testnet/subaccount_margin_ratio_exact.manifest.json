@@ -1,0 +1,29 @@
+{
+  "captured_at": "2026-10-11T04:27:20Z",
+  "deployment": "testnet",
+  "endpoint_role": "public_rest_account_data",
+  "account_scope": {
+    "wallet": "0x781ed35b167068c93dfadab41dfb680edaca4e50",
+    "subaccount": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/internal/v1/account/margin-ratio",
+    "query": {
+      "address": "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+    }
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "payload_path": "subaccount_margin_ratio_exact.json",
+    "payload_sha256": "275c77d40274b1670b636b4c74d1dd53546b3205a9e22e5df3e676989c0f9c8d",
+    "format": "reformatted from the read-only live response"
+  },
+  "runtime_identity": null,
+  "limitations": [
+    "The REST response is mutable and is not pinned to a block hash.",
+    "The legacy numeric fields are rounded displays; exactMargin contains decimal strings.",
+    "The exact maintenance requirement does not establish initial margin or free collateral."
+  ]
+}

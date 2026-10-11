@@ -10,17 +10,166 @@ __all__ = [
     "DEEPX",
     "DEEPX_CLIENT_ID",
     "DEEPX_VENUE",
+    "DeepXBalanceChangePosition",
+    "DeepXBalanceChangeRecord",
+    "DeepXBalanceChangesPage",
     "DeepXDataClientConfig",
     "DeepXDataClientFactory",
+    "DeepXDelegateAccount",
+    "DeepXDelegateWallets",
     "DeepXExecutionClientConfig",
     "DeepXExecutionClientFactory",
+    "DeepXHourlyUnsettledFundingRecord",
     "DeepXHttpReadRetryConfig",
+    "DeepXLendingService",
+    "DeepXLiquidationRecord",
+    "DeepXLiquidationRecordsPage",
     "DeepXNetworkConfig",
+    "DeepXPerpAccountTradeRecord",
+    "DeepXPerpAccountTradesPage",
+    "DeepXPerpFundingFeeRecord",
+    "DeepXPerpFundingFeesPage",
+    "DeepXPerpHistoryOrdersPage",
+    "DeepXPerpLiquidationPrice",
+    "DeepXPerpOpenOrdersPage",
+    "DeepXPerpOrderRecord",
+    "DeepXPerpPositionRecord",
+    "DeepXPerpPositionsPage",
+    "DeepXPerpWalletOrderItemsPage",
+    "DeepXPerpWalletOrderMarket",
+    "DeepXPerpWalletOrdersPage",
+    "DeepXPerpWalletSubaccountOrders",
+    "DeepXPerpWalletSubaccountTrades",
+    "DeepXPerpWalletTradeMarket",
+    "DeepXPerpWalletTradesPage",
+    "DeepXQuotaHistoryPage",
+    "DeepXQuotaHistoryRecord",
+    "DeepXQuotaSummary",
+    "DeepXRestStatusPollResult",
+    "DeepXRestStatusPoller",
+    "DeepXRestTransactionStatus",
+    "DeepXSpotAccountTradeRecord",
+    "DeepXSpotAccountTradesPage",
+    "DeepXSpotHistoryOrdersPage",
+    "DeepXSpotOpenOrdersPage",
+    "DeepXSpotOrderRecord",
+    "DeepXSpotWalletOrderItemsPage",
+    "DeepXSpotWalletOrderMarket",
+    "DeepXSpotWalletOrdersPage",
+    "DeepXSpotWalletSubaccountOrders",
+    "DeepXSpotWalletSubaccountTrades",
+    "DeepXSpotWalletTradeItemsPage",
+    "DeepXSpotWalletTradeMarket",
+    "DeepXSpotWalletTradesPage",
+    "DeepXSubaccountBalanceAsset",
+    "DeepXSubaccountBalances",
+    "DeepXSubaccountEquity",
+    "DeepXSubaccountMarginRatio",
+    "DeepXSubaccountPerpPositions",
+    "DeepXSubaccountProfile",
+    "DeepXSubaccountSnapshot",
+    "DeepXUserStats",
+    "DeepXWalletAccountSnapshot",
+    "DeepXWalletDelegateAccounts",
+    "DeepXWalletFundingFeesPage",
+    "DeepXWalletPerpPositions",
+    "DeepXWalletSubaccounts",
+    "get_deepx_balance_change_pages",
+    "get_deepx_balance_changes",
+    "get_deepx_delegate_accounts",
+    "get_deepx_delegator_accounts",
+    "get_deepx_hourly_unsettled_funding_pages",
+    "get_deepx_liquidation_record_pages",
+    "get_deepx_liquidation_records",
+    "get_deepx_perp_account_trade_pages",
+    "get_deepx_perp_account_trades",
+    "get_deepx_perp_funding_fee_pages",
+    "get_deepx_perp_funding_fees",
+    "get_deepx_perp_history_order_pages",
+    "get_deepx_perp_history_orders",
+    "get_deepx_perp_liquidation_price",
+    "get_deepx_perp_open_order_pages",
+    "get_deepx_perp_open_orders",
+    "get_deepx_perp_order_by_tx",
+    "get_deepx_perp_position_pages",
+    "get_deepx_perp_positions",
+    "get_deepx_perp_wallet_order_pages",
+    "get_deepx_perp_wallet_orders",
+    "get_deepx_perp_wallet_trade_pages",
+    "get_deepx_perp_wallet_trades",
+    "get_deepx_quota_history",
+    "get_deepx_quota_history_pages",
+    "get_deepx_quota_summary",
+    "get_deepx_rest_transaction_status",
+    "get_deepx_spot_account_trade_pages",
+    "get_deepx_spot_account_trades",
+    "get_deepx_spot_history_order_pages",
+    "get_deepx_spot_history_orders",
+    "get_deepx_spot_open_order_pages",
+    "get_deepx_spot_open_orders",
+    "get_deepx_spot_order_by_tx",
+    "get_deepx_spot_wallet_order_pages",
+    "get_deepx_spot_wallet_orders",
+    "get_deepx_spot_wallet_trade_pages",
+    "get_deepx_spot_wallet_trades",
+    "get_deepx_user_stats",
+    "get_deepx_wallet_account_snapshot",
+    "get_deepx_wallet_funding_fee_pages",
+    "get_deepx_wallet_funding_fees",
+    "get_deepx_wallet_perp_positions",
+    "get_deepx_wallet_subaccounts",
 ]
 
 DEEPX: str
 DEEPX_CLIENT_ID: model.ClientId
 DEEPX_VENUE: model.Venue
+
+@typing.final
+class DeepXBalanceChangePosition:
+    @property
+    def id(self) -> int: ...
+    @property
+    def owner(self) -> str: ...
+    @property
+    def market_id(self) -> int: ...
+
+@typing.final
+class DeepXBalanceChangeRecord:
+    @property
+    def id(self) -> int: ...
+    @property
+    def asset(self) -> str: ...
+    @property
+    def balance_change(self) -> str: ...
+    @property
+    def change_type(self) -> str: ...
+    @property
+    def time(self) -> int: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def event_idx(self) -> int: ...
+    @property
+    def tx_hash(self) -> str | None: ...
+    @property
+    def tx_hash_type(self) -> str | None: ...
+    @property
+    def from_address(self) -> str | None: ...
+    @property
+    def to_address(self) -> str | None: ...
+    @property
+    def cross_chain_json(self) -> str | None: ...
+    @property
+    def position(self) -> DeepXBalanceChangePosition | None: ...
+
+@typing.final
+class DeepXBalanceChangesPage:
+    @property
+    def items(self) -> list[DeepXBalanceChangeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
 
 @typing.final
 class DeepXDataClientConfig:
@@ -30,12 +179,15 @@ class DeepXDataClientConfig:
     def http_timeout_secs(self) -> int: ...
     @property
     def websocket_timeout_secs(self) -> int: ...
+    @property
+    def perpetual_only(self) -> bool: ...
     def __init__(
         self,
         network: DeepXNetworkConfig | None = None,
         proxy_url: str | None = None,
         http_timeout_secs: int | None = None,
         websocket_timeout_secs: int | None = None,
+        perpetual_only: bool | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...
@@ -44,6 +196,28 @@ class DeepXDataClientConfig:
 class DeepXDataClientFactory:
     def __init__(self) -> None: ...
     def name(self) -> str: ...
+
+@typing.final
+class DeepXDelegateAccount:
+    @property
+    def delegate_address(self) -> str: ...
+    @property
+    def delegate_name(self) -> str: ...
+    @property
+    def valid_until(self) -> int: ...
+    @property
+    def mode(self) -> str: ...
+    @property
+    def create_time(self) -> int: ...
+    @property
+    def active(self) -> bool: ...
+
+@typing.final
+class DeepXDelegateWallets:
+    @property
+    def delegate(self) -> str: ...
+    @property
+    def wallets(self) -> list[str]: ...
 
 @typing.final
 class DeepXExecutionClientConfig:
@@ -93,6 +267,35 @@ class DeepXExecutionClientFactory:
     def name(self) -> str: ...
 
 @typing.final
+class DeepXHourlyUnsettledFundingRecord:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def position_version(self) -> int: ...
+    @property
+    def signed_position_size_raw(self) -> str: ...
+    @property
+    def baseline_index_raw(self) -> str: ...
+    @property
+    def cumulative_index_raw(self) -> str: ...
+    @property
+    def delta_index_raw(self) -> str: ...
+    @property
+    def mark_price_raw(self) -> str: ...
+    @property
+    def payment_raw(self) -> str: ...
+    @property
+    def boundary_timestamp_ms(self) -> int: ...
+    @property
+    def boundary_block(self) -> int: ...
+    @property
+    def boundary_event_index(self) -> int: ...
+    @property
+    def boundary_event_id(self) -> str: ...
+
+@typing.final
 class DeepXHttpReadRetryConfig:
     @property
     def max_retries(self) -> int: ...
@@ -117,6 +320,168 @@ class DeepXHttpReadRetryConfig:
     ) -> None: ...
 
 @typing.final
+class DeepXLendingAsset:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def asset(self) -> str: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def created_at(self) -> str: ...
+
+@typing.final
+class DeepXLendingInterestRateParams:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def asset(self) -> str: ...
+    @property
+    def r_min(self) -> str: ...
+    @property
+    def u1(self) -> str: ...
+    @property
+    def u2(self) -> str: ...
+    @property
+    def u3(self) -> str: ...
+    @property
+    def u4(self) -> str | None: ...
+    @property
+    def u5(self) -> str | None: ...
+    @property
+    def r1(self) -> str: ...
+    @property
+    def r2(self) -> str: ...
+    @property
+    def r3(self) -> str: ...
+    @property
+    def r4(self) -> str | None: ...
+    @property
+    def r5(self) -> str | None: ...
+    @property
+    def r_max(self) -> str: ...
+    @property
+    def rho(self) -> str: ...
+
+@typing.final
+class DeepXLendingInterestRateRecord:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def asset(self) -> str: ...
+    @property
+    def supply_apr(self) -> str: ...
+    @property
+    def borrow_apr(self) -> str: ...
+    @property
+    def statistic_time(self) -> int: ...
+
+@typing.final
+class DeepXLendingService:
+    def __init__(self, config: DeepXDataClientConfig | None = None) -> None: ...
+    def get_assets(self) -> list[DeepXLendingAsset]: ...
+    def get_interest_rate_params(
+        self, market_id: int | None = None, asset: str | None = None
+    ) -> list[DeepXLendingInterestRateParams]: ...
+    def get_interest_rate_history(
+        self,
+        start_ms: int,
+        interval: str = "1h",
+        market_id: int | None = None,
+        asset: str | None = None,
+        end_ms: int | None = None,
+        limit: int | None = None,
+        sort: str = "DESC",
+    ) -> list[DeepXLendingInterestRateRecord]: ...
+    def get_status_history(
+        self,
+        start_ms: int,
+        interval: str = "1h",
+        market_id: int | None = None,
+        asset: str | None = None,
+        end_ms: int | None = None,
+        limit: int | None = None,
+        sort: str = "DESC",
+    ) -> list[DeepXLendingStatusRecord]: ...
+
+@typing.final
+class DeepXLendingStatusRecord:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def asset(self) -> str: ...
+    @property
+    def index_price(self) -> str: ...
+    @property
+    def total_supplied(self) -> str: ...
+    @property
+    def total_borrowed(self) -> str: ...
+    @property
+    def utilization_rate(self) -> str: ...
+    @property
+    def supply_apr(self) -> str: ...
+    @property
+    def borrow_apr(self) -> str: ...
+    @property
+    def statistic_time(self) -> int: ...
+
+@typing.final
+class DeepXLiquidationRecord:
+    @property
+    def id(self) -> int: ...
+    @property
+    def liquidation_id(self) -> int: ...
+    @property
+    def liquidation_type(self) -> str: ...
+    @property
+    def liquidation_detail_json(self) -> str: ...
+    @property
+    def tx_hash(self) -> str | None: ...
+    @property
+    def target_account(self) -> str: ...
+    @property
+    def liquidator(self) -> str: ...
+    @property
+    def margin_shortage(self) -> str: ...
+    @property
+    def canceled_order_ids_json(self) -> str: ...
+    @property
+    def margin_freed(self) -> str: ...
+    @property
+    def market_index(self) -> int | None: ...
+    @property
+    def liquidator_fee(self) -> str | None: ...
+    @property
+    def if_fee(self) -> str: ...
+    @property
+    def liquidate_base_amount(self) -> str | None: ...
+    @property
+    def oracle_price(self) -> str | None: ...
+    @property
+    def liquidator_order_id(self) -> int | None: ...
+    @property
+    def target_account_order_id(self) -> int | None: ...
+    @property
+    def borrow_amount(self) -> str | None: ...
+    @property
+    def bankrupt(self) -> bool: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def event_idx(self) -> int: ...
+    @property
+    def created_at(self) -> str: ...
+
+@typing.final
+class DeepXLiquidationRecordsPage:
+    @property
+    def items(self) -> list[DeepXLiquidationRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
 class DeepXNetworkConfig:
     @property
     def http_read_retry(self) -> DeepXHttpReadRetryConfig: ...
@@ -134,3 +499,1092 @@ class DeepXNetworkConfig:
     ) -> None: ...
     @property
     def environment(self) -> str: ...
+
+@typing.final
+class DeepXPerpAccountTradeRecord:
+    @property
+    def id(self) -> int: ...
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def order_id(self) -> str: ...
+    @property
+    def is_long(self) -> bool: ...
+    @property
+    def taker(self) -> str: ...
+    @property
+    def price(self) -> str: ...
+    @property
+    def size(self) -> str: ...
+    @property
+    def leverage(self) -> str: ...
+    @property
+    def created_at(self) -> str: ...
+    @property
+    def filled_direction(self) -> str: ...
+    @property
+    def fee(self) -> str: ...
+    @property
+    def fee_asset(self) -> str: ...
+
+@typing.final
+class DeepXPerpAccountTradesPage:
+    @property
+    def items(self) -> list[DeepXPerpAccountTradeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpFundingFeeRecord:
+    @property
+    def owner(self) -> str: ...
+    @property
+    def market(self) -> int: ...
+    @property
+    def position_size(self) -> str: ...
+    @property
+    def is_long(self) -> bool: ...
+    @property
+    def fee(self) -> str: ...
+    @property
+    def fee_rate(self) -> str: ...
+    @property
+    def created_at(self) -> str: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def event_idx(self) -> int: ...
+    @property
+    def is_settled(self) -> bool: ...
+
+@typing.final
+class DeepXPerpFundingFeesPage:
+    @property
+    def items(self) -> list[DeepXPerpFundingFeeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpHistoryOrdersPage:
+    @property
+    def items(self) -> list[DeepXPerpOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpLiquidationPrice:
+    @property
+    def address(self) -> str: ...
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def market_name(self) -> str: ...
+    @property
+    def liquidate_price(self) -> str | None: ...
+
+@typing.final
+class DeepXPerpOpenOrdersPage:
+    @property
+    def items(self) -> list[DeepXPerpOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpOrderRecord:
+    @property
+    def order_id(self) -> str: ...
+    @property
+    def owner(self) -> str: ...
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def is_long(self) -> bool: ...
+    @property
+    def size(self) -> str: ...
+    @property
+    def price(self) -> str: ...
+    @property
+    def avg_fill_price(self) -> str | None: ...
+    @property
+    def order_type(self) -> str: ...
+    @property
+    def create_time(self) -> str: ...
+    @property
+    def updated_time(self) -> str | None: ...
+    @property
+    def leverage(self) -> str: ...
+    @property
+    def slippage(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def size_filled(self) -> str: ...
+    @property
+    def size_remain(self) -> str: ...
+    @property
+    def take_profit(self) -> str | None: ...
+    @property
+    def stop_loss(self) -> str | None: ...
+    @property
+    def reduce_only(self) -> bool: ...
+    @property
+    def post_only(self) -> str: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def tx_hash(self) -> str: ...
+    @property
+    def tx_hash_type(self) -> str: ...
+    @property
+    def cancel_reason(self) -> str: ...
+    @property
+    def cancel_height(self) -> int | None: ...
+    @property
+    def fee(self) -> str: ...
+
+@typing.final
+class DeepXPerpPositionRecord:
+    @property
+    def id(self) -> int: ...
+    @property
+    def owner(self) -> str: ...
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def is_long(self) -> bool: ...
+    @property
+    def base_asset_amount(self) -> str: ...
+    @property
+    def entry_price(self) -> str: ...
+    @property
+    def leverage(self) -> str: ...
+    @property
+    def last_funding_rate(self) -> str: ...
+    @property
+    def version(self) -> int: ...
+    @property
+    def realized_pnl(self) -> str: ...
+    @property
+    def funding_payment(self) -> str: ...
+    @property
+    def take_profit(self) -> str: ...
+    @property
+    def stop_loss(self) -> str: ...
+    @property
+    def last_settle_price(self) -> str: ...
+    @property
+    def pnl(self) -> str: ...
+    @property
+    def open_block_num(self) -> int: ...
+    @property
+    def open_time(self) -> str: ...
+    @property
+    def open_event_idx(self) -> int: ...
+    @property
+    def close_price(self) -> str | None: ...
+    @property
+    def close_block_num(self) -> int | None: ...
+    @property
+    def close_time(self) -> str | None: ...
+    @property
+    def close_event_idx(self) -> int | None: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def total_fee(self) -> str: ...
+    @property
+    def liquidate_price(self) -> str | None: ...
+    @property
+    def created_at(self) -> str: ...
+    @property
+    def updated_at(self) -> str: ...
+
+@typing.final
+class DeepXPerpPositionsPage:
+    @property
+    def items(self) -> list[DeepXPerpPositionRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpWalletOrderItemsPage:
+    @property
+    def items(self) -> list[DeepXPerpOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpWalletOrderMarket:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def market_name(self) -> str: ...
+    @property
+    def subaccounts(self) -> list[DeepXPerpWalletSubaccountOrders]: ...
+
+@typing.final
+class DeepXPerpWalletOrdersPage:
+    @property
+    def markets(self) -> list[DeepXPerpWalletOrderMarket]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXPerpWalletSubaccountOrders:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def orders(self) -> DeepXPerpWalletOrderItemsPage: ...
+
+@typing.final
+class DeepXPerpWalletSubaccountTrades:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def trades(self) -> DeepXPerpWalletTradesPage: ...
+
+@typing.final
+class DeepXPerpWalletTradeMarket:
+    @property
+    def market_id(self) -> int: ...
+    @property
+    def market_name(self) -> str: ...
+    @property
+    def subaccounts(self) -> list[DeepXPerpWalletSubaccountTrades]: ...
+
+@typing.final
+class DeepXPerpWalletTradesPage:
+    @property
+    def items(self) -> list[DeepXPerpAccountTradeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXQuotaHistoryPage:
+    @property
+    def items(self) -> list[DeepXQuotaHistoryRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXQuotaHistoryRecord:
+    @property
+    def id(self) -> str: ...
+    @property
+    def history_type(self) -> str: ...
+    @property
+    def owner_address(self) -> str: ...
+    @property
+    def buyer_type(self) -> str | None: ...
+    @property
+    def buyer_address(self) -> str | None: ...
+    @property
+    def quota(self) -> int: ...
+    @property
+    def tx_hash(self) -> str: ...
+    @property
+    def tx_hash_type(self) -> str: ...
+    @property
+    def block_number(self) -> int: ...
+    @property
+    def event_index(self) -> int: ...
+    @property
+    def created_at(self) -> str: ...
+
+@typing.final
+class DeepXQuotaSummary:
+    @property
+    def owner(self) -> str: ...
+    @property
+    def subaccount_count(self) -> int: ...
+    @property
+    def spot_volume_usd(self) -> str: ...
+    @property
+    def perp_volume_usd(self) -> str: ...
+    @property
+    def total_volume_usd(self) -> str: ...
+    @property
+    def quota_earned(self) -> int: ...
+    @property
+    def quota_granted(self) -> int: ...
+    @property
+    def quota_reserved(self) -> int: ...
+    @property
+    def quota_pending(self) -> int: ...
+    @property
+    def first_trade_ts_ms(self) -> int | None: ...
+    @property
+    def last_trade_ts_ms(self) -> int | None: ...
+    @property
+    def first_trade_at(self) -> str | None: ...
+    @property
+    def last_trade_at(self) -> str | None: ...
+    @property
+    def updated_at(self) -> str | None: ...
+
+@typing.final
+class DeepXRestStatusPollResult:
+    @property
+    def termination(self) -> str: ...
+    @property
+    def attempts(self) -> int: ...
+    @property
+    def last_observation(self) -> DeepXRestTransactionStatus | None: ...
+    @property
+    def last_error(self) -> str | None: ...
+
+@typing.final
+class DeepXRestStatusPoller:
+    def __init__(self, config: DeepXDataClientConfig | None = None) -> None: ...
+    def cancel(self) -> None: ...
+    @property
+    def cancelled(self) -> bool: ...
+    def poll(
+        self, tx_hash: str, max_attempts: int, interval_ms: int, timeout_ms: int
+    ) -> DeepXRestStatusPollResult: ...
+
+@typing.final
+class DeepXRestTransactionStatus:
+    @property
+    def tx_hash(self) -> str: ...
+    @property
+    def confirmation(self) -> str: ...
+    @property
+    def order_id(self) -> int | None: ...
+    @property
+    def backend_status(self) -> str | None: ...
+    @property
+    def data_json(self) -> str: ...
+
+@typing.final
+class DeepXSpotAccountTradeRecord:
+    @property
+    def id(self) -> int: ...
+    @property
+    def order_id(self) -> str: ...
+    @property
+    def order_side(self) -> str: ...
+    @property
+    def pair(self) -> str: ...
+    @property
+    def pair_name(self) -> str: ...
+    @property
+    def base_amount(self) -> str: ...
+    @property
+    def quote_amount(self) -> str: ...
+    @property
+    def price(self) -> str: ...
+    @property
+    def fee(self) -> str: ...
+    @property
+    def fee_asset(self) -> str: ...
+    @property
+    def taker(self) -> str: ...
+    @property
+    def created_at(self) -> str: ...
+
+@typing.final
+class DeepXSpotAccountTradesPage:
+    @property
+    def items(self) -> list[DeepXSpotAccountTradeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotHistoryOrdersPage:
+    @property
+    def items(self) -> list[DeepXSpotOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotOpenOrdersPage:
+    @property
+    def items(self) -> list[DeepXSpotOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotOrderRecord:
+    @property
+    def pair(self) -> str: ...
+    @property
+    def pair_name(self) -> str: ...
+    @property
+    def order_id(self) -> str: ...
+    @property
+    def order_side(self) -> str: ...
+    @property
+    def price(self) -> str: ...
+    @property
+    def avg_fill_price(self) -> str | None: ...
+    @property
+    def slippage(self) -> str: ...
+    @property
+    def create_time(self) -> str: ...
+    @property
+    def block_number(self) -> int: ...
+    @property
+    def maker(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def price_type(self) -> str: ...
+    @property
+    def base_amount(self) -> str: ...
+    @property
+    def base_remaining_amount(self) -> str: ...
+    @property
+    def quote_amount(self) -> str: ...
+    @property
+    def quote_remaining_amount(self) -> str: ...
+    @property
+    def post_only(self) -> str: ...
+    @property
+    def reduce_only(self) -> bool: ...
+    @property
+    def tx_hash(self) -> str: ...
+    @property
+    def tx_hash_type(self) -> str: ...
+    @property
+    def fee(self) -> str: ...
+    @property
+    def cancel_reason(self) -> str | None: ...
+    @property
+    def cancel_height(self) -> int | None: ...
+
+@typing.final
+class DeepXSpotWalletOrderItemsPage:
+    @property
+    def items(self) -> list[DeepXSpotOrderRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotWalletOrderMarket:
+    @property
+    def pair(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def subaccounts(self) -> list[DeepXSpotWalletSubaccountOrders]: ...
+
+@typing.final
+class DeepXSpotWalletOrdersPage:
+    @property
+    def markets(self) -> list[DeepXSpotWalletOrderMarket]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotWalletSubaccountOrders:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def orders(self) -> DeepXSpotWalletOrderItemsPage: ...
+
+@typing.final
+class DeepXSpotWalletSubaccountTrades:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def trades(self) -> DeepXSpotWalletTradeItemsPage: ...
+
+@typing.final
+class DeepXSpotWalletTradeItemsPage:
+    @property
+    def items(self) -> list[DeepXSpotAccountTradeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSpotWalletTradeMarket:
+    @property
+    def pair(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def subaccounts(self) -> list[DeepXSpotWalletSubaccountTrades]: ...
+
+@typing.final
+class DeepXSpotWalletTradesPage:
+    @property
+    def markets(self) -> list[DeepXSpotWalletTradeMarket]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXSubaccountBalanceAsset:
+    @property
+    def symbol(self) -> str: ...
+    @property
+    def decimals(self) -> int: ...
+    @property
+    def price(self) -> str: ...
+    @property
+    def balance(self) -> str: ...
+    @property
+    def balance_usd(self) -> str: ...
+    @property
+    def balance_borrowed(self) -> str: ...
+    @property
+    def balance_borrowed_usd(self) -> str: ...
+    @property
+    def borrow_interest(self) -> str: ...
+    @property
+    def borrow_interest_usd(self) -> str: ...
+
+@typing.final
+class DeepXSubaccountBalances:
+    @property
+    def address(self) -> str: ...
+    @property
+    def assets(self) -> list[DeepXSubaccountBalanceAsset]: ...
+
+@typing.final
+class DeepXSubaccountEquity:
+    @property
+    def subaccount(self) -> str: ...
+    @property
+    def total_deposits_usd(self) -> str: ...
+    @property
+    def total_borrows_usd(self) -> str: ...
+    @property
+    def unrealized_pnl_usd(self) -> str: ...
+    @property
+    def equity_usd(self) -> str: ...
+
+@typing.final
+class DeepXSubaccountMarginRatio:
+    @property
+    def collateral(self) -> str: ...
+    @property
+    def margin_required(self) -> str: ...
+    @property
+    def margin_ratio(self) -> str | None: ...
+    @property
+    def exact_total_collateral(self) -> str | None: ...
+    @property
+    def exact_maintenance_margin_required(self) -> str | None: ...
+    @property
+    def exact_uni_mmr(self) -> str | None: ...
+
+@typing.final
+class DeepXSubaccountPerpPositions:
+    @property
+    def profile(self) -> DeepXSubaccountProfile: ...
+    @property
+    def pages(self) -> list[DeepXPerpPositionsPage]: ...
+
+@typing.final
+class DeepXSubaccountProfile:
+    @property
+    def authority(self) -> str: ...
+    @property
+    def address(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def status(self) -> str: ...
+    @property
+    def spot_positions_json(self) -> list[str]: ...
+    @property
+    def next_order_id(self) -> int: ...
+    @property
+    def spot_margin_trading_enabled(self) -> bool: ...
+    @property
+    def margin_strategy(self) -> str: ...
+    @property
+    def height(self) -> int: ...
+    @property
+    def created_at(self) -> int: ...
+
+@typing.final
+class DeepXSubaccountSnapshot:
+    @property
+    def profile(self) -> DeepXSubaccountProfile: ...
+    @property
+    def balances(self) -> DeepXSubaccountBalances: ...
+    @property
+    def equity(self) -> DeepXSubaccountEquity: ...
+    @property
+    def margin_ratio(self) -> DeepXSubaccountMarginRatio: ...
+
+@typing.final
+class DeepXUserStats:
+    @property
+    def subaccounts(self) -> list[str]: ...
+    @property
+    def if_staked_quote_asset_amount(self) -> str: ...
+    @property
+    def number_of_sub_accounts(self) -> int: ...
+    @property
+    def number_of_sub_accounts_created(self) -> int: ...
+
+@typing.final
+class DeepXWalletAccountSnapshot:
+    @property
+    def directory(self) -> DeepXWalletSubaccounts: ...
+    @property
+    def stats(self) -> DeepXUserStats: ...
+    @property
+    def subaccounts(self) -> list[DeepXSubaccountSnapshot]: ...
+
+@typing.final
+class DeepXWalletDelegateAccounts:
+    @property
+    def wallet(self) -> str: ...
+    @property
+    def accounts(self) -> list[DeepXDelegateAccount]: ...
+
+@typing.final
+class DeepXWalletFundingFeesPage:
+    @property
+    def items(self) -> list[DeepXPerpFundingFeeRecord]: ...
+    @property
+    def next_cursor(self) -> str | None: ...
+    @property
+    def has_next(self) -> bool: ...
+
+@typing.final
+class DeepXWalletPerpPositions:
+    @property
+    def directory(self) -> DeepXWalletSubaccounts: ...
+    @property
+    def stats(self) -> DeepXUserStats: ...
+    @property
+    def subaccounts(self) -> list[DeepXSubaccountPerpPositions]: ...
+
+@typing.final
+class DeepXWalletSubaccounts:
+    @property
+    def wallet(self) -> str: ...
+    @property
+    def addresses(self) -> list[str]: ...
+
+def get_deepx_balance_change_pages(
+    max_pages: int,
+    wallet: str | None = None,
+    subaccount: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    change_types: typing.Sequence[str] | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXBalanceChangesPage]: ...
+def get_deepx_balance_changes(
+    wallet: str | None = None,
+    subaccount: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    change_types: typing.Sequence[str] | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXBalanceChangesPage: ...
+def get_deepx_delegate_accounts(
+    wallet: str, config: DeepXDataClientConfig | None = None
+) -> DeepXWalletDelegateAccounts: ...
+def get_deepx_delegator_accounts(
+    delegate: str, config: DeepXDataClientConfig | None = None
+) -> DeepXDelegateWallets: ...
+def get_deepx_hourly_unsettled_funding_pages(
+    max_pages: int,
+    wallet: str | None = None,
+    subaccount: str | None = None,
+    market_id: int | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    sort: str = "DESC",
+    config: DeepXDataClientConfig | None = None,
+) -> list[list[DeepXHourlyUnsettledFundingRecord]]: ...
+def get_deepx_liquidation_record_pages(
+    max_pages: int,
+    wallet: str | None = None,
+    subaccount: str | None = None,
+    liquidation_types: typing.Sequence[str] | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXLiquidationRecordsPage]: ...
+def get_deepx_liquidation_records(
+    wallet: str | None = None,
+    subaccount: str | None = None,
+    liquidation_types: typing.Sequence[str] | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXLiquidationRecordsPage: ...
+def get_deepx_perp_account_trade_pages(
+    subaccount: str,
+    max_pages: int,
+    order_id: str | None = None,
+    market_id: int | None = None,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpAccountTradesPage]: ...
+def get_deepx_perp_account_trades(
+    subaccount: str,
+    order_id: str | None = None,
+    market_id: int | None = None,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpAccountTradesPage: ...
+def get_deepx_perp_funding_fee_pages(
+    subaccount: str,
+    max_pages: int,
+    market_id: int | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpFundingFeesPage]: ...
+def get_deepx_perp_funding_fees(
+    subaccount: str,
+    market_id: int | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpFundingFeesPage: ...
+def get_deepx_perp_history_order_pages(
+    subaccount: str,
+    max_pages: int,
+    market_id: int | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpHistoryOrdersPage]: ...
+def get_deepx_perp_history_orders(
+    subaccount: str,
+    market_id: int | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpHistoryOrdersPage: ...
+def get_deepx_perp_liquidation_price(
+    subaccount: str,
+    market_id: int | None = None,
+    market_name: str | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpLiquidationPrice: ...
+def get_deepx_perp_open_order_pages(
+    subaccount: str,
+    market_id: int,
+    max_pages: int,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpOpenOrdersPage]: ...
+def get_deepx_perp_open_orders(
+    subaccount: str,
+    market_id: int,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpOpenOrdersPage: ...
+def get_deepx_perp_order_by_tx(
+    tx_hash: str, config: DeepXDataClientConfig | None = None
+) -> DeepXPerpOrderRecord: ...
+def get_deepx_perp_position_pages(
+    subaccount: str,
+    max_pages: int,
+    market_id: int | None = None,
+    only_closed: bool | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpPositionsPage]: ...
+def get_deepx_perp_positions(
+    subaccount: str,
+    market_id: int | None = None,
+    only_closed: bool | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpPositionsPage: ...
+def get_deepx_perp_wallet_order_pages(
+    wallet: str,
+    max_pages: int,
+    market_name: str | None = None,
+    market_id: int | None = None,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpWalletOrdersPage]: ...
+def get_deepx_perp_wallet_orders(
+    wallet: str,
+    market_name: str | None = None,
+    market_id: int | None = None,
+    is_long: bool | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXPerpWalletOrdersPage: ...
+def get_deepx_perp_wallet_trade_pages(
+    wallet: str,
+    subaccount: str,
+    market_id: int,
+    market_name: str,
+    max_pages: int,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpWalletTradesPage]: ...
+def get_deepx_perp_wallet_trades(
+    wallet: str,
+    market_name: str | None = None,
+    market_id: int | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXPerpWalletTradeMarket]: ...
+def get_deepx_quota_history(
+    wallet: str,
+    buyer_address: str | None = None,
+    history_type: str | None = None,
+    cursor: str | None = None,
+    limit: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXQuotaHistoryPage: ...
+def get_deepx_quota_history_pages(
+    wallet: str,
+    max_pages: int,
+    buyer_address: str | None = None,
+    history_type: str | None = None,
+    cursor: str | None = None,
+    limit: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXQuotaHistoryPage]: ...
+def get_deepx_quota_summary(
+    wallet: str, config: DeepXDataClientConfig | None = None
+) -> DeepXQuotaSummary: ...
+def get_deepx_rest_transaction_status(
+    tx_hash: str, config: DeepXDataClientConfig | None = None
+) -> DeepXRestTransactionStatus: ...
+def get_deepx_spot_account_trade_pages(
+    subaccount: str,
+    max_pages: int,
+    order_id: str | None = None,
+    order_side: str | None = None,
+    name: str | None = None,
+    pair: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXSpotAccountTradesPage]: ...
+def get_deepx_spot_account_trades(
+    subaccount: str,
+    order_id: str | None = None,
+    order_side: str | None = None,
+    name: str | None = None,
+    pair: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXSpotAccountTradesPage: ...
+def get_deepx_spot_history_order_pages(
+    subaccount: str,
+    max_pages: int,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXSpotHistoryOrdersPage]: ...
+def get_deepx_spot_history_orders(
+    subaccount: str,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXSpotHistoryOrdersPage: ...
+def get_deepx_spot_open_order_pages(
+    subaccount: str,
+    max_pages: int,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXSpotOpenOrdersPage]: ...
+def get_deepx_spot_open_orders(
+    subaccount: str,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXSpotOpenOrdersPage: ...
+def get_deepx_spot_order_by_tx(
+    tx_hash: str, config: DeepXDataClientConfig | None = None
+) -> DeepXSpotOrderRecord: ...
+def get_deepx_spot_wallet_order_pages(
+    wallet: str,
+    max_pages: int,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXSpotWalletOrdersPage]: ...
+def get_deepx_spot_wallet_orders(
+    wallet: str,
+    name: str | None = None,
+    pair: str | None = None,
+    order_side: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXSpotWalletOrdersPage: ...
+def get_deepx_spot_wallet_trade_pages(
+    wallet: str,
+    max_pages: int,
+    name: str | None = None,
+    pair: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXSpotWalletTradesPage]: ...
+def get_deepx_spot_wallet_trades(
+    wallet: str,
+    name: str | None = None,
+    pair: str | None = None,
+    cursor: str | None = None,
+    sort: str = "DESC",
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXSpotWalletTradesPage: ...
+def get_deepx_user_stats(
+    wallet: str, config: DeepXDataClientConfig | None = None
+) -> DeepXUserStats: ...
+def get_deepx_wallet_account_snapshot(
+    wallet: str, config: DeepXDataClientConfig | None = None
+) -> DeepXWalletAccountSnapshot: ...
+def get_deepx_wallet_funding_fee_pages(
+    wallet: str,
+    max_pages: int,
+    market_name: str | None = None,
+    market_id: int | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> list[DeepXWalletFundingFeesPage]: ...
+def get_deepx_wallet_funding_fees(
+    wallet: str,
+    market_name: str | None = None,
+    market_id: int | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    cursor: str | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXWalletFundingFeesPage: ...
+def get_deepx_wallet_perp_positions(
+    wallet: str,
+    max_subaccounts: int,
+    max_pages_per_subaccount: int,
+    market_id: int | None = None,
+    only_closed: bool | None = None,
+    page_size: int | None = None,
+    config: DeepXDataClientConfig | None = None,
+) -> DeepXWalletPerpPositions: ...
+def get_deepx_wallet_subaccounts(
+    wallet: str, config: DeepXDataClientConfig | None = None
+) -> DeepXWalletSubaccounts: ...

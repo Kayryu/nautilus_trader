@@ -14,8 +14,6 @@
 
 //! Exact conversion of observed public mark, oracle, and funding frames.
 
-use std::str::FromStr;
-
 use nautilus_common::messages::DataEvent;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -107,13 +105,15 @@ pub(super) fn parse_public_price_event(
 }
 
 fn parse_scalar_decimal(raw: &RawValue) -> anyhow::Result<Decimal> {
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct ExactNumber(#[serde(deserialize_with = "exact_decimal::deserialize")] Decimal);
+
     anyhow::ensure!(
-        !raw.get().starts_with('"') && !raw.get().starts_with(['{', '[']),
+        !raw.get().starts_with('"'),
         "DeepX public price payload is not a scalar JSON number"
     );
-    Decimal::from_str(raw.get())
-        .or_else(|_| Decimal::from_scientific(raw.get()))
-        .map_err(Into::into)
+    Ok(serde_json::from_str::<ExactNumber>(raw.get())?.0)
 }
 
 fn timestamp_ns(timestamp_ms: u64) -> anyhow::Result<UnixNanos> {
@@ -173,6 +173,22 @@ mod tests {
     }
 
     #[rstest]
+    fn parses_exact_scientific_price_frame() {
+        let event = parse_public_price_event(
+            &frame("mark_price", "2.384511399e3", 1_789_546_201_652),
+            DeepXWsPublicChannel::MarkPrice,
+            3,
+            &instrument(),
+            UnixNanos::from(7),
+        )
+        .unwrap();
+        let DataEvent::Data(Data::MarkPrice(update)) = event else {
+            panic!("expected mark price update")
+        };
+        assert_eq!(update.value.as_decimal(), Decimal::new(2_384_511_399, 6));
+    }
+
+    #[rstest]
     fn parses_funding_without_inventing_payment_schedule() {
         let event = parse_public_price_event(
             &frame(
@@ -191,7 +207,7 @@ mod tests {
         };
         assert_eq!(
             update.rate,
-            Decimal::from_str("0.000108085430235316").unwrap()
+            Decimal::from_str_exact("0.000108085430235316").unwrap()
         );
         assert_eq!(update.interval, None);
         assert_eq!(update.next_funding_ns, None);
@@ -200,6 +216,16 @@ mod tests {
 
     #[rstest]
     #[case("precision", "2384.123456789012345678901234", 1_789_546_201_652)]
+    #[case(
+        "rounded-plain",
+        "2384.51000000000000000000000000001",
+        1_789_546_201_652
+    )]
+    #[case(
+        "rounded-scientific",
+        "2.384510000000000000000000000001e3",
+        1_789_546_201_652
+    )]
     #[case("zero", "0", 1_789_546_201_652)]
     #[case("string", r#""2384.51""#, 1_789_546_201_652)]
     #[case("overflow", "2384.51", u64::MAX)]

@@ -221,7 +221,7 @@ mod tests {
         kind: &str,
         previous: Option<u64>,
         id: u64,
-        bids: serde_json::Value,
+        bids: &serde_json::Value,
     ) -> DeepXWsPublicFrame {
         DeepXWsPublicFrame::parse(
             &json!({"type":"data", "channel":"orderbook",
@@ -241,7 +241,7 @@ mod tests {
     fn snapshot_delta_delete_and_replacement() {
         let mut stream = DeepXWsBookStream::new(2, NonZeroUsize::new(4).unwrap());
         stream
-            .ingest(&frame("snapshot", None, u64::MAX - 10, levels()))
+            .ingest(&frame("snapshot", None, u64::MAX - 10, &levels()))
             .unwrap();
         let price = stream
             .snapshot()
@@ -257,13 +257,13 @@ mod tests {
                 "delta",
                 Some(u64::MAX - 10),
                 u64::MAX,
-                json!([
+                &json!([
             {"price":price,"qty":0,"value":0}, {"price":1,"qty":2,"value":2}]),
             ))
             .unwrap();
         assert_eq!(stream.snapshot().unwrap().bids.len(), 1);
         stream
-            .ingest(&frame("snapshot", None, 2, json!([])))
+            .ingest(&frame("snapshot", None, 2, &json!([])))
             .unwrap();
         assert!(stream.snapshot().unwrap().bids.is_empty());
     }
@@ -272,25 +272,25 @@ mod tests {
     fn gaps_invalidate_and_only_snapshot_restores() {
         let mut stream = DeepXWsBookStream::new(2, NonZeroUsize::new(4).unwrap());
         assert!(matches!(
-            stream.ingest(&frame("delta", Some(1), 2, levels())),
+            stream.ingest(&frame("delta", Some(1), 2, &levels())),
             Err(DeepXWsBookError::SequenceGap)
         ));
         stream
-            .ingest(&frame("snapshot", None, 10, levels()))
+            .ingest(&frame("snapshot", None, 10, &levels()))
             .unwrap();
         assert!(
             stream
-                .ingest(&frame("delta", Some(9), 11, levels()))
+                .ingest(&frame("delta", Some(9), 11, &levels()))
                 .is_err()
         );
         assert!(stream.snapshot().is_none());
         assert!(
             stream
-                .ingest(&frame("delta", Some(10), 11, levels()))
+                .ingest(&frame("delta", Some(10), 11, &levels()))
                 .is_err()
         );
         stream
-            .ingest(&frame("snapshot", None, 12, levels()))
+            .ingest(&frame("snapshot", None, 12, &levels()))
             .unwrap();
         assert_eq!(stream.snapshot().unwrap().last_update_id, 12);
     }
@@ -304,25 +304,25 @@ mod tests {
     fn failed_updates_never_expose_partial_or_stale_books(#[case] mutation: &str) {
         let mut stream = DeepXWsBookStream::new(2, NonZeroUsize::new(2).unwrap());
         stream
-            .ingest(&frame("snapshot", None, 1, levels()))
+            .ingest(&frame("snapshot", None, 1, &levels()))
             .unwrap();
         let mut bids = json!([{"price":1,"qty":1,"value":1}]);
         match mutation {
             "duplicate" => {
-                bids = json!([{"price":1,"qty":1,"value":1},{"price":"1.0","qty":2,"value":2}])
+                bids = json!([{"price":1,"qty":1,"value":1},{"price":"1.0","qty":2,"value":2}]);
             }
             "negative" => bids[0]["qty"] = json!(-1),
             "capacity" => {
-                bids = json!([{"price":1,"qty":1,"value":1},{"price":2,"qty":2,"value":4}])
+                bids = json!([{"price":1,"qty":1,"value":1},{"price":2,"qty":2,"value":4}]);
             }
             "decode" => bids[0]["price"] = json!("not a decimal"),
             _ => {}
         }
-        let mut update = frame("delta", Some(1), 2, bids);
-        if mutation == "scope" {
-            if let DeepXWsPublicFrame::Data { market, .. } = &mut update {
-                market.id = 3;
-            }
+        let mut update = frame("delta", Some(1), 2, &bids);
+        if mutation == "scope"
+            && let DeepXWsPublicFrame::Data { market, .. } = &mut update
+        {
+            market.id = 3;
         }
         assert!(stream.ingest(&update).is_err());
         assert!(stream.snapshot().is_none());

@@ -163,6 +163,12 @@ path = "bin/verify_rest_subaccount_directory.rs"
 doc = false
 
 [[bin]]
+name = "deepx-verify-rest-quota-summary"
+path = "bin/verify_rest_quota_summary.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "deepx-verify-rest-quota-history"
 path = "bin/verify_rest_quota_history.rs"
 doc = false
@@ -253,9 +259,21 @@ path = "bin/verify_rest_wallet_orders.rs"
 doc = false
 
 [[bin]]
+name = "deepx-verify-rest-wallet-open-orders"
+path = "bin/verify_rest_wallet_open_orders.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "deepx-verify-rest-lending-markets"
 path = "bin/verify_rest_lending_markets.rs"
 doc = false
+
+[[bin]]
+name = "deepx-verify-rest-open-interest-history"
+path = "bin/verify_rest_open_interest_history.rs"
+doc = false
+test = false
 
 [[bin]]
 name = "deepx-verify-ws-connection"
@@ -278,6 +296,68 @@ path = "bin/verify_ws_account_balances.rs"
 doc = false
 
 [[bin]]
+name = "deepx-verify-ws-account-metrics"
+path = "bin/verify_ws_account_metrics.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-perp-open-orders"
+path = "bin/verify_ws_perp_open_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-perp-trade-history"
+path = "bin/verify_ws_perp_trade_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-perp-order-history"
+path = "bin/verify_ws_perp_order_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-spot-trade-history"
+path = "bin/verify_ws_spot_trade_history.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-spot-order-history"
+path = "bin/verify_ws_spot_order_history.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "deepx-verify-ws-spot-open-orders"
+path = "bin/verify_ws_spot_open_orders.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-perp-open-positions"
+path = "bin/verify_ws_perp_open_positions.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-candles"
+path = "bin/verify_ws_candles.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-lending-rates"
+path = "bin/verify_ws_lending_rates.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-ws-open-interest"
+path = "bin/verify_ws_open_interest.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "deepx-verify-live-trades"
 path = "bin/verify_live_trades.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-finalized-perp-trades"
+path = "bin/verify_finalized_perp_trades.rs"
 doc = false

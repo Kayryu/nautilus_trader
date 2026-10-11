@@ -65,7 +65,26 @@ with 58 total events. Its extrinsic index 8 proves both successful dispatch and 
 placement for order `1789445053841`; the fixture records the finalized block hash, storage keys,
 batch counts, runtime identity, and REST cross-reference.
 
-The historical fixture proves runtime event conformance for one existing public transaction.
+The same complete spec369 event fixture contains four `PerpMarket.NewTrade` events. A strict
+metadata decoder retains each event's block hash, number, global event index, counterparties,
+order IDs, and raw financial integers. Event index 51 belongs to the wallet's market 3 order
+`1789445053841`; its buyer, taker side, direction, price, size, leverage, and fee agree exactly
+with the captured account-trade record after applying the observed market and USDC scales. The
+REST trade ID `185969410000051` agrees with that block and index. A second read-only capture at
+finalized spec371 block `187071212` contains one complete 29-event batch. Two market 3 events
+for the same wallet subaccount match the separate REST partial fills exactly: global indices 14
+and 22 correspond to trade IDs `187071212000014` and `187071212000022`. The historical runtime
+metadata hash matches the approved spec371 fixture, and repeated storage reads returned the same
+batch bytes; an independent `state_queryStorageAt` read agreed at the same block hash. The exact
+matcher now requires the observed `block_number * 1_000_000 + event_index`
+REST ID and one unique event, checking account, order, market, taker, direction, price, size,
+leverage, signed fee, and fee asset in validated market units. It rejects ambiguous duplicates,
+inexact decimal conversion, and conflicting IDs. This is a fail-closed check based on captured
+spec369/spec371 evidence, not a guarantee that the backend cannot change its ID scheme. Neither
+the decoder nor the matcher establishes block canonicality, proves the REST timestamp, or emits
+framework fills. The matching RPC responses are consistency evidence, not a Merkle proof.
+
+The historical fixtures prove runtime event conformance for two existing public blocks.
 Broader malformed, conflicting and boundary coverage still uses synthetic metadata-encoded events
 and mock canonical RPC across both approved runtime versions. This does not prove current
 signer/subaccount authorization, private-event decoding, or framework lifecycle coordination. No
@@ -120,11 +139,16 @@ submission coordinator.
 
 ## Opt-in durable REST submission
 
-`submit_rest_transaction_once(client, prepared)` consumes an acknowledged durable
-`DeepXPreparedSubmission`. Its operation identity selects the documented `marketType` and
+`submit_rest_transaction_once(client, prepared, runtime_permit)` consumes an acknowledged durable
+`DeepXPreparedSubmission` only while its retained runtime permit is active and matches the durable
+runtime identity. A revoked or mismatched permit prevents the HTTP request. The operation identity
+selects the documented `marketType` and
 `action` for perpetual placement, close, TP/SL, cancellation, or Spot placement/cancellation.
 The exact signed SCALE bytes are sent to `/internal/v1/chain/tx/transact` once, using the
 primary endpoint and a redirect-rejecting transport, without read retry or endpoint failover.
+The OpenAPI action set does not include atomic perpetual modification, so the REST boundary
+returns `NotSent` for `PerpModify` before sending a request. Tracked modification uses the direct
+RPC submission path.
 
 Successful acknowledgement requires `data.tx_hash` to equal the recorded and recomputed
 Blake2-256 extrinsic hash. Backend action data is retained separately; it is not verified
@@ -179,6 +203,18 @@ as strings. Their
 bounded typed collectors reject duplicate record identities across page boundaries as well as
 ownership, market, filter, financial-value, timestamp, and page-size mismatches without returning
 partial results. Raw readers remain available when unknown fields must be retained.
+Perpetual account-trade pages also preserve the requested timestamp order across page boundaries.
+A read-only `sort=ASC` query on 2026-10-09 for the contributor wallet's market 3 subaccount
+returned ten trades in nondecreasing `createdAt` order. The captured trade fixture is descending;
+report test servers reverse that fixture when serving the ascending report request.
+The documented incremental-only `user_perp_order_history` WebSocket channel acknowledged separate
+market-3 subscriptions for all four subaccounts of wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` on 2026-10-10. The read-only observer binds
+each acknowledgement to its exact market and subaccount. No order update arrived during the bounded
+probe, so no data-frame schema, history completeness, or framework event conversion is inferred.
+The corresponding `user_spot_order_history` channel acknowledged all four wallet subaccounts for
+`ETH/USDC` on 2026-10-10. Its observer also binds the response to the selected REST pair ID.
+The Spot channel is incremental-only; no data frame or complete history was observed.
 `get_perp_history_order_pages_raw`, `get_perp_account_trade_pages_raw`,
 `get_perp_funding_fee_pages_raw`, and `get_perp_position_pages_raw` follow cursors only within an
 explicit nonzero page budget and preserve page boundaries. Empty continuation pages, repeated
@@ -197,6 +233,10 @@ global opaque cursor and reuse the exact typed funding-fee record boundary. Retu
 valid AccountId20 values, but the reader does not independently join them to the mutable wallet
 directory. A live wallet read on 2026-09-16 validated 41 records across markets 3 and 4 in one page.
 This does not establish history completeness or cursor stability.
+Python exposes `get_deepx_wallet_funding_fees` and the bounded
+`get_deepx_wallet_funding_fee_pages` collector using the same typed validation. Position size,
+fee, and fee rate remain exact decimal strings. The wallet response is mutable and does not
+independently prove ownership or authorize account events.
 The wallet-wide trade response groups records by subaccount and can return different nested cursors
 while accepting only one request cursor. Without a documented traversal rule,
 `get_perp_wallet_trades(request)` exposes one validated grouped trade snapshot and preserves each
@@ -206,12 +246,29 @@ ordering, page sizes, cursor metadata, and duplicate trade IDs. It allows zero s
 captured response contains one such historical record; this raw observation is not a framework
 fill report. The response does not echo the requested wallet and is not joined to the separately
 mutable subaccount directory, so it does not independently establish ownership.
+Python exposes `get_deepx_perp_wallet_trades` for one validated grouped response and
+`get_deepx_perp_wallet_trade_pages` for bounded pagination of one selected market/subaccount
+group. Trade prices, sizes, leverage, and fees are returned as exact decimal strings. These
+read-only REST results can change between requests, do not prove wallet ownership, and are not
+framework fill reports.
 
 A read-only run on 2026-09-17 queried the contributor wallet and validated two markets, five
 market/subaccount groups, and 22 records. Three groups advertised continuation through three
 distinct cursors, directly confirming why no aggregate page collector is exposed. Run
 `deepx-verify-rest-wallet-trades <wallet-account-id20> [market-id]` for the same credential-free
-single-snapshot check. It sends no credentials, follow-up pagination, or transactions.
+single-snapshot check. `get_perp_wallet_trade_pages_for_subaccount` follows the cursor of one
+explicit market/subaccount group within a page budget. It rejects missing groups, duplicate trade
+IDs, reversed time order, repeated cursors, and exhausted budgets without returning partial pages.
+The verifier accepts an optional `<subaccount> <max-pages>` pair after the market ID to exercise
+that read-only traversal. Neither method proves wallet ownership or a stable historical snapshot.
+On 2026-10-09, market 3 for wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50` exposed one
+continuation group. Its subaccount `0x977654069311fa41b88f7901dc65fae9a76fd60b` reached a
+terminal page after eight requests with 100 records per page, yielding 727 distinct records in
+requested time order. This is a mutable read, not a block-pinned completeness proof.
+A later read-only market-3 query returned three subaccount groups and 12 first-page trades, with
+one continuation group. Subaccount `0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` returned a
+terminal page containing five trades when queried with a page size of 100. These observations do
+not establish a stable wallet-wide trade snapshot.
 
 A read-only query on 2026-09-24 repeated the wallet trade observation and counted four distinct
 subaccounts across five market/subaccount groups, two markets, and 22 records. Three groups still
@@ -231,6 +288,16 @@ The response does not echo the wallet and is not joined to the mutable directory
 independently prove ownership or become a framework mass-status/external-order response. Run
 `deepx-verify-rest-wallet-orders <wallet-account-id20> [market-id]` for bounded credential-free
 validation.
+`deepx-verify-rest-wallet-open-orders <wallet-account-id20> <market-id>` first resolves the
+current subaccount directory, then validates bounded perpetual open-order pages for every listed
+subaccount. It reports per-subaccount counts only after every query succeeds. These sequential
+REST reads include a final directory membership recheck but are not an atomic wallet snapshot or
+finalized order evidence.
+The typed open-order reader accepts only `Open` with no fill or `PartiallyFilled` with exact
+filled-plus-remaining quantity and a positive average fill price. Terminal, unknown, and
+inconsistent states fail closed before a page is returned.
+A read-only market-3 query on 2026-10-11 returned zero open orders across the four subaccounts of
+wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50`; this does not prove a finalized absence.
 `get_perp_order_by_id` decodes and validates one exact decimal order identity, owner, market,
 financial fields, and timestamps. The optional `avgFillPrice` and `updatedTime` fields follow the
 nullable/omitted OpenAPI cancellation example. Run
@@ -271,11 +338,23 @@ time-in-force only from immutable local context because REST omits it. System-ge
 orders, `Adaptive` post-only values, quote-denominated quantities, external or unbound orders,
 missing Perpetual `updatedTime`, and incomplete average-fill evidence fail closed. Spot reports
 reconstruct filled base quantity from bounded order-specific trade history; canceled Spot orders
-require the timestamp read from their exact finalized cancellation block. The single-order framework
+require the timestamp read from their exact finalized cancellation block. An `IocUnfilled`
+cancellation reason must agree with the tracked IOC time-in-force. The single-order framework
 report method resolves only a locally bound client or venue order ID, validates any supplied
 identity against immutable local context, resolves the market only from the failure-atomic startup
 catalog snapshot, and performs the bounded configuration-owned REST read. Startup retains matching
 Spot pair and instrument indexes alongside the perpetual market indexes and clears them on reset.
+
+A read-only sample of 600 public ETH/USDC Spot history records on 2026-10-09 contained seven
+`Filled` Limit orders whose `quoteAmount` differed from `baseAmount` times the limit `price`.
+The report therefore checks the original quote notional for zero-fill orders; nonzero fills
+require exact base-quantity reconstruction from order-specific trade records. One improved-price
+Buy order had limit price `2450.46` and submitted base quantity `0.2976`, but its single trade at
+`2450.44` and Filled record both reported base quantity `0.297602428951535`. For this Filled Buy
+case, the report preserves the executed base precision and accepts an overfill only when the
+reported quote remains within the submitted quote budget and exactly matches the trade quote sum.
+Every reconstructed trade must also respect the tracked Buy or Sell limit price.
+These observations do not establish a complete quote-amount lifecycle rule or Spot IOC behavior.
 
 `generate_order_status_reports` provides strict bounded reconciliation for locally tracked Spot and
 perpetual orders. It reads active pages for each selected startup market and, when `open_only` is
@@ -314,12 +393,13 @@ All three sources must succeed or no mass status is returned. Successful results
 `reports_complete=false`: the independently paginated mutable REST reads do not form an atomic
 account snapshot, and position-product completeness remains unproven. This deliberately selects
 the framework's conservative incomplete-report reconciliation behavior. Perpetual Limit GTC/IOC
-and Spot base-quantity Limit GTC initial submissions use durable DirectPallet paths that record
+and Spot base-quantity Limit GTC/IOC initial submissions use durable DirectPallet paths that record
 `OrderSubmitted` before sending; terminal events require finalized reconciliation. Tracked
-Perpetual and Spot Limit GTC cancellation also use durable DirectPallet paths. Order lists,
-modifications, and private execution streaming remain disabled. Spot submission and cancellation
-have not been validated with live testnet transactions. Execution connection startup is available
-only for the strict finalized flat-account subset described below.
+Perpetual and Spot Limit GTC cancellation also use durable DirectPallet paths. Independent order
+lists of at most 20 members use non-atomic durable single-order placement; contingent and linked
+lists remain disabled. Modifications and private execution streaming remain disabled. Spot
+submission and cancellation have not been validated with live testnet transactions. Execution
+connection startup is available only for the strict finalized flat-account subset described below.
 The pinned Python SDK contributes signing construction but no account-history mapping evidence. The
 chain source confirms the underlying order status, taker, fill-direction, and active-position
 storage types, but not REST lifecycle IDs, fee-asset presentation, or historical snapshot rules.
@@ -329,10 +409,11 @@ storage types, but not REST lifecycle IDs, fee-asset presentation, or historical
 The Rust `DeepXDataClient` now supports read-only testnet REST connection and perpetual
 instrument discovery. `connect` requires an initialized live framework data receiver, loads
 both public market lists using the configured retry/failover transport, validates the complete
-perpetual instrument set before emitting it, and enables connection-snapshot instrument queries.
-`request_instrument` and `request_instruments` preserve request correlation, canonical client
-and venue routing, parameters when empty, and the injected framework clock's response timestamp.
-Time-bounded history, nonempty filters, foreign identities, unknown instruments, and Spot
+perpetual instrument set before emitting it. `request_instrument` and `request_instruments`
+independently refresh and validate the complete catalog before returning a correlated response.
+They preserve canonical client and venue routing, empty parameters, and the injected framework
+clock's response timestamp. Failed refreshes emit no partial response or change to the connected
+store. Time-bounded history, nonempty filters, foreign identities, unknown instruments, and Spot
 instrument construction fail explicitly rather than returning misleading successful results.
 
 Disconnect, stop, reset, and dispose clear readiness and instrument state. Repeated connection
@@ -356,9 +437,11 @@ Requests must use a standard, externally aggregated, last-price `BarType` whose 
 preserves correlation, client identity, the requested bar type, optional bounds, and parameters in
 an ascending `DataResponse::Bars`. The optional limit may not exceed the venue maximum of 5000.
 
-Each response must carry the instrument's raw venue pair and timestamps inside the inclusive
-millisecond REST bounds. OHLC prices and base volume are converted only when exactly representable
-at the instrument's declared price and size precision; nonpositive prices, precision loss, invalid
+Each response must carry the instrument's raw venue pair and timestamps inside the requested
+framework bounds. Live Spot and perpetual REST candle queries showed that `end` is exclusive; the
+client adds one millisecond to the inclusive framework upper bound before requesting either market.
+OHLC prices and base volume are converted only when exactly representable at the instrument's
+declared price and size precision; nonpositive prices, precision loss, invalid
 OHLC, negative volume, foreign identity, or an unrepresentable timestamp reject the whole response.
 The venue's `time` is preserved directly as `ts_event`. The OpenAPI does not define whether it is a
 bucket-open or bucket-close timestamp, so the adapter does not shift it or infer completion. Exact
@@ -371,7 +454,36 @@ collected in ascending time pages, starting each continuation one millisecond af
 page's final candle. An explicit request limit caps the total response; otherwise collection stops
 at 100 pages of 5000 rows and returns an error without partial data if another page is required.
 Market identity changes, non-advancing timestamps, transport, bounds, or conversion failures also
-emit no partial response. Streaming bar subscriptions remain unsupported.
+emit no partial response. The public WebSocket documents a perpetual `candles` channel; observed
+one-minute frames repeatedly revised the current bucket and the next observed bucket skipped one
+minute. Shared decimal decoding accepts scientific JSON numbers only when they are exactly
+representable; excess precision rejects the observation. A raw protocol state machine binds
+market, channel, interval, and pair, returns a bucket only after a later bucket arrives, and
+reports skipped minutes. The read-only
+`observe_first_superseded_perp_candle` API returns one observation and closes its connection.
+On 2026-10-08, a live market 3 `ETH-USDC` observation returned bucket `1791478800000`, volume
+`56.768`, and `gap_after=false`.
+A later same-bucket comparison returned WebSocket volume `65.511` and REST volume `52.995`, with
+different close and high values. A repeat REST read returned volume `65.511` and the same close as
+WebSocket, but REST high remained `2418.1899999999996` against WebSocket `2418.19`. A successor
+bucket therefore does not establish final OHLCV, and REST history may lag and carry decimal
+artifacts that fail exact instrument-precision conversion.
+On 2026-10-09, the first REST read of bucket `1791492060000` reported volume `38.654` while the
+superseded WebSocket update reported `65.426`; a later REST read matched the WebSocket OHLCV
+exactly. `deepx-verify-ws-candles` now allows up to 90 seconds for the exact bucket to converge,
+but does not treat convergence as a finality guarantee. A repeat observation of bucket
+`1791492300000` matched on the 33rd REST read without a skipped minute.
+Framework streaming bars support only externally aggregated, last-price, one-minute perpetual
+candles. A bar is emitted when a newer bucket supersedes it, with the venue bucket timestamp as
+`ts_event`. This is an observed update, not a finality guarantee: the venue may revise a bucket
+after its successor appears. The subscription stops on malformed data, a skipped bucket, a
+disconnect, or 180 seconds without another completed bucket. It does not reconnect or backfill, so
+clients must explicitly resubscribe and reconcile any missing interval before relying on a
+continuous series. Spot and other intervals remain unsupported.
+On 2026-10-11, `deepx-verify-live-trades --bars` published one market-3 framework bar for bucket
+`1791670680000` with open `2506.14`, high `2506.22`, low `2505.67`, close `2506.22`, and volume
+`26.008`, then retired the subscription. This confirms one observed delivery and shutdown, not
+historical continuity or finality.
 Observed testnet JSON can contain binary-float artifacts such as `2481.3799999999997` for a market
 with a `0.01` tick; those rows fail exact framework conversion rather than being rounded.
 
@@ -506,10 +618,13 @@ spec371/tx1, and metadata SHA-256
 fixture binds that runtime metadata to its finalized block identity. The pinned Python SDK
 verifier now accepts spec371 and reproduces complete bytes for System remark, Subaccount
 no-op, perpetual Limit GTC, Limit IOC, Market IOC, and ordinary Perp cancellation. It also
-reproduces the sell-side reduce-only `MustPostOnly` placement. The spec371 run now covers thirteen
-call/argument vectors, including Spot placement/cancellation, Perp close and PnL point management,
-Subaccount deletion, and delegate removal. This does not authorize submission or prove every
+reproduces the sell-side reduce-only `MustPostOnly` placement. The spec371 run additionally covers
+Spot placement/cancellation, Perp close and PnL point management, and Subaccount deletion. Delegate
+setup, mode change, and removal vectors match under spec366, spec369, and spec371. This does not
+authorize submission or prove every
 operation, account authorization, financial-unit conversion, or live execution readiness.
+An October 8, 2026 read-only RPC check still reported spec371/tx1 and the same metadata SHA-256;
+the captured runtime still provides no `Subaccount.PerpOrderModified` sizing event.
 
 ## Perpetual placement checkpoint and SDK parity
 
@@ -526,16 +641,25 @@ with a required `signedExtrinsic` hex property. Account report responses still r
 generic `SingleResult` rather than complete typed financial/status contracts. This inspection
 does not supply private-stream captures, account initialization, or finality evidence.
 
-The SDK signing source at GitHub blob `cc85676dee70db35bbd996b560938597c3715558`
-provides `build_signed_pallet_call_extrinsic` using an ECDSA keypair and
-`substrate.create_signed_extrinsic`. `bin/verify_sdk_signing.py` executes those exact reviewed
-builder/key-constructor functions with an offline fixture transport. For each captured spec366,
+The SDK signing source at GitHub blob `0108f89d79366f13e747ef59c75ce73a543dc404`
+provides `build_signed_pallet_call_extrinsic` using an ECDSA keypair and the separately pinned
+`_runtime_compat.py` blob `06b2e9fc84cc36c647452027b9c5b2cbbfcafb8c`.
+`bin/verify_sdk_signing.py` executes the reviewed builder, key constructor, and compatibility
+helper with an offline fixture transport. The approved snapshots use `CheckMortality`, for which
+the helper delegates to `substrate.create_signed_extrinsic`; its separate `CheckNonceEra` path is
+not validated or enabled by these vectors. For each captured spec366,
 spec369, and spec371 runtime, it proves complete-byte parity for System remark, Subaccount no-op,
-perpetual Limit GTC/IOC, Market IOC, ordinary Perp cancellation, and sell-side reduce-only
-`MustPostOnly` for spec366, spec369, and spec371. Under spec371, it also checks Spot placement,
-Perp close, Spot cancellation, Perp profit/loss point management, Subaccount deletion, and delegate
-removal. The Limit GTC vector uses maximum u128 size/price/take-profit and an absent stop-loss. Rust
-signing tests assert the same SDK-produced vectors. Parity for other calls, parameter combinations,
+delegate setup, both writable delegate modes, delegate removal, perpetual Limit GTC/IOC,
+Market IOC, ordinary Perp cancellation, Perp close with absent or 50 raw slippage, Perp profit/loss
+point management, and sell-side reduce-only
+`MustPostOnly` for spec366, spec369, and spec371. Spot Buy Limit IOC is checked under spec369 and
+spec371, as is Spot Buy `Market(None)`. Under spec371, it also checks Spot Limit GTC, Sell IOC,
+and Sell `Market(Some(50))` placement, Spot
+cancellation, and Subaccount
+deletion. These offline bytes do not establish live Spot IOC behavior. The
+Limit GTC vector uses maximum u128 size/price/take-profit and an absent stop-loss. Rust
+signing tests assert the same SDK-produced vectors, including spec369 `modify_orders`. Parity for
+other calls, parameter combinations,
 or unlisted runtimes remains unproven.
 
 Native Rust signing continues to use the DeepX subxt fork pinned at
@@ -616,6 +740,19 @@ no submission or live execution authority and proves neither independent SDK par
 authorization. Fast Spot cancel inclusion and recovery remain blocked by missing approved spec366
 event proof; local spec369 behavior is not equivalent to the captured approved spec366 tx1 runtime.
 
+## Offline subaccount initialization signing
+
+`signing::sign_initialize_subaccount(permit, key, params, nonce)` accepts opaque name bytes in
+`DeepXInitializeSubaccountParams`. Captured spec366/tx1 metadata declares
+`Subaccount.initialize_subaccount` at pallet 19, call 0 with one `name` field. The read-only chain
+source bounds that field to 32 bytes; the typed signer rejects longer names before encoding. Tests
+cover empty, 32-byte, and ordinary names, exact SCALE call bytes, and a complete spec371/tx1 signed
+extrinsic independently matched to the pinned Python SDK.
+
+The resulting subaccount address depends on chain state and block number. This offline API neither
+predicts that address nor checks name uniqueness, owner eligibility, quota, dispatch, or finality.
+It reserves no nonce and sends no transaction; live subaccount creation remains disabled.
+
 ## Offline subaccount deletion signing
 
 `signing::sign_delete_subaccount(permit, key, params, nonce)` accepts
@@ -637,6 +774,111 @@ or business success is inferred. Maintainer approval is confirmed; independent S
 parity, authorization, business-event/finality evidence, and live conformance remain
 gates. Local spec369 sources are not authoritative for this captured spec366 schema.
 
+## Offline subaccount renaming signing
+
+`signing::sign_rename_subaccount(permit, key, params, nonce)` encodes the owner-signed
+`Subaccount.rename_subaccount` call under an approved runtime permit. The local node source and
+approved metadata for specs 366, 369, and 371 agree on pallet 19, call 7, followed by a 20-byte
+subaccount and a bounded name of at most 32 bytes. The signer rejects longer names before
+encoding. Complete extrinsics for specs 366, 369, and 371 match the pinned Python SDK builder
+byte-for-byte.
+
+This offline signer does not check ownership, name uniqueness, dispatch, or finality. It reserves
+no nonce and sends no transaction; operational subaccount management remains disabled.
+
+## Offline Spot margin setting signing
+
+`signing::sign_set_spot_margin(permit, key, params, nonce)` signs the owner-scoped
+`Subaccount.set_spot_margin` call with an exact subaccount AccountId20 and a Boolean setting.
+Approved metadata for specs 366, 369, and 371 declares pallet 19, call 6, with `H160` and `bool`
+arguments. Complete signed extrinsics for enabling the setting match the pinned Python SDK under
+all three runtime snapshots; local tests also check exact SCALE bytes for both Boolean values.
+
+The inspected chain call verifies ownership and rejects a change while the subaccount has open Spot
+orders. It changes `SubaccountInfo` without emitting a dedicated business event. Dispatch success
+alone therefore does not prove the resulting flag; an operational workflow still needs a finalized
+state read at the same canonical block and a durable transaction lifecycle. A read-only REST query
+on 2026-10-10 returned `spotMarginTradingEnabled: false` for all four subaccounts of wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50`. Those mutable, non-block-pinned profiles do
+not establish signing authorization or current chain state. This signer reserves no nonce and
+submits no transaction; operational Spot margin changes remain disabled.
+
+`rpc::observe_finalized_spot_margin_evidence` now reads `Subaccount.SubaccountInfo` at an approved
+finalized runtime checkpoint. It requires a caller-supplied expected wallet authority, decodes the
+complete SCALE value against that checkpoint's approved metadata, checks both account identities,
+compares `state_queryStorageAt` with `state_getStorage` at the same block hash, and rechecks the
+canonical hash for the checkpoint height. The approved spec366, 369, and 371 metadata fixtures
+declare the identity-keyed map. A read-only spec371 capture at finalized block `217394490` for
+subaccount `0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` decoded the flag as `false`;
+both storage methods returned identical bytes, and a later height lookup returned the same hash.
+These matching RPC responses are consistency evidence, not a cryptographic storage proof. The
+public observer retains the existing historical `Core_version` guard; the current endpoint reports
+spec371 at the captured spec369 checkpoint, so it fails closed before live state collection. No
+Spot-margin mutation or transaction-result confirmation is enabled.
+
+## Offline wallet delegate setup signing
+
+`signing::sign_set_delegate_account(permit, key, params, nonce)` accepts
+`DeepXSetDelegateAccountParams` with an exact 20-byte `delegate`, opaque `name` bytes, and a raw
+Unix millisecond `valid_until`. The captured spec366/tx1 metadata declares
+`Subaccount.set_delegate_account` at pallet 19, call 2 with `H160`, `Vec<u8>`, and `u64` fields in
+that order. Subxt encodes these fields against the permitted immutable runtime snapshot. Tests
+cover exact SCALE call bytes across empty and compact-length-boundary labels and one complete
+signed extrinsic independently matched to the pinned Python SDK under each approved runtime.
+
+This API does not check delegate ownership, expiry against chain time, naming policy, quota, or
+authorization. It performs no network request, nonce reservation, persistence, submission, or live
+management activation. Runtime dispatch, business-event, finality, and authorization evidence
+remain required before an operational delegate command can be enabled.
+
+## Offline wallet delegate mode signing
+
+`signing::sign_update_delegate_mode(permit, key, params, nonce)` accepts an exact 20-byte delegate
+address and either `PlaceOrCancelOrder` or `Disable`. Captured spec366/tx1 metadata declares
+`Subaccount.update_delegate_mode` at pallet 19, call 4 with `address: H160` and
+`new_mode: DelegateMode`. The read-only chain source rejects the enum's `DepositOrWithdraw` and
+`UpdateSubaccount` variants during dispatch, so the typed signing API cannot select them. Tests
+cover both SCALE variant indices and complete signed bytes for both writable modes under each
+approved runtime, independently matched to the pinned Python SDK.
+
+A read-only 2026-10-09 query for wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50`
+returned one active delegate in `PlaceOrCancelOrder` mode. That mutable REST observation does not
+prove authorization, expiry at execution time, or a successful mode change. This offline signer
+does not reserve a nonce or submit a transaction; operational delegate management remains disabled.
+
+`transaction::decode_finalized_delegate_mode_changes` decodes complete `System.Events` bytes with
+approved metadata, preserving the supplied block hash and number, global event index, extrinsic
+index, owner, delegate, and all four runtime mode variants. It rejects truncated or trailing bytes,
+invalid fields, and a mode update outside an extrinsic phase. Metadata-encoded tests cover all four
+runtime modes and malformed event storage. The caller must separately prove the block is canonical
+and finalized and bind the extrinsic to its signed call; no live mode-change event has been verified
+for this wallet.
+
+`transaction::verify_finalized_delegate_mode_change_events` binds exactly one matching mode
+change and one successful dispatch to a finalized transaction location from the Watch observer.
+It rejects missing, duplicate, failed, or conflicting same-index evidence. The caller must supply
+complete event storage read at that location's block hash and independently verify that the located
+signed extrinsic encodes the expected wallet call. This event check alone does not activate delegate
+management.
+
+`transaction::observe_finalized_delegate_mode_change_at` reads a previously located extrinsic from
+the Watch endpoint, rechecks its finalized canonical membership, selects fixture-approved historical
+metadata, reads complete event storage twice at that block hash, and verifies the expected event and
+dispatch before checking membership again. Local RPC tests reject non-finality, historical runtime
+inconsistency, changed storage or canonical hash, unapproved metadata, and malformed storage.
+The endpoint observations do not replace a cryptographic storage proof, and the caller still must
+bind the target signed extrinsic to the intended wallet call. No live mode change for the specified
+wallet has been verified.
+
+`transaction::observe_signed_delegate_mode_change_at` binds an owned offline-signed call to the
+chain observation without submitting it. Its `DeepXSignedDelegateModeQuery` carries the delegate,
+mode, nonce, and requested height. The observer regenerates exact signed bytes from the retained
+runtime permit and key, locates that hash in the requested finalized block, requires the historical
+runtime to match the signing permit, and verifies the same-index event and dispatch. A height above
+the finalized head returns a pending checkpoint. Local RPC tests cover
+exact membership, a changed nonce, pending finality, and signing-runtime mismatch. Historical
+success does not establish current delegate permissions or enable management submission.
+
 ## Offline wallet delegate removal signing
 
 `signing::sign_remove_delegate_account(permit, key, params, nonce)` accepts
@@ -654,9 +896,37 @@ permits remain bound to their approved snapshot during quiescence.
 
 This API performs no network access, nonce allocation, persistence, submission, or live
 activation. It infers no ownership, authorization, revocation timing, quota, or financial
-semantics. Maintainer approval is confirmed; independent SDK parity, authorization,
-business-event/finality evidence, and live conformance remain gates. Local spec369
-sources are not substituted for the captured fixture.
+semantics. A complete signed removal vector matches the pinned Python SDK under each approved
+spec366, spec369, and spec371 snapshot; other argument combinations remain unproven. Maintainer
+approval is confirmed; authorization, business-event/finality evidence, and live conformance
+remain gates. Local spec369 sources are not substituted for the captured fixture.
+
+`transaction::decode_finalized_delegate_account_changes` decodes complete `System.Events` under
+approved metadata for `DelegateAccountSet` and `DelegateAccountRemoved`. It preserves block identity,
+global event and extrinsic indices, owner, delegate, and operation kind. The runtime setup event does
+not reveal the label, expiry, or whether an existing delegate was renewed.
+
+`transaction::verify_finalized_delegate_account_change_events` additionally requires one matching
+same-index event and one successful dispatch at a supplied finalized transaction location. Local
+metadata-encoded tests cover both variants under approved spec-366, 369, and 371 snapshots and
+reject incomplete, duplicate, wrong-phase, failed, and conflicting evidence. The caller must
+independently source complete event storage at that block hash and bind the located signed call
+before treating the result as a wallet action.
+
+`transaction::observe_finalized_delegate_account_change_at` sources those events from the Watch
+endpoint at a finalized canonical location. It verifies fixture-approved historical metadata,
+reads complete event storage twice at the block hash, checks the expected account event and
+successful dispatch, and rechecks exact extrinsic membership. Local RPC tests cover both setup and
+removal, changed storage, and a conflicting operation. This observation still does not bind the
+signed setup label or expiry and does not establish current delegate permissions.
+
+`transaction::observe_signed_delegate_account_change_at` binds an owned setup or removal call to
+that chain observation without submitting it. It regenerates the exact signed bytes from the
+retained runtime permit, key, typed operation, and nonce; locates the hash at the requested finalized
+height; requires the historical runtime to match the signing permit; and verifies the matching
+same-index event and dispatch. Setup label and expiry remain bound through the signed call even
+though the event omits them. Local RPC tests cover both operations, pending finality, changed nonce,
+label, and expiry. Historical success does not prove present delegate permissions.
 
 ## Offline perpetual profit and loss point signing
 
@@ -670,10 +940,10 @@ this is the simple management-call fallback, not an order modification API.
 
 Encoding is metadata-driven under an explicit snapshot permit. Focused tests cover exact
 SCALE bytes, zero and maximum integers, malformed arguments, each field and nonce changing
-signed identity, deterministic signing, and runtime-change permit gating. A complete signed
-spec371 vector matches the pinned Python SDK; this does not establish parity for spec366/369 or
-other argument combinations. Local spec369 sources corroborate the signature but do not prove
-spec366 semantics.
+signed identity, deterministic signing, and runtime-change permit gating. Complete signed vectors
+for the same raw point values match the pinned Python SDK under spec366, spec369, and spec371.
+Other argument combinations remain unproven. The captured metadata and offline SDK vectors prove
+encoding under those versions, not live financial or trigger semantics.
 
 No financial units, zero-value meaning, trigger behavior, or ownership authorization are
 inferred. This API performs no network access, nonce allocation, persistence, submission,
@@ -688,8 +958,8 @@ The approved spec366/tx1 metadata declares `PerpMarket.close_position` at call i
 with those four direct arguments, in that order. The signer uses dynamic metadata encoding
 and requires a snapshot-service permit. Tests check exact SCALE fields, integer boundaries,
 optional slippage, malformed bindings, signed identity sensitivity, and runtime-change gating.
-One complete signed vector matches the pinned Python SDK under spec371; parity for spec366/369
-or other argument combinations remains unproven.
+Complete signed vectors match the pinned Python SDK under spec366, spec369, and spec371 for
+absent slippage and `Some(50)` raw slippage. Other argument combinations remain unproven.
 
 The proof source is the existing runtime fixture under
 `crates/adapters/deepx/test_data/runtime/testnet/` with metadata SHA-256
@@ -747,6 +1017,9 @@ cancellation conformance remain unresolved.
 
 The Rust HTTP client provides typed `get_delegate_accounts(wallet)` and
 `get_delegator_accounts(delegate)` readers for both directions of the public delegate directory.
+Python `get_deepx_delegate_accounts(wallet, config=None)` and
+`get_deepx_delegator_accounts(delegate, config=None)` expose the same validated directories as
+read-only, blocking one-shot calls. Async Python callers can use `asyncio.to_thread`.
 Both require a `0x`-prefixed 20-byte address and send only the documented `address` query parameter
 through the shared transport, retry, failover, and venue-envelope checks. Returned addresses are
 validated and case-insensitive duplicates fail closed. The original `get_delegate_accounts_raw`
@@ -759,6 +1032,10 @@ zero expiry only for legacy records, and defines the four delegate modes. Typed 
 unknown modes and nonzero expiry timestamps that do not follow creation. The contributor wallet's
 `One-Click Trading` delegate was active in `PlaceOrCancelOrder` mode, and its reverse directory
 contained the same wallet.
+
+A repeat read-only query on 2026-10-09 found the same active delegate at
+`0x1b856b9bf1d0ceeb0927a081c759813cd703a54f` in `PlaceOrCancelOrder` mode. The reverse
+directory again contained wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50`.
 
 These REST reads are mutable and not block-pinned. The backend-reported `active` flag is retained
 as an observation rather than recomputed or treated as permission. Neither direction proves chain
@@ -777,17 +1054,32 @@ mismatches, duplicate or empty asset symbols, unsupported asset precision, negat
 amounts, token quantities whose significant scale exceeds each asset's declared decimals, and
 negative deposit or borrow totals. Equity and unrealized PnL remain signed.
 
-`get_subaccount_margin_ratio(address)` decodes `collateral`, `marginRequired`, and nullable
-`marginRatio` directly into exact decimals and rejects negative values. The refreshed internal
-OpenAPI inspected on 2026-09-16 was byte-identical to the prior captured document and describes
-the endpoint only as an account margin ratio. It does not identify whether `marginRequired` uses
-initial or maintenance weighting. The typed reader therefore does not construct a Nautilus
-`MarginBalance`, infer free collateral, or claim account initialization semantics.
+`get_subaccount_margin_ratio(address)` retains the legacy `collateral`, `marginRequired`, and
+nullable `marginRatio` fields as rounded displays. The 2026-10-11 internal OpenAPI and a read-only
+testnet response now include `exactMargin.totalCollateral`, `maintMarginReq`, and nullable `uniMMR`
+as decimal strings. The reader requires these exact fields, rejects negative values, requires
+`uniMMR` to be null exactly when maintenance margin is zero, and checks non-null ratios against
+collateral divided by maintenance margin truncated to eight places. For the contributor's market-3
+subaccount, the exact collateral is `970.964181` USDC while the legacy display is `970.96`.
+Historical responses without `exactMargin` remain parseable as fixtures but are rejected by the
+live reader. Exact maintenance margin still does not establish initial margin, free collateral,
+or a block-pinned account state, so this reader does not construct a Nautilus `MarginBalance`.
 
-`get_wallet_account_snapshot(address)` composes the directory, authority-bound profile, exact
-balances, equity, and margin-ratio reads for every returned subaccount. It preserves directory
-order and returns no partial collection on failure. Because REST responses are not block-pinned,
-this API does not claim cross-request venue snapshot atomicity.
+`get_wallet_account_snapshot(address)` composes the directory, user stats, authority-bound profile,
+exact balances, equity, and margin-ratio reads for every returned subaccount. It requires the
+statistics subaccount set to match the directory, rechecks directory membership after the account
+reads, preserves directory order, and returns no partial collection on failure. Because REST
+responses are not block-pinned, this API does not claim
+cross-request venue snapshot atomicity.
+
+Python `get_deepx_wallet_subaccounts(wallet, config=None)` exposes the validated directory alone.
+`get_deepx_wallet_account_snapshot(wallet, config=None)` exposes the complete failure-atomic Rust
+composition as a blocking one-shot read. The margin-ratio object exposes the exact collateral,
+maintenance requirement, and `uniMMR` separately from legacy rounded displays. Its other
+financial fields are decimal strings, and
+uninterpreted Spot-position items remain raw JSON strings. Async Python callers can use
+`asyncio.to_thread`. Neither function establishes current chain ownership or a synchronized
+account balance across its separate REST requests.
 
 `get_balance_changes(request)` decodes one page of signed exact balance deltas for exactly one
 wallet or subaccount. `get_balance_change_pages(request, max_pages)` follows cursors within an
@@ -797,10 +1089,28 @@ positions owned by multiple subaccounts. Cross-chain extensions remain raw JSON.
 non-block-pinned REST observations do not prove complete account history, free/locked semantics,
 or current balance state and are not converted into Nautilus account state.
 
+Python `get_deepx_balance_changes(wallet=..., ...)` or
+`get_deepx_balance_changes(subaccount=..., ...)` returns one validated page with its opaque cursor.
+It accepts timestamp, change-type, cursor, and page-size filters and requires exactly one account
+scope. Signed changes are exposed as exact decimal strings; optional position identity and raw
+cross-chain JSON remain separate. The call is blocking; async Python callers can use
+`asyncio.to_thread`. It does not infer a current balance from historical deltas.
+
+Python `get_deepx_balance_change_pages(*, max_pages, wallet=None, subaccount=None, ...)` returns
+all validated pages within an explicit positive budget, preserving page boundaries and exact
+signed decimal strings. Duplicate record IDs, invalid cursors, and budget exhaustion reject the
+whole collection; each page is validated before the next cursor is requested. It remains mutable
+REST history rather than a finalized or synchronized account balance.
+
 A read-only Rust verification on 2026-09-16 queried the contributor-provided wallet and validated
 18 `USDC` records across one page, including funding-fee, settlement, liquidation-fee, and
 withdrawal changes. Position-linked records spanned three subaccounts. No credentials or
 transactions were sent.
+
+On 2026-10-11, the bounded Python reader queried the same wallet and validated one terminal page
+with 18 records: ten funding fees, six settlements, one liquidation fee, and one withdrawal.
+Position-linked records named all four current subaccounts. The mutable REST history was not
+reconciled with finalized events; no credentials or transactions were used.
 
 `get_liquidation_records(request)` decodes one page of exact raw-unit liquidation records for
 exactly one wallet or subaccount. `get_liquidation_record_pages(request, max_pages)` follows the
@@ -811,10 +1121,20 @@ integer amounts, fees, and oracle values retain protocol units; JSON-encoded liq
 and canceled-order identities are structurally validated but remain uninterpreted. Wallet scope can
 span multiple target subaccounts, and no Nautilus liquidation or risk event is constructed.
 
+Python `get_deepx_liquidation_records(*, wallet=None, subaccount=None, ...)` exposes one typed
+page; `get_deepx_liquidation_record_pages(*, max_pages, wallet=None, subaccount=None, ...)`
+collects validated pages within a required positive budget. Raw u128 values are decimal strings,
+and embedded detail fields remain JSON strings. The bounded collector validates each page before
+following its cursor and returns no partial collection on failure.
+
 A read-only Rust verification on 2026-09-17 queried the contributor-provided wallet and validated
 14 liquidation records in one terminal page. The mutable REST history was not block-pinned, so the
 observation does not prove snapshot completeness, canonical inclusion, or finality. No credentials
 or transactions were sent.
+
+On 2026-10-11, the bounded Python reader again validated one terminal wallet page with 14
+`LiquidatePerp` records targeting two subaccounts. This current REST observation still does not
+prove finalized liquidation events. No credentials or transactions were used.
 
 Both JSON number and string financial fields decode directly to exact `Decimal` values. Unknown
 `spotPositions` profile entries remain raw JSON rather than acquiring inferred business semantics.
@@ -841,10 +1161,14 @@ credentials or transactions were sent.
 the current count to match the returned directory, requires the cumulative created count not to be
 smaller, and preserves `ifStakedQuoteAssetAmount` as an exact nonnegative decimal. The OpenAPI does
 not establish its asset, scale, or account-balance meaning, so no currency or Nautilus balance is
-constructed. `get_perp_liquidation_price(request)` requires exactly one market name or ID, binds the
-returned subaccount and market identity to that request, and preserves a positive exact price or
+constructed. Python `get_deepx_user_stats(wallet, config=None)` exposes the same validated read,
+with the staked amount as an exact decimal string. `get_perp_liquidation_price(request)` requires
+exactly one market name or ID, binds the returned subaccount and market identity to that request,
+and preserves a positive exact price or
 `None`. It does not infer liquidation methodology, price units, freshness, position state, or
-framework risk semantics.
+framework risk semantics. Python `get_deepx_perp_liquidation_price(subaccount, market_id=None,
+market_name=None, config=None)` exposes the same validated observation as an exact decimal string
+or `None` and requires exactly one market selector.
 
 `get_invitation_status(wallet)` returns the invitation-bound observation. Testnet currently returns a
 boolean although OpenAPI shows an object; the reader accepts both forms and validates the returned
@@ -875,23 +1199,56 @@ OpenAPI has no stable item schema. These mutable REST records are not proof of c
 raw JSON because OpenAPI defines no stable item schema. The
 `deepx-verify-rest-liquidation-keeper-state <subaccount> [chain-id]` command performs a
 credential-free read. The state does not establish liquidation execution or chain finality.
-`get_liquidation_cranker_record_pages_raw(request, max_pages)` and
+`get_liquidation_execution_record_pages_raw(request, max_pages)`,
+`get_liquidation_cranker_record_pages_raw(request, max_pages)`, and
 `get_liquidation_tp_sl_record_pages_raw(request, max_pages)` collect bounded cursor pages of
-executor history. The request validates exact scope, hashes, time and block bounds, and cursor
-metadata; record items remain raw because the endpoint item schema is unstable. The
-`deepx-verify-rest-liquidation-execution-records <cranker|tp-sl> <wallet|subaccount>
-<account-id20>` command checks either route without credentials. Mutable records do not establish
-chain inclusion or finality.
+ordinary liquidation, cranker, and TP/SL executor history. The request validates exact scope,
+hashes, time and block bounds, page size, and cursor metadata; record items remain raw because
+the endpoint item schema is unstable. The
+`deepx-verify-rest-liquidation-execution-records <liquidation|cranker|tp-sl> <wallet|subaccount>
+<account-id20>` command checks any of the three routes without credentials. Mutable records do
+not establish chain inclusion or finality. A read-only `curl` request for wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` on 2026-10-09 returned HTTP 200 with one
+terminal empty page (`items: []`, `nextCursor: null`, `hasNext: false`) from the ordinary liquidation
+route. The Rust read-only verifier independently returned one page with zero records. This
+verifies the empty response shape, not nonempty item semantics or chain finality.
 
-A read-only verification on 2026-09-29 returned four cranker records and no TP/SL records for
-wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50`, all in one terminal page per endpoint. The
-four cranker responses identify the wallet's subaccount and include submitted transaction hashes;
-they remain mutable backend observations and were not reconciled against finalized chain events.
-No credentials or transactions were used.
+Read-only verification on 2026-09-29 and again with the Rust verifier on 2026-10-09 returned four
+cranker records and no TP/SL records for wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50`, all in one terminal page per endpoint. The
+cranker responses identify the wallet's subaccount and include submitted transaction hashes; they
+remain mutable backend observations and were not reconciled against finalized chain events. No
+credentials or transactions were used.
 
 A live read-only verification on 2026-09-16 returned four current and four cumulatively created
 subaccounts, an IF staked quote amount of zero, and a null `ETH-USDC` market-3 liquidation price for
 all four subaccounts. No credentials or transactions were sent.
+
+Python `get_deepx_perp_positions(subaccount, market_id=None, only_closed=None, cursor=None,
+page_size=None, config=None)` returns one validated position-lifecycle page. Each record preserves
+the venue lifecycle status, ownership, timestamps, and exact decimal strings; `has_next` and
+`next_cursor` retain the venue's pagination boundary. The response is mutable REST history, not a
+finalized chain position or a complete account snapshot.
+
+Python `get_deepx_perp_position_pages(subaccount, max_pages, market_id=None, only_closed=None,
+cursor=None, page_size=None, config=None)` collects validated pages within a required positive
+page budget. It rejects repeated position IDs and invalid cursor progression across pages and
+returns no partial collection on failure. Each page is validated before its continuation is
+requested. Pages can change between REST requests, so even a
+terminal collection is not a block-pinned snapshot.
+
+Python `get_deepx_wallet_perp_positions(wallet, max_subaccounts, max_pages_per_subaccount,
+market_id=None, only_closed=None, page_size=None, config=None)` bounds both the wallet directory
+and each subaccount's lifecycle pagination. It requires the directory and user stats to agree,
+checks every subaccount profile against the wallet, rejects repeated position IDs across the
+collection, and rechecks directory membership before returning all pages. A changed result still
+cannot be ruled out between mutable REST requests; this is not finalized exposure evidence.
+
+A read-only wallet-wide query on 2026-10-11 for
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` and market 3 validated all four current
+subaccounts. Their position-lifecycle record counts were 2, 11, 1, and 0, each within one terminal
+page; all 14 returned records reported `Closed`. This is current REST history, not a finalized
+position snapshot. No credentials or transactions were used.
 
 `get_hourly_unsettled_funding(request)` preserves signed position, funding-index, mark-price, and
 payment values as exact raw on-chain integers. It validates account and market scope, timestamps,
@@ -902,6 +1259,59 @@ events, repeated cursors, and page-budget exhaustion without returning a partial
 full terminal page requires one additional empty request because the response has no `hasNext`
 field. The reader does not infer asset precision, settlement, current account state, or framework
 PnL and funding events.
+Python exposes the same bounded wallet or subaccount reader as
+`get_deepx_hourly_unsettled_funding_pages`. It retains each page and returns signed position,
+funding-index, mark-price, and payment values as raw integer strings without assigning precision.
+The validated perpetual wallet-order reader is available as `get_deepx_perp_wallet_orders` and
+`get_deepx_perp_wallet_order_pages`. It retains market/subaccount groups, exposes exact decimal
+strings, and follows the response's shared global cursor within an explicit page budget. These
+mutable pages do not establish finalized order state or independently prove wallet ownership.
+Python also exposes `get_deepx_perp_open_orders` and `get_deepx_perp_open_order_pages` for one
+subaccount and market. They return validated typed records with exact decimal strings; the latter
+requires a page budget and rejects invalid or repeated cursor pages without partial results.
+The open-order REST response is mutable and does not establish finality or wallet-wide completeness.
+Python `get_deepx_perp_history_orders` and `get_deepx_perp_history_order_pages` expose the
+validated historical order reader for one subaccount, optionally across markets. They preserve
+terminal statuses and signed fees as exact decimal strings; the bounded reader fails without a
+partial result on invalid records or pagination.
+Python `get_deepx_perp_account_trades` and `get_deepx_perp_account_trade_pages` expose validated
+subaccount trade pages with optional exact order filters and timestamp bounds. They retain signed
+fees and exact decimal values without producing framework fill reports. Neither mutable REST view
+establishes chain finality.
+Python `get_deepx_perp_funding_fees` and `get_deepx_perp_funding_fee_pages` expose validated
+funding-fee pages for one subaccount with optional market and time bounds. They retain signed fees,
+rates, and settlement flags as venue observations without inferring payment currency, cadence, or
+framework account state. The bounded collector rejects duplicate chain event identities and
+pagination failures without returning partial results.
+A read-only testnet query on 2026-10-11 resolved wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` to four subaccounts. Its
+`0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` subaccount returned four market-3 historical
+orders, five account trades, and four funding-fee records, each in one terminal page. These
+current REST records are not a block-pinned reconciliation snapshot.
+`get_deepx_spot_open_orders` and `get_deepx_spot_open_order_pages` expose the same read-only
+single-subaccount pattern for one Spot market selected by name or bytes32 pair. They retain exact
+decimal strings, reject terminal and inconsistent active orders, and require an explicit page
+budget for collection. Their mutable pages do not prove finalized state or a complete wallet view.
+`get_deepx_spot_history_orders` and `get_deepx_spot_history_order_pages` expose validated Spot
+history for one subaccount, optionally across markets. The bounded reader retains page boundaries
+and rejects duplicate order IDs, invalid records, cursor failures, or page-budget exhaustion
+without returning a partial result. These mutable pages are not finalized order reports.
+A read-only testnet query on 2026-10-11 resolved the contributor wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` to four subaccounts; each cross-market Spot
+history request returned an empty terminal page. This current REST observation does not establish
+historical completeness or chain finality.
+Python also exposes `get_deepx_perp_order_by_tx` and `get_deepx_spot_order_by_tx` for exact-hash
+lookups. Both reject a response bound to another hash and preserve validated order values; the
+mutable REST association alone is not canonical inclusion or finality evidence.
+`get_deepx_rest_transaction_status` performs one hash-bound backend GET and retains the original
+JSON payload. Its `pending`, `best`, and `decode_failed` results do not advance the durable order
+lifecycle. A testnet query for a historical hash from wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` returned backend `10020`; this is not evidence
+that the transaction was unsent or absent from the chain.
+`DeepXRestStatusPoller` adds explicit attempt, interval, and deadline limits for an already
+submitted hash. Another Python thread can cancel its in-flight read; cancellation is sticky for
+the poller instance. The result retains the last valid observation and latest error, but never
+submits bytes, marks an order final, or authorizes retrying a transaction.
 
 Captured spec-369 fixtures prove two exact five-row continuations for market 3. A read-only testnet
 verification on 2026-09-17 returned all ten boundaries in the captured inclusive time range, then
@@ -909,10 +1319,11 @@ accepted an empty terminal page. Run `cargo run -p nautilus-deepx --bin
 deepx-verify-rest-hourly-unsettled-funding -- <wallet> <market-id>` to repeat the bounded read. No
 credentials or transactions are sent.
 
-The documented `account/perp/position-orders` projection remains disabled. Active and closed known
-position IDs returned HTTP service code 503 stating that the projection was unavailable,
-incomplete, or its cursor had expired. The adapter therefore exposes no typed success model or
-reconciliation behavior for that endpoint.
+The 2026-10-11 OpenAPI now documents `account/perp/position-orders` with a fixed ascending
+order-ID/side cursor and explicit incomplete-coverage errors. A read-only probe for both known
+active and closed position IDs still returned service code 503: historical reconstruction is
+required. The adapter therefore exposes no typed success model or reconciliation behavior for
+that endpoint.
 
 `get_quota_summary(wallet)` reads the public wallet-level quota aggregate. It preserves Spot,
 perpetual, and total USD volume strings as exact decimals, binds the returned owner to the request,
@@ -920,23 +1331,54 @@ and validates nonnegative additive volume totals plus paired RFC 3339 and millis
 timestamps. Quota counters remain venue observations and are not converted into execution limits,
 claim eligibility, or account state. The account snapshot verifier independently requires the
 reported subaccount count to match the wallet directory.
+Run `cargo run -p nautilus-deepx --bin deepx-verify-rest-quota-summary -- <wallet>` to inspect the
+validated aggregate without credentials or transactions.
+Python `get_deepx_quota_summary(wallet, config=None)` uses the same validated reader and returns a
+read-only `DeepXQuotaSummary`. USD volumes are exact decimal strings. This one-shot call blocks the
+calling Python thread; async callers can use `asyncio.to_thread`.
+Python `get_deepx_quota_history(...)` returns one validated `DeepXQuotaHistoryPage`. It accepts
+wallet, buyer address, history type, cursor, limit, and data-client config arguments. Its records
+retain the closed quota and buyer classifications, owner, amount, chain event identity, and
+transaction hash.
+Follow `next_cursor` only while `has_next` is true; an empty page is valid. This read also blocks
+the calling Python thread and grants no claim authority.
+`get_deepx_quota_history_pages(wallet, max_pages, ...)` follows the same validated cursor chain
+within a caller-supplied page budget. It returns no partial result if a page fails validation or
+the budget is exhausted. These mutable REST pages are not a block-pinned snapshot.
 
-`get_quota_claim_raw(claim_id)` reads the backend task state for one claim ID and leaves its
-generic response payload uninterpreted. This is not chain-finality evidence. The mutating claim
-creation endpoint remains disabled.
+`get_quota_claim_raw(claim_id)` reads the backend task state for one claim ID, verifies the
+returned integer ID, and leaves the remaining response payload uninterpreted. This is not
+chain-finality evidence. The mutating claim
+creation endpoint remains disabled. The current OpenAPI now specifies the three-line
+`DeepX quota claim` personal-sign message and a 160-byte maximum idempotency key. Its
+2026-10-11 revision permits either the wallet or an active enabled delegate to sign while the
+claim remains addressed to the wallet.
+`sign_quota_claim(key, wallet, idempotency_key)` builds that exact message and a serializable
+signature payload offline. It normalizes the wallet to lowercase and never posts a claim. A
+separate-signing-key vector matches an independent EIP-191 implementation but does not prove
+that the key is a live authorized delegate. A matching signature does not establish wallet or
+delegate authorization, retry persistence, backend acceptance, or a finalized quota grant.
+`sign_buy_quota(permit, key, params, nonce)` encodes `Lending.buy_quota` with an exact AccountId20,
+u32 quota count, and optional source subaccount through the pinned Subxt fork. Complete extrinsic
+bytes match the pinned Python SDK with and without a source subaccount on spec366, spec369, and
+spec371. This offline signer does not establish quota pricing, payer authorization, or purchase
+finality; operational quota purchase remains disabled.
 
 A live read-only verification on 2026-09-17 returned four subaccounts, zero Spot volume,
 perpetual and total volume `2970.527580000000000000`, earned quota `2970`, granted and reserved
 quota zero, and pending quota `2970` for the contributor-provided wallet. No credentials or
 transactions were sent. The quota history response was empty for that wallet; typed history records
 and bounded cursor handling are available, but the empty response does not exercise record decoding.
+On 2026-10-10, the Python one-page reader again returned zero records, `has_next=false`, and no
+cursor for the same wallet. The captured public-wallet purchase fixture exercises typed decoding.
 Quota claim creation and quota purchase remain disabled.
 
 The wallet directory result retains the wallet address used for its query rather than returning an
 unscoped address list. `get_account_ownership_proof` derives AccountId20 from the local secp256k1 key
 and requires that it match the directory wallet and profile authority, that the configured exact
 AccountId20 appears exactly once in the directory and matches the profile address, and that the
-profile is active. It returns an opaque `DeepXAccountOwnershipProof`. The execution startup gate
+profile is active. A second directory read rejects membership changes during verification. It
+returns an opaque `DeepXAccountOwnershipProof`. The execution startup gate
 accepts only a proof matching its own key and configured subaccount, after runtime validation and
 before account-stream confirmation; reset discards the proof so reconnect cannot reuse it.
 
@@ -986,11 +1428,28 @@ A live read-only verification on 2026-09-16 returned three assets and three rate
 1, then validated three recent USDC APR rows and three matching-scope pool-status rows. No
 credentials or transactions were sent.
 
+`DeepXLendingService` exposes the same four validated public reads to Python with a reusable
+read-only HTTP client. It returns exact decimal strings for curve parameters, APRs, and pool
+values. History methods require an explicit start time and retain the Rust reader's market,
+range, ordering, and value checks.
+
 These endpoints provide raw market observations only. The adapter does not infer asset precision or
 quantity units, directory or bucket completeness, data freshness, `rho` semantics, APR compounding,
 collateral behavior, framework instruments, yields, market-status events, balances, or lending
-transactions. The responses are mutable and not pinned to a block hash; no PyO3 lending service is
-exposed.
+transactions. The responses are mutable and not pinned to a block hash.
+The public `lending_interest_rate` WebSocket channel returned an acknowledged batch containing
+ETH, SOL, and USDC for market 1 on 2026-10-10. A bounded observer checks acknowledgement order,
+asset identities against the validated REST directory, unique items, matching minute-aligned
+statistic times, and nonnegative exact APRs while retaining the original JSON. The first batch is
+a mutable observation and does not establish continuity, completeness, compounding, or framework
+yields.
+The optional strict REST comparison found a same-bucket ETH supply-APR disagreement on
+2026-10-10: WebSocket `0.000001212754759968964` and REST
+`0.0000012127547599689641` at statistic time `1791630660000`, while borrow APR agreed.
+The adapter preserves those distinct values and does not round them into a fabricated match.
+A later read-only comparison on 2026-10-10 matched ETH, SOL, and USDC in market 1 at statistic
+time `1791631020000`; ETH supply APR was `0.0000012127547870728891` in both responses. This
+single successful bucket does not resolve the earlier disagreement or prove feed consistency.
 
 ## Perpetual order lookup
 
@@ -1031,8 +1490,9 @@ Focused tests bind the field order and exact SCALE arguments to the approved spe
 metadata fixture (SHA-256 `e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`),
 cover both flags and u64 boundaries, reject malformed dynamic bindings, and check that each
 operation field and nonce changes signed identity. The local spec369 node is not substituted
-for that fixture. One complete signed vector matches the pinned Python SDK under spec371; parity
-for spec366/369 or other argument combinations remains unproven.
+for that fixture. The same ordinary sell-side Spot cancellation matches complete signed vectors
+from the pinned Python SDK under spec366, spec369, and spec371. Other argument combinations remain
+unproven.
 
 The durable `DeepXTransactionOperation::SpotCancel` identity retains the full pair, subaccount,
 order ID, buy/sell flag, and fast-cancel flag through transaction-record serialization.
@@ -1068,9 +1528,15 @@ inclusion contract; framework cancellation commands submit ordinary cancels by d
 `fast_perp_cancel` enabling the Perp fast path. Fast Spot cancellation remains unavailable because
 the approved event behavior is not established. Perpetual Limit modification uses one atomic
 cancel-and-place extrinsic, durable `OrderPendingUpdate` staging, and finalized evidence for both
-ordered transaction legs before publishing an update outcome. Spot modification, testnet
-replacement behavior, cancel-all, batch cancel, close, and other unsupported operational order
-commands remain disabled. Testnet Spot owner authorization and dispatch behavior remain unverified.
+ordered transaction legs before publishing an update outcome. The submission gate requires
+approved runtime metadata with the exact `Subaccount.PerpOrderModified` sizing-event fields and
+numeric SCALE types. The captured spec371 runtime does not declare this event, so live modification
+remains disabled. Spot modification, testnet replacement behavior, cancel-all, close-position,
+and other unsupported operational order commands remain disabled. Framework batch cancellation
+fans out validated items through the durable single-order path with the parent command IDs; it is
+non-atomic and does not discover orders absent from the local cache. Venue-native batch
+cancellation remains disabled. Testnet Spot owner authorization and dispatch behavior remain
+unverified.
 Maintainer approval remains unresolved; this local milestone is not a PR.
 
 The Rust adapter crate and workspace wiring now exist. The following protocol-core foundations are
@@ -1420,7 +1886,7 @@ integration.
   `InstrumentProvider` populates a standard `InstrumentStore` from REST metadata and a shared
   finalized Spot spec checkpoint with failure-atomic loads and preserved cached instruments on
   refresh. A read-only REST data client publishes Spot and perpetual instruments and handles
-  connection-snapshot instrument requests and bounded historical Spot/Perpetual bars and trades,
+  fresh instrument requests and bounded historical Spot/Perpetual bars and trades,
   perpetual funding, and current one-shot Spot REST and Perpetual WebSocket L2 book snapshots. Spot
   candle volumes that exceed instrument precision fail closed; this currently occurs in captured
   and live responses. Public trade, quote, and configured L2 book subscriptions have bounded
@@ -1520,7 +1986,7 @@ integration.
   opt-in client-owned method can submit only after full startup through that retained Submission
   endpoint while holding the signer lease and runtime permit. Reset, stop, and disconnect erase the
   evidence. The lower-level method remains disconnected from framework order commands; supported
-  Perp Limit and Spot Limit GTC commands use the retained Submission endpoint through their own
+  Perp Limit and Spot Limit GTC/IOC commands use the retained Submission endpoint through their own
   one-shot paths.
   A separate pure order-mapping boundary accepts only simple perpetual Limit GTC and Limit IOC
   framework orders. It verifies command/event identity, configured subaccount, immutable market
@@ -1534,7 +2000,7 @@ integration.
   CAS-committed `submitting` transition. Mapping and startup failures occur before context mutation
   or nonce allocation. This preparation function performs no transmission or framework event
   emission; framework `submit_order` uses a separate asynchronous coordinator for those steps.
-  Spot framework mapping accepts only simple base-quantity Limit GTC orders without post-only or
+  Spot framework mapping accepts only simple base-quantity Limit GTC/IOC orders without post-only or
   reduce-only flags. It requires a cached Spot CurrencyPair whose constraints came from the
   finalized runtime `SpotMarketSpec`, exactly converts base and quote amounts at their currency
   precisions, and requires the runtime's six-decimal quote scale. Spot placement uses the durable
@@ -1708,10 +2174,12 @@ integration.
   collects its `Timestamp.Now`, margin, lending, perpetual-position, and perpetual and Spot active
   order components against the exact block hash. The Spot account index is decoded even when no
   order IDs are requested; when it is nonempty, every active ID is read from `OrderInfo` and checked
-  against the index at that same checkpoint. An empty index is finalized evidence that the
-  flat-balance gate has no Spot orders to account for. The account and wallet verifiers display raw
-  order fields without unit conversion. The combined capability gate requires `state_getStorage`,
-  and the timestamp must decode as one exact non-zero SCALE `u64` Unix millisecond value. Any
+  against the index at that same checkpoint. An empty index supports the flat-balance gate only
+  when the endpoint honors the requested checkpoint. The account and wallet verifiers display raw
+  order fields without unit conversion. The combined capability gate requires `state_getStorage`
+  and `chain_getBlock`. The timestamp must decode as one exact non-zero SCALE `u64` Unix millisecond
+  value. A repeated timestamp read and a `state_queryStorageAt` timestamp read must agree with the
+  block's `Timestamp.set` inherent, and every account in a batch must have the same timestamp. Any
   component failure rejects the whole result rather than exposing a partial snapshot.
   `deepx-verify-finalized-account <subaccount-account-id20>` exercises this credential-free atomic
   raw-evidence envelope. The raw result does not assign asset currency or free/locked semantics;
@@ -1721,27 +2189,90 @@ integration.
   capability, ownership, and transaction-runtime evidence; neither entry point signs or mutates
   state.
   `deepx-verify-finalized-wallet <wallet-account-id20>` resolves the wallet through the validated
-  public subaccount directory and attempts complete finalized account evidence for every returned
-  subaccount. Each successful result is pinned to its own finalized checkpoint; failures are
-  reported per subaccount after the remaining entries are queried, and any failure leaves the
-  command unsuccessful. The mutable REST directory is not chain-level ownership evidence, so this
-  command is a read-only discovery aid. It reports raw lending, perpetual-position, and active-order
-  fields, and whether the exact flat-balance conversion gate accepts each account; it does not
-  construct an `AccountState` or grant mutation authority. A live read-only run on 2026-09-29
-  resolved four directory subaccounts and
-  collected complete evidence for all four at spec 371 checkpoints. Each reported one lending
+  public subaccount directory and collects complete finalized account evidence for every returned
+  subaccount at one approved runtime checkpoint. Duplicate addresses or any incomplete account
+  result reject the entire batch. The mutable REST directory is not chain-level ownership
+  evidence, so this command is a read-only discovery aid. It reports raw lending,
+  perpetual-position, and active-order fields, and whether the exact flat-balance conversion gate
+  accepts each account; it does not construct an `AccountState` or grant mutation authority.
+  A live read-only run on 2026-09-29 resolved four directory subaccounts and returned account
+  components for all four while requesting spec371 checkpoints. Each reported one lending
   position and no perpetual positions or active perpetual orders. All four passed the exact
-  flat-balance conversion and reported USDC total equal to free with zero locked. Querying the wallet
-  address itself as though it were a subaccount still correctly fails closed because it has no
+  flat-balance conversion on the returned values and reported USDC total equal to free with zero
+  locked. The later historical-storage inconsistency means this run did not prove those components
+  came from their requested finalized blocks. Querying the wallet address itself as though it were
+  a subaccount still correctly fails closed because it has no
   `SubaccountInfo`.
-  A live read-only run on 2026-09-23 verified the combined boundary for owned subaccount
+  On 2026-10-08, a read-only per-account run again resolved all four wallet subaccounts and
+  returned flat USDC balances while requesting separate spec371 finalized blocks, with no positions
+  or active orders. A subsequent wallet batch read returned all four at block `214757490`, hash
+  `0xf0a25e180c773f827990169797611919a7d49df3436e89b06adc179a4b5e8de6`, but reported
+  `Timestamp.Now` values that differed by seconds despite the identical hash. This does not
+  establish coherent live shared-checkpoint account evidence. Other live attempts failed on
+  intermittent RPC TLS handshake EOFs. Two direct read-only
+  `state_getStorage(Timestamp.Now, fixed_hash)` calls at that same hash returned
+  `1791460864166` and `1791460877536` milliseconds, confirming that this endpoint can return
+  changing timestamp storage for a fixed finalized hash. The observer now rejects timestamp
+  disagreement within an account read or across a wallet batch. Agreement is only a consistency
+  check, not proof that other storage and runtime API responses honor the supplied hash. The
+  historical `chain_getBlock` response at that hash contained a `Timestamp.set` inherent encoding
+  `1791460419316` milliseconds, different from the mutable storage reads; the account observer now
+  checks storage against that inherent. Two `state_queryStorageAt` calls at the same hash both
+  labeled their result with that hash but returned `1791462177436` and `1791462198716`
+  milliseconds for `Timestamp.Now`. The account observer also checks this method's timestamp
+  result against the inherent. Identity and method-list probes retain independent observations for
+  each RPC role and retry failed read-only requests at most twice. A read-only rerun for
+  `0x781ed35b167068c93dfadab41dfb680edaca4e50` resolved four subaccounts, then rejected the
+  first account because the block inherent was `1791462893116` milliseconds while storage at its
+  requested hash returned `1791462900536`. With independent role probes and bounded read-only
+  retries restored, another run again resolved four subaccounts and rejected the first: block
+  inherent `1791463510605` milliseconds, requested-hash storage `1791463515715`. Live
+  shared-checkpoint conformance remains unverified.
+  Historical runtime selection is also unreliable on this endpoint. The captured finalized
+  spec-366 hash `0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6`
+  returned spec `371` through both `Core_version` and `state_getRuntimeVersion`. A captured
+  spec-369 finalized hash likewise returned spec `371` through `state_getRuntimeVersion`. Complete
+  account evidence and signing-bound chain time now require both runtime methods to return spec
+  `369` at that spec-369 hash. A read-only wallet rerun resolved four subaccounts, then rejected the
+  first because `Core_version` returned `371`. This detects the observed historical runtime defect;
+  it does not establish historical correctness of every `state_call` response. An `eth_call` with an
+  impossible canonical block hash also returned a successful `0x`, so EIP-1898 block selection is
+  not yet trustworthy. Complete account evidence now requires a harmless call at the selected
+  checkpoint to succeed and the same call with an impossible canonical hash to return a structured
+  JSON-RPC error. The live wallet run fails at the earlier runtime guard, so this new `eth_call`
+  guard has mock coverage but no end-to-end live acceptance evidence.
+  An October 9, 2026 read-only wallet rerun again resolved all four subaccounts and failed the
+  spec-369 checkpoint guard because `Core_version` returned `371`. Direct JSON-RPC requests
+  confirmed that block `184886760` still maps to the captured hash, but `Core_version` and
+  `state_getRuntimeVersion` both returned spec `371` with that hash explicitly supplied. The
+  unpinned runtime-version call also returned spec `371`. Both runtime methods rejected an
+  impossible hash with `UnknownBlock`, confirming that they parse the supplied hash. The cause of
+  the inconsistent result for the known historical hash is unverified.
+  On October 10, 2026, another read-only wallet run again resolved four subaccounts and rejected
+  `Core_version` returning `371` at that spec-369 checkpoint. The separately advertised
+  `chain_getRuntimeVersion` method also returned `371` for the captured spec-369 block hash, so it
+  does not supply independent historical runtime evidence.
+  On October 11, 2026, the read-only wallet verifier again resolved four directory subaccounts
+  and stopped before account storage reads because historical `Core_version` returned spec `371`
+  for the captured spec-369 checkpoint. No finalized wallet account result was accepted.
+  Signing-bound account observation now closes its owned snapshot service to new signing permits
+  when these probes or timestamp consistency checks demonstrate contradictory RPC behavior.
+  Standalone read-only finalized evidence readers now run the same historical runtime probe at
+  their shared runtime-snapshot boundary before reading account, market, position, or order values.
+  The local node source also shows that custom `lending_batchPositionsFor` and
+  `lending_totalCollateralAndMarginRequiredFor` RPC handlers ignore their `at` argument and
+  select `best_hash`. The adapter's finalized account collector instead calls the runtime APIs
+  through `state_call` with the requested checkpoint hash. This avoids the known custom-RPC
+  behavior, but the public endpoint's `state_call` hash semantics still need live proof.
+  A live read-only run on 2026-09-23 exercised the combined boundary for owned subaccount
   `0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` at finalized block `196050060` and hash
   `0xaac093675fa1ec964b0e969db4dbdb8d7a874b9458cfdd4ed75e4d25cf45e99d`. It returned both
   margin directions, one USDC lending deposit, no perpetual positions with runtime maximum eight,
   and no active perpetual orders. Querying contributor wallet
   `0x781ed35b167068c93dfadab41dfb680edaca4e50` failed closed at margin collection because the
   runtime omits addresses without `SubaccountInfo`; the adapter does not reinterpret a wallet's
-  absent subaccount entry as zero margin.
+  absent subaccount entry as zero margin. That run predates the block-inherent check and does not
+  establish historical storage binding.
   `map_finalized_flat_account_balances` adds a framework conversion only for an exposure-free,
   fully withdrawable state. It requires zero initial and maintenance margin, no perpetual position,
   no active perpetual or Spot order, no lending borrow, and exact equality between every effective
@@ -1834,18 +2365,23 @@ integration.
   Startup mass reconciliation can restore acknowledged durable transaction records, reconcile
   in-block finality and reorganization evidence, resume an exact not-included checkpoint, and
   observe submitting or accepted records against the Submission endpoint's valid pending pool.
+  Restored signer sets reject duplicate durable cache keys and timestamp nonces before nonce
+  allocator restoration or startup recovery consumes them.
   Exact pool presence durably records acceptance; pool absence remains unresolved without a write.
   Complete framework-owned Spot and Perpetual placements and finalized cancellations replay their
   durable outbox through acknowledged execution ingress and commit exact application-and-
-  persistence receipts before startup advances. Tracked Spot and Perpetual Limit GTC cancellation
+  persistence receipts before startup advances. Outbox replay follows the monotonic timestamp
+  nonce so successive finalized modifications restore replacement order IDs in reservation order,
+  independent of durable-store result order. Tracked Spot and Perpetual Limit GTC cancellation
   and the currently supported placement commands use durable DirectPallet paths. Spot mutations
   still lack live testnet validation. Remaining Phase E work includes a fixture-backed private
   execution decoder and event route, complete restart and report reconciliation across mutable
-  sources, and live validation of each enabled transaction command. Order lists, modifications,
-  and other advanced transaction mutations remain unavailable.
-- **Phase F - Partial:** Read-only wallet quota summary, typed delegate directories, and selected
-  offline subaccount/delegate signing primitives exist. Typed quota history, management services,
-  authorization conformance, and all quota/delegate/subaccount mutations remain disabled.
+  sources, and live validation of each enabled transaction command. Contingent and linked order
+  lists, modifications, and other advanced transaction mutations remain unavailable.
+- **Phase F - Partial:** Read-only Rust and one-shot Python quota reads, typed Rust and Python
+  delegate directories, and selected offline subaccount/delegate signing primitives exist;
+  management services, authorization conformance, and all quota/delegate/subaccount mutations
+  remain disabled.
 - **Phase G - Partial:** This document and the strict Rust data and execution configs exist. The
   execution config exposes a non-zero HTTP read timeout, defaulting to 30 seconds, an optional
   redacted proxy URL, a non-zero canonical recovery scan range size, defaulting to 100 finalized
@@ -1872,12 +2408,28 @@ the catalog and perpetual instrument conversion are covered by sanitized mock re
 than runtime-tagged protocol evidence. Raw Spot
 `min_order_size`, `tick_size`, and `step_size` can be read either from the precompile's current
 state or through `observe_finalized_spot_market_spec_evidence`, which pins the ABI response to an
-approved read-only runtime and canonical finalized block. The chain's `MarketSpec` confirms that
-tick size uses `1e6` price scale and quantity constraints use base-token atomic units at
-`baseDecimal` precision. The pure `parse_spot_instrument` converter requires finalized evidence
+approved read-only runtime and canonical finalized block. The Spot batch validates block timestamp
+and EIP-1898 selection before reading any pair, then checks the timestamp again after the batch;
+disagreement blocks catalog publication. The chain's `MarketSpec` confirms that tick size uses
+`1e6` price scale and quantity constraints use base-token atomic units at `baseDecimal` precision.
+The pure `parse_spot_instrument` converter requires finalized evidence
 and an exact REST tick match. The `InstrumentProvider` now batches every listed Spot pair at one
 finalized checkpoint and publishes the complete catalog atomically, but lacks a checked-in
-runtime-tagged end-to-end capture. Existing fixtures cover selected REST pages, WebSocket
+runtime-tagged end-to-end capture. `observe_finalized_perp_order_spec_evidence` cross-checks the
+Perp precompile's raw minimum size, tick, and step against metadata-typed pallet storage at one
+canonical finalized checkpoint. Storage also supplies the minimum notional omitted by the
+precompile. The reader requires timestamp storage to match both the block inherent and an
+independent storage query, then rechecks the timestamp after reading the market value. On
+2026-10-09, repeated read-only
+`state_getStorage(PerpMarket.PerpMarkets[3], fixed_hash)` calls returned different bytes for the
+same finalized hash. The reader now requires identical market storage bytes from two reads at
+that hash and rejects observed drift, but this cannot prove all responses came from one state.
+This endpoint cannot currently validate the reader end to end.
+`state_getReadProof` calls for market and timestamp keys returned empty proof arrays at historical
+and current finalized hashes, so that endpoint did not provide a verifiable fallback. Timestamp
+and repeated market-byte agreement are only consistency checks for this reader. Market status,
+price guards, and account
+limits remain separate trading gates. Existing fixtures cover selected REST pages, WebSocket
 messages, finalized Perpetual events, recovery boundaries, and pagination; coverage remains
 incomplete for full REST histories, all reconnect and reorganization cases, and management
 operations. Within Phase B,
@@ -1909,12 +2461,12 @@ Never use production credentials with this integration.
 | Environment           | DeepX testnet                                    | Verified       | Deployment identity captured on 2026-09-01.                          |
 | Protocol core         | Rust types, fixtures, HTTP/WS and runtime state  | Partial        | Runtime-tagged reads, public WS feeds, and durable direct-pallet lifecycle evidence are partial; production submission is unsupported. |
 | Mainnet               | None                                             | Unsupported    | No validated deployment or protocol evidence is present.             |
-| Spot                  | Nautilus data and execution clients              | Partial        | REST market data, node-backed books, and a durable Limit GTC submit path; testnet validation remains outstanding. |
+| Spot                  | Nautilus data and execution clients              | Partial        | REST market data, node-backed books, and durable Limit GTC/IOC submission; testnet validation remains outstanding. |
 | Perpetual futures     | Nautilus data and execution clients              | Partial        | Market data and selected durable order workflows exist; broader account, order, and testnet conformance remain incomplete. |
 | Lending               | Separate Rust and PyO3 service client            | Partial        | Public Rust market observations only; no PyO3 or mutations.          |
 | Subaccount management | Separate Rust and PyO3 service client            | Planned        | Requires verified ownership and authorization behavior.              |
-| Delegates             | Separate Rust and PyO3 service client            | Partial        | Typed public directories only; no PyO3, authorization, or mutations. |
-| Quota                 | Separate Rust and PyO3 service client            | Partial        | Public Rust summary only; no history, PyO3, claims, or purchases.    |
+| Delegates             | Separate Rust and PyO3 service client            | Partial        | Typed Rust and Python public directories; no authorization or mutations. |
+| Quota                 | Separate Rust and PyO3 service client            | Partial        | Typed Rust and Python summary/bounded history reads; no service, claim creation, or purchases. |
 | Bridge                | Separate Rust and PyO3 service client            | Planned        | Requires verified source and destination finality.                   |
 | Direct pallet backend | Metadata-driven SCALE extrinsics                 | Partial        | Explicit configuration and durable Perpetual workflows; live trading remains gated on conformance evidence. |
 | Legacy EVM backend    | EVM transaction wrapped by a Substrate extrinsic | Planned        | Explicit configuration; implemented independently.                   |
@@ -2062,8 +2614,16 @@ The typed perpetual open-interest primitive calls
 optional positive limit. It fixes the verified request time frame to `1m` and order to `ASC`,
 preserves total open interest and the long-to-short ratio as exact decimal values, and leaves the
 venue response order unchanged. Mock tests prove typed query encoding and exact response decoding.
-The units of total open interest, aggregation rules, boundary inclusion, completeness, freshness,
-and conversion to Nautilus data remain unproven, so no framework open-interest event is emitted.
+The bounded history reader follows minute-aligned pages and validates pair identity, ordering,
+time bounds, and nonnegative values. A read-only testnet run returned four ETH-USDC buckets across
+two pages. The public `open_interest` WebSocket observer requires an exact acknowledgement, market
+ID and pair, a minute-aligned statistic time, and nonnegative exact values. A 2026-10-10 market-3
+run observed bucket `1791632940000` with total open interest `3332.231`, long-short ratio
+`2.57875`, and long/short counts of 2063/800. Optional exact REST comparison rejected a later
+same-bucket disagreement at `1791633000000`: WebSocket total open interest `3325.824` versus REST
+`3326.907`, while the ratio and counts agreed. These mutable observations do not establish
+continuous history, units, freshness, or Nautilus event semantics, so no framework open-interest
+event is emitted.
 
 `get_perp_trades_history` adds bounded cursor pagination over an explicit inclusive millisecond
 range with `DeepXPerpTradesHistoryRequest`. It retains market/time/page-size filters on every page,
@@ -2122,8 +2682,8 @@ credentials or transactions were sent.
 The public `get_spot_candles`, `get_spot_last_price`, `get_spot_volume`, and `get_spot_order_book`
 readers require exactly one market name or bytes32 pair and preserve all JSON financial values as
 exact decimals. Spot candles use the documented closed interval set, ascending non-TradingView
-responses, inclusive request bounds, and a maximum limit of 5000. Responses reject a mismatched
-echoed market name, nonpositive or inconsistent OHLC, negative volume, duplicate/descending
+responses, an inclusive `start` and exclusive `end`, and a maximum limit of 5000. Responses reject
+a mismatched echoed market name, nonpositive or inconsistent OHLC, negative volume, duplicate/descending
 timestamps, or excessive row counts. Spot books echo both name and bytes32 identity and validate
 positive quantities/prices, nonnegative server notionals, unique strictly ordered levels, sequence,
 and engine time. The optional aggregation tick is a positive exact Decimal serialized directly as
@@ -2169,7 +2729,17 @@ pages do not prove complete or stable account history. Status, price type, post-
 transaction-hash type, fee ownership, and lifecycle semantics remain uninterpreted, and no
 framework order report is emitted. Run
 `deepx-verify-rest-spot-orders <subaccount> <market-name>` for a credential-free live read. Typed
-Spot wallet-group conversion remains deferred to its own evidence slice.
+`get_spot_wallet_orders` and its bounded page collector validate grouped Spot order records,
+maker identity, one shared cursor, requested scope, exact financial values, duplicate order
+identities, and group-local time order. Python exposes the same validated observations through
+`get_deepx_spot_wallet_orders` and `get_deepx_spot_wallet_order_pages`; financial values remain
+exact decimal strings. The response does not echo the requested wallet and is mutable, so it does
+not independently prove wallet ownership or produce framework order reports.
+Python exposes the validated read-only Spot wallet trade observation through
+`get_deepx_spot_wallet_trades` and `get_deepx_spot_wallet_trade_pages`. It preserves the globally
+repeated cursor, market/subaccount groups, and exact decimal strings for base amount, quote amount,
+price, and fee. The REST response is mutable and does not echo wallet ownership. These observations
+are not framework fill reports.
 
 `get_spot_order_by_id_raw` preserves the exact lookup payload. Its typed counterpart binds owner,
 market name or pair, side, and decimal order ID to the request. `get_spot_order_by_tx` accepts only
@@ -2191,6 +2761,12 @@ Records do not echo the requested subaccount, so ownership cannot be independent
 the response. Taker and order-side
 labels remain observations and no fill report is emitted. Run
 `deepx-verify-rest-spot-account-trades <subaccount> <market-name>` for a credential-free live read.
+Python `get_deepx_spot_account_trades` and `get_deepx_spot_account_trade_pages` expose these
+validated typed reads with exact decimal strings and an explicit page budget for collection.
+A read-only testnet query on 2026-10-11 returned an empty terminal cross-market Spot trade page
+for each of the four current subaccounts of wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50`. The mutable REST result is not proof of
+historical completeness or chain finality.
 
 The typed raw perpetual trades primitive calls `GET /internal/v1/market/perp/trades` with a
 deployment market ID, an optional positive page size, and an optional opaque cursor. It fixes the
@@ -2213,8 +2789,10 @@ the position fill direction remains uninterpreted. No streaming trade event is e
 
 All three raw candle-shaped history endpoints reject empty pair identities, pages exceeding an
 explicit requested limit, timestamps outside the requested bounds, duplicate or descending
-timestamps, inconsistent OHLC ranges, and negative volume. Empty pages and gaps are accepted;
-validation does not infer timestamp boundary semantics, volume units, market identity from a
+timestamps, inconsistent OHLC ranges, and negative volume. Live boundary queries showed inclusive
+`start` and exclusive `end` across Spot and all three perpetual candle-shaped endpoints. Empty
+pages and gaps are accepted; validation does not infer bucket-open versus bucket-close meaning,
+volume units, market identity from a
 numeric ID, or candle completeness.
 
 The typed raw perpetual candles primitive calls `GET /internal/v1/market/perp/candles` with a
@@ -2227,7 +2805,7 @@ the venue pair, bucket timestamps, and response order without interpretation. Re
 incomplete bucket. The same responses contained binary-float artifacts such as
 `2481.3799999999997` despite the market's `0.01` price increment. Mock tests prove every documented
 interval token, exact high-precision response decoding, and synchronous limit rejection. No
-sanitized runtime fixture or multi-page capture proves boundary inclusion, empty-bucket behavior,
+sanitized runtime fixture or multi-page capture proves empty-bucket behavior,
 completeness, or freshness. The framework request path accepts only exact instrument-precision
 OHLCV, preserves the venue time without shifting it, and emits no partial response when a row
 contains backend artifacts that would require quantization.
@@ -2404,7 +2982,70 @@ Local endpoint tests additionally cover initial suppression, overlapping pushes,
 failure, idempotent admission and all retirement paths. REST connected readiness still does not
 prove a live subscription is acknowledged or healthy. Local reconnect tests cover REST pagination,
 missing boundary/precision failures, cancellation during recovery, and failed-task re-admission.
-Execution-account streams remain incomplete.
+An independent read-only `user_perp_open_orders` protocol boundary now serializes an exact
+market/subaccount subscription. `observe_initial_perp_open_orders_page` owns the socket,
+requires one matching acknowledgement, validates the first complete page, retains order items
+as raw JSON after checking order ID, owner, market ID, and duplicate numeric IDs, then closes the
+connection. A testnet run for subaccount
+`0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` and market `3` returned zero open orders.
+`deepx-verify-ws-perp-open-orders <subaccount> <market-id>` repeats that observation. Incremental
+order updates, nonempty item interpretation, reconnect recovery, and execution reports remain
+incomplete.
+
+`deepx-verify-ws-account-metrics <wallet>` uses the REST directory to observe initial
+`user_total_deposits`, `user_net_value`, `user_equity`, and `user_portfolio_margin_ratio` frames
+for each subaccount. The observer requires one exact four-channel ACK and retains each raw JSON
+object after checking its address and required numeric fields. Up to four data frames arriving
+before the ACK are buffered and withheld until it matches; overflow or a missing ACK fails the
+observation. The portfolio frame additionally
+binds the nested `exactMargin` address and exposes its decimal strings as exact `Decimal` values,
+including nullable ratios. A read-only run for wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` on 2026-10-09 returned all four summaries for
+four subaccounts. The backend publishes rounded outer JSON numbers and decimal strings inside
+`exactMargin`; these separate mutable frames do not prove atomic portfolio state, finalized
+exposure, or transaction authority.
+An October 10 read-only rerun again returned all 16 initial summaries. The four subaccounts'
+`exactMargin.availableMargin` strings were `970.963998`, `1143.574222`, `11.077664`, and
+`1.338918`, while the outer values were rounded to two decimal places. This confirms the need to
+retain the exact strings for financial interpretation; it does not establish finalized balances.
+A subsequent read-only run on the same date accepted all 16 frames with strict decimal parsing.
+The four `exactMargin.availableMargin` strings were `970.964025`, `1143.574254`, `11.077664`,
+and `1.338918`. A separate finalized-wallet run again resolved all four subaccounts but stopped
+because `Core_version` returned spec `371` for the captured spec-369 checkpoint. The WebSocket
+observations do not resolve that historical runtime contradiction.
+An experimental `addressType: wallet` subscription for the same four channels was acknowledged
+with the wallet address, but only deposits, net value, and equity frames arrived during a bounded
+observation. Their wallet-addressed values were all zero while the four subaccounts had nonzero
+values. The endpoint therefore has no verified wallet aggregate contract for these summaries;
+the verifier continues to read each directory subaccount separately.
+
+The wallet mode, `deepx-verify-ws-perp-open-orders --wallet <wallet> <market-id>`, binds the
+expanded ACK to the current REST subaccount directory and requires one initial page per address.
+For wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50`, a read-only market 3 run on
+2026-10-09 returned four empty pages. These separate mutable reads do not prove finalized
+ownership or canonical order state.
+
+The read-only Spot `user_spot_open_orders` observer binds one market name, bytes32 pair and
+subaccount to its acknowledgement and first complete page. It rejects foreign identities,
+pagination gaps and duplicate numeric order IDs, retaining nonempty items as raw JSON. A testnet
+run on 2026-10-09 for the contributor wallet's
+`0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` subaccount and ETH/USDC returned zero open
+orders. Run `deepx-verify-ws-spot-open-orders <subaccount> <market-name>` to repeat the
+credential-free observation. Nonempty Spot WebSocket items and incremental order updates remain
+unverified and cannot produce framework execution reports.
+
+`deepx-verify-ws-spot-open-orders --wallet <wallet> <market-name>` queries the REST subaccount
+directory and checks that a wallet-scoped subscription ACK expands to exactly those subaccounts.
+It then requires one complete initial page for each. The directory and WebSocket pages are mutable,
+separate reads; they do not establish block-pinned ownership or finalized order state. A changing
+directory can cause the check to fail.
+On 2026-10-09, wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50` returned four
+matching ETH/USDC subaccount pages, all empty.
+The same read-only wallet query on 2026-10-11 again returned four empty ETH/USDC pages. The
+typed REST Spot open-order reader additionally rejects terminal or unknown states and requires
+`Open` orders to have their full base amount remaining with no average fill price, or
+`PartiallyFilled` orders to have a positive remaining base amount below the original amount and a
+positive average fill price. The historical Spot order reader still accepts terminal records.
 
 Spot `subscribe_trades` uses a dedicated acknowledged Spot market connection bound to both the
 canonical market name and finalized bytes32 pair. The observed `trades` data envelope contains an
@@ -2430,15 +3071,19 @@ The public `mark_price`, `oracle_price`, and `funding_rate` channels now map to 
 acknowledgement-gated connection and applies the same bounded reconnect, heartbeat, initial-data
 deadline, cancellation, and connection-epoch publication fence as live trades. Mark and oracle
 values preserve the observed decimal scale rather than being rounded to the instrument's tradable
-tick. The public envelope timestamp is `ts_event`. Funding timestamp ordering is validated, while
-`interval` and `next_funding_ns` remain `None` because the observed payload does not establish a
-payment schedule. Semantic or precision failures stop the subscription without partial emission;
+tick. Scalar JSON numbers, including scientific notation, are rejected if decimal conversion
+would lose precision. The public envelope timestamp is `ts_event`. Funding timestamp ordering is
+validated, while `interval` and `next_funding_ns` remain `None` because the observed payload does
+not establish a payment schedule. Semantic or precision failures stop the subscription without
+partial emission;
 transport failures may reconnect to obtain a fresh current observation, without replaying invented
 intermediate updates. The raw `latest_price` channel has no framework mapping.
 
 A read-only `deepx-verify-live-trades --prices` run on 2026-09-16 received exact ETH mark
 `2383.328348`, index `2386.075`, and funding rate `0.000211552824917299` framework events, then
 verified unsubscribe/disconnect fencing. The verifier sent no account or transaction commands.
+A 2026-10-10 read-only run after exact scalar decoding received mark `2494.790959`, index
+`2498.055`, and funding `0.0000125` events and verified unsubscribe/disconnect fencing.
 
 `DeepXWsBookStream` now validates and reconstructs the configured perpetual orderbook view.
 Prices, quantities and server notionals retain exact decimal values. Snapshots replace both sides;
@@ -2457,11 +3102,26 @@ instrument price increment. Every accepted snapshot or delta publishes a complet
 venue sequence, engine timestamp, snapshot flag, and typed zero padding. DeepX provides aggregated
 levels without constituent order counts, so each populated level has count one. The subscription
 shares the book stream's initial-data deadline, bounded fresh-snapshot reconnect, idempotency, and
-synchronous retirement fencing. It does not implement historical depth requests. The read-only
+synchronous retirement fencing. Spot current depth requests use a separate Watch RPC
+`orderbook_subscribe` connection with the requested depth (default 10, maximum 10), and return one
+correlated snapshot with the node's actual per-level order counts. Perpetual current depth requests
+use a separate acknowledged public connection and return one correlated snapshot at the requested
+depth (default 10, maximum 10), with venue sequence, engine time, typed zero padding, and one count
+per aggregated level. Delta-first, malformed, precision-losing, and over-depth responses emit no
+framework response. Historical depth requests remain unsupported. The read-only
 `deepx-verify-live-trades --depth10` mode verifies this path without account or transaction access.
 On 2026-09-16, it received BTC sequence `8310457` at engine time `1789549039088000000`, with best
 bid `75643.8000 x 0.0212` and best ask `75645.8000 x 0.0169`, then verified unsubscribe and
 disconnect fencing.
+The data-client `perpetual_only` setting loads only the Perpetual REST directory and does not
+request Spot metadata or finalized Spot specs. The verification binary enables this read-only
+scope for its Perpetual modes; its Spot mode and the default data-client configuration still
+verify Spot at startup.
+On 2026-10-09, `deepx-verify-live-trades --depth-request` used this scope and received a
+correlated BTC-USDC Perpetual depth snapshot at sequence `171784273`, engine timestamp
+`1791538177203000000`, best bid `82598.2000`, and best ask `82598.4000`. It accessed only public
+market data; no account command or transaction was sent. This read-only result does not change the
+historical-runtime guard required for Spot or signing.
 
 `request_book_snapshot` opens a dedicated public connection, requests the caller's depth with the
 instrument price increment, waits for the exact acknowledgement, and accepts only the first full
@@ -2523,7 +3183,7 @@ or WebSocket clients, endpoint helpers, signing primitives, or credentials.
 endpoint override is accepted. `DeepXExecutionClientConfig` requires an explicit subaccount for a
 valid execution configuration and accepts only `direct_pallet` or `legacy_evm` as an explicit
 backend. The execution client currently wires tracked Perpetual Limit GTC/IOC and Spot
-base-quantity Limit GTC placement, plus tracked Perpetual and Spot Limit GTC cancellation, to the
+base-quantity Limit GTC/IOC placement, plus tracked Perpetual and Spot Limit GTC cancellation, to the
 `direct_pallet` backend. Advanced order types and `legacy_evm` execution remain unavailable. Spot
 transaction behavior has not been validated with live testnet transactions. Config representations
 redact private keys, and the public API exposes only
@@ -2543,6 +3203,7 @@ execution lifecycle invokes the autonomous startup when it calls `connect`.
 | ---------------------- | --------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Instrument definitions | Implemented                 | Implemented                         | Spot: REST metadata is paired with exact quantity limits and tick data from one approved finalized checkpoint.                  |
 | Historical candles     | Partial                     | Implemented (bounded pagination)    | Both use exact instrument precision; Spot also checks finalized tick/step grids. Bucket-close semantics remain undefined.        |
+| Streaming bars         | -                           | Partial (one-minute candles)         | Superseded WebSocket buckets may be revised later; gaps and disconnects stop the subscription without backfill.                 |
 | Historical trades      | Implemented                 | Implemented                         | Bounded correlated Spot/Perpetual responses; exact instrument precision and identity checks.                                    |
 | Order book snapshots   | Implemented (one-shot REST) | Implemented (configured L2 view)    | Spot REST levels become a bounded L2 snapshot with exact precision, sequence, and engine time.                                  |
 | Order book deltas      | Partial                     | Implemented (bounded recovery)      | Spot node RPC currently supplies complete snapshots, published as replacement batches; incremental Spot deltas are unavailable. |
@@ -2551,12 +3212,19 @@ execution lifecycle invokes the autonomous startup when it calls `connect`.
 | Mark and index prices  | -                           | Implemented                         | Exact acknowledged mark/oracle updates with bounded reconnect; no intermediate replay or freshness guarantee.                   |
 | Funding                | -                           | Implemented                         | Bounded history and exact live rate updates; no inferred payment interval or next payment time.                                 |
 | Long-short ratio       | -                           | Partial                             | Typed single-page reads and bounded cursor history; no framework events.                                                        |
-| Open interest          | -                           | Partial                             | Typed single-page history only; units remain unproven.                                                                          |
+| Open interest          | -                           | Partial                             | Bounded REST history and raw acknowledged WebSocket observations; units and framework mapping remain unproven.                   |
 | Volume statistics      | -                           | Partial                             | Raw fixed-period window; units and boundaries unproven.                                                                         |
 | Last price             | -                           | Partial                             | Raw exact value only; no timestamp or freshness semantics.                                                                      |
-| Live bars              | Planned                     | Planned                             | Streaming candle transport and incomplete-bucket publication remain unsupported.                                                |
 | Market status          | Partial                     | Partial                             | Explicit `isPaused`/Perp `isDeleted` REST fields are polled every 30 seconds; status timestamp is local observation time.         |
 | Lending market status  | Partial                     | -                                   | Raw directory, rate curves, APR and pool status only; precision, units, freshness, and framework events remain unproven.        |
+
+A complete catalog that omits a subscribed market publishes `NotAvailableForTrading` with
+`is_trading=false` until a later complete refresh restores its observed status. A failed catalog
+read publishes no status change and retains the last observation; it is not venue evidence that
+the market stopped trading or was deleted.
+On 2026-10-11, `deepx-verify-live-trades --status` observed one market-3 `TRADING` framework
+status event with a local observation timestamp, then unsubscribed and disconnected without a
+later event. This one read does not prove future transition delivery or catalog freshness.
 
 The instrument provider constructs `CryptoPerpetual` definitions from catalog metadata with
 settlement currency, linear costing, and a unit multiplier asserted as documented assumptions that
@@ -2572,9 +3240,9 @@ emit an order book assembled from unverified or discontinuous data.
 
 | Capability         | Spot    | Perpetual | Evidence gate                                                                                                                                       |
 | ------------------ | ------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Market order       | Planned | Partial   | Durable Perp Market IOC pipeline with oracle-guarded `Market(None)` mapping; testnet execution and fill behavior remain unverified.                 |
+| Market order       | Planned | Partial   | Spot Buy `Market(None)` and Sell `Market(Some(50))` match SDK signed bytes; the pallet requires explicit positive quote and base amounts, while framework MarketOrder has no quote budget. Terminal report mapping remains unverified. Perp Market IOC uses an oracle guard. |
 | Limit GTC          | Partial | Partial   | Spot supports durable base-quantity Limit GTC submission and indexed finalized order-state evidence; testnet validation and fills remain outstanding. |
-| Limit IOC          | Planned | Partial   | Durable Perp Limit IOC pipeline; venue partial-fill behavior remains unverified.                                                                    |
+| Limit IOC          | Partial | Partial   | Spot maps exact base/quote amounts and signs `Limit(IOC)`; local pallet cancels unmatched quantity as `IocUnfilled`. Testnet fills remain unverified. |
 | Post-only          | Planned | Partial   | Perp `MustPostOnly` mapping and durable submission; crossing behavior needs testnet evidence.                                                       |
 | Reduce-only        | -       | Partial   | Perp reduce-only mapping and durable submission; position-side and over-reduction behavior need testnet evidence.                                   |
 | Stop order         | Planned | Planned   | Trigger source, direction, and lifecycle behavior.                                                                                                  |
@@ -2590,8 +3258,65 @@ emit an order book assembled from unverified or discontinuous data.
 No order capability may emit a rejection after an outcome becomes ambiguous. Recovery must merge
 relay, stream, REST, transaction-pool, block, event, and finality evidence without blindly
 replaying mutating bytes.
+The current testnet OpenAPI's perpetual and Spot `check-order` routes document only a failure
+wrapper for unavailable legacy order-hash sources; they provide no successful response contract.
+On 2026-10-10, a read-only perpetual query using an observed order transaction hash returned
+service code `10011` with `fail: true` and an empty `data` array.
+They cannot establish transaction absence or resolve an ambiguous submission.
 
 ## Account and reports
+
+`observe_initial_perp_open_positions_page` reads one acknowledged `user_perp_positions`
+WebSocket snapshot for an exact market and subaccount with `status: open`. A read-only testnet
+observation for the contributor's market 3 subaccount on 2026-10-09 returned `items: null`,
+`totalCount: 0`, and `totalPage: 0`. The observer accepts this documented empty form, preserves
+nonempty items as raw JSON, and rejects foreign identities or incomplete pagination. The snapshot
+requires each nonempty item to identify the requested owner and market, carry `Open` status, and
+have a unique nonzero position ID. No nonempty live WebSocket item was available from this wallet;
+its current REST position pages contain only `Closed` records. The snapshot is mutable and does
+not establish finalized exposure or produce a framework position report. Run
+`deepx-verify-ws-perp-open-positions <subaccount-account-id20> <market-id>` for one credential-free
+observation.
+
+The `--wallet <wallet> <market-id>` mode checks that the expanded `open` ACK matches the current
+REST subaccount directory and reads one initial page per address. A market 3 run on 2026-10-09 for
+wallet `0x781ed35b167068c93dfadab41dfb680edaca4e50` returned four empty pages. The venue
+repeated an identical page before all addresses arrived; the observer admits identical repeats but
+rejects conflicting content. These mutable reads do not prove finalized ownership or exposure.
+
+The read-only `user_spot_trade_history` observer binds one verified Spot market and exact
+subaccount per subscription, validates each incremental trade's pair and account scope, and keeps
+its exact decimal values and raw JSON. It accepts at most 20 batches and 100 items per address.
+The wallet verifier observes each current directory subaccount, then reports only if every
+subscription succeeds. An `ETH/USDC` run on 2026-10-09 for wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50` acknowledged four subscriptions and received
+zero trade batches in each ten-second window. No nonempty Spot WebSocket trade frame was verified;
+the observer does not dispatch fills. The optional REST matcher requires an exact subaccount and
+pair request, bounded timestamp range, all typed trade fields, a unique venue ID, and no duplicate
+matches across batches. A read-only wallet `--reconcile` run likewise observed zero batches, so
+nonempty WS-to-REST matching has local test coverage but no live acceptance evidence. REST account
+trade rows do not echo the subaccount and are not block-pinned; a match is only mutable candidate
+evidence.
+The approved-metadata Spot event decoder retains every `SpotMarket.OrderMatched` field and its
+global `System.Events` index. A pure exact matcher binds REST trade ID, pair, account, order side,
+gross base/quote amounts, runtime price, and side-specific fee asset and sign to one supplied
+event. Spec-371 metadata-encoded tests pass for a buyer taker and seller maker. The specified
+wallet's current `trades-by-wallet` response has empty `ETH/USDC` and `SOL/USDC` subaccount
+groups. No wallet-owned live Spot trade has yet exercised the chain match, and the matcher alone
+does not establish canonical finality or authorize fill delivery.
+The Spot finalized-block observer requires a fixture-approved historical runtime, checks the
+requested height against the finalized head, rejects inconsistent spec-369 historical runtime
+responses before reading complete event storage twice at one hash, and rechecks that height's
+canonical hash. The Perpetual finalized-trade observer applies the same historical check before
+event reads. Local RPC tests cover unchanged events, non-finality, historical runtime inconsistency,
+changed storage or hash, unapproved runtime, and malformed storage. The wallet verifier's
+`--finalized` mode collects at most 20 batches, 100 items, and 20 distinct event blocks before
+printing any three-source match. The specified wallet's read-only `ETH/USDC` run on 2026-10-09
+again observed zero batches and matched zero trades. No live nonempty Spot stream or three-source
+match has been verified, and no Spot fill dispatch is enabled.
+The read-only Perpetual verifier for block `187071212` and the same wallet stopped at the public
+RPC's historical `Core_version` response of spec 371 for a captured spec-369 hash; it returned no
+finalized trades.
 
 | Capability              | Current status | Evidence gate                                                                                                                   |
 | ----------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -2632,11 +3357,27 @@ runtime-refresh boundary exist.
 
 ### Legacy EVM precompile
 
+`sign_offline_evm_transaction` signs caller-supplied EIP-1559 and legacy envelopes entirely offline
+with the pinned SDK's zero-fee fields. `sign_offline_evm_transact_extrinsic` requires an active
+approved runtime permit and testnet chain ID `4846`, then embeds either envelope in the unsigned
+`Ethereum.transact` wrapper. SDK and Rust regression vectors match complete EVM bytes, EVM
+transaction hashes, signer, and complete wrapper bytes for both formats. The caller supplies the
+nonce, gas limit, destination, calldata, and value. These primitives do not discover a precompile
+address, encode its ABI, reserve a nonce, persist transaction state, or submit bytes. Legacy EVM
+execution remains unsupported.
+
+The inspected testnet chain source registers the Perp precompile at `0x044e` and declares
+`setProfitAndLossPoint(address,uint16,uint128,uint128)`. The typed
+`sign_offline_perp_pnl_evm_transact_extrinsic` entry point encodes this ABI call and produces the
+offline EVM envelope and unsigned wrapper. Its EVM and outer hashes match pinned SDK vectors in
+both envelope modes. The inspected Spot and Perp precompiles contain no order-placement ABI, so
+this evidence does not authorize a legacy order workflow.
+
 The legacy path is expected to encode ABI calldata, sign an EVM transaction, and wrap the decoded
 transaction plus signer AccountId20 in an unsigned `Ethereum.transact` extrinsic. The Python SDK
 reference uses `create_unsigned_extrinsic` for this wrapper; there is no second outer signature. It
-remains unsupported until fixtures prove the precompile address, ABI, chain ID, nonce, gas fields,
-transaction format, EVM signature, wrapper bytes, and both transaction hashes.
+remains unsupported for other calls until their precompile address and ABI are proved, and the
+transaction lifecycle is validated end to end.
 
 ## Transaction evidence
 
@@ -2855,10 +3596,17 @@ configured signing key using the configured non-zero clock-drift limit, which de
 seconds. It also retains the fixture-approved runtime snapshot service and can use it to observe
 chain time without accepting a caller-supplied snapshot or time value. That operation first
 validates and applies runtime version and metadata from one finalized Watch checkpoint, then reads
-`Timestamp.Now` from the exact same block hash and accepts only one non-zero SCALE `u64` Unix
-millisecond value. Runtime change evidence is latched before any later timestamp-read failure. The
-operation does not allocate a new nonce, enable sequential account nonces, sign, persist a
-transaction, or submit it. A separate client-owned perpetual placement reservation operation
+`Timestamp.Now` from the exact same block hash and requires it to agree with the block's
+`Timestamp.set` inherent and an independent `state_queryStorageAt` read. Historical runtime
+selection must also return the captured spec-369 version. A version mismatch or contradictory
+block timestamp evidence closes the owned snapshot service to new signing permits until restart;
+ordinary RPC transport failures do not latch that stop. Runtime change evidence is latched
+before any later timestamp-read failure. The operation does not allocate a new nonce, enable
+sequential account nonces, sign, persist a transaction, or submit it. The signer rechecks an
+existing permit immediately before encoding, and order submission tasks recheck their retained
+permit before starting the transport. A revoked permit at that point is classified as locally not
+sent while the durable `submitting` context remains available for reconciliation. A separate
+client-owned perpetual placement reservation operation
 combines a fresh observation with the retained signer lease, timestamp allocator, snapshot permit,
 and PostgreSQL store. It validates the retained ownership proof against the signer and requested
 subaccount, binds the instrument to the immutable market catalog, holds the matching runtime permit
@@ -2986,7 +3734,9 @@ The following unresolved questions keep their dependent capabilities disabled:
   existing timestamp reservation boundary.
 - Relay acknowledgement meaning and correlation with stream, REST, and chain evidence.
 - Canonical inclusion, reorganization, finality, pool eviction, and missed-block recovery.
-- Quota idempotency and the exact EIP-191 claim message.
+- Quota claim idempotency, wallet or delegate authorization, and executor finality. The exact
+  three-line EIP-191 message is documented and can be signed offline, but claim creation remains
+  disabled.
 - Delegate ownership, mode, expiry, revocation, and wallet-wide effects.
 - Lending precision, units, freshness, completeness, compounding, collateral, framework semantics,
   and authoritative completion evidence.
@@ -3023,9 +3773,10 @@ Failed or incomplete conformance leaves that capability disabled and documented 
 
 ## Known limitations
 
-- The Python package exposes only validated configs, disconnected factories, and canonical
-  identities; it does not expose an operational client or management service.
-- No DeepX market data, account, signing, trading, or management capability is currently enabled.
+- The Python package exposes validated configs, client factories, selected read-only services, and
+  canonical identities. Operational clients are constructed by the framework factories.
+- DeepX remains testnet-only and partial: the capability tables above define which market data,
+  account, report, signing, and trading paths have implementation and evidence.
 - Mainnet is explicitly unsupported.
 - The Python SDK is a protocol reference and golden-vector oracle only; it will not be a runtime
   dependency.

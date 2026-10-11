@@ -17,7 +17,10 @@
 
 mod postgres;
 
-use std::fmt::{self, Debug};
+use std::{
+    collections::HashSet,
+    fmt::{self, Debug},
+};
 
 use nautilus_common::messages::OrderEventConsumerReceipt;
 use nautilus_core::UnixNanos;
@@ -31,7 +34,7 @@ use thiserror::Error;
 
 use super::{
     DeepXDirectRuntimeIdentity, DeepXDurableSignedExtrinsic, DeepXFinalityObservation,
-    DeepXFinalizedRecoveryCollection, DeepXFrameworkOrderContext,
+    DeepXFinalizedRecoveryCheckpoint, DeepXFinalizedRecoveryCollection, DeepXFrameworkOrderContext,
     DeepXFrameworkOrderEventAcknowledgementError, DeepXFrameworkOrderEventStagingError,
     DeepXNonceReservation, DeepXRecoveryDecision, DeepXReorganizationDecision,
     DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTimestampNonceError,
@@ -230,6 +233,9 @@ pub enum DeepXTransactionPersistenceError {
     /// A committed-write acknowledgement did not cover the exact current record.
     #[error("DeepX transaction committed-write acknowledgement does not match the record")]
     AcknowledgementMismatch,
+    /// The restored signer set contains the same durable key or timestamp nonce twice.
+    #[error("DeepX restored transaction set contains a duplicate {0}")]
+    DuplicateRestoredIdentity(&'static str),
     /// The signer lease belongs to another account.
     #[error("DeepX signer lease does not match the transaction signer")]
     LeaseMismatch,
@@ -316,11 +322,33 @@ where
 {
     store.verify_signer_lease(lease).await?;
     let restored = store.load_committed_for_signer(lease).await?;
-    for item in &restored {
+    verify_restored_signer_set(lease, &restored)?;
+    Ok(restored)
+}
+
+fn verify_restored_signer_set(
+    lease: &impl DeepXSignerLease,
+    restored: &[DeepXRestoredTransactionRecord],
+) -> Result<(), DeepXTransactionPersistenceError> {
+    let mut cache_keys = HashSet::with_capacity(restored.len());
+    let mut timestamp_nonces = HashSet::with_capacity(restored.len());
+    for item in restored {
         item.committed().verify(item.record())?;
         verify_signer_lease(lease, item.record())?;
+        if !cache_keys.insert(item.committed().cache_key()) {
+            return Err(DeepXTransactionPersistenceError::DuplicateRestoredIdentity(
+                "cache key",
+            ));
+        }
+        if let DeepXNonceReservation::TimestampOrderId { value } = item.record().identity().nonce()
+            && !timestamp_nonces.insert(value)
+        {
+            return Err(DeepXTransactionPersistenceError::DuplicateRestoredIdentity(
+                "timestamp nonce",
+            ));
+        }
     }
-    Ok(restored)
+    Ok(())
 }
 
 /// Restores a timestamp nonce allocator from the complete durable signer record set.
@@ -710,10 +738,7 @@ where
         order_side,
         nonce,
         runtime,
-        params.subaccount,
-        params.order_id,
-        params.market_id,
-        params.fast_cancel,
+        params,
     );
     let record = match framework_order_context {
         Some(context) => DeepXTransactionRecord::created_with_framework_order_context(
@@ -3404,8 +3429,10 @@ where
         capabilities,
         snapshot,
         record.identity(),
-        checkpoint.finalized_block_number(),
-        checkpoint.finalized_block_hash(),
+        DeepXFinalizedRecoveryCheckpoint::new(
+            checkpoint.finalized_block_number(),
+            checkpoint.finalized_block_hash(),
+        ),
         max_blocks_per_range,
         signed_extrinsic.extrinsic_hash(),
     )
@@ -3498,8 +3525,10 @@ where
         capabilities,
         snapshot,
         record.identity(),
-        checkpoint.finalized_block_number(),
-        checkpoint.finalized_block_hash(),
+        DeepXFinalizedRecoveryCheckpoint::new(
+            checkpoint.finalized_block_number(),
+            checkpoint.finalized_block_hash(),
+        ),
         max_blocks_per_range,
         signed_extrinsic.extrinsic_hash(),
     )
@@ -3592,8 +3621,10 @@ where
         capabilities,
         snapshot,
         record.identity(),
-        checkpoint.finalized_block_number(),
-        checkpoint.finalized_block_hash(),
+        DeepXFinalizedRecoveryCheckpoint::new(
+            checkpoint.finalized_block_number(),
+            checkpoint.finalized_block_hash(),
+        ),
         max_blocks_per_range,
         signed_extrinsic.extrinsic_hash(),
     )
@@ -3662,8 +3693,7 @@ where
         endpoints,
         capabilities,
         snapshot,
-        store,
-        lease,
+        (store, lease),
         restored,
         max_blocks_per_range,
         DeepXDurableRecoveryObserver::Default,
@@ -3705,8 +3735,7 @@ pub async fn reconcile_not_included_checkpoint_with_observer<S>(
     endpoints: &DeepXValidatedRpcEndpoints,
     capabilities: &DeepXValidatedRpcMethodCapabilities,
     snapshot: &RuntimeSnapshot,
-    store: &S,
-    lease: &S::Lease,
+    store_lease: (&S, &S::Lease),
     restored: &DeepXRestoredTransactionRecord,
     max_blocks_per_range: u64,
     observer: DeepXDurableRecoveryObserver<'_>,
@@ -3714,6 +3743,7 @@ pub async fn reconcile_not_included_checkpoint_with_observer<S>(
 where
     S: DeepXTransactionStore,
 {
+    let (store, lease) = store_lease;
     let record = restored.record();
     if record.lifecycle().state() != DeepXTransactionState::NotIncluded {
         return Err(DeepXFinalizedRecoveryCommitError::IneligibleState(
@@ -3771,8 +3801,10 @@ where
                 capabilities,
                 snapshot,
                 record.identity(),
-                absence.finalized_block_number(),
-                absence.finalized_block_hash(),
+                DeepXFinalizedRecoveryCheckpoint::new(
+                    absence.finalized_block_number(),
+                    absence.finalized_block_hash(),
+                ),
                 max_blocks_per_range,
                 target_extrinsic_hash,
             )
@@ -3840,8 +3872,10 @@ where
                 capabilities,
                 snapshot,
                 record.identity(),
-                absence.finalized_block_number(),
-                absence.finalized_block_hash(),
+                DeepXFinalizedRecoveryCheckpoint::new(
+                    absence.finalized_block_number(),
+                    absence.finalized_block_hash(),
+                ),
                 max_blocks_per_range,
                 target_extrinsic_hash,
             )
@@ -3853,8 +3887,10 @@ where
                 capabilities,
                 snapshot,
                 record.identity(),
-                absence.finalized_block_number(),
-                absence.finalized_block_hash(),
+                DeepXFinalizedRecoveryCheckpoint::new(
+                    absence.finalized_block_number(),
+                    absence.finalized_block_hash(),
+                ),
                 max_blocks_per_range,
                 target_extrinsic_hash,
             )
@@ -4515,6 +4551,63 @@ mod tests {
                 signed_extensions: vec!["CheckNonce".to_string()],
             },
         ))
+    }
+
+    #[rstest]
+    fn restored_signer_set_rejects_duplicate_cache_key() {
+        let record = record();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(1),
+        )
+        .unwrap();
+        let item = DeepXRestoredTransactionRecord::new(record, committed).unwrap();
+        let lease = TestLease {
+            signer: [7; 20],
+            generation: 4,
+        };
+
+        assert!(matches!(
+            verify_restored_signer_set(&lease, &[item.clone(), item]),
+            Err(DeepXTransactionPersistenceError::DuplicateRestoredIdentity(
+                "cache key"
+            )),
+        ));
+    }
+
+    #[rstest]
+    fn restored_signer_set_rejects_distinct_records_with_same_timestamp_nonce() {
+        let first = record();
+        let second = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+            ClientOrderId::new("O-19700101-000000-001-001-2"),
+            [7; 20],
+            first.identity().instrument_id(),
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            first.identity().runtime().clone(),
+        ));
+        let restored = [first, second]
+            .into_iter()
+            .map(|record| {
+                let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+                    &record,
+                    DeepXTransactionRevision::new(1),
+                )
+                .unwrap();
+                DeepXRestoredTransactionRecord::new(record, committed).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let lease = TestLease {
+            signer: [7; 20],
+            generation: 4,
+        };
+
+        let error = verify_restored_signer_set(&lease, &restored).unwrap_err();
+        assert!(matches!(
+            error,
+            DeepXTransactionPersistenceError::DuplicateRestoredIdentity("timestamp nonce"),
+        ));
+        assert!(!error.is_proven_not_committed());
     }
 
     fn signed_record() -> DeepXTransactionRecord {
@@ -5469,7 +5562,10 @@ mod tests {
             )),
             5 | 6 => {
                 let (identity, signed) = spot_place_fixture(operation == 5);
-                let mut record = DeepXTransactionRecord::created(identity);
+                let mut record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+                    identity,
+                    DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+                );
                 record.record_signed(&signed).unwrap();
                 record
             }
@@ -5695,12 +5791,13 @@ mod tests {
         )
         .unwrap();
         let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let runtime_permit = service.acquire().unwrap();
         let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
             &store,
             &lease,
             &committed,
             &created,
-            &service.acquire().unwrap(),
+            &runtime_permit,
             &verifier,
         )
         .await
@@ -5737,12 +5834,168 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = crate::http::client::DeepXHttpClient::new(url, Some(2), None).unwrap();
-        let acknowledgement = crate::transaction::submit_rest_transaction_once(&client, prepared)
-            .await
-            .unwrap();
+        let acknowledgement =
+            crate::transaction::submit_rest_transaction_once(&client, prepared, &runtime_permit)
+                .await
+                .unwrap();
         assert_eq!(acknowledgement.submitted.extrinsic_hash(), hash);
         assert_eq!(acknowledgement.data["confirmation"], "pending");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(store.current_revision(), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn perpetual_modify_has_no_rest_transact_action() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Router, routing::post};
+
+        let params = perp_modify_params_fixture();
+        let nonce = 1_725_000_000_125;
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let runtime_permit = service.acquire().unwrap();
+        let signed =
+            crate::signing::sign_perp_modify_order(&runtime_permit, &remark_key(), params, nonce)
+                .unwrap();
+        let mut record = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            perp_modify_identity(params, nonce),
+            DeepXSubmissionScanCheckpoint::new(40, [40; 32]),
+        );
+        record.record_signed(&signed).unwrap();
+        let store = TestStore::new(2, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        let verifier = DeepXPerpModifyCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
+        let prepared =
+            prepare_initial_submission(&store, &lease, restored[0].committed(), &record, &verifier)
+                .await
+                .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/internal/v1/chain/tx/transact",
+            post(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async { "unexpected submission" }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::http::DeepXHttpClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let result =
+            crate::transaction::submit_rest_transaction_once(&client, prepared, &runtime_permit)
+                .await;
+        assert!(matches!(
+            result,
+            Err(crate::transaction::DeepXRestSubmissionError::NotSent(reason))
+                if reason.contains("no documented REST transact action")
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(store.current_revision(), 3);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn invalid_runtime_permit_blocks_durable_rest_submission(#[case] mismatched: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Router, routing::post};
+
+        let record = direct_operation_fixture(0);
+        let store = TestStore::new(2, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let restored = store.load_committed_for_signer(&lease).await.unwrap();
+        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
+            remark_snapshot(),
+            remark_key(),
+            [0x11; 20],
+        )
+        .unwrap();
+        let prepared =
+            prepare_initial_submission(&store, &lease, restored[0].committed(), &record, &verifier)
+                .await
+                .unwrap();
+        let snapshot = if mismatched {
+            let metadata: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test_data/runtime/testnet/",
+                "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
+            )))
+            .unwrap();
+            let bytes = nautilus_core::hex::decode(
+                metadata["result"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            crate::signing::RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                nautilus_core::hex::decode_array(
+                    "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+                )
+                .unwrap(),
+                371,
+                1,
+                &bytes,
+            )
+            .unwrap()
+        } else {
+            remark_snapshot()
+        };
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot);
+        let runtime_permit = service.acquire().unwrap();
+        if !mismatched {
+            service.halt_for_inconsistent_evidence().unwrap();
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let router = Router::new().route(
+            "/internal/v1/chain/tx/transact",
+            post(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                async { "unexpected submission" }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::http::DeepXHttpClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let result =
+            crate::transaction::submit_rest_transaction_once(&client, prepared, &runtime_permit)
+                .await;
+        let Err(crate::transaction::DeepXRestSubmissionError::NotSent(reason)) = result else {
+            panic!("invalid runtime permit must prevent REST submission");
+        };
+        if mismatched {
+            assert!(reason.contains("runtime permit does not match"));
+        } else {
+            assert!(reason.contains("inconsistent"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(store.current_revision(), 3);
         server.abort();
     }
@@ -5844,7 +6097,9 @@ mod tests {
         )
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let acknowledgement = submit_rest_transaction_once(&client, prepared)
+        let service = crate::signing::DeepXRuntimeSnapshotService::new(remark_snapshot());
+        let runtime_permit = service.acquire().unwrap();
+        let acknowledgement = submit_rest_transaction_once(&client, prepared, &runtime_permit)
             .await
             .unwrap();
         let accepted = commit_initial_submission_acceptance(
@@ -5961,7 +6216,7 @@ mod tests {
             "signer" => identity["signer"] = serde_json::to_value([0x22u8; 20]).unwrap(),
             "runtime" => identity["runtime"]["spec_version"] = json!(999),
             "subaccount" => {
-                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap()
+                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap();
             }
             "operation" => {
                 identity["operation"] =
@@ -5971,7 +6226,7 @@ mod tests {
             "nonce" => {
                 identity["nonce"] =
                     serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 123 })
-                        .unwrap()
+                        .unwrap();
             }
             "price" => identity["operation"]["price"] = json!("1"),
             _ => unreachable!(),
@@ -6120,17 +6375,18 @@ mod tests {
         .unwrap();
         match corruption {
             "foreign" => {
-                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap()
+                identity["operation"]["subaccount"] = serde_json::to_value([0x22u8; 20]).unwrap();
             }
             "legacy" => {
                 identity.as_object_mut().unwrap().remove("operation");
             }
             "sequential" => {
-                identity["nonce"] = serde_json::to_value(DeepXNonceReservation::SequentialAccount {
-                    account_index: 0,
-                    nonce: 1,
-                })
-                .unwrap()
+                identity["nonce"] =
+                    serde_json::to_value(DeepXNonceReservation::SequentialAccount {
+                        account_index: 0,
+                        nonce: 1,
+                    })
+                    .unwrap();
             }
             _ => {}
         }
@@ -6919,7 +7175,7 @@ mod tests {
         };
         let store = TestStore {
             commit_outcome_unknown: mutation == 3,
-            signed_commit_fault: if mutation == 5 { 1 } else { 0 },
+            signed_commit_fault: u8::from(mutation == 5),
             ..TestStore::new(3, &record)
         };
         let mut lease = store
@@ -7080,7 +7336,7 @@ mod tests {
         };
         let store = TestStore {
             commit_outcome_unknown: mutation == 3,
-            signed_commit_fault: if mutation == 5 { 1 } else { 0 },
+            signed_commit_fault: u8::from(mutation == 5),
             ..TestStore::new(3, &record)
         };
         let mut lease = store
@@ -7316,8 +7572,8 @@ mod tests {
             )),
             1 | 2 => assert!(matches!(
                 result,
-                Err(DeepXSignedTransactionPreparationError::Record(_))
-                    | Err(DeepXSignedTransactionPreparationError::Binding(_))
+                Err(DeepXSignedTransactionPreparationError::Record(_)
+                    | DeepXSignedTransactionPreparationError::Binding(_))
             )),
             3 => assert!(matches!(
                 result,
@@ -7398,14 +7654,14 @@ mod tests {
             11 => {
                 wire["nonce"] =
                     serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 0 })
-                        .unwrap()
+                        .unwrap();
             }
             12 => {
                 wire["nonce"] = serde_json::to_value(DeepXNonceReservation::SequentialAccount {
                     account_index: 0,
                     nonce: u64::MAX,
                 })
-                .unwrap()
+                .unwrap();
             }
             13 => {
                 wire.as_object_mut().unwrap().remove("operation");
@@ -7413,7 +7669,7 @@ mod tests {
             14 => {
                 wire["operation"] =
                     serde_json::to_value(perp_cancel_identity([0x11; 20], 1, 7, false).operation())
-                        .unwrap()
+                        .unwrap();
             }
             _ => unreachable!(),
         }
@@ -7509,10 +7765,12 @@ mod tests {
                 value: 1_725_000_000_125,
             },
             remark_runtime(),
-            subaccount,
-            order_id,
-            market_id,
-            fast_cancel,
+            DeepXPerpCancelParams {
+                subaccount,
+                order_id,
+                market_id,
+                fast_cancel,
+            },
         )
     }
 
@@ -7586,7 +7844,7 @@ mod tests {
             .unwrap();
         let signed =
             crate::signing::sign_perp_modify_order(&permit, &remark_key(), params, nonce).unwrap();
-        let mut record = DeepXTransactionRecord::created(identity.clone());
+        let mut record = DeepXTransactionRecord::created(identity);
         record.record_signed(&signed).unwrap();
         let mut changed_params = params;
         changed_params.place.price -= 1;
@@ -7618,10 +7876,12 @@ mod tests {
             side,
             DeepXNonceReservation::TimestampOrderId { value: u64::MAX },
             remark_runtime(),
-            [0xa5; 20],
-            order_id,
-            market_id,
-            fast_cancel,
+            DeepXPerpCancelParams {
+                subaccount: [0xa5; 20],
+                order_id,
+                market_id,
+                fast_cancel,
+            },
         );
         let record = DeepXTransactionRecord::created(identity);
         let store = TestStore::new(3, &record);
@@ -7694,10 +7954,12 @@ mod tests {
                 identity.order_side(),
                 identity.nonce(),
                 runtime,
-                [0x11; 20],
-                u64::MAX,
-                u16::MAX,
-                true,
+                DeepXPerpCancelParams {
+                    subaccount: [0x11; 20],
+                    order_id: u64::MAX,
+                    market_id: u16::MAX,
+                    fast_cancel: true,
+                },
             ));
         }
         if mutation == 4 {
@@ -8174,7 +8436,7 @@ mod tests {
             3 => {
                 wire["nonce"] =
                     serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 1 })
-                        .unwrap()
+                        .unwrap();
             }
             _ => unreachable!(),
         }
@@ -8248,14 +8510,14 @@ mod tests {
             12 => {
                 wire["nonce"] =
                     serde_json::to_value(DeepXNonceReservation::TimestampOrderId { value: 1 })
-                        .unwrap()
+                        .unwrap();
             }
             13 => {
                 wire["nonce"] = serde_json::to_value(DeepXNonceReservation::SequentialAccount {
                     account_index: 0,
                     nonce: 7,
                 })
-                .unwrap()
+                .unwrap();
             }
             14 => wire["order_side"] = serde_json::to_value(OrderSide::Sell).unwrap(),
             15 => wire
@@ -8433,10 +8695,12 @@ mod tests {
             signed_identity.order_side(),
             signed_identity.nonce(),
             signed_identity.runtime().clone(),
-            [0x11; 20],
-            1_725_000_000_001,
-            7,
-            false,
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 1_725_000_000_001,
+                market_id: 7,
+                fast_cancel: false,
+            },
         );
         let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
 
@@ -8537,10 +8801,12 @@ mod tests {
             identity.order_side(),
             nonce,
             runtime,
-            [0x11; 20],
-            1_725_000_000_001,
-            7,
-            false,
+            DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 1_725_000_000_001,
+                market_id: 7,
+                fast_cancel: false,
+            },
         );
         let verifier = DeepXPerpCancelCallVerifier::new(remark_snapshot(), remark_key()).unwrap();
 
@@ -9482,8 +9748,7 @@ mod tests {
             &endpoints,
             &capabilities,
             &selected_snapshot,
-            &store,
-            &lease,
+            (&store, &lease),
             &restored,
             10,
             DeepXDurableRecoveryObserver::OrdinarySpotCancel(&verifier),
@@ -9598,8 +9863,7 @@ mod tests {
             &endpoints,
             &capabilities,
             &snapshot,
-            &store,
-            &lease,
+            (&store, &lease),
             &restored,
             10,
             DeepXDurableRecoveryObserver::PerpCancel(&verifier),
@@ -9714,8 +9978,7 @@ mod tests {
             &endpoints,
             &capabilities,
             &snapshot,
-            &store,
-            &lease,
+            (&store, &lease),
             &restored[0],
             10,
             match operation {

@@ -364,6 +364,9 @@ pub enum DeepXAccountOwnershipError {
     /// The configured subaccount is absent from the signer's account directory.
     #[error("configured DeepX subaccount is not owned by the signing identity")]
     SubaccountNotOwned,
+    /// The account directory changed while the profile was being checked.
+    #[error("DeepX account directory changed during ownership verification")]
+    DirectoryChanged,
     /// The profile belongs to a subaccount other than the configured identity.
     #[error("DeepX subaccount profile address does not match the configured subaccount")]
     ProfileAddressMismatch,

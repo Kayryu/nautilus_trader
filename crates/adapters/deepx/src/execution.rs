@@ -16,16 +16,22 @@
 //! Fail-closed DeepX execution client startup boundary.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use nautilus_common::{
-    cache::fifo::{FifoCache, FifoCacheMap},
+    cache::{
+        Cache,
+        fifo::{FifoCache, FifoCacheMap},
+    },
     clients::ExecutionClient,
     live::{dst, runner::get_exec_event_sender},
     log_error,
@@ -117,22 +123,24 @@ use crate::{
         DeepXDurableRecoveryObserver, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
         DeepXFinalizedTransactionLocation, DeepXFrameworkOrderContext,
         DeepXFrameworkOrderEventMaterializationError, DeepXFrameworkOrderOutboxCommitError,
-        DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpModifyCallVerifier,
-        DeepXPerpPlaceCallVerifier, DeepXPerpProfitAndLossPointCallVerifier,
-        DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
-        DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
-        DeepXPreparedSubmission, DeepXReorganizationCommitError, DeepXReservationPreparationError,
-        DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
-        DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier,
-        DeepXSubmissionAcceptanceCommitError, DeepXSubmissionAttemptOutcome,
-        DeepXSubmissionFailure, DeepXSubmissionPreparationError, DeepXSubmissionScanCheckpoint,
-        DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTransactionOperation,
-        DeepXTransactionPersistenceError, DeepXTransactionRecord, DeepXTransactionRecoveryAction,
-        DeepXTransactionState, DeepXTransactionStore, DeepXTransactionWatchError,
-        commit_framework_order_event_acknowledgement, commit_framework_order_event_staging,
-        commit_initial_submission_acceptance, load_verified_committed_for_signer,
-        materialize_perp_framework_order_events, observe_and_commit_finality,
-        observe_and_commit_reorganization,
+        DeepXNonceReservation, DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier,
+        DeepXPerpModifyCallVerifier, DeepXPerpPlaceCallVerifier,
+        DeepXPerpProfitAndLossPointCallVerifier, DeepXPoolReconciliationCommitError,
+        DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXPreparedReservation,
+        DeepXPreparedSignedTransaction, DeepXPreparedSubmission, DeepXReorganizationCommitError,
+        DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
+        DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
+        DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError,
+        DeepXSubmissionAttemptOutcome, DeepXSubmissionFailure, DeepXSubmissionPreparationError,
+        DeepXSubmissionScanCheckpoint, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
+        DeepXTransactionOperation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
+        DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
+        DeepXTransactionWatchError, commit_framework_order_event_acknowledgement,
+        commit_framework_order_event_staging, commit_initial_submission_acceptance,
+        load_verified_committed_for_signer, match_finalized_perp_account_trade,
+        match_finalized_spot_account_trade, materialize_perp_framework_order_events,
+        observe_and_commit_finality, observe_and_commit_reorganization,
+        observe_finalized_perp_trades_at, observe_finalized_spot_trades_at,
         prepare_framework_perp_cancel_reservation as prepare_durable_framework_perp_cancel_reservation,
         prepare_framework_perp_modify_reservation as prepare_durable_framework_perp_modify_reservation,
         prepare_framework_perp_place_reservation as prepare_durable_framework_perp_place_reservation,
@@ -146,7 +154,7 @@ use crate::{
         reconcile_submission_pool, reconcile_submitted_perp_cancel_checkpoint,
         reconcile_submitted_perp_modify_checkpoint, reconcile_submitted_perp_place_checkpoint,
         reconcile_submitted_spot_cancel_checkpoint, reconcile_submitted_spot_place_checkpoint,
-        restore_timestamp_nonce_allocator, submit_once_preserving_context,
+        restore_timestamp_nonce_allocator, submit_once_with_runtime_guard,
     },
     websocket::{
         DeepXWsAccountConnection, DeepXWsConfirmedAccountSubscription,
@@ -162,12 +170,15 @@ const ORDER_REPORT_PAGE_SIZE: u32 = 100;
 const ORDER_REPORT_MAX_PAGES: usize = 100;
 const FILL_REPORT_PAGE_SIZE: u32 = 100;
 const FILL_REPORT_MAX_PAGES: usize = 100;
+const FILL_REPORT_MAX_FINALIZED_BLOCKS: usize = 100;
 const ORDER_EVENT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT_STREAM_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+const MAX_ORDER_LIST_FANOUT: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DeepXPerpetualReportMetadata {
     base_decimal: u8,
+    quote_decimal: u8,
     price_precision: u8,
     size_precision: u8,
     price_increment: rust_decimal::Decimal,
@@ -185,9 +196,29 @@ struct DeepXSpotReportMarket {
     pair: String,
     base_symbol: String,
     quote_symbol: String,
+    base_decimal: u8,
+    quote_decimal: u8,
     is_paused: bool,
     maker_fee_rate: rust_decimal::Decimal,
     taker_fee_rate: rust_decimal::Decimal,
+}
+
+struct DeepXTrackedSpotReportInput<'a> {
+    record: &'a DeepXSpotOrderRecord,
+    market: &'a DeepXSpotReportMarket,
+    venue_order_id: VenueOrderId,
+    context: OrderContext,
+    ts_init: UnixNanos,
+    remaining_pages: Option<&'a mut usize>,
+}
+
+fn consume_order_report_pages(remaining_pages: &mut usize, pages: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        pages <= *remaining_pages,
+        "DeepX order report page budget exceeded",
+    );
+    *remaining_pages -= pages;
+    Ok(())
 }
 
 fn normalize_spot_pair(pair: &str) -> String {
@@ -528,6 +559,15 @@ pub(crate) enum DeepXFillReportError {
     /// The requested venue order identity cannot be sent or compared exactly.
     #[error("DeepX fill report venue order ID must be an exact decimal u64")]
     InvalidVenueOrderId,
+    /// An exact market and venue order ID returned trades on both order sides.
+    #[error("DeepX fill report order ID has conflicting order sides")]
+    ConflictingOrderSides,
+    /// An exact venue order ID returned trades for multiple instruments.
+    #[error("DeepX fill report order ID has conflicting instruments")]
+    ConflictingOrderInstruments,
+    /// Exact order lookup exhausted its shared page budget before all market sides were read.
+    #[error("DeepX targeted fill report page budget exceeded")]
+    PaginationBudgetExceeded,
     /// The requested instrument was absent from the immutable startup catalog.
     #[error("DeepX fill report has no validated market for {0}")]
     UnknownInstrument(InstrumentId),
@@ -594,6 +634,21 @@ pub(crate) enum DeepXFillReportError {
     /// Restored local context disagrees with the REST trade side.
     #[error("DeepX fill report side does not match registered order context")]
     ContextSideMismatch,
+}
+
+fn validate_targeted_fill_identity(reports: &[FillReport]) -> Result<(), DeepXFillReportError> {
+    let Some(first) = reports.first() else {
+        return Ok(());
+    };
+    for report in &reports[1..] {
+        if report.instrument_id != first.instrument_id {
+            return Err(DeepXFillReportError::ConflictingOrderInstruments);
+        }
+        if report.order_side != first.order_side {
+            return Err(DeepXFillReportError::ConflictingOrderSides);
+        }
+    }
+    Ok(())
 }
 
 /// Errors raised while calculating commission from immutable DeepX market metadata.
@@ -1308,7 +1363,39 @@ fn order_context_from_submit_order(cmd: &SubmitOrder) -> OrderContext {
 }
 
 fn cached_order_matches_submit_command(order: &OrderAny, cmd: &SubmitOrder) -> bool {
-    OrderContext::from(order) == order_context_from_submit_order(cmd)
+    order.init_event() == &cmd.order_init
+        && OrderContext::from(order) == order_context_from_submit_order(cmd)
+}
+
+fn restored_placement_ids(records: &[DeepXRestoredTransactionRecord]) -> HashSet<ClientOrderId> {
+    records
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.record().identity().operation(),
+                Some(
+                    DeepXTransactionOperation::PerpPlace { .. }
+                        | DeepXTransactionOperation::SpotPlace { .. }
+                )
+            )
+        })
+        .map(|item| ClientOrderId::new(item.record().identity().client_order_id()))
+        .collect()
+}
+
+fn resolve_placement_preflight<T>(
+    result: anyhow::Result<T>,
+    order: &OrderAny,
+    emitter: &ExecutionEventEmitter,
+    product: &'static str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(e) => {
+            emitter.emit_order_denied(order, &format!("DeepX {product} order was not sent: {e}"));
+            None
+        }
+    }
 }
 
 fn framework_order_context_from_submit_order(
@@ -1383,6 +1470,62 @@ fn framework_order_context_from_cancel_order(
         submitted_event_id,
         terminal_event_id,
     )
+}
+
+fn inherit_batch_cancel_context(cancel: &mut CancelOrder, batch: &BatchCancelOrders) {
+    cancel.causation_id = Some(batch.command_id);
+    cancel.correlation_id = batch.correlation_id.or(Some(batch.command_id));
+}
+
+fn build_cancel_all_batch(
+    cache: &Cache,
+    account_id: AccountId,
+    client_id: ClientId,
+    cmd: CancelAllOrders,
+) -> BatchCancelOrders {
+    let mut orders = cache
+        .orders_open(
+            Some(&cmd.instrument_id.venue),
+            Some(&cmd.instrument_id),
+            Some(&cmd.strategy_id),
+            Some(&account_id),
+            cmd.order_side,
+        )
+        .into_iter()
+        .map(|order| order.cloned())
+        .collect::<Vec<_>>();
+    orders.retain(|order| cache.client_id(&order.client_order_id()) == Some(&client_id));
+    orders.sort_unstable_by_key(|order| order.client_order_id());
+    let cancels = orders
+        .into_iter()
+        .map(|order| {
+            CancelOrder::new(
+                cmd.trader_id,
+                cmd.client_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                order.client_order_id(),
+                order.venue_order_id(),
+                UUID4::new(),
+                cmd.ts_init,
+                None,
+                None,
+            )
+        })
+        .collect();
+    let mut batch = BatchCancelOrders::new(
+        cmd.trader_id,
+        cmd.client_id,
+        cmd.strategy_id,
+        cmd.instrument_id,
+        cancels,
+        cmd.command_id,
+        cmd.ts_init,
+        cmd.params,
+        cmd.correlation_id,
+    );
+    batch.causation_id = cmd.causation_id;
+    batch
 }
 
 fn framework_order_context_from_modify_order(
@@ -1616,8 +1759,8 @@ impl<const N: usize> DeepXOrderContextState<N> {
         tracked_venue_by_client.retain(|client_order_id, _| {
             tracked.contains_key(client_order_id) || terminal.contains_key(client_order_id)
         });
-        tracked_client_by_venue.retain(|venue_order_id, client_order_id| {
-            tracked_venue_by_client.get(client_order_id) == Some(venue_order_id)
+        tracked_client_by_venue.retain(|_, client_order_id| {
+            tracked.contains_key(client_order_id) || terminal.contains_key(client_order_id)
         });
     }
 }
@@ -1906,19 +2049,30 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
         {
             return Err(DeepXOrderContextError::Conflict(client_order_id));
         }
-        if state.tracked_venue_by_client.get(&client_order_id) == Some(&venue_order_id)
-            && state.tracked.get(&client_order_id) == Some(&context)
+        if state
+            .tracked_client_by_venue
+            .get(&previous_venue_order_id)
+            .is_some_and(|existing| *existing != client_order_id)
+            || state
+                .external_client_by_venue
+                .contains_key(&previous_venue_order_id)
         {
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                previous_venue_order_id,
+            ));
+        }
+        let current = state.tracked_venue_by_client.get(&client_order_id).copied();
+        if current == Some(venue_order_id) && state.tracked.get(&client_order_id) == Some(&context)
+        {
+            state
+                .tracked_client_by_venue
+                .insert(previous_venue_order_id, client_order_id);
             return Ok(());
         }
-        if state.tracked_venue_by_client.get(&client_order_id) != Some(&previous_venue_order_id) {
+        if current != Some(previous_venue_order_id) {
             return Err(DeepXOrderContextError::VenueOrderBindingConflict {
                 client_order_id,
-                venue_order_id: state
-                    .tracked_venue_by_client
-                    .get(&client_order_id)
-                    .copied()
-                    .unwrap_or(previous_venue_order_id),
+                venue_order_id: current.unwrap_or(previous_venue_order_id),
             });
         }
         if state
@@ -1933,7 +2087,7 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
         }
         state
             .tracked_client_by_venue
-            .remove(&previous_venue_order_id);
+            .insert(previous_venue_order_id, client_order_id);
         state
             .tracked_client_by_venue
             .insert(venue_order_id, client_order_id);
@@ -2022,6 +2176,36 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             .copied())
     }
 
+    fn bind_tracked_venue_order_alias(
+        &self,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+    ) -> Result<(), DeepXOrderContextError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXOrderContextError::LockPoisoned)?;
+        if !state.tracked.contains_key(&client_order_id)
+            && !state.terminal.contains_key(&client_order_id)
+        {
+            return Err(DeepXOrderContextError::ContextNotFound(client_order_id));
+        }
+        if state
+            .tracked_client_by_venue
+            .get(&venue_order_id)
+            .is_some_and(|existing| *existing != client_order_id)
+            || state.external_client_by_venue.contains_key(&venue_order_id)
+        {
+            return Err(DeepXOrderContextError::VenueOrderOwnershipConflict(
+                venue_order_id,
+            ));
+        }
+        state
+            .tracked_client_by_venue
+            .insert(venue_order_id, client_order_id);
+        Ok(())
+    }
+
     fn external_by_venue(
         &self,
         venue_order_id: &VenueOrderId,
@@ -2060,7 +2244,9 @@ impl<const N: usize> DeepXOrderContextRegistryInner<N> {
             && (state
                 .tracked_venue_by_client
                 .get(&client_order_id)
-                .is_some_and(|bound| bound != &venue_order_id)
+                .is_some_and(|bound| {
+                    bound != &venue_order_id && tracked_client_by_venue != Some(&client_order_id)
+                })
                 || tracked_client_by_venue.is_some_and(|bound| bound != &client_order_id)
                 || external_by_client
                     .is_some_and(|context| context.venue_order_id != venue_order_id)
@@ -2219,6 +2405,7 @@ struct DeepXPerpPlaceSubmissionTask {
     recovery_blocks_per_range: u64,
     receipt_timeout: Duration,
     params: DeepXPerpPlaceParams,
+    order: OrderAny,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     order_side: OrderSide,
@@ -2240,6 +2427,7 @@ struct DeepXSpotPlaceSubmissionTask {
     recovery_blocks_per_range: u64,
     receipt_timeout: Duration,
     params: DeepXSpotPlaceParams,
+    order: OrderAny,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
     order_side: OrderSide,
@@ -2328,12 +2516,18 @@ pub struct DeepXExecutionClient {
     emitter: ExecutionEventEmitter,
     query_tasks: TaskGroup,
     query_epoch: Arc<Mutex<bool>>,
+    account_tasks: TaskGroup,
+    account_monitor_live: Option<Arc<AtomicBool>>,
+    account_monitor_frames:
+        Option<tokio::sync::watch::Receiver<Option<DeepXWsConfirmedBalancesFrame>>>,
+    account_monitor_close: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     perpetual_market_ids: HashMap<InstrumentId, u64>,
     perpetual_instrument_ids: HashMap<u64, InstrumentId>,
     perpetual_report_metadata: HashMap<InstrumentId, DeepXPerpetualReportMetadata>,
     spot_report_markets: HashMap<InstrumentId, DeepXSpotReportMarket>,
     spot_report_instruments_by_pair: HashMap<String, InstrumentId>,
     order_contexts: Arc<DeepXOrderContextRegistry>,
+    admitted_placements: Mutex<HashSet<ClientOrderId>>,
     active_cancels: Arc<Mutex<HashSet<(ClientOrderId, VenueOrderId)>>>,
     trade_dedup: DeepXTradeDedup<TRADE_DEDUP_CAPACITY>,
     startup: DeepXExecutionStartup,
@@ -2373,11 +2567,30 @@ impl Drop for DeepXStartupEpochGuard<'_> {
     }
 }
 
+struct DeepXAccountMonitorGuard {
+    live: Arc<AtomicBool>,
+    epoch: Arc<Mutex<bool>>,
+    snapshot_service: DeepXRuntimeSnapshotService,
+}
+
+impl Drop for DeepXAccountMonitorGuard {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+        if let Err(e) = self.snapshot_service.retire_client() {
+            log::error!("DeepX account monitor permit retirement failed: {e}");
+        }
+        match self.epoch.lock() {
+            Ok(mut active) => *active = false,
+            Err(_) => log::error!("DeepX account monitor query epoch lock is poisoned"),
+        }
+    }
+}
+
 impl DeepXExecutionClient {
     fn perp_modify_fill_semantics_proven(&self) -> bool {
-        // The pallet places the encoded size as-is after canceling
-        // without rebasing concurrent fills.
-        false
+        self.runtime_snapshot.as_ref().is_some_and(|snapshot| {
+            crate::transaction::perp_modify_sizing_event_supported(snapshot.metadata())
+        })
     }
 
     fn report_order_context_for_venue_id(
@@ -2499,7 +2712,7 @@ impl DeepXExecutionClient {
         cmd: &QueryOrder,
     ) -> anyhow::Result<DeepXTrackedOrderQuery> {
         anyhow::ensure!(
-            self.core.is_connected(),
+            self.is_connected(),
             "DeepX order query requires a connected execution client"
         );
         anyhow::ensure!(
@@ -2695,7 +2908,7 @@ impl DeepXExecutionClient {
         {
             return Err(DeepXTrackedOrderReportError::InvalidFinancialValues);
         }
-        if record.size_filled + record.size_remain != record.size {
+        if record.size_filled.checked_add(record.size_remain) != Some(record.size) {
             return Err(DeepXTrackedOrderReportError::SizeAccountingMismatch);
         }
         let avg_fill_price = match (record.size_filled.is_zero(), record.avg_fill_price) {
@@ -2979,10 +3192,15 @@ impl DeepXExecutionClient {
         if self.config.execution_backend != DeepXExecutionBackend::DirectPallet {
             return Ok(());
         }
-        let cache = self.core.cache();
-        let instrument = cache
-            .instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("DeepX Spot instrument is not loaded"))?;
+        let instrument = {
+            let cache = self.core.try_cache().map_err(|_| {
+                anyhow::anyhow!("DeepX Spot order validation cache is already mutably borrowed")
+            })?;
+            cache
+                .instrument(&instrument_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("DeepX Spot instrument is not loaded"))?
+        };
         let mut ids = Vec::with_capacity(records.len());
         let mut unique = HashSet::new();
         for record in records {
@@ -3037,12 +3255,16 @@ impl DeepXExecutionClient {
         endpoints: Option<&DeepXValidatedRpcEndpoints>,
         capabilities: Option<&DeepXValidatedRpcMethodCapabilities>,
         block_timestamps: &mut HashMap<u32, u64>,
-        record: &DeepXSpotOrderRecord,
-        market: &DeepXSpotReportMarket,
-        venue_order_id: VenueOrderId,
-        context: OrderContext,
-        ts_init: UnixNanos,
+        input: DeepXTrackedSpotReportInput<'_>,
     ) -> anyhow::Result<OrderStatusReport> {
+        let DeepXTrackedSpotReportInput {
+            record,
+            market,
+            venue_order_id,
+            context,
+            ts_init,
+            remaining_pages,
+        } = input;
         anyhow::ensure!(
             record.maker.eq_ignore_ascii_case(subaccount),
             "DeepX Spot order report owner mismatch"
@@ -3079,10 +3301,6 @@ impl DeepXExecutionClient {
             context.identity.order_type == OrderType::Limit,
             "DeepX Spot order report type mismatch"
         );
-        anyhow::ensure!(
-            record.base_amount == context.quantity.as_decimal(),
-            "DeepX Spot order report quantity mismatch"
-        );
         let report_price = context
             .price
             .ok_or_else(|| anyhow::anyhow!("DeepX Spot tracked limit order has no price"))?;
@@ -3112,7 +3330,30 @@ impl DeepXExecutionClient {
                 && record.quote_remaining_amount <= record.quote_amount,
             "DeepX Spot order report contains invalid amounts",
         );
+        let submitted_base_amount = context.quantity.as_decimal();
+        let submitted_quote_amount = submitted_base_amount
+            .checked_mul(report_price.as_decimal())
+            .ok_or_else(|| anyhow::anyhow!("DeepX Spot order report notional exceeds Decimal"))?;
+        let improved_buy_fill = order_side == OrderSide::Buy
+            && record.status == "Filled"
+            && record.base_amount > submitted_base_amount;
+        anyhow::ensure!(
+            record.base_amount == submitted_base_amount || improved_buy_fill,
+            "DeepX Spot order report quantity mismatch",
+        );
+        if order_side == OrderSide::Buy {
+            anyhow::ensure!(
+                record.quote_amount <= submitted_quote_amount,
+                "DeepX Spot order report exceeds submitted quote budget",
+            );
+        }
         let filled_decimal = record.base_amount - record.base_remaining_amount;
+        if filled_decimal.is_zero() {
+            anyhow::ensure!(
+                record.quote_amount == submitted_quote_amount,
+                "DeepX Spot order report quote amount mismatch",
+            );
+        }
         anyhow::ensure!(
             filled_decimal.is_zero() == record.avg_fill_price.is_none(),
             "DeepX Spot order report average fill price conflicts with executed quantity",
@@ -3143,10 +3384,19 @@ impl DeepXExecutionClient {
                 end_ms: None,
                 page_size: Some(ORDER_REPORT_PAGE_SIZE),
             };
+            let page_budget = remaining_pages
+                .as_deref()
+                .copied()
+                .unwrap_or(ORDER_REPORT_MAX_PAGES);
+            anyhow::ensure!(page_budget > 0, "DeepX order report page budget exceeded");
             let pages = http
-                .get_spot_account_trade_pages(&request, ORDER_REPORT_MAX_PAGES)
+                .get_spot_account_trade_pages(&request, page_budget)
                 .await?;
+            if let Some(remaining_pages) = remaining_pages {
+                consume_order_report_pages(remaining_pages, pages.len())?;
+            }
             let mut trade_base_amount = rust_decimal::Decimal::ZERO;
+            let mut trade_quote_amount = rust_decimal::Decimal::ZERO;
             let mut last_trade_timestamp = ts_accepted;
             let mut trade_count = 0usize;
             for trade in pages.into_iter().flat_map(|page| page.items) {
@@ -3157,10 +3407,22 @@ impl DeepXExecutionClient {
                         && normalize_spot_pair(&trade.pair) == normalize_spot_pair(&market.pair),
                     "DeepX Spot order report trade identity mismatch",
                 );
+                anyhow::ensure!(
+                    match order_side {
+                        OrderSide::Buy => trade.price <= report_price.as_decimal(),
+                        OrderSide::Sell => trade.price >= report_price.as_decimal(),
+                    },
+                    "DeepX Spot execution price violates order limit",
+                );
                 trade_base_amount = trade_base_amount
                     .checked_add(trade.base_amount)
                     .ok_or_else(|| {
                         anyhow::anyhow!("DeepX Spot filled quantity sum exceeds Decimal")
+                    })?;
+                trade_quote_amount = trade_quote_amount
+                    .checked_add(trade.quote_amount)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DeepX Spot executed quote sum exceeds Decimal")
                     })?;
                 let trade_timestamp =
                     parse_tracked_order_report_timestamp("trade.createdAt", &trade.created_at)?;
@@ -3175,6 +3437,12 @@ impl DeepXExecutionClient {
                 trade_count > 0 && trade_base_amount == filled_decimal,
                 "DeepX Spot order report execution records do not reconstruct filled quantity",
             );
+            if improved_buy_fill {
+                anyhow::ensure!(
+                    trade_quote_amount == record.quote_amount,
+                    "DeepX Spot order report execution records do not reconstruct spent quote",
+                );
+            }
             ts_last = last_trade_timestamp;
         }
 
@@ -3192,6 +3460,11 @@ impl DeepXExecutionClient {
                 OrderStatus::Filled
             }
             "Canceled" => {
+                anyhow::ensure!(
+                    record.cancel_reason.as_deref() != Some("IocUnfilled")
+                        || context.time_in_force == TimeInForce::Ioc,
+                    "DeepX Spot IOC cancellation conflicts with tracked time in force",
+                );
                 let cancel_height = record.cancel_height.ok_or_else(|| {
                     anyhow::anyhow!("DeepX canceled Spot order has no cancellation block height")
                 })?;
@@ -3237,7 +3510,7 @@ impl DeepXExecutionClient {
             "DeepX Spot order update precedes order creation"
         );
 
-        let filled_qty = Quantity::from_decimal_dp(filled_decimal, context.quantity.precision)?;
+        let filled_qty = Quantity::from_decimal(filled_decimal)?;
         anyhow::ensure!(
             filled_qty.as_decimal() == filled_decimal,
             "DeepX Spot filled quantity exceeds local precision",
@@ -3279,6 +3552,7 @@ impl DeepXExecutionClient {
         instrument_id: InstrumentId,
         market: &DeepXSpotReportMarket,
         block_timestamps: &mut HashMap<u32, u64>,
+        remaining_pages: &mut usize,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
         let venue_order_id = VenueOrderId::new(record.order_id.as_str());
@@ -3298,11 +3572,14 @@ impl DeepXExecutionClient {
             self.runtime_rpc_endpoints.as_ref(),
             self.runtime_rpc_capabilities.as_ref(),
             block_timestamps,
-            record,
-            market,
-            venue_order_id,
-            context,
-            ts_init,
+            DeepXTrackedSpotReportInput {
+                record,
+                market,
+                venue_order_id,
+                context,
+                ts_init,
+                remaining_pages: Some(remaining_pages),
+            },
         )
         .await
     }
@@ -3381,6 +3658,152 @@ impl DeepXExecutionClient {
         )))
     }
 
+    fn validated_fill_subaccount(&self) -> anyhow::Result<[u8; 20]> {
+        let subaccount = self
+            .account_ownership
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX fill report has no validated account ownership"))?
+            .subaccount();
+        let configured = self
+            .config
+            .subaccount_id
+            .as_deref()
+            .and_then(|value| value.strip_prefix("0x"))
+            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok());
+        anyhow::ensure!(
+            configured == Some(subaccount),
+            "DeepX fill report subaccount differs from validated ownership",
+        );
+        Ok(subaccount)
+    }
+
+    async fn verify_owned_finalized_perp_fill_records(
+        &self,
+        records: &[DeepXPerpAccountTradeRecord],
+    ) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let endpoints = self
+            .runtime_rpc_endpoints
+            .as_ref()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let capabilities = self
+            .runtime_rpc_capabilities
+            .as_ref()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let subaccount = self.validated_fill_subaccount()?;
+
+        let mut by_block = BTreeMap::<u64, Vec<&DeepXPerpAccountTradeRecord>>::new();
+        for record in records {
+            let block_number = record.id / 1_000_000;
+            anyhow::ensure!(
+                block_number > 0,
+                "DeepX fill report has an invalid finalized block number",
+            );
+            by_block.entry(block_number).or_default().push(record);
+        }
+        anyhow::ensure!(
+            by_block.len() <= FILL_REPORT_MAX_FINALIZED_BLOCKS,
+            "DeepX fill report finalized block budget exceeded",
+        );
+        for (block_number, block_records) in by_block {
+            let trades = observe_finalized_perp_trades_at(
+                &self.config.network.environment,
+                endpoints,
+                capabilities,
+                block_number,
+            )
+            .await?;
+            for record in block_records {
+                let instrument_id = self
+                    .perpetual_instrument_ids
+                    .get(&record.market_id)
+                    .ok_or(DeepXFillReportError::UnknownMarket(record.market_id))?;
+                let metadata = self
+                    .perpetual_report_metadata
+                    .get(instrument_id)
+                    .ok_or(DeepXFillReportError::MarketIdentityMismatch)?;
+                match_finalized_perp_account_trade(
+                    &trades,
+                    record,
+                    subaccount,
+                    metadata.base_decimal,
+                    metadata.quote_decimal,
+                    metadata.quote_currency.code.as_str(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_owned_finalized_spot_fill_records(
+        &self,
+        records: &[DeepXSpotAccountTradeRecord],
+        remaining_blocks: &mut usize,
+    ) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut by_block = BTreeMap::<u64, Vec<&DeepXSpotAccountTradeRecord>>::new();
+        for record in records {
+            let block_number = record.id / 1_000_000;
+            anyhow::ensure!(
+                block_number > 0,
+                "DeepX Spot fill report has an invalid finalized block number",
+            );
+            by_block.entry(block_number).or_default().push(record);
+        }
+        anyhow::ensure!(
+            by_block.len() <= *remaining_blocks,
+            "DeepX Spot fill report finalized block budget exceeded",
+        );
+        *remaining_blocks -= by_block.len();
+        let endpoints = self
+            .runtime_rpc_endpoints
+            .as_ref()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let capabilities = self
+            .runtime_rpc_capabilities
+            .as_ref()
+            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
+        let subaccount = self.validated_fill_subaccount()?;
+        for (block_number, block_records) in by_block {
+            let trades = observe_finalized_spot_trades_at(
+                &self.config.network.environment,
+                endpoints,
+                capabilities,
+                block_number,
+            )
+            .await?;
+            for record in block_records {
+                let instrument_id = self
+                    .spot_report_instruments_by_pair
+                    .get(&normalize_spot_pair(&record.pair))
+                    .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
+                let market = self
+                    .spot_report_markets
+                    .get(instrument_id)
+                    .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
+                anyhow::ensure!(
+                    record.pair_name == market.name
+                        && normalize_spot_pair(&record.pair) == normalize_spot_pair(&market.pair),
+                    "DeepX Spot fill report market identity differs from validated catalog",
+                );
+                match_finalized_spot_account_trade(
+                    &trades,
+                    record,
+                    subaccount,
+                    market.base_decimal,
+                    market.quote_decimal,
+                    &market.base_symbol,
+                    &market.quote_symbol,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn build_fill_report(
         &self,
         record: &DeepXPerpAccountTradeRecord,
@@ -3420,7 +3843,9 @@ impl DeepXExecutionClient {
             LiquiditySide::Maker
         };
 
-        if record.size % metadata.size_increment != rust_decimal::Decimal::ZERO {
+        if record.size <= rust_decimal::Decimal::ZERO
+            || record.size % metadata.size_increment != rust_decimal::Decimal::ZERO
+        {
             return Err(DeepXFillReportError::QuantityIncrementMismatch);
         }
         let last_qty = Quantity::from_decimal_dp(record.size, metadata.size_precision)
@@ -3428,7 +3853,9 @@ impl DeepXExecutionClient {
         if last_qty.as_decimal() != record.size {
             return Err(DeepXFillReportError::QuantityPrecisionLoss);
         }
-        if record.price % metadata.price_increment != rust_decimal::Decimal::ZERO {
+        if record.price <= rust_decimal::Decimal::ZERO
+            || record.price % metadata.price_increment != rust_decimal::Decimal::ZERO
+        {
             return Err(DeepXFillReportError::PriceIncrementMismatch);
         }
         let last_px = Price::from_decimal_dp(record.price, metadata.price_precision)
@@ -3656,6 +4083,69 @@ impl DeepXExecutionClient {
             ts_init,
             None,
         ))
+    }
+
+    async fn collect_spot_fill_reports_for_market(
+        &self,
+        subaccount: &str,
+        instrument_id: InstrumentId,
+        market: &DeepXSpotReportMarket,
+        cmd: &GenerateFillReports,
+        remaining_pages: &mut usize,
+        remaining_blocks: &mut usize,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let order_sides = if cmd.venue_order_id.is_some() {
+            vec![
+                Some(DeepXSpotOrderSide::Buy),
+                Some(DeepXSpotOrderSide::Sell),
+            ]
+        } else {
+            vec![None]
+        };
+        let mut reports = Vec::new();
+        let mut records = Vec::new();
+        for order_side in order_sides {
+            if *remaining_pages == 0 {
+                return Err(DeepXFillReportError::PaginationBudgetExceeded.into());
+            }
+            let pages = self
+                .http
+                .get_spot_account_trade_pages(
+                    &DeepXSpotAccountTradesRequest {
+                        subaccount: subaccount.to_string(),
+                        order_id: cmd
+                            .venue_order_id
+                            .map(|venue_order_id| venue_order_id.as_str().to_string()),
+                        order_side,
+                        name: None,
+                        pair: Some(market.pair.clone()),
+                        cursor: None,
+                        sort: DeepXAccountSortOrder::Ascending,
+                        start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
+                        end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
+                        page_size: Some(FILL_REPORT_PAGE_SIZE),
+                    },
+                    *remaining_pages,
+                )
+                .await?;
+            *remaining_pages -= pages.len();
+            for record in pages.into_iter().flat_map(|page| page.items) {
+                let report =
+                    self.build_spot_fill_report(&record, instrument_id, market, cmd.ts_init)?;
+                if cmd.start.is_some_and(|start| report.ts_event < start)
+                    || cmd.end.is_some_and(|end| report.ts_event > end)
+                {
+                    continue;
+                }
+                records.push(record);
+                reports.push(report);
+            }
+        }
+        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
+            self.verify_owned_finalized_spot_fill_records(&records, remaining_blocks)
+                .await?;
+        }
+        Ok(reports)
     }
 
     pub(crate) fn merge_validated_order_reports(
@@ -3893,7 +4383,7 @@ impl DeepXExecutionClient {
     }
 
     fn direct_submission_url(&self) -> Result<String, DeepXTransactionRuntimeError> {
-        if !self.startup.is_ready() || !self.core.is_connected() {
+        if !self.startup.is_ready() || !self.is_connected() {
             return Err(DeepXTransactionRuntimeError::SubmissionStartupIncomplete);
         }
         let endpoints = self
@@ -3950,12 +4440,17 @@ impl DeepXExecutionClient {
             emitter,
             query_tasks: TaskGroup::default(),
             query_epoch: Arc::new(Mutex::new(false)),
+            account_tasks: TaskGroup::default(),
+            account_monitor_live: None,
+            account_monitor_frames: None,
+            account_monitor_close: None,
             perpetual_market_ids: HashMap::new(),
             perpetual_instrument_ids: HashMap::new(),
             perpetual_report_metadata: HashMap::new(),
             spot_report_markets: HashMap::new(),
             spot_report_instruments_by_pair: HashMap::new(),
             order_contexts: Arc::new(DeepXOrderContextRegistry::default()),
+            admitted_placements: Mutex::new(HashSet::new()),
             active_cancels: Arc::new(Mutex::new(HashSet::new())),
             trade_dedup: DeepXTradeDedup::default(),
             startup: DeepXExecutionStartup::default(),
@@ -4005,6 +4500,97 @@ impl DeepXExecutionClient {
     /// access fails.
     pub fn register_order(&self, order: &OrderAny) -> Result<(), DeepXOrderContextError> {
         self.register_order_context(OrderContext::from(order))
+    }
+
+    fn admit_placement(&self, client_order_id: ClientOrderId) -> anyhow::Result<bool> {
+        let mut admitted = self
+            .admitted_placements
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepX placement admission registry is poisoned"))?;
+        Ok(admitted.insert(client_order_id))
+    }
+
+    fn prepare_independent_order_list(
+        &self,
+        cmd: &SubmitOrderList,
+        orders: &[OrderAny],
+    ) -> anyhow::Result<Vec<SubmitOrder>> {
+        cmd.order_list.validate()?;
+        anyhow::ensure!(
+            orders.len() == cmd.order_list.client_order_ids.len()
+                && cmd.order_inits.len() == orders.len()
+                && orders.len() <= MAX_ORDER_LIST_FANOUT,
+            "DeepX order list has invalid length or exceeds {MAX_ORDER_LIST_FANOUT} orders"
+        );
+        anyhow::ensure!(
+            cmd.trader_id == self.core.trader_id
+                && cmd.client_id.is_none_or(|id| id == self.core.client_id)
+                && cmd.strategy_id == cmd.order_list.strategy_id
+                && cmd.instrument_id == cmd.order_list.instrument_id
+                && cmd.instrument_id == orders[0].instrument_id()
+                && cmd.instrument_id.venue == *DEEPX_VENUE,
+            "DeepX order-list command execution identity mismatch"
+        );
+        let mut command_ids = HashSet::from([cmd.command_id]);
+        let mut children = Vec::with_capacity(orders.len());
+        for ((order, init), client_order_id) in orders
+            .iter()
+            .zip(&cmd.order_inits)
+            .zip(&cmd.order_list.client_order_ids)
+        {
+            anyhow::ensure!(
+                order.client_order_id() == *client_order_id
+                    && init.client_order_id == *client_order_id
+                    && order.init_event() == init
+                    && order.trader_id() == cmd.trader_id
+                    && order.strategy_id() == cmd.strategy_id
+                    && order.instrument_id().venue == *DEEPX_VENUE
+                    && order.order_list_id() == Some(cmd.order_list.id)
+                    && cmd.command_id != init.event_id,
+                "DeepX order-list member identity differs from its cached initialization"
+            );
+            anyhow::ensure!(
+                order.contingency_type().is_none()
+                    && order.linked_order_ids().is_none()
+                    && order.parent_order_id().is_none(),
+                "DeepX order-list submission supports only independent orders"
+            );
+            let command_id = loop {
+                let candidate = UUID4::new();
+                if candidate != init.event_id && command_ids.insert(candidate) {
+                    break candidate;
+                }
+            };
+            let mut child = SubmitOrder::new(
+                cmd.trader_id,
+                cmd.client_id,
+                cmd.strategy_id,
+                order.instrument_id(),
+                *client_order_id,
+                init.clone(),
+                cmd.exec_algorithm_id,
+                cmd.position_id,
+                cmd.params.clone(),
+                command_id,
+                cmd.ts_init,
+                cmd.correlation_id.or(Some(cmd.command_id)),
+            );
+            child.causation_id = Some(cmd.command_id);
+            if self.spot_report_markets.contains_key(&child.instrument_id) {
+                self.build_spot_place_params(&child)?;
+            } else {
+                self.build_perp_place_params(&child)?;
+            }
+            children.push(child);
+        }
+        anyhow::ensure!(
+            cmd.position_id.is_none()
+                || orders
+                    .iter()
+                    .all(|order| order.instrument_id() == cmd.instrument_id),
+            "DeepX mixed-instrument order list cannot share a position ID"
+        );
+        Ok(children)
     }
 
     /// Maps a framework submit command to exact user-callable perpetual pallet arguments.
@@ -4057,7 +4643,6 @@ impl DeepXExecutionClient {
             || order.emulation_trigger.is_some()
             || order.trigger_instrument_id.is_some()
             || order.contingency_type.is_some()
-            || order.order_list_id.is_some()
             || order.linked_order_ids.is_some()
             || order.parent_order_id.is_some()
             || order.exec_algorithm_id.is_some()
@@ -4295,11 +4880,11 @@ impl DeepXExecutionClient {
         );
         anyhow::ensure!(
             order.order_type == OrderType::Limit
-                && order.time_in_force == TimeInForce::Gtc
+                && matches!(order.time_in_force, TimeInForce::Gtc | TimeInForce::Ioc)
                 && !order.post_only
                 && !order.reduce_only
                 && !order.quote_quantity,
-            "DeepX Spot supports only base-quantity Limit GTC orders without advanced flags"
+            "DeepX Spot supports only base-quantity Limit GTC/IOC orders without advanced flags"
         );
         anyhow::ensure!(
             cmd.exec_algorithm_id.is_none()
@@ -4316,7 +4901,6 @@ impl DeepXExecutionClient {
                 && order.emulation_trigger.is_none()
                 && order.trigger_instrument_id.is_none()
                 && order.contingency_type.is_none()
-                && order.order_list_id.is_none()
                 && order.linked_order_ids.is_none()
                 && order.parent_order_id.is_none()
                 && order.exec_algorithm_id.is_none()
@@ -4374,7 +4958,7 @@ impl DeepXExecutionClient {
         let price = order
             .price
             .filter(|price| price.as_decimal() > rust_decimal::Decimal::ZERO)
-            .ok_or_else(|| anyhow::anyhow!("DeepX Spot Limit GTC requires a positive price"))?
+            .ok_or_else(|| anyhow::anyhow!("DeepX Spot Limit GTC/IOC requires a positive price"))?
             .as_decimal();
         anyhow::ensure!(
             price % instrument.price_increment().as_decimal() == rust_decimal::Decimal::ZERO,
@@ -4400,7 +4984,11 @@ impl DeepXExecutionClient {
             is_buy: order.order_side == OrderSide::Buy,
             quote_amount: as_u256(quote_amount),
             base_amount: as_u256(base_amount),
-            order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+            order_type: DeepXSpotOrderType::Limit(match order.time_in_force {
+                TimeInForce::Gtc => DeepXTimeInForce::Gtc,
+                TimeInForce::Ioc => DeepXTimeInForce::Ioc,
+                _ => unreachable!("unsupported Spot time in force was rejected above"),
+            }),
             post_only: DeepXPostOnlyParam::None,
             reduce_only: false,
         })
@@ -4755,6 +5343,8 @@ impl DeepXExecutionClient {
                                 pair: market.pair.clone(),
                                 base_symbol: market.base_symbol.clone(),
                                 quote_symbol: market.quote_symbol.clone(),
+                                base_decimal: market.base_decimal,
+                                quote_decimal: market.quote_decimal,
                                 is_paused: market.is_paused,
                                 maker_fee_rate: market.maker_fee_rate,
                                 taker_fee_rate: market.taker_fee_rate,
@@ -4775,6 +5365,7 @@ impl DeepXExecutionClient {
                 .map_err(|_| DeepXExecutionStartupError::MarketCatalogIdentityMismatch)?;
             let report_metadata = DeepXPerpetualReportMetadata {
                 base_decimal: market.base_decimal,
+                quote_decimal: market.quote_decimal,
                 price_precision: price_increment.precision,
                 size_precision: size_increment.precision,
                 price_increment: market.order_spec_tick_size,
@@ -5111,22 +5702,55 @@ impl DeepXExecutionClient {
     }
 
     /// Closes and releases the client-owned account connection.
+    /// A ready execution client becomes disconnected before the close handshake.
     ///
     /// # Errors
     ///
     /// Returns an error if the bounded WebSocket close handshake fails.
     pub async fn close_account_connection(&mut self) -> anyhow::Result<()> {
-        self.startup_account_subscription = None;
-        if let Some(mut connection) = self.account_connection.take() {
-            connection.close().await?;
+        let connection = self.account_connection.take();
+        let monitor_close = self.account_monitor_close.take();
+        self.revoke_account_stream();
+        let close_result = if let Some(mut connection) = connection {
+            connection.close().await
+        } else {
+            Ok(())
+        };
+        let shutdown_result = if self.account_tasks.is_open() {
+            Ok(())
+        } else {
+            self.account_tasks
+                .finish_shutdown(
+                    Duration::from_secs(self.config.websocket_timeout_secs),
+                    Duration::from_secs(1),
+                )
+                .await
+        };
+        close_result?;
+        shutdown_result?;
+        if let Some(close) = monitor_close {
+            close
+                .await
+                .map_err(|_| anyhow::anyhow!("DeepX account monitor close result was lost"))??;
         }
         Ok(())
     }
 
-    /// Reads the next confirmed balance frame from the client-owned account connection.
+    fn revoke_account_stream(&mut self) {
+        if self.startup.is_ready() {
+            self.reset_startup();
+        } else {
+            self.account_connection = None;
+            self.startup_account_subscription = None;
+        }
+    }
+
+    /// Reads a confirmed balance frame from the client-owned account stream.
     ///
-    /// A receive timeout preserves the current connection and proof so the caller can retry.
-    /// Any error which makes the subscription non-current revokes both immediately.
+    /// After autonomous startup, a supervised reader retains the latest frame, so intermediate
+    /// frames may be skipped. A receive timeout preserves the current connection and proof.
+    /// Any error which makes the subscription non-current revokes it immediately, and a ready
+    /// execution client becomes disconnected.
     ///
     /// # Errors
     ///
@@ -5136,23 +5760,59 @@ impl DeepXExecutionClient {
         &mut self,
     ) -> Result<DeepXWsConfirmedBalancesFrame, DeepXAccountStreamReadError> {
         let Some(subscription) = self.startup_account_subscription else {
-            self.account_connection = None;
+            self.revoke_account_stream();
             return Err(DeepXAccountStreamReadError::SubscriptionUnavailable);
         };
+        if let Some(receiver) = self.account_monitor_frames.as_mut() {
+            if !self
+                .account_monitor_live
+                .as_ref()
+                .is_some_and(|live| live.load(Ordering::Acquire))
+            {
+                self.revoke_account_stream();
+                return Err(DeepXAccountStreamReadError::SubscriptionUnavailable);
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(self.config.websocket_timeout_secs),
+                receiver.changed(),
+            )
+            .await;
+            let result = match result {
+                Ok(Ok(())) => receiver
+                    .borrow_and_update()
+                    .clone()
+                    .ok_or(DeepXAccountStreamReadError::SubscriptionUnavailable),
+                Ok(Err(_)) => Err(DeepXAccountStreamReadError::SubscriptionUnavailable),
+                Err(_) => Err(DeepXAccountStreamReadError::Transport(
+                    crate::websocket::DeepXWsError::ReceiveTimeout.into(),
+                )),
+            };
+            if !self
+                .account_monitor_live
+                .as_ref()
+                .is_some_and(|live| live.load(Ordering::Acquire))
+                || matches!(
+                    &result,
+                    Err(DeepXAccountStreamReadError::SubscriptionUnavailable)
+                )
+            {
+                self.revoke_account_stream();
+                return Err(DeepXAccountStreamReadError::SubscriptionUnavailable);
+            }
+            return result;
+        }
         let Some(connection) = self.account_connection.as_mut() else {
-            self.startup_account_subscription = None;
+            self.revoke_account_stream();
             return Err(DeepXAccountStreamReadError::ConnectionNotOwned);
         };
         if !connection.is_current_subscription(subscription) {
-            self.account_connection = None;
-            self.startup_account_subscription = None;
+            self.revoke_account_stream();
             return Err(DeepXAccountStreamReadError::SubscriptionUnavailable);
         }
 
         let result = connection.next_balances(subscription).await;
         if !connection.is_current_subscription(subscription) {
-            self.account_connection = None;
-            self.startup_account_subscription = None;
+            self.revoke_account_stream();
         }
         result.map_err(DeepXAccountStreamReadError::Transport)
     }
@@ -5345,6 +6005,10 @@ impl DeepXExecutionClient {
         let (nonce_allocator, restored) = self
             .restore_timestamp_nonce_allocator(&store, &lease)
             .await?;
+        self.admitted_placements
+            .lock()
+            .map_err(|_| anyhow::anyhow!("DeepX placement admission registry is poisoned"))?
+            .extend(restored_placement_ids(&restored));
         self.transaction_runtime = Some(Arc::new(DeepXExecutionTransactionRuntime {
             store,
             lease,
@@ -6100,7 +6764,8 @@ impl DeepXExecutionClient {
             return Err(DeepXTransactionRuntimeError::SnapshotIdentityMismatch);
         }
         let (context, permit) = prepared.into_parts();
-        let outcome = submit_once_preserving_context(context, permit, submit).await;
+        let outcome =
+            submit_once_with_runtime_guard(context, permit, &runtime_permit, submit).await;
         drop(runtime_permit);
         Ok(outcome)
     }
@@ -6509,8 +7174,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::PerpPlace(&verifier),
@@ -6528,8 +7192,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::PerpClose(&verifier),
@@ -6547,8 +7210,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(&verifier),
@@ -6566,8 +7228,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::SpotPlace(&verifier),
@@ -6585,8 +7246,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::OrdinarySpotCancel(&verifier),
@@ -6604,8 +7264,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::PerpCancel(&verifier),
@@ -6623,8 +7282,7 @@ impl DeepXExecutionClient {
                             endpoints,
                             capabilities,
                             snapshot,
-                            store,
-                            lease,
+                            (store, lease),
                             &item,
                             self.config.recovery_blocks_per_range,
                             DeepXDurableRecoveryObserver::PerpModify(&verifier),
@@ -6666,7 +7324,8 @@ impl DeepXExecutionClient {
     where
         S: DeepXTransactionStore,
     {
-        let restored = load_verified_committed_for_signer(store, lease).await?;
+        let mut restored = load_verified_committed_for_signer(store, lease).await?;
+        sort_recovery_outboxes(&mut restored);
         for item in restored {
             if item.record().framework_order_context().is_none() {
                 continue;
@@ -6755,6 +7414,19 @@ impl DeepXExecutionClient {
         else {
             anyhow::bail!("DeepX modify has no timestamp order ID nonce");
         };
+        let replacement = VenueOrderId::new(value.to_string());
+        let current = self
+            .order_contexts
+            .tracked_venue_order_id(&context.client_order_id())?;
+        if current != Some(previous) {
+            anyhow::ensure!(
+                current.is_some(),
+                "DeepX modified order has no current venue order binding"
+            );
+            self.order_contexts
+                .bind_tracked_venue_order_alias(context.client_order_id(), previous)?;
+            return Ok(());
+        }
         let mut order_context = match self
             .order_contexts
             .route(Some(context.client_order_id()), None)?
@@ -6770,7 +7442,7 @@ impl DeepXExecutionClient {
         self.order_contexts.replace_tracked_venue_order_id(
             context.client_order_id(),
             previous,
-            VenueOrderId::new(value.to_string()),
+            replacement,
             order_context,
         )?;
         Ok(())
@@ -7027,9 +7699,18 @@ impl DeepXExecutionClient {
 
     /// Clears startup evidence and marks the execution core disconnected.
     pub fn reset_startup(&mut self) {
+        if let Some(live) = self.account_monitor_live.take() {
+            live.store(false, Ordering::Release);
+        }
+        if let Some(runtime) = self.transaction_runtime.as_ref()
+            && let Err(e) = runtime.snapshot_service.retire_client()
+        {
+            log::error!("DeepX runtime permit retirement failed during startup reset: {e}");
+        }
         if let Ok(mut active) = self.query_epoch.lock() {
             *active = false;
         }
+        self.account_tasks.begin_shutdown();
         self.query_tasks.abort();
         self.core.set_disconnected();
         self.startup.reset();
@@ -7038,6 +7719,8 @@ impl DeepXExecutionClient {
         self.runtime_rpc_capabilities = None;
         self.account_ownership = None;
         self.account_connection = None;
+        self.account_monitor_frames = None;
+        self.account_monitor_close = None;
         self.transaction_runtime = None;
         self.startup_account_subscription = None;
         self.startup_account_event_id = None;
@@ -7059,9 +7742,26 @@ impl DeepXExecutionClient {
     /// reset.
     pub async fn abort_startup(&mut self) -> anyhow::Result<()> {
         let connection = self.account_connection.take();
+        let monitor_close = self.account_monitor_close.take();
         self.reset_startup();
-        if let Some(mut connection) = connection {
-            connection.close().await?;
+        let close_result = if let Some(mut connection) = connection {
+            connection.close().await
+        } else {
+            Ok(())
+        };
+        let shutdown_result = self
+            .account_tasks
+            .finish_shutdown(
+                Duration::from_secs(self.config.websocket_timeout_secs),
+                Duration::from_secs(1),
+            )
+            .await;
+        close_result?;
+        shutdown_result?;
+        if let Some(close) = monitor_close {
+            close
+                .await
+                .map_err(|_| anyhow::anyhow!("DeepX account monitor close result was lost"))??;
         }
         Ok(())
     }
@@ -7070,6 +7770,10 @@ impl DeepXExecutionClient {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.core.is_connected()
+            && self
+                .account_monitor_live
+                .as_ref()
+                .is_none_or(|live| live.load(Ordering::Acquire))
     }
 
     /// Returns the validated execution configuration.
@@ -7101,6 +7805,79 @@ impl DeepXExecutionClient {
             .query_epoch
             .lock()
             .map_err(|_| anyhow::anyhow!("DeepX order query epoch lock is poisoned"))? = true;
+        Ok(())
+    }
+
+    async fn activate_account_monitor(
+        &mut self,
+        snapshot_service: DeepXRuntimeSnapshotService,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.startup.is_ready() && self.core.is_connected(),
+            "DeepX account monitor requires completed startup"
+        );
+        let subscription = self
+            .startup_account_subscription
+            .ok_or_else(|| anyhow::anyhow!("DeepX account monitor has no subscription proof"))?;
+        anyhow::ensure!(
+            self.account_connection
+                .as_ref()
+                .is_some_and(|connection| connection.is_current_subscription(subscription)),
+            "DeepX account monitor has no current owned connection"
+        );
+        if !self.account_tasks.is_open() {
+            self.account_tasks
+                .finish_shutdown(
+                    Duration::from_secs(self.config.websocket_timeout_secs),
+                    Duration::from_secs(1),
+                )
+                .await?;
+            self.account_tasks.start_generation()?;
+        }
+        let mut connection = self.account_connection.take().expect("validated above");
+        let cancellation = self.account_tasks.cancellation_token();
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
+        let live = Arc::new(AtomicBool::new(true));
+        let task_live = Arc::clone(&live);
+        let epoch = Arc::clone(&self.query_epoch);
+        self.account_tasks.spawn(async move {
+            let _guard = DeepXAccountMonitorGuard {
+                live: task_live,
+                epoch,
+                snapshot_service,
+            };
+            let close_result = loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        break connection.close().await;
+                    }
+                    result = connection.next_balances(subscription) => match result {
+                        Ok(frame) => {
+                            sender.send_replace(Some(frame));
+                        }
+                        Err(e) if matches!(
+                            e.downcast_ref::<crate::websocket::DeepXWsError>(),
+                            Some(crate::websocket::DeepXWsError::ReceiveTimeout)
+                        ) => {}
+                        Err(e) => {
+                            log::error!("DeepX account stream became terminal: {e:#}");
+                            break Ok(());
+                        }
+                    }
+                }
+            };
+            if let Err(Err(e)) = close_sender.send(close_result) {
+                log::warn!("DeepX account monitor close failed: {e:#}");
+            }
+        })?;
+        self.account_monitor_live = Some(live);
+        self.account_monitor_frames = Some(receiver);
+        self.account_monitor_close = Some(close_receiver);
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX account monitor became terminal during startup"
+        );
         Ok(())
     }
 
@@ -7161,6 +7938,29 @@ impl DeepXExecutionClient {
     }
 }
 
+fn sort_recovery_outboxes(restored: &mut [DeepXRestoredTransactionRecord]) {
+    restored.sort_by(|left, right| {
+        recovery_outbox_order(left.record())
+            .cmp(&recovery_outbox_order(right.record()))
+            .then_with(|| {
+                left.record()
+                    .identity()
+                    .client_order_id()
+                    .cmp(right.record().identity().client_order_id())
+            })
+    });
+}
+
+fn recovery_outbox_order(record: &DeepXTransactionRecord) -> (u8, u64, u64) {
+    match record.identity().nonce() {
+        DeepXNonceReservation::TimestampOrderId { value } => (0, 0, value),
+        DeepXNonceReservation::SequentialAccount {
+            account_index,
+            nonce,
+        } => (1, account_index, nonce),
+    }
+}
+
 fn parse_tracked_order_report_timestamp(
     field: &'static str,
     value: &str,
@@ -7174,33 +7974,40 @@ fn parse_tracked_order_report_timestamp(
 }
 
 async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> anyhow::Result<()> {
-    task.order_contexts.register(task.order_context)?;
-    anyhow::ensure!(
-        task.ownership.signer() == task.runtime.lease.signer()
-            && task.ownership.subaccount() == task.params.subaccount
-            && task.order_side
-                == if task.params.is_buy {
-                    OrderSide::Buy
-                } else {
-                    OrderSide::Sell
-                },
-        "DeepX Spot order ownership or side differs from validated command"
-    );
-    let chain_time = observe_and_apply_finalized_chain_time(
-        &task.environment,
-        &task.endpoints,
-        &task.capabilities,
-        &task.runtime.snapshot_service,
-    )
-    .await?;
-    let reservation_permit = task.runtime.snapshot_service.acquire()?;
-    if chain_time.runtime_identity() != reservation_permit.snapshot().identity()
-        || chain_time.runtime_identity() != &task.runtime_identity
-    {
-        anyhow::bail!(
+    let preflight = async {
+        task.order_contexts.register(task.order_context)?;
+        anyhow::ensure!(
+            task.ownership.signer() == task.runtime.lease.signer()
+                && task.ownership.subaccount() == task.params.subaccount
+                && task.order_side
+                    == if task.params.is_buy {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    },
+            "DeepX Spot order ownership or side differs from validated command"
+        );
+        let chain_time = observe_and_apply_finalized_chain_time(
+            &task.environment,
+            &task.endpoints,
+            &task.capabilities,
+            &task.runtime.snapshot_service,
+        )
+        .await?;
+        let permit = task.runtime.snapshot_service.acquire()?;
+        anyhow::ensure!(
+            chain_time.runtime_identity() == permit.snapshot().identity()
+                && chain_time.runtime_identity() == &task.runtime_identity,
             "DeepX finalized chain time runtime identity changed before Spot reservation"
         );
+        Ok::<_, anyhow::Error>((chain_time, permit))
     }
+    .await;
+    let Some((chain_time, reservation_permit)) =
+        resolve_placement_preflight(preflight, &task.order, &task.emitter, "Spot")
+    else {
+        return Ok(());
+    };
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
         u64::from(chain_time.checkpoint().block_number()),
         chain_time.checkpoint().block_hash(),
@@ -7270,9 +8077,10 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
     .await?;
     deliver_spot_place_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
-    let outcome = submit_once_preserving_context(
+    let outcome = submit_once_with_runtime_guard(
         submitting,
         transmission_permit,
+        &submission_permit,
         move |bytes, expected_hash| async move {
             crate::transaction::submit_direct_pallet_once_classified(
                 &submission_url,
@@ -7395,23 +8203,31 @@ async fn deliver_spot_place_outbox(
 }
 
 async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> anyhow::Result<()> {
-    task.order_contexts.register(task.order_context)?;
-    validate_perp_place_order_side(task.order_side, task.params.is_long)?;
-    let market_ids = HashMap::from([(task.instrument_id, u64::from(task.params.market_id))]);
-
-    let chain_time = observe_and_apply_finalized_chain_time(
-        &task.environment,
-        &task.endpoints,
-        &task.capabilities,
-        &task.runtime.snapshot_service,
-    )
-    .await?;
-    let reservation_permit = task.runtime.snapshot_service.acquire()?;
-    if chain_time.runtime_identity() != reservation_permit.snapshot().identity()
-        || chain_time.runtime_identity() != &task.runtime_identity
-    {
-        anyhow::bail!("DeepX finalized chain time runtime identity changed before reservation");
+    let preflight = async {
+        task.order_contexts.register(task.order_context)?;
+        validate_perp_place_order_side(task.order_side, task.params.is_long)?;
+        let chain_time = observe_and_apply_finalized_chain_time(
+            &task.environment,
+            &task.endpoints,
+            &task.capabilities,
+            &task.runtime.snapshot_service,
+        )
+        .await?;
+        let permit = task.runtime.snapshot_service.acquire()?;
+        anyhow::ensure!(
+            chain_time.runtime_identity() == permit.snapshot().identity()
+                && chain_time.runtime_identity() == &task.runtime_identity,
+            "DeepX finalized chain time runtime identity changed before reservation"
+        );
+        Ok::<_, anyhow::Error>((chain_time, permit))
     }
+    .await;
+    let Some((chain_time, reservation_permit)) =
+        resolve_placement_preflight(preflight, &task.order, &task.emitter, "perpetual")
+    else {
+        return Ok(());
+    };
+    let market_ids = HashMap::from([(task.instrument_id, u64::from(task.params.market_id))]);
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
         u64::from(chain_time.checkpoint().block_number()),
         chain_time.checkpoint().block_hash(),
@@ -7493,9 +8309,10 @@ async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> a
     .await?;
     deliver_perp_place_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
-    let outcome = submit_once_preserving_context(
+    let outcome = submit_once_with_runtime_guard(
         submitting,
         transmission_permit,
+        &submission_permit,
         move |bytes, expected_hash| async move {
             crate::transaction::submit_direct_pallet_once_classified(
                 &submission_url,
@@ -7707,10 +8524,7 @@ async fn run_perp_cancel_task(task: DeepXPerpCancelTask) -> anyhow::Result<()> {
             task.order_side,
             crate::transaction::DeepXNonceReservation::TimestampOrderId { value: 1 },
             DeepXDirectRuntimeIdentity::from(&task.runtime_identity),
-            task.params.subaccount,
-            task.params.order_id,
-            task.params.market_id,
-            task.params.fast_cancel,
+            task.params,
         ),
     )?;
 
@@ -7810,9 +8624,10 @@ async fn run_perp_cancel_task(task: DeepXPerpCancelTask) -> anyhow::Result<()> {
     .await?;
     deliver_perp_cancel_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
-    let outcome = submit_once_preserving_context(
+    let outcome = submit_once_with_runtime_guard(
         submitting,
         transmission_permit,
+        &submission_permit,
         move |bytes, expected_hash| async move {
             crate::transaction::submit_direct_pallet_once_classified(
                 &submission_url,
@@ -8069,9 +8884,10 @@ async fn run_spot_cancel_task(task: DeepXSpotCancelTask) -> anyhow::Result<()> {
     .await?;
     deliver_spot_cancel_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
-    let outcome = submit_once_preserving_context(
+    let outcome = submit_once_with_runtime_guard(
         submitting,
         transmission_permit,
+        &submission_permit,
         move |bytes, expected_hash| async move {
             crate::transaction::submit_direct_pallet_once_classified(
                 &submission_url,
@@ -8272,23 +9088,36 @@ async fn deliver_perp_modify_outbox(
         else {
             anyhow::bail!("DeepX modify has no timestamp order ID nonce");
         };
-        let mut order_context = task.order_context.clone();
+        let mut order_context = task.order_context;
         order_context.quantity = context
             .modify_quantity()
             .ok_or_else(|| anyhow::anyhow!("DeepX modify is missing replacement quantity"))?;
         order_context.price = context.modify_price();
-        task.order_contexts.replace_tracked_venue_order_id(
-            task.client_order_id,
-            previous,
-            VenueOrderId::new(value.to_string()),
-            order_context,
-        )?;
+        let replacement = VenueOrderId::new(value.to_string());
+        let current = task
+            .order_contexts
+            .tracked_venue_order_id(&task.client_order_id)?;
+        if current == Some(previous) {
+            task.order_contexts.replace_tracked_venue_order_id(
+                task.client_order_id,
+                previous,
+                replacement,
+                order_context,
+            )?;
+        } else {
+            anyhow::ensure!(
+                current.is_some(),
+                "DeepX modified order has no current venue order binding"
+            );
+            task.order_contexts
+                .bind_tracked_venue_order_alias(task.client_order_id, previous)?;
+        }
     }
     Ok(())
 }
 
 async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
-    task.order_contexts.register(task.order_context.clone())?;
+    task.order_contexts.register(task.order_context)?;
     anyhow::ensure!(
         task.ownership.signer() == task.runtime.lease.signer()
             && task.ownership.subaccount() == task.params.cancel.subaccount
@@ -8489,9 +9318,10 @@ async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
     .await?;
     deliver_perp_modify_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
-    let outcome = submit_once_preserving_context(
+    let outcome = submit_once_with_runtime_guard(
         submitting,
         transmission_permit,
+        &submission_permit,
         move |bytes, expected_hash| async move {
             crate::transaction::submit_direct_pallet_once_classified(
                 &submission_url,
@@ -8577,7 +9407,7 @@ async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
 #[async_trait(?Send)]
 impl ExecutionClient for DeepXExecutionClient {
     fn is_connected(&self) -> bool {
-        self.core.is_connected()
+        Self::is_connected(self)
     }
 
     fn client_id(&self) -> ClientId {
@@ -8647,8 +9477,11 @@ impl ExecutionClient for DeepXExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.startup.is_ready() && self.core.is_connected() {
-            return self.activate_query_tasks().await;
+        if self.startup.is_ready() {
+            if self.is_connected() {
+                return self.activate_query_tasks().await;
+            }
+            self.abort_startup().await?;
         }
 
         let mut guard = DeepXStartupEpochGuard::new(self);
@@ -8671,6 +9504,17 @@ impl ExecutionClient for DeepXExecutionClient {
                 .complete_startup_with_finalized_flat_account_state(&frame, timeout)
                 .await?;
             guard.client.activate_query_tasks().await?;
+            let snapshot_service = guard
+                .client
+                .transaction_runtime
+                .as_ref()
+                .ok_or(DeepXTransactionRuntimeError::NotInitialized)?
+                .snapshot_service
+                .clone();
+            guard
+                .client
+                .activate_account_monitor(snapshot_service)
+                .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -8763,6 +9607,7 @@ impl ExecutionClient for DeepXExecutionClient {
                 recovery_blocks_per_range: self.config.recovery_blocks_per_range,
                 receipt_timeout: Duration::from_secs(self.config.websocket_timeout_secs),
                 params,
+                order,
                 instrument_id: cmd.instrument_id,
                 client_order_id: cmd.client_order_id,
                 order_side: cmd.order_init.order_side,
@@ -8774,11 +9619,24 @@ impl ExecutionClient for DeepXExecutionClient {
                 order_contexts: Arc::clone(&self.order_contexts),
                 emitter: self.emitter.clone(),
             };
-            self.query_tasks.spawn(async move {
-                if let Err(e) = run_spot_place_submission_task(task).await {
+            if !self.admit_placement(cmd.client_order_id)? {
+                log::warn!(
+                    "DeepX Spot order {} was already admitted for submission",
+                    cmd.client_order_id
+                );
+                return Ok(());
+            }
+            if let Err(e) = self.query_tasks.spawn(async move {
+                if let Err(e) = Box::pin(run_spot_place_submission_task(task)).await {
                     log::error!("DeepX Spot order submission failed: {e:#}");
                 }
-            })?;
+            }) {
+                self.admitted_placements
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("DeepX placement admission registry is poisoned"))?
+                    .remove(&cmd.client_order_id);
+                return Err(e.into());
+            }
             return Ok(());
         }
         let params = match self.build_perp_place_params(&cmd) {
@@ -8824,6 +9682,7 @@ impl ExecutionClient for DeepXExecutionClient {
             recovery_blocks_per_range: self.config.recovery_blocks_per_range,
             receipt_timeout: Duration::from_secs(self.config.websocket_timeout_secs),
             params,
+            order,
             instrument_id: cmd.instrument_id,
             client_order_id: cmd.client_order_id,
             order_side: cmd.order_init.order_side,
@@ -8835,16 +9694,70 @@ impl ExecutionClient for DeepXExecutionClient {
             order_contexts: Arc::clone(&self.order_contexts),
             emitter: self.emitter.clone(),
         };
-        self.query_tasks.spawn(async move {
-            if let Err(e) = run_perp_place_submission_task(task).await {
+        if !self.admit_placement(cmd.client_order_id)? {
+            log::warn!(
+                "DeepX perpetual order {} was already admitted for submission",
+                cmd.client_order_id
+            );
+            return Ok(());
+        }
+        if let Err(e) = self.query_tasks.spawn(async move {
+            if let Err(e) = Box::pin(run_perp_place_submission_task(task)).await {
                 log::error!("DeepX perpetual order submission failed: {e:#}");
             }
-        })?;
+        }) {
+            self.admitted_placements
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DeepX placement admission registry is poisoned"))?
+                .remove(&cmd.client_order_id);
+            return Err(e.into());
+        }
         Ok(())
     }
 
-    fn submit_order_list(&self, _cmd: SubmitOrderList) -> anyhow::Result<()> {
-        anyhow::bail!("DeepX order-list submission is not operational")
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_connected(),
+            "DeepX order-list submission requires a connected execution client"
+        );
+        cmd.order_list.validate()?;
+        let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+        if orders
+            .iter()
+            .any(|order| order.status() != OrderStatus::Initialized)
+        {
+            log::warn!(
+                "DeepX order list {} contains an order that is no longer initialized",
+                cmd.order_list.id
+            );
+            return Ok(());
+        }
+        let children = match self.prepare_independent_order_list(&cmd, &orders) {
+            Ok(children) => children,
+            Err(e) => {
+                let reason = format!(
+                    "DeepX order list {} was not submitted: {e}",
+                    cmd.order_list.id
+                );
+                for order in &orders {
+                    self.emitter.emit_order_denied(order, &reason);
+                }
+                return Ok(());
+            }
+        };
+        for (index, child) in children.into_iter().enumerate() {
+            if let Err(e) = self.submit_order(child) {
+                let reason = format!(
+                    "DeepX order list {} stopped before dispatching remaining orders: {e}",
+                    cmd.order_list.id
+                );
+                for order in &orders[index..] {
+                    self.emitter.emit_order_denied(order, &reason);
+                }
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
@@ -8968,7 +9881,7 @@ impl ExecutionClient for DeepXExecutionClient {
         };
         self.query_tasks.spawn(async move {
             let _admission_guard = admission_guard;
-            if let Err(e) = run_perp_modify_task(task).await {
+            if let Err(e) = Box::pin(run_perp_modify_task(task)).await {
                 log::error!("DeepX perpetual order modification failed: {e:#}");
             }
         })?;
@@ -9139,7 +10052,7 @@ impl ExecutionClient for DeepXExecutionClient {
             };
             self.query_tasks.spawn(async move {
                 let _admission_guard = admission_guard;
-                if let Err(error) = run_spot_cancel_task(task).await {
+                if let Err(error) = Box::pin(run_spot_cancel_task(task)).await {
                     log::error!("DeepX Spot order cancellation failed: {error:#}");
                 }
             })?;
@@ -9202,7 +10115,7 @@ impl ExecutionClient for DeepXExecutionClient {
         };
         self.query_tasks.spawn(async move {
             let _admission_guard = admission_guard;
-            if let Err(error) = run_perp_cancel_task(task).await {
+            if let Err(error) = Box::pin(run_perp_cancel_task(task)).await {
                 log::error!("DeepX order cancellation failed: {error:#}");
             }
         })?;
@@ -9225,48 +10138,17 @@ impl ExecutionClient for DeepXExecutionClient {
             cmd.instrument_id.venue == *DEEPX_VENUE,
             "DeepX cancel-all instrument venue mismatch"
         );
-
-        let orders = self
-            .core
-            .cache()
-            .orders_open(
-                Some(&self.core.venue),
-                Some(&cmd.instrument_id),
-                Some(&cmd.strategy_id),
-                Some(&self.core.account_id),
-                cmd.order_side,
-            )
-            .into_iter()
-            .map(|order| order.cloned())
-            .collect::<Vec<_>>();
-
-        for order in orders {
-            let mut cancel = CancelOrder::new(
-                cmd.trader_id,
-                Some(self.core.client_id),
-                order.strategy_id(),
-                order.instrument_id(),
-                order.client_order_id(),
-                order.venue_order_id(),
-                UUID4::new(),
-                cmd.ts_init,
-                cmd.params.clone(),
-                cmd.correlation_id.or(Some(cmd.command_id)),
-            );
-            cancel.causation_id = Some(cmd.command_id);
-            if let Err(e) = self.cancel_order(cancel) {
-                self.emitter.emit_order_cancel_rejected_event(
-                    order.strategy_id(),
-                    order.instrument_id(),
-                    order.client_order_id(),
-                    order.venue_order_id(),
-                    &e.to_string(),
-                    get_atomic_clock_realtime().get_time_ns(),
-                );
-            }
-        }
-
-        Ok(())
+        anyhow::ensure!(
+            cmd.params.as_ref().is_none_or(|params| params.is_empty()),
+            "DeepX cancel-all parameters are unsupported"
+        );
+        let batch = build_cancel_all_batch(
+            &self.core.cache(),
+            self.core.account_id,
+            self.core.client_id,
+            cmd,
+        );
+        self.batch_cancel_orders(batch)
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
@@ -9286,7 +10168,8 @@ impl ExecutionClient for DeepXExecutionClient {
             "DeepX batch cancel instrument venue mismatch"
         );
 
-        for cancel in cmd.cancels {
+        for item in &cmd.cancels {
+            let mut cancel = item.clone();
             if cancel.trader_id != cmd.trader_id
                 || cancel.client_id.is_some_and(|id| id != self.core.client_id)
                 || cancel.strategy_id != cmd.strategy_id
@@ -9302,12 +10185,19 @@ impl ExecutionClient for DeepXExecutionClient {
                 );
                 continue;
             }
-            if let Err(e) = self.cancel_order(cancel.clone()) {
+            inherit_batch_cancel_context(&mut cancel, &cmd);
+            let (strategy_id, instrument_id, client_order_id, venue_order_id) = (
+                cancel.strategy_id,
+                cancel.instrument_id,
+                cancel.client_order_id,
+                cancel.venue_order_id,
+            );
+            if let Err(e) = self.cancel_order(cancel) {
                 self.emitter.emit_order_cancel_rejected_event(
-                    cancel.strategy_id,
-                    cancel.instrument_id,
-                    cancel.client_order_id,
-                    cancel.venue_order_id,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    venue_order_id,
                     &e.to_string(),
                     get_atomic_clock_realtime().get_time_ns(),
                 );
@@ -9319,7 +10209,7 @@ impl ExecutionClient for DeepXExecutionClient {
 
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.core.is_connected(),
+            self.is_connected(),
             "DeepX account query requires a connected execution client"
         );
         anyhow::ensure!(
@@ -9422,11 +10312,14 @@ impl ExecutionClient for DeepXExecutionClient {
                         endpoints.as_ref(),
                         capabilities.as_ref(),
                         &mut block_timestamps,
-                        &record,
-                        market,
-                        query.venue_order_id,
-                        query.context,
-                        query.ts_init,
+                        DeepXTrackedSpotReportInput {
+                            record: &record,
+                            market,
+                            venue_order_id: query.venue_order_id,
+                            context: query.context,
+                            ts_init: query.ts_init,
+                            remaining_pages: None,
+                        },
                     )
                     .await
                 } else {
@@ -9540,11 +10433,14 @@ impl ExecutionClient for DeepXExecutionClient {
                     self.runtime_rpc_endpoints.as_ref(),
                     self.runtime_rpc_capabilities.as_ref(),
                     &mut block_timestamps,
-                    &record,
-                    market,
-                    tracked_venue_order_id,
-                    context,
-                    cmd.ts_init,
+                    DeepXTrackedSpotReportInput {
+                        record: &record,
+                        market,
+                        venue_order_id: tracked_venue_order_id,
+                        context,
+                        ts_init: cmd.ts_init,
+                        remaining_pages: None,
+                    },
                 )
                 .await?,
             ));
@@ -9676,7 +10572,12 @@ impl ExecutionClient for DeepXExecutionClient {
         };
 
         let mut reports = Vec::new();
+        let mut remaining_pages = ORDER_REPORT_MAX_PAGES;
         for market_id in market_ids {
+            anyhow::ensure!(
+                remaining_pages > 0,
+                "DeepX order report page budget exceeded"
+            );
             let open_pages = self
                 .http
                 .get_perp_open_order_pages(
@@ -9688,32 +10589,34 @@ impl ExecutionClient for DeepXExecutionClient {
                         page_size: Some(ORDER_REPORT_PAGE_SIZE),
                         sort: DeepXAccountSortOrder::Ascending,
                     },
-                    ORDER_REPORT_MAX_PAGES,
+                    remaining_pages,
                 )
                 .await?;
+            consume_order_report_pages(&mut remaining_pages, open_pages.len())?;
             let mut observed_open_order_ids = HashSet::new();
             for record in open_pages.into_iter().flat_map(|page| page.items) {
                 let venue_order_id = VenueOrderId::new(record.order_id.as_str());
-                let finalized = finalized_perp_orders
-                    .as_ref()
-                    .and_then(|evidence| {
-                        evidence.orders().iter().find(|order| {
+                if let Some(evidence) = finalized_perp_orders.as_ref() {
+                    let finalized = evidence
+                        .orders()
+                        .iter()
+                        .find(|order| {
                             u64::from(order.market_id()) == market_id
                                 && order.order_id().to_string() == record.order_id
                         })
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "DeepX active Perpetual order {venue_order_id} is absent from finalized storage"
-                        )
-                    })?;
-                Self::validate_finalized_perp_order_record(
-                    &self.perpetual_instrument_ids,
-                    &self.perpetual_report_metadata,
-                    &record,
-                    market_id,
-                    finalized,
-                )?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "DeepX active Perpetual order {venue_order_id} is absent from finalized storage"
+                            )
+                        })?;
+                    Self::validate_finalized_perp_order_record(
+                        &self.perpetual_instrument_ids,
+                        &self.perpetual_report_metadata,
+                        &record,
+                        market_id,
+                        finalized,
+                    )?;
+                }
                 anyhow::ensure!(
                     observed_open_order_ids.insert(record.order_id.clone()),
                     "DeepX active Perpetual order response duplicated order {}",
@@ -9747,6 +10650,10 @@ impl ExecutionClient for DeepXExecutionClient {
             }
 
             if !cmd.open_only {
+                anyhow::ensure!(
+                    remaining_pages > 0,
+                    "DeepX order report page budget exceeded"
+                );
                 let history_pages = self
                     .http
                     .get_perp_history_order_pages(
@@ -9757,9 +10664,10 @@ impl ExecutionClient for DeepXExecutionClient {
                             page_size: Some(ORDER_REPORT_PAGE_SIZE),
                             sort: DeepXAccountSortOrder::Ascending,
                         },
-                        ORDER_REPORT_MAX_PAGES,
+                        remaining_pages,
                     )
                     .await?;
+                consume_order_report_pages(&mut remaining_pages, history_pages.len())?;
                 let history_records = history_pages
                     .into_iter()
                     .flat_map(|page| page.items)
@@ -9827,6 +10735,10 @@ impl ExecutionClient for DeepXExecutionClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!("DeepX Spot order report market catalog is incomplete")
                 })?;
+            anyhow::ensure!(
+                remaining_pages > 0,
+                "DeepX order report page budget exceeded"
+            );
             let open_pages = self
                 .http
                 .get_spot_open_order_pages(
@@ -9839,9 +10751,10 @@ impl ExecutionClient for DeepXExecutionClient {
                         sort: DeepXAccountSortOrder::Ascending,
                         page_size: Some(ORDER_REPORT_PAGE_SIZE),
                     },
-                    ORDER_REPORT_MAX_PAGES,
+                    remaining_pages,
                 )
                 .await?;
+            consume_order_report_pages(&mut remaining_pages, open_pages.len())?;
             let open_records = open_pages
                 .into_iter()
                 .flat_map(|page| page.items)
@@ -9860,6 +10773,7 @@ impl ExecutionClient for DeepXExecutionClient {
                         instrument_id,
                         market,
                         &mut block_timestamps,
+                        &mut remaining_pages,
                         cmd.ts_init,
                     )
                     .await?;
@@ -9872,6 +10786,10 @@ impl ExecutionClient for DeepXExecutionClient {
             }
 
             if !cmd.open_only {
+                anyhow::ensure!(
+                    remaining_pages > 0,
+                    "DeepX order report page budget exceeded"
+                );
                 let history_pages = self
                     .http
                     .get_spot_history_order_pages(
@@ -9884,9 +10802,10 @@ impl ExecutionClient for DeepXExecutionClient {
                             sort: DeepXAccountSortOrder::Ascending,
                             page_size: Some(ORDER_REPORT_PAGE_SIZE),
                         },
-                        ORDER_REPORT_MAX_PAGES,
+                        remaining_pages,
                     )
                     .await?;
+                consume_order_report_pages(&mut remaining_pages, history_pages.len())?;
                 let history_records = history_pages
                     .into_iter()
                     .flat_map(|page| page.items)
@@ -9905,6 +10824,7 @@ impl ExecutionClient for DeepXExecutionClient {
                             instrument_id,
                             market,
                             &mut block_timestamps,
+                            &mut remaining_pages,
                             cmd.ts_init,
                         )
                         .await?,
@@ -9932,60 +10852,44 @@ impl ExecutionClient for DeepXExecutionClient {
                 .is_some_and(|(start, end)| start > end),
             "DeepX fill report start must not exceed end",
         );
+        anyhow::ensure!(
+            cmd.params.as_ref().is_none_or(|params| params.is_empty()),
+            "DeepX fill report parameters are unsupported",
+        );
         let subaccount = self
             .config
             .subaccount_id
             .as_deref()
             .ok_or(DeepXFillReportError::MissingConfiguredSubaccount)?;
         if let Some(venue_order_id) = cmd.venue_order_id
-            && (venue_order_id.as_str().is_empty()
-                || !venue_order_id
-                    .as_str()
-                    .bytes()
-                    .all(|value| value.is_ascii_digit())
-                || venue_order_id.as_str().parse::<u64>().is_err())
+            && crate::common::parse::parse_canonical_order_id(venue_order_id.as_str()).is_none()
         {
             return Err(DeepXFillReportError::InvalidVenueOrderId.into());
         }
         if let Some(instrument_id) = cmd.instrument_id
             && let Some(market) = self.spot_report_markets.get(&instrument_id)
         {
-            let start_ms = cmd.start.map(|value| value.as_u64() / 1_000_000);
-            let end_ms = cmd.end.map(|value| value.as_u64() / 1_000_000);
-            let pages = self
-                .http
-                .get_spot_account_trade_pages(
-                    &DeepXSpotAccountTradesRequest {
-                        subaccount: subaccount.to_string(),
-                        order_id: None,
-                        order_side: None,
-                        name: None,
-                        pair: Some(market.pair.clone()),
-                        cursor: None,
-                        sort: DeepXAccountSortOrder::Ascending,
-                        start_ms,
-                        end_ms,
-                        page_size: Some(FILL_REPORT_PAGE_SIZE),
-                    },
-                    FILL_REPORT_MAX_PAGES,
+            if self
+                .spot_report_instruments_by_pair
+                .get(&normalize_spot_pair(&market.pair))
+                != Some(&instrument_id)
+            {
+                return Err(DeepXFillReportError::SpotMarketIdentityMismatch.into());
+            }
+            let mut remaining_pages = FILL_REPORT_MAX_PAGES;
+            let mut remaining_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
+            let reports = self
+                .collect_spot_fill_reports_for_market(
+                    subaccount,
+                    instrument_id,
+                    market,
+                    &cmd,
+                    &mut remaining_pages,
+                    &mut remaining_blocks,
                 )
                 .await?;
-            let mut reports = Vec::new();
-            for record in pages.into_iter().flat_map(|page| page.items) {
-                if cmd
-                    .venue_order_id
-                    .is_some_and(|venue_order_id| venue_order_id.as_str() != record.order_id)
-                {
-                    continue;
-                }
-                let report =
-                    self.build_spot_fill_report(&record, instrument_id, market, cmd.ts_init)?;
-                if cmd.start.is_some_and(|start| report.ts_event < start)
-                    || cmd.end.is_some_and(|end| report.ts_event > end)
-                {
-                    continue;
-                }
-                reports.push(report);
+            if cmd.venue_order_id.is_some() {
+                validate_targeted_fill_identity(&reports)?;
             }
             return Ok(self.merge_validated_fill_reports(reports)?);
         }
@@ -10008,87 +10912,166 @@ impl ExecutionClient for DeepXExecutionClient {
         if market_id.is_none()
             && (self.perpetual_market_ids.is_empty() && self.spot_report_markets.is_empty()
                 || self.perpetual_market_ids.len() != self.perpetual_instrument_ids.len()
-                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len())
+                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len()
+                || self
+                    .perpetual_market_ids
+                    .iter()
+                    .any(|(instrument_id, market_id)| {
+                        self.perpetual_instrument_ids.get(market_id) != Some(instrument_id)
+                            || !self.perpetual_report_metadata.contains_key(instrument_id)
+                    })
+                || self.spot_report_markets.len() != self.spot_report_instruments_by_pair.len()
+                || self
+                    .spot_report_markets
+                    .iter()
+                    .any(|(instrument_id, market)| {
+                        self.spot_report_instruments_by_pair
+                            .get(&normalize_spot_pair(&market.pair))
+                            != Some(instrument_id)
+                    }))
         {
             return Err(DeepXFillReportError::MarketIdentityMismatch.into());
         }
 
-        let pages = self
-            .http
-            .get_perp_account_trade_pages(
-                &DeepXPerpAccountTradesRequest {
-                    subaccount: subaccount.to_string(),
-                    order_id: None,
-                    market_id,
-                    is_long: None,
-                    cursor: None,
-                    sort: DeepXAccountSortOrder::Ascending,
-                    start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
-                    end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
-                    page_size: Some(FILL_REPORT_PAGE_SIZE),
-                },
-                FILL_REPORT_MAX_PAGES,
-            )
-            .await?;
         let mut reports = Vec::new();
-        for record in pages.into_iter().flat_map(|page| page.items) {
-            if cmd
-                .venue_order_id
-                .is_some_and(|venue_order_id| venue_order_id.as_str() != record.order_id)
-            {
-                continue;
+        let mut perp_records = Vec::new();
+        let mut spot_records = Vec::new();
+        let mut remaining_pages = FILL_REPORT_MAX_PAGES;
+        let mut remaining_spot_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
+        if !self.perpetual_market_ids.is_empty() {
+            let selected_markets = if cmd.venue_order_id.is_some() && market_id.is_none() {
+                let mut ids = self
+                    .perpetual_market_ids
+                    .values()
+                    .copied()
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids.into_iter().map(Some).collect::<Vec<_>>()
+            } else {
+                vec![market_id]
+            };
+            for selected_market_id in selected_markets {
+                let order_sides = if cmd.venue_order_id.is_some() {
+                    vec![Some(true), Some(false)]
+                } else {
+                    vec![None]
+                };
+                for is_long in order_sides {
+                    if remaining_pages == 0 {
+                        return Err(DeepXFillReportError::PaginationBudgetExceeded.into());
+                    }
+                    let pages = self
+                        .http
+                        .get_perp_account_trade_pages(
+                            &DeepXPerpAccountTradesRequest {
+                                subaccount: subaccount.to_string(),
+                                order_id: if is_long.is_some() {
+                                    cmd.venue_order_id
+                                        .map(|venue_order_id| venue_order_id.as_str().to_string())
+                                } else {
+                                    None
+                                },
+                                market_id: selected_market_id,
+                                is_long,
+                                cursor: None,
+                                sort: DeepXAccountSortOrder::Ascending,
+                                start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
+                                end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
+                                page_size: Some(FILL_REPORT_PAGE_SIZE),
+                            },
+                            remaining_pages,
+                        )
+                        .await?;
+                    remaining_pages -= pages.len();
+                    for record in pages.into_iter().flat_map(|page| page.items) {
+                        if cmd.venue_order_id.is_some_and(|venue_order_id| {
+                            venue_order_id.as_str() != record.order_id
+                        }) {
+                            continue;
+                        }
+                        let report = self.build_fill_report(&record, cmd.ts_init)?;
+                        if cmd.start.is_some_and(|start| report.ts_event < start)
+                            || cmd.end.is_some_and(|end| report.ts_event > end)
+                        {
+                            continue;
+                        }
+                        perp_records.push(record);
+                        reports.push(report);
+                    }
+                }
             }
-            let report = self.build_fill_report(&record, cmd.ts_init)?;
-            if cmd.start.is_some_and(|start| report.ts_event < start)
-                || cmd.end.is_some_and(|end| report.ts_event > end)
-            {
-                continue;
-            }
-            reports.push(report);
         }
         if cmd.instrument_id.is_none() && !self.spot_report_markets.is_empty() {
-            let spot_pages = self
-                .http
-                .get_spot_account_trade_pages(
-                    &DeepXSpotAccountTradesRequest {
-                        subaccount: subaccount.to_string(),
-                        order_id: None,
-                        order_side: None,
-                        name: None,
-                        pair: None,
-                        cursor: None,
-                        sort: DeepXAccountSortOrder::Ascending,
-                        start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
-                        end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
-                        page_size: Some(FILL_REPORT_PAGE_SIZE),
-                    },
-                    FILL_REPORT_MAX_PAGES,
-                )
-                .await?;
-            for record in spot_pages.into_iter().flat_map(|page| page.items) {
-                if cmd
-                    .venue_order_id
-                    .is_some_and(|venue_order_id| venue_order_id.as_str() != record.order_id)
-                {
-                    continue;
+            if cmd.venue_order_id.is_some() {
+                let mut markets = self.spot_report_markets.iter().collect::<Vec<_>>();
+                markets.sort_by_key(|(instrument_id, _)| *instrument_id);
+                for (instrument_id, market) in markets {
+                    reports.extend(
+                        self.collect_spot_fill_reports_for_market(
+                            subaccount,
+                            *instrument_id,
+                            market,
+                            &cmd,
+                            &mut remaining_pages,
+                            &mut remaining_spot_blocks,
+                        )
+                        .await?,
+                    );
                 }
-                let instrument_id = self
-                    .spot_report_instruments_by_pair
-                    .get(&normalize_spot_pair(&record.pair))
-                    .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
-                let market = self
-                    .spot_report_markets
-                    .get(instrument_id)
-                    .ok_or(DeepXFillReportError::MarketIdentityMismatch)?;
-                let report =
-                    self.build_spot_fill_report(&record, *instrument_id, market, cmd.ts_init)?;
-                if cmd.start.is_some_and(|start| report.ts_event < start)
-                    || cmd.end.is_some_and(|end| report.ts_event > end)
-                {
-                    continue;
+            } else {
+                if remaining_pages == 0 {
+                    return Err(DeepXFillReportError::PaginationBudgetExceeded.into());
                 }
-                reports.push(report);
+                let spot_pages = self
+                    .http
+                    .get_spot_account_trade_pages(
+                        &DeepXSpotAccountTradesRequest {
+                            subaccount: subaccount.to_string(),
+                            order_id: None,
+                            order_side: None,
+                            name: None,
+                            pair: None,
+                            cursor: None,
+                            sort: DeepXAccountSortOrder::Ascending,
+                            start_ms: cmd.start.map(|value| value.as_u64() / 1_000_000),
+                            end_ms: cmd.end.map(|value| value.as_u64() / 1_000_000),
+                            page_size: Some(FILL_REPORT_PAGE_SIZE),
+                        },
+                        remaining_pages,
+                    )
+                    .await?;
+                for record in spot_pages.into_iter().flat_map(|page| page.items) {
+                    let instrument_id = self
+                        .spot_report_instruments_by_pair
+                        .get(&normalize_spot_pair(&record.pair))
+                        .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
+                    let market = self
+                        .spot_report_markets
+                        .get(instrument_id)
+                        .ok_or(DeepXFillReportError::MarketIdentityMismatch)?;
+                    let report =
+                        self.build_spot_fill_report(&record, *instrument_id, market, cmd.ts_init)?;
+                    if cmd.start.is_some_and(|start| report.ts_event < start)
+                        || cmd.end.is_some_and(|end| report.ts_event > end)
+                    {
+                        continue;
+                    }
+                    spot_records.push(record);
+                    reports.push(report);
+                }
             }
+        }
+        if cmd.venue_order_id.is_some() {
+            validate_targeted_fill_identity(&reports)?;
+        }
+        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
+            self.verify_owned_finalized_perp_fill_records(&perp_records)
+                .await?;
+            self.verify_owned_finalized_spot_fill_records(
+                &spot_records,
+                &mut remaining_spot_blocks,
+            )
+            .await?;
         }
         Ok(self.merge_validated_fill_reports(reports)?)
     }
@@ -10102,6 +11085,10 @@ impl ExecutionClient for DeepXExecutionClient {
                 .zip(cmd.end)
                 .is_some_and(|(start, end)| start > end),
             "DeepX position report start must not exceed end",
+        );
+        anyhow::ensure!(
+            cmd.params.as_ref().is_none_or(|params| params.is_empty()),
+            "DeepX position report parameters are unsupported",
         );
         let subaccount = self
             .config
@@ -10127,7 +11114,14 @@ impl ExecutionClient for DeepXExecutionClient {
         if market_id.is_none()
             && (self.perpetual_market_ids.is_empty()
                 || self.perpetual_market_ids.len() != self.perpetual_instrument_ids.len()
-                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len())
+                || self.perpetual_market_ids.len() != self.perpetual_report_metadata.len()
+                || self
+                    .perpetual_market_ids
+                    .iter()
+                    .any(|(instrument_id, market_id)| {
+                        self.perpetual_instrument_ids.get(market_id) != Some(instrument_id)
+                            || !self.perpetual_report_metadata.contains_key(instrument_id)
+                    }))
         {
             return Err(DeepXPositionReportError::MarketIdentityMismatch.into());
         }
@@ -10161,7 +11155,6 @@ impl ExecutionClient for DeepXExecutionClient {
             .await?;
             let timestamp_ns = timestamp_ms
                 .checked_mul(1_000_000)
-                .and_then(|value| u64::try_from(value).ok())
                 .ok_or(DeepXPositionReportError::InvalidFinalizedTimestamp)?;
             let ts_event = UnixNanos::from(timestamp_ns);
             let mut reports = Vec::new();
@@ -10446,6 +11439,7 @@ mod tests {
         extract::ws::{Message as WsMessage, WebSocketUpgrade},
         routing::{get, post},
     };
+    use futures_util::FutureExt;
     use nautilus_common::{
         cache::Cache,
         live::runner::replace_exec_event_sender,
@@ -10458,18 +11452,19 @@ mod tests {
     use nautilus_model::{
         accounts::{AccountAny, MarginAccount},
         enums::{
-            AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
-            TimeInForce,
+            AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus,
+            OrderType, PositionSide, TimeInForce,
         },
         events::{AccountState, OrderAccepted, OrderEventAny, OrderSubmitted},
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId,
-            VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId,
+            TraderId, VenueOrderId,
         },
         instruments::stubs::crypto_perpetual_ethusdt,
-        orders::OrderTestBuilder,
+        orders::{OrderList, OrderTestBuilder},
         types::{Money, Price, Quantity},
     };
+    use parity_scale_codec::Encode;
     use rstest::rstest;
     use serde_json::{Value, json};
     use subxt_core::config::{Hasher, substrate::BlakeTwo256};
@@ -10533,6 +11528,8 @@ mod tests {
         include_str!("../test_data/http/testnet/perp_positions_account_market_3.json");
     const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str =
         include_str!("../test_data/http/testnet/perp_account_trades_account_market_3.json");
+    const EMPTY_SPOT_MARKETS_RESPONSE: &str =
+        r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
     const TEST_SUBACCOUNT: &str = "0x1111111111111111111111111111111111111111";
 
     #[derive(Debug)]
@@ -10842,7 +11839,7 @@ mod tests {
 
     fn tracked_limit_report_fixture() -> (DeepXExecutionClient, DeepXPerpOrderRecord, VenueOrderId)
     {
-        let client = test_client();
+        let client = test_perp_report_client();
         let order = tracked_limit_order();
         let record = tracked_limit_order_record();
         let venue_order_id = VenueOrderId::from(record.order_id.as_str());
@@ -10853,8 +11850,15 @@ mod tests {
         (client, record, venue_order_id)
     }
 
+    fn test_perp_report_client() -> DeepXExecutionClient {
+        let mut client = test_client();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        client.perpetual_market_ids.insert(instrument_id, 3);
+        client.perpetual_instrument_ids.insert(3, instrument_id);
+        client
+    }
+
     async fn report_test_client(path: &'static str, mut response: Value) -> DeepXExecutionClient {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
         for item in response["data"]["items"].as_array_mut().unwrap() {
             item["owner"] = TEST_SUBACCOUNT.into();
@@ -10862,7 +11866,7 @@ mod tests {
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
-                get(|| async { SPOT_RESPONSE }),
+                get(|| async { EMPTY_SPOT_MARKETS_RESPONSE }),
             )
             .route(
                 "/internal/v1/market/perp/markets",
@@ -10903,6 +11907,7 @@ mod tests {
             ..Default::default()
         };
         let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         let mut provider = DeepXMarketProvider::new(client.http.clone());
         provider.load_all().await.unwrap();
         client.record_instruments_loaded(&provider).unwrap();
@@ -10913,7 +11918,8 @@ mod tests {
         report_test_client("/internal/v1/account/position", response).await
     }
 
-    async fn fill_report_test_client(response: Value) -> DeepXExecutionClient {
+    async fn fill_report_test_client(mut response: Value) -> DeepXExecutionClient {
+        response["data"]["items"].as_array_mut().unwrap().reverse();
         report_test_client("/internal/v1/account/perp/trades", response).await
     }
 
@@ -10921,7 +11927,6 @@ mod tests {
         mut open_response: Value,
         mut history_response: Value,
     ) -> DeepXExecutionClient {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
         for response in [&mut open_response, &mut history_response] {
             for item in response["data"]["items"].as_array_mut().unwrap() {
@@ -10931,7 +11936,7 @@ mod tests {
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
-                get(|| async { SPOT_RESPONSE }),
+                get(|| async { EMPTY_SPOT_MARKETS_RESPONSE }),
             )
             .route(
                 "/internal/v1/market/perp/markets",
@@ -10978,6 +11983,7 @@ mod tests {
             ..Default::default()
         };
         let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         let mut provider = DeepXMarketProvider::new(client.http.clone());
         provider.load_all().await.unwrap();
         client.record_instruments_loaded(&provider).unwrap();
@@ -10986,18 +11992,21 @@ mod tests {
 
     async fn mass_status_test_client(
         open_response: Value,
-        trade_response: Value,
+        mut trade_response: Value,
         mut position_response: Value,
     ) -> DeepXExecutionClient {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        trade_response["data"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
         for item in position_response["data"]["items"].as_array_mut().unwrap() {
             item["owner"] = TEST_SUBACCOUNT.into();
         }
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
-                get(|| async { SPOT_RESPONSE }),
+                get(|| async { EMPTY_SPOT_MARKETS_RESPONSE }),
             )
             .route(
                 "/internal/v1/market/perp/markets",
@@ -11050,6 +12059,7 @@ mod tests {
             ..Default::default()
         };
         let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         let mut provider = DeepXMarketProvider::new(client.http.clone());
         provider.load_all().await.unwrap();
         client.record_instruments_loaded(&provider).unwrap();
@@ -11085,6 +12095,7 @@ mod tests {
             instrument_id,
             DeepXPerpetualReportMetadata {
                 base_decimal: market.base_decimal,
+                quote_decimal: market.quote_decimal,
                 price_precision: instrument.price_precision(),
                 size_precision: instrument.size_precision(),
                 price_increment: market.order_spec_tick_size,
@@ -11110,6 +12121,137 @@ mod tests {
         )
     }
 
+    fn independent_list_orders() -> Vec<OrderAny> {
+        ["O-DEEPX-LIST-1", "O-DEEPX-LIST-2"]
+            .into_iter()
+            .map(|id| {
+                OrderTestBuilder::new(OrderType::Limit)
+                    .client_order_id(ClientOrderId::from(id))
+                    .strategy_id(StrategyId::from("S-DEEPX-001"))
+                    .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+                    .order_list_id(OrderListId::from("OL-DEEPX-001"))
+                    .side(OrderSide::Buy)
+                    .quantity(Quantity::from("0.3"))
+                    .price(Price::from("2500.00"))
+                    .time_in_force(TimeInForce::Gtc)
+                    .build()
+            })
+            .collect()
+    }
+
+    fn submit_list_command(orders: &[OrderAny]) -> SubmitOrderList {
+        let order_list = OrderList::from_orders(orders, UnixNanos::default());
+        SubmitOrderList::new(
+            orders[0].trader_id(),
+            Some(ClientId::from("DEEPX")),
+            orders[0].strategy_id(),
+            order_list,
+            orders
+                .iter()
+                .map(|order| order.init_event().clone())
+                .collect(),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(UUID4::new()),
+        )
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn independent_order_list_prepares_distinct_child_commands(#[case] explicit_correlation: bool) {
+        let (client, _) = commission_test_client();
+        let orders = independent_list_orders();
+        let mut command = submit_list_command(&orders);
+        if !explicit_correlation {
+            command.correlation_id = None;
+        }
+
+        let children = client
+            .prepare_independent_order_list(&command, &orders)
+            .unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert_ne!(children[0].command_id, children[1].command_id);
+        for (child, order) in children.iter().zip(&orders) {
+            assert_ne!(child.command_id, command.command_id);
+            assert_ne!(child.command_id, order.init_event().event_id);
+            assert_eq!(child.client_order_id, order.client_order_id());
+            assert_eq!(child.order_init, *order.init_event());
+            assert_eq!(child.causation_id, Some(command.command_id));
+            assert_eq!(
+                child.correlation_id,
+                command.correlation_id.or(Some(command.command_id))
+            );
+        }
+    }
+
+    #[rstest]
+    fn independent_order_list_rejects_contingent_and_forged_members() {
+        let (client, _) = commission_test_client();
+        let orders = independent_list_orders();
+        let mut command = submit_list_command(&orders);
+        command.order_inits[1].event_id = UUID4::new();
+        assert!(
+            client
+                .prepare_independent_order_list(&command, &orders)
+                .is_err()
+        );
+
+        let mut contingent = independent_list_orders();
+        contingent[1] = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-LIST-2"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+            .order_list_id(OrderListId::from("OL-DEEPX-001"))
+            .contingency_type(ContingencyType::Oco)
+            .linked_order_ids(vec![ClientOrderId::from("O-DEEPX-LIST-1")])
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.3"))
+            .price(Price::from("2500.00"))
+            .time_in_force(TimeInForce::Gtc)
+            .build();
+        let command = submit_list_command(&contingent);
+        assert!(
+            client
+                .prepare_independent_order_list(&command, &contingent)
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn order_list_mapping_failure_denies_every_member_before_dispatch() {
+        let (mut client, cache) = test_client_with_cache();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        ExecutionClient::start(&mut client).unwrap();
+        client.core.set_connected();
+        let orders = independent_list_orders();
+        let command = submit_list_command(&orders);
+        for order in &orders {
+            cache
+                .borrow_mut()
+                .add_order(order.clone(), None, Some(client.core.client_id), false)
+                .unwrap();
+        }
+
+        client.submit_order_list(command).unwrap();
+
+        for order in &orders {
+            let event = receiver.try_recv().unwrap();
+            assert!(matches!(
+                event,
+                ExecutionEvent::Order(OrderEventAny::Denied(denied))
+                    if denied.client_order_id == order.client_order_id()
+            ));
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(client.query_tasks.is_empty());
+    }
+
     #[rstest]
     fn submit_command_must_match_cached_order_terms() {
         let order = test_order("1.250");
@@ -11119,6 +12261,141 @@ mod tests {
 
         command.order_init.quantity = Quantity::from("1.251");
         assert!(!cached_order_matches_submit_command(&order, &command));
+    }
+
+    #[rstest]
+    fn submit_command_must_match_cached_initialization_identity() {
+        let order = test_order("1.250");
+        let mut command = submit_command(&order);
+
+        command.order_init.event_id = UUID4::new();
+        assert!(!cached_order_matches_submit_command(&order, &command));
+
+        command = submit_command(&order);
+        command.order_init.order_list_id = Some(nautilus_model::identifiers::OrderListId::from(
+            "OL-DEEPX-FORGED",
+        ));
+        assert!(!cached_order_matches_submit_command(&order, &command));
+    }
+
+    #[rstest]
+    fn submit_order_denies_forged_initialization_before_submission() {
+        let (mut client, cache) = test_client_with_cache();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        ExecutionClient::start(&mut client).unwrap();
+        client.core.set_connected();
+        let order = test_order("1.250");
+        let mut command = submit_command(&order);
+        command.order_init.event_id = UUID4::new();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(client.core.client_id), false)
+            .unwrap();
+
+        client.submit_order(command).unwrap();
+
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Denied(denied))
+                if denied.client_order_id == order.client_order_id()
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(client.query_tasks.is_empty());
+    }
+
+    #[rstest]
+    fn placement_admission_prevents_duplicate_submission_across_startup_reset() {
+        let mut client = test_client();
+        let first = ClientOrderId::from("O-DEEPX-ADMISSION-1");
+        let second = ClientOrderId::from("O-DEEPX-ADMISSION-2");
+
+        assert!(client.admit_placement(first).unwrap());
+        assert!(!client.admit_placement(first).unwrap());
+        client.reset_startup();
+        assert!(!client.admit_placement(first).unwrap());
+        assert!(client.admit_placement(second).unwrap());
+    }
+
+    #[rstest]
+    fn restored_placement_admission_excludes_cancel_records() {
+        let client = test_client();
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let runtime = DeepXDirectRuntimeIdentity::from(test_runtime_snapshot().identity());
+        let placed = DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_place(
+            ClientOrderId::new("O-DEEPX-RESTORED-PLACE"),
+            signer,
+            instrument_id,
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 42 },
+            runtime.clone(),
+            test_perp_place_params(),
+        ));
+        let cancelled = DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_cancel(
+            ClientOrderId::new("O-DEEPX-RESTORED-CANCEL"),
+            signer,
+            instrument_id,
+            OrderSide::Buy,
+            DeepXNonceReservation::TimestampOrderId { value: 43 },
+            runtime,
+            crate::signing::DeepXPerpCancelParams {
+                subaccount: [0x11; 20],
+                order_id: 7,
+                market_id: 3,
+                fast_cancel: false,
+            },
+        ));
+        let records = [placed, cancelled]
+            .into_iter()
+            .map(|record| {
+                let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+                    &record,
+                    DeepXTransactionRevision::new(1),
+                )
+                .unwrap();
+                DeepXRestoredTransactionRecord::new(record, committed).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            restored_placement_ids(&records),
+            HashSet::from([ClientOrderId::new("O-DEEPX-RESTORED-PLACE")]),
+        );
+    }
+
+    #[rstest]
+    fn placement_preflight_denies_only_proven_not_sent_failure() {
+        let mut client = test_client();
+        let order = test_order("1.250");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        ExecutionClient::start(&mut client).unwrap();
+
+        assert_eq!(
+            resolve_placement_preflight(
+                Err::<u64, _>(anyhow::anyhow!("chain time unavailable")),
+                &order,
+                &client.emitter,
+                "perpetual",
+            ),
+            None,
+        );
+        let event = receiver.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Denied(denied))
+                if denied.client_order_id == order.client_order_id()
+                    && denied.reason.as_str()
+                        == "DeepX perpetual order was not sent: chain time unavailable"
+        ));
+
+        assert_eq!(
+            resolve_placement_preflight(Ok(42), &order, &client.emitter, "Spot"),
+            Some(42),
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[rstest]
@@ -11152,9 +12429,25 @@ mod tests {
         account_id: AccountId,
         venue_order_id: VenueOrderId,
     ) {
+        accept_order_in_cache_for_client(
+            cache,
+            order,
+            account_id,
+            venue_order_id,
+            ClientId::from("DEEPX"),
+        );
+    }
+
+    fn accept_order_in_cache_for_client(
+        cache: &Rc<RefCell<Cache>>,
+        order: &OrderAny,
+        account_id: AccountId,
+        venue_order_id: VenueOrderId,
+        client_id: ClientId,
+    ) {
         cache
             .borrow_mut()
-            .add_order(order.clone(), None, Some(ClientId::from("DEEPX")), false)
+            .add_order(order.clone(), None, Some(client_id), false)
             .unwrap();
         let submitted = OrderSubmitted::new(
             order.trader_id(),
@@ -12920,6 +14213,7 @@ mod tests {
         assert_eq!(metadata.size_precision, 4);
         assert_eq!(metadata.price_precision, 4);
         assert_eq!(metadata.base_decimal, 18);
+        assert_eq!(metadata.quote_decimal, 6);
         assert_eq!(metadata.size_increment, rust_decimal::Decimal::new(10, 4));
         assert_eq!(metadata.price_increment, rust_decimal::Decimal::new(100, 4));
         assert_eq!(metadata.min_quantity, rust_decimal::Decimal::new(10, 4));
@@ -13409,6 +14703,123 @@ mod tests {
         assert_eq!(quote, 25_000_000);
         assert!(
             spot_limit_amounts("0.01".parse().unwrap(), "2500".parse().unwrap(), 18, 18,).is_err()
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Gtc, DeepXTimeInForce::Gtc)]
+    #[case(TimeInForce::Ioc, DeepXTimeInForce::Ioc)]
+    fn spot_limit_order_maps_exact_runtime_amounts_and_time_in_force(
+        #[case] time_in_force: TimeInForce,
+        #[case] expected: DeepXTimeInForce,
+    ) {
+        let (mut client, cache) = test_client_with_cache();
+        let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        let pair = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
+        let base = Currency::new_checked(
+            "ETH",
+            18,
+            0,
+            "ETH",
+            nautilus_model::enums::CurrencyType::Crypto,
+        )
+        .unwrap();
+        let quote = Currency::new_checked(
+            "USDC",
+            6,
+            0,
+            "USDC",
+            nautilus_model::enums::CurrencyType::Crypto,
+        )
+        .unwrap();
+        let instrument = nautilus_model::instruments::CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(nautilus_model::identifiers::Symbol::from("ETH/USDC"))
+            .base_currency(base)
+            .quote_currency(quote)
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .min_quantity(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        client.spot_report_markets.insert(
+            instrument_id,
+            DeepXSpotReportMarket {
+                name: "ETH/USDC".to_string(),
+                pair: pair.to_string(),
+                base_symbol: "ETH".to_string(),
+                quote_symbol: "USDC".to_string(),
+                base_decimal: 18,
+                quote_decimal: 6,
+                is_paused: false,
+                maker_fee_rate: rust_decimal::Decimal::ZERO,
+                taker_fee_rate: rust_decimal::Decimal::ZERO,
+            },
+        );
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-SPOT-IOC-MAP"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(instrument_id)
+            .order_list_id(OrderListId::from("OL-DEEPX-SPOT-MAP"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.01"))
+            .price(Price::from("2500.00"))
+            .time_in_force(time_in_force)
+            .build();
+
+        let params = client
+            .build_spot_place_params(&submit_command(&order))
+            .unwrap();
+
+        assert_eq!(params.order_type, DeepXSpotOrderType::Limit(expected));
+        assert_eq!(
+            u128::from_le_bytes(params.base_amount[..16].try_into().unwrap()),
+            10_000_000_000_000_000
+        );
+        assert_eq!(
+            u128::from_le_bytes(params.quote_amount[..16].try_into().unwrap()),
+            25_000_000
+        );
+        assert!(params.base_amount[16..].iter().all(|byte| *byte == 0));
+        assert!(params.quote_amount[16..].iter().all(|byte| *byte == 0));
+    }
+
+    #[rstest]
+    #[case(OrderType::Market, TimeInForce::Ioc, false)]
+    #[case(OrderType::Market, TimeInForce::Gtc, false)]
+    #[case(OrderType::Limit, TimeInForce::Fok, false)]
+    #[case(OrderType::Limit, TimeInForce::Ioc, true)]
+    fn spot_unsupported_order_types_fail_before_catalog_access(
+        #[case] order_type: OrderType,
+        #[case] time_in_force: TimeInForce,
+        #[case] post_only: bool,
+    ) {
+        let client = test_client();
+        let order = OrderTestBuilder::new(order_type)
+            .client_order_id(ClientOrderId::from("O-DEEPX-SPOT-UNVERIFIED"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.01"))
+            .price(Price::from("2500"))
+            .time_in_force(time_in_force)
+            .post_only(post_only)
+            .build();
+
+        assert_eq!(
+            client
+                .build_spot_place_params(&submit_command(&order))
+                .unwrap_err()
+                .to_string(),
+            "DeepX Spot supports only base-quantity Limit GTC/IOC orders without advanced flags",
         );
     }
 
@@ -13906,6 +15317,42 @@ mod tests {
             .startup
             .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)?;
         Ok(())
+    }
+
+    #[rstest]
+    fn recovery_outboxes_follow_timestamp_nonces_when_store_returns_reverse_order() {
+        let client = test_client();
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let runtime = DeepXDirectRuntimeIdentity::from(test_runtime_snapshot().identity());
+        let mut restored = [("O-DEEPX-MODIFY-2", 44), ("O-DEEPX-MODIFY-1", 43)]
+            .into_iter()
+            .map(|(client_order_id, nonce)| {
+                let record = DeepXTransactionRecord::created(DeepXTransactionIdentity::new(
+                    ClientOrderId::from(client_order_id),
+                    signer,
+                    InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+                    OrderSide::Buy,
+                    DeepXNonceReservation::TimestampOrderId { value: nonce },
+                    runtime.clone(),
+                ));
+                let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+                    &record,
+                    DeepXTransactionRevision::new(1),
+                )
+                .unwrap();
+                DeepXRestoredTransactionRecord::new(record, committed).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        sort_recovery_outboxes(&mut restored);
+
+        assert_eq!(
+            restored
+                .iter()
+                .map(|item| recovery_outbox_order(item.record()).2)
+                .collect::<Vec<_>>(),
+            [43, 44]
+        );
     }
 
     #[tokio::test]
@@ -14920,10 +16367,7 @@ mod tests {
                     OrderSide::Buy,
                     DeepXNonceReservation::TimestampOrderId { value: 42 },
                     DeepXDirectRuntimeIdentity::from(snapshot.identity()),
-                    params.subaccount,
-                    params.order_id,
-                    params.market_id,
-                    params.fast_cancel,
+                    params,
                 );
             }
             _ => {
@@ -14951,7 +16395,7 @@ mod tests {
             signed.bytes[30] ^= 1;
             signed.extrinsic_hash = BlakeTwo256.hash(&signed.bytes).0;
         }
-        let mut record = if operation == 0 {
+        let mut record = if matches!(operation, 0..=2) {
             DeepXTransactionRecord::created_with_submission_scan_checkpoint(
                 identity,
                 DeepXSubmissionScanCheckpoint::new(70, [9; 32]),
@@ -15200,6 +16644,90 @@ mod tests {
         (connection, subscription, frame)
     }
 
+    async fn controllable_account_stream() -> (
+        DeepXWsAccountConnection,
+        DeepXWsConfirmedAccountSubscription,
+        DeepXWsConfirmedBalancesFrame,
+        tokio::sync::watch::Sender<u8>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (control, events) = tokio::sync::watch::channel(0_u8);
+        let app = Router::new().route(
+            "/internal/v1/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let mut events = events.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(WsMessage::Text(_))) = socket.recv().await else {
+                            return;
+                        };
+                        let ack = json!({
+                            "type": "subscribed",
+                            "market": {"type": "all"},
+                            "subscriptions": [{
+                                "channel": "user_balances",
+                                "address": TEST_SUBACCOUNT,
+                            }],
+                            "message": "Successfully subscribed to 1 channels",
+                        });
+                        let frame = |timestamp| {
+                            json!({
+                                "type": "data",
+                                "channel": "user_balances",
+                                "market": {"type": "all"},
+                                "data": {"address": TEST_SUBACCOUNT, "assets": []},
+                                "timestamp": timestamp,
+                            })
+                        };
+                        socket
+                            .send(WsMessage::Text(ack.to_string().into()))
+                            .await
+                            .unwrap();
+                        socket
+                            .send(WsMessage::Text(frame(1).to_string().into()))
+                            .await
+                            .unwrap();
+                        while events.changed().await.is_ok() {
+                            let action = *events.borrow_and_update();
+                            match action {
+                                1 => {
+                                    let _ = socket
+                                        .send(WsMessage::Text(frame(2).to_string().into()))
+                                        .await;
+                                }
+                                2 => {
+                                    let _ = socket.send(WsMessage::Close(None)).await;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_ws: Some(format!("ws://{address}")),
+            ..Default::default()
+        };
+        let mut connection = DeepXWsAccountConnection::connect(
+            &network,
+            None,
+            Duration::from_secs(1),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+        let subscription = connection
+            .subscribe_user_balances(TEST_SUBACCOUNT)
+            .await
+            .unwrap();
+        let first = connection.next_balances(subscription).await.unwrap();
+        (connection, subscription, first, control)
+    }
+
     fn reconciliation_fill_report(trade_id: &str, ts_event: u64) -> FillReport {
         FillReport::new(
             AccountId::from("DEEPX-001"),
@@ -15280,6 +16808,23 @@ mod tests {
     }
 
     #[rstest]
+    fn tracked_order_report_rejects_overflowing_rest_quantities() {
+        let (client, mut record, venue_order_id) = tracked_limit_report_fixture();
+        record.size_filled = rust_decimal::Decimal::MAX;
+        record.size_remain = rust_decimal::Decimal::MAX;
+
+        assert_eq!(
+            client.build_tracked_order_status_report(
+                &record,
+                3,
+                venue_order_id,
+                UnixNanos::default(),
+            ),
+            Err(DeepXTrackedOrderReportError::SizeAccountingMismatch),
+        );
+    }
+
+    #[rstest]
     #[case("Open", OrderStatus::Accepted)]
     #[case("PartiallyFilled", OrderStatus::PartiallyFilled)]
     #[case("Filled", OrderStatus::Filled)]
@@ -15331,7 +16876,7 @@ mod tests {
 
     #[rstest]
     fn tracked_market_order_report_does_not_publish_venue_slippage_guard_as_price() {
-        let client = test_client();
+        let client = test_perp_report_client();
         let order = OrderTestBuilder::new(OrderType::Market)
             .client_order_id(ClientOrderId::from("O-DEEPX-MARKET-REPORT"))
             .strategy_id(StrategyId::from("S-DEEPX-001"))
@@ -15361,7 +16906,7 @@ mod tests {
 
     #[rstest]
     fn tracked_limit_order_report_maps_confirmed_post_only_context() {
-        let client = test_client();
+        let client = test_perp_report_client();
         let order = OrderTestBuilder::new(OrderType::Limit)
             .client_order_id(ClientOrderId::from("O-DEEPX-POST-ONLY-REPORT"))
             .strategy_id(StrategyId::from("S-DEEPX-001"))
@@ -15479,7 +17024,7 @@ mod tests {
             ),
             Err(DeepXTrackedOrderReportError::PostOnlyMismatch),
         ));
-        let mut mismatched = record.clone();
+        let mut mismatched = record;
         mismatched.reduce_only = true;
         assert!(matches!(
             client.build_tracked_order_status_report(
@@ -15642,7 +17187,7 @@ mod tests {
     fn tracked_order_report_rejects_untracked_external_and_quote_quantity_context() {
         let record = tracked_limit_order_record();
         let venue_order_id = VenueOrderId::from(record.order_id.as_str());
-        let client = test_client();
+        let client = test_perp_report_client();
         assert!(matches!(
             client.build_tracked_order_status_report(
                 &record,
@@ -15654,7 +17199,7 @@ mod tests {
                 if message.contains(venue_order_id.as_str()),
         ));
 
-        let client = test_client();
+        let client = test_perp_report_client();
         register_external_order(
             &client,
             test_external_order_context("O-DEEPX-EXTERNAL", venue_order_id.as_str()),
@@ -15668,10 +17213,10 @@ mod tests {
                 UnixNanos::default(),
             ),
             Err(DeepXTrackedOrderReportError::InvalidContext(message))
-                if message.contains(venue_order_id.as_str()),
+                if message.contains("O-DEEPX-EXTERNAL"),
         ));
 
-        let client = test_client();
+        let client = test_perp_report_client();
         let order = OrderTestBuilder::new(OrderType::Limit)
             .client_order_id(ClientOrderId::from("O-DEEPX-QUOTE-REPORT"))
             .strategy_id(StrategyId::from("S-DEEPX-001"))
@@ -15830,7 +17375,6 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_order_report_generation_uses_validated_catalog_and_rest_record() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
         let mut fixture: Value =
             serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
@@ -15845,7 +17389,7 @@ mod tests {
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
-                get(|| async { SPOT_RESPONSE }),
+                get(|| async { EMPTY_SPOT_MARKETS_RESPONSE }),
             )
             .route(
                 "/internal/v1/market/perp/markets",
@@ -15886,6 +17430,7 @@ mod tests {
             ..Default::default()
         };
         let mut client = DeepXExecutionClient::new(core, config).unwrap();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         let mut provider = DeepXMarketProvider::new(client.http.clone());
         provider.load_all().await.unwrap();
         client.record_instruments_loaded(&provider).unwrap();
@@ -15987,6 +17532,8 @@ mod tests {
             pair: record.pair.clone(),
             base_symbol: "ETH".to_string(),
             quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
             is_paused: false,
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
@@ -16000,11 +17547,14 @@ mod tests {
             None,
             None,
             &mut block_timestamps,
-            &record,
-            &market,
-            venue_order_id,
-            context,
-            UnixNanos::from(123_456_789),
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id,
+                context,
+                ts_init: UnixNanos::from(123_456_789),
+                remaining_pages: None,
+            },
         )
         .await
         .unwrap();
@@ -16058,6 +17608,8 @@ mod tests {
             pair: pair.to_string(),
             base_symbol: "ETH".to_string(),
             quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
             is_paused: false,
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
@@ -16159,6 +17711,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let mut client = test_client();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
         let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
         let pair = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
@@ -16169,6 +17722,8 @@ mod tests {
                 pair: pair.to_string(),
                 base_symbol: "ETH".to_string(),
                 quote_symbol: "USDC".to_string(),
+                base_decimal: 18,
+                quote_decimal: 6,
                 is_paused: false,
                 maker_fee_rate: rust_decimal::Decimal::ZERO,
                 taker_fee_rate: rust_decimal::Decimal::ZERO,
@@ -16207,8 +17762,14 @@ mod tests {
         server.abort();
     }
 
+    #[rstest]
+    #[case(false, "DeepX Spot order report quantity mismatch")]
+    #[case(true, "DeepX Spot order report exceeds submitted quote budget")]
     #[tokio::test]
-    async fn tracked_spot_order_report_rejects_forged_quantity_before_trade_lookup() {
+    async fn tracked_spot_order_report_rejects_forged_amount_before_trade_lookup(
+        #[case] wrong_quote: bool,
+        #[case] expected: &str,
+    ) {
         let client = test_client();
         let order = test_order_with_instrument("O-DEEPX-SPOT-STATUS", "0.8849", "ETH-USDC.DEEPX");
         let context = OrderContext::from(&order);
@@ -16220,12 +17781,21 @@ mod tests {
         record.maker = TEST_SUBACCOUNT.to_string();
         record.order_side = "Buy".to_string();
         record.price = rust_decimal::Decimal::from(2500);
-        record.base_amount = rust_decimal::Decimal::new(8848, 4);
+        record.base_amount = rust_decimal::Decimal::new(8849, 4);
+        record.quote_amount = rust_decimal::Decimal::new(2_212_250, 3);
+        if wrong_quote {
+            record.quote_amount += rust_decimal::Decimal::new(1, 6);
+        } else {
+            record.base_amount -= rust_decimal::Decimal::new(1, 4);
+            record.base_remaining_amount = record.base_amount;
+        }
         let market = DeepXSpotReportMarket {
             name: "ETH/USDC".to_string(),
             pair: record.pair.clone(),
             base_symbol: "ETH".to_string(),
             quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
             is_paused: false,
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
@@ -16239,23 +17809,28 @@ mod tests {
             None,
             None,
             &mut block_timestamps,
-            &record,
-            &market,
-            VenueOrderId::from(record.order_id.as_str()),
-            context,
-            UnixNanos::default(),
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context,
+                ts_init: UnixNanos::default(),
+                remaining_pages: None,
+            },
         )
         .await
         .unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "DeepX Spot order report quantity mismatch"
-        );
+        assert_eq!(error.to_string(), expected);
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn tracked_spot_partial_report_reconciles_exact_trade_quantity_and_time() {
+    async fn tracked_spot_fill_report_reconciles_exact_trade_quantity_and_time(
+        #[case] filled_at_better_price: bool,
+    ) {
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
             "../test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
@@ -16263,15 +17838,35 @@ mod tests {
         let mut record = response.data;
         record.maker = TEST_SUBACCOUNT.to_string();
         record.order_side = "Buy".to_string();
-        record.status = "PartiallyFilled".to_string();
+        record.status = if filled_at_better_price {
+            "Filled".to_string()
+        } else {
+            "PartiallyFilled".to_string()
+        };
         record.cancel_height = None;
         record.cancel_reason = None;
         record.price = rust_decimal::Decimal::from(2500);
-        record.avg_fill_price = Some(rust_decimal::Decimal::from(2500));
+        record.avg_fill_price = Some(rust_decimal::Decimal::from(if filled_at_better_price {
+            2499
+        } else {
+            2500
+        }));
         record.base_amount = rust_decimal::Decimal::new(8849, 4);
-        record.base_remaining_amount = rust_decimal::Decimal::new(5849, 4);
-        record.quote_amount = rust_decimal::Decimal::new(2_212_250, 3);
-        record.quote_remaining_amount = rust_decimal::Decimal::new(1_462_500, 3);
+        record.base_remaining_amount = if filled_at_better_price {
+            rust_decimal::Decimal::ZERO
+        } else {
+            rust_decimal::Decimal::new(5849, 4)
+        };
+        record.quote_amount = if filled_at_better_price {
+            rust_decimal::Decimal::new(22_113_651, 4)
+        } else {
+            rust_decimal::Decimal::new(2_212_250, 3)
+        };
+        record.quote_remaining_amount = if filled_at_better_price {
+            rust_decimal::Decimal::ZERO
+        } else {
+            rust_decimal::Decimal::new(1_462_500, 3)
+        };
         let trades = json!({
             "code": 200,
             "msg": "success",
@@ -16282,9 +17877,9 @@ mod tests {
                     "orderSide": "Buy",
                     "pair": record.pair.clone(),
                     "pairName": "ETH/USDC",
-                    "baseAmount": 0.3,
-                    "quoteAmount": 750.0,
-                    "price": 2500,
+                    "baseAmount": if filled_at_better_price { 0.8849 } else { 0.3 },
+                    "quoteAmount": if filled_at_better_price { 2211.3651 } else { 750.0 },
+                    "price": if filled_at_better_price { 2499 } else { 2500 },
                     "fee": 0.0,
                     "feeAsset": "",
                     "taker": "Buyer",
@@ -16313,11 +17908,112 @@ mod tests {
             pair: record.pair.clone(),
             base_symbol: "ETH".to_string(),
             quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
             is_paused: false,
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
+        let mut block_timestamps = HashMap::new();
+        let mut remaining_pages = 1;
+        let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
+            &http,
+            AccountId::from("DEEPX-001"),
+            TEST_SUBACCOUNT,
+            None,
+            None,
+            &mut block_timestamps,
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::from(123_456_789),
+                remaining_pages: Some(&mut remaining_pages),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(remaining_pages, 0);
+
+        assert_eq!(
+            report.order_status,
+            if filled_at_better_price {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartiallyFilled
+            }
+        );
+        assert_eq!(
+            report.filled_qty.as_decimal(),
+            if filled_at_better_price {
+                rust_decimal::Decimal::new(8849, 4)
+            } else {
+                rust_decimal::Decimal::new(3, 1)
+            }
+        );
+        assert_eq!(report.avg_px, record.avg_fill_price);
+        assert!(report.ts_last > report.ts_accepted);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tracked_spot_buy_report_preserves_improved_price_overfill() {
+        const TRADE_RESPONSE: &str = r#"{"code":200,"msg":"success","data":{"items":[{"id":215125063000027,"orderId":"1791486151624","orderSide":"Buy","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37","pairName":"ETH/USDC","baseAmount":0.297602428951535,"quoteAmount":729.256896,"price":2450.44,"fee":0,"feeAsset":"","taker":"Buyer","createdAt":"2026-10-08T19:02:32.057Z"}],"nextCursor":null,"hasNext":false},"fail":false}"#;
+        let trades: Arc<Mutex<Value>> =
+            Arc::new(Mutex::new(serde_json::from_str(TRADE_RESPONSE).unwrap()));
+        let mutable_trades = Arc::clone(&trades);
+        let router = Router::new().route(
+            "/internal/v1/account/spot/trades",
+            get(move || {
+                let trades = Arc::clone(&trades);
+                async move { Json(trades.lock().unwrap().clone()) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+        ))
+        .unwrap();
+        let mut record = response.data;
+        record.maker = TEST_SUBACCOUNT.to_string();
+        record.order_id = "1791486151624".to_string();
+        record.order_side = "Buy".to_string();
+        record.status = "Filled".to_string();
+        record.create_time = "2026-10-08T19:02:32.057Z".to_string();
+        record.cancel_height = None;
+        record.cancel_reason = None;
+        record.price = "2450.46".parse().unwrap();
+        record.avg_fill_price = Some("2450.44".parse().unwrap());
+        record.base_amount = "0.297602428951535".parse().unwrap();
+        record.base_remaining_amount = rust_decimal::Decimal::ZERO;
+        record.quote_amount = "729.256896".parse().unwrap();
+        record.quote_remaining_amount = rust_decimal::Decimal::ZERO;
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-SPOT-IMPROVED-BUY"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.2976"))
+            .price(Price::from("2450.46"))
+            .time_in_force(TimeInForce::Gtc)
+            .build();
+        let market = DeepXSpotReportMarket {
+            name: "ETH/USDC".to_string(),
+            pair: record.pair.clone(),
+            base_symbol: "ETH".to_string(),
+            quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
+            is_paused: false,
+            maker_fee_rate: rust_decimal::Decimal::ZERO,
+            taker_fee_rate: rust_decimal::Decimal::ZERO,
+        };
         let mut block_timestamps = HashMap::new();
         let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &http,
@@ -16326,36 +18022,184 @@ mod tests {
             None,
             None,
             &mut block_timestamps,
-            &record,
-            &market,
-            VenueOrderId::from(record.order_id.as_str()),
-            OrderContext::from(&order),
-            UnixNanos::from(123_456_789),
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::default(),
+                remaining_pages: None,
+            },
         )
         .await
         .unwrap();
 
-        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, Quantity::from("0.2976"));
         assert_eq!(
             report.filled_qty.as_decimal(),
-            rust_decimal::Decimal::new(3, 1)
+            "0.297602428951535".parse().unwrap()
         );
-        assert_eq!(report.avg_px, Some(rust_decimal::Decimal::from(2500)));
-        assert!(report.ts_last > report.ts_accepted);
+        assert_eq!(report.avg_px, Some("2450.44".parse().unwrap()));
+
+        record.quote_amount = "729.256897".parse().unwrap();
+        let error = DeepXExecutionClient::build_tracked_spot_order_status_report(
+            &http,
+            AccountId::from("DEEPX-001"),
+            TEST_SUBACCOUNT,
+            None,
+            None,
+            &mut block_timestamps,
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::default(),
+                remaining_pages: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX Spot order report exceeds submitted quote budget"
+        );
+
+        record.quote_amount = "729.256895".parse().unwrap();
+        let error = DeepXExecutionClient::build_tracked_spot_order_status_report(
+            &http,
+            AccountId::from("DEEPX-001"),
+            TEST_SUBACCOUNT,
+            None,
+            None,
+            &mut block_timestamps,
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::default(),
+                remaining_pages: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX Spot order report execution records do not reconstruct spent quote"
+        );
+
+        record.quote_amount = "729.256896".parse().unwrap();
+        mutable_trades.lock().unwrap()["data"]["items"][0]["price"] = json!(2450.47);
+        let error = DeepXExecutionClient::build_tracked_spot_order_status_report(
+            &http,
+            AccountId::from("DEEPX-001"),
+            TEST_SUBACCOUNT,
+            None,
+            None,
+            &mut block_timestamps,
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::default(),
+                remaining_pages: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX Spot execution price violates order limit"
+        );
         server.abort();
     }
 
     #[tokio::test]
-    async fn tracked_spot_canceled_report_uses_finalized_cancel_block_time() {
+    async fn finalized_spot_order_validation_rejects_busy_cache_without_panicking() {
+        let (client, cache) = test_client_with_cache();
+        let _borrow = cache.borrow_mut();
+        let market = DeepXSpotReportMarket {
+            name: "ETH/USDC".to_string(),
+            pair: format!("0x{}", "11".repeat(32)),
+            base_symbol: "ETH".to_string(),
+            quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
+            is_paused: false,
+            maker_fee_rate: rust_decimal::Decimal::ZERO,
+            taker_fee_rate: rust_decimal::Decimal::ZERO,
+        };
+
+        let error = client
+            .validate_owned_finalized_spot_order_records(
+                InstrumentId::from("ETH-USDC.DEEPX"),
+                &market,
+                &[],
+                true,
+            )
+            .now_or_never()
+            .expect("busy cache must be rejected before suspension")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX Spot order validation cache is already mutably borrowed",
+        );
+    }
+
+    #[rstest]
+    #[case(TimeInForce::Gtc, "UserCanceled", false, false)]
+    #[case(TimeInForce::Ioc, "IocUnfilled", false, false)]
+    #[case(TimeInForce::Ioc, "IocUnfilled", true, false)]
+    #[case(TimeInForce::Gtc, "IocUnfilled", false, true)]
+    #[tokio::test]
+    async fn tracked_spot_canceled_report_uses_finalized_cancel_block_time(
+        #[case] time_in_force: TimeInForce,
+        #[case] cancel_reason: &str,
+        #[case] partially_filled: bool,
+        #[case] conflicts_with_context: bool,
+    ) {
         let cancel_height = 188_574_100u32;
         let cancel_timestamp_ms = 1_800_000_000_123u64;
         let genesis_hash =
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
         let canceled_hash = format!("0x{}", "11".repeat(32));
         let finalized_hash = format!("0x{}", "22".repeat(32));
-        let router = Router::new().route(
-            "/",
-            post({
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/spot/trades",
+                get(|| async {
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {
+                            "items": [{
+                                "id": 188_574_101_000_001_u64,
+                                "orderId": "1789627379350",
+                                "orderSide": "Buy",
+                                "pair": "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+                                "pairName": "ETH/USDC",
+                                "baseAmount": 0.3,
+                                "quoteAmount": 750.0,
+                                "price": 2500,
+                                "fee": 0.0,
+                                "feeAsset": "",
+                                "taker": "Buyer",
+                                "createdAt": "2026-09-17T07:00:00.123Z",
+                            }],
+                            "nextCursor": null,
+                            "hasNext": false,
+                        },
+                        "fail": false,
+                    }))
+                }),
+            )
+            .route(
+                "/",
+                post({
                 let canceled_hash = canceled_hash.clone();
                 let finalized_hash = finalized_hash.clone();
                 move |Json(request): Json<Value>| {
@@ -16404,8 +18248,8 @@ mod tests {
                         }))
                     }
                 }
-            }),
-        );
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -16442,41 +18286,81 @@ mod tests {
         record.order_side = "Buy".to_string();
         record.price = rust_decimal::Decimal::from(2500);
         record.base_amount = rust_decimal::Decimal::new(8849, 4);
-        record.base_remaining_amount = record.base_amount;
+        record.base_remaining_amount = if partially_filled {
+            rust_decimal::Decimal::new(5849, 4)
+        } else {
+            record.base_amount
+        };
         record.quote_amount = rust_decimal::Decimal::new(2_212_250, 3);
-        record.quote_remaining_amount = record.quote_amount;
+        record.quote_remaining_amount = if partially_filled {
+            rust_decimal::Decimal::new(1_462_500, 3)
+        } else {
+            record.quote_amount
+        };
+        record.avg_fill_price = partially_filled.then_some(rust_decimal::Decimal::from(2500));
         record.cancel_height = Some(u64::from(cancel_height));
-        let order =
-            test_order_with_instrument("O-DEEPX-SPOT-CANCELED-STATUS", "0.8849", "ETH-USDC.DEEPX");
+        record.cancel_reason = Some(cancel_reason.to_string());
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-DEEPX-SPOT-CANCELED-STATUS"))
+            .strategy_id(StrategyId::from("S-DEEPX-001"))
+            .instrument_id(InstrumentId::from("ETH-USDC.DEEPX"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("0.8849"))
+            .price(Price::from("2500.00"))
+            .time_in_force(time_in_force)
+            .build();
         let market = DeepXSpotReportMarket {
             name: "ETH/USDC".to_string(),
             pair: record.pair.clone(),
             base_symbol: "ETH".to_string(),
             quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
             is_paused: false,
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
-        let client = test_client();
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
         let mut block_timestamps = HashMap::new();
 
-        let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
-            &client.http,
-            client.core.account_id,
+        let result = DeepXExecutionClient::build_tracked_spot_order_status_report(
+            &http,
+            AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
             Some(&endpoints),
             Some(&capabilities),
             &mut block_timestamps,
-            &record,
-            &market,
-            VenueOrderId::from(record.order_id.as_str()),
-            OrderContext::from(&order),
-            UnixNanos::from(123_456_789),
+            DeepXTrackedSpotReportInput {
+                record: &record,
+                market: &market,
+                venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                context: OrderContext::from(&order),
+                ts_init: UnixNanos::from(123_456_789),
+                remaining_pages: None,
+            },
         )
-        .await
-        .unwrap();
+        .await;
+        if conflicts_with_context {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "DeepX Spot IOC cancellation conflicts with tracked time in force"
+            );
+            server.abort();
+            return;
+        }
+        let report = result.unwrap();
 
         assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.time_in_force, time_in_force);
+        assert_eq!(report.cancel_reason.as_deref(), Some(cancel_reason));
+        assert_eq!(
+            report.filled_qty.as_decimal(),
+            if partially_filled {
+                rust_decimal::Decimal::new(3, 1)
+            } else {
+                rust_decimal::Decimal::ZERO
+            }
+        );
         assert_eq!(
             report.ts_last,
             UnixNanos::from(cancel_timestamp_ms * 1_000_000)
@@ -16600,6 +18484,56 @@ mod tests {
         assert!(reports[0].order_status.is_open());
     }
 
+    #[rstest]
+    fn order_report_page_budget_rejects_overuse_without_debiting() {
+        let mut remaining_pages = 1;
+        assert_eq!(
+            consume_order_report_pages(&mut remaining_pages, 2)
+                .unwrap_err()
+                .to_string(),
+            "DeepX order report page budget exceeded",
+        );
+        assert_eq!(remaining_pages, 1);
+        consume_order_report_pages(&mut remaining_pages, 1).unwrap();
+        assert_eq!(remaining_pages, 0);
+    }
+
+    #[tokio::test]
+    async fn direct_order_reports_require_finalized_runtime_evidence() {
+        let fixture: Value = serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut open_order = fixture["data"]["items"][2].clone();
+        open_order["status"] = "Open".into();
+        open_order["sizeFilled"] = json!(0.0);
+        open_order["sizeRemain"] = json!(0.3);
+        open_order["avgFillPrice"] = Value::Null;
+        open_order["fee"] = json!(0.0);
+        let mut open_response = fixture.clone();
+        open_response["data"]["items"] = json!([open_order]);
+        let mut history_response = fixture;
+        history_response["data"]["items"] = json!([]);
+        let mut client = order_reports_test_client(open_response, history_response).await;
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        let command = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            true,
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_order_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX transaction runtime has not been initialized"
+        );
+    }
+
     #[tokio::test]
     async fn order_report_generation_rejects_closed_active_endpoint_record() {
         let fixture: Value = serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
@@ -16634,7 +18568,10 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "DeepX active-order response contains closed order 1789445053841",
+            concat!(
+                "invalid DeepX HTTP perp open orders response: ",
+                "item 0 order 1789445053841 has invalid active state or quantities"
+            ),
         );
     }
 
@@ -16713,7 +18650,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "DeepX venue order ID 1789445053841 is not bound to tracked order context",
+            "DeepX external order context is invalid: DeepX venue order ID 1789445053841 has no registered order context",
         );
     }
 
@@ -16820,7 +18757,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "DeepX order status report instrument conflicts with tracked order context",
+            "DeepX order context instrument conflicts with report request",
         );
     }
 
@@ -17046,6 +18983,51 @@ mod tests {
             error.to_string(),
             "DeepX position report start must not exceed end",
         );
+
+        let mut params = Params::new();
+        params.insert("unsupported".to_string(), serde_json::json!(true));
+        let unsupported_params = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            Some(params),
+            None,
+        );
+        let error = ExecutionClient::generate_position_status_reports(&client, &unsupported_params)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX position report parameters are unsupported",
+        );
+    }
+
+    #[tokio::test]
+    async fn all_market_position_reports_reject_inconsistent_perp_index_before_http() {
+        let response = serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        let mut client = position_report_test_client(response).await;
+        client
+            .perpetual_instrument_ids
+            .insert(3, InstrumentId::from("WRONG-PERP.DEEPX"));
+        let command = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_position_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            DeepXPositionReportError::MarketIdentityMismatch.to_string(),
+        );
     }
 
     #[rstest]
@@ -17061,6 +19043,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(merged, vec![first]);
+    }
+
+    #[rstest]
+    fn targeted_fill_identity_rejects_cross_market_and_side_matches() {
+        let first = reconciliation_fill_report("trade-1", 20);
+        let mut other = reconciliation_fill_report("trade-2", 21);
+        assert_eq!(
+            validate_targeted_fill_identity(std::slice::from_ref(&first)),
+            Ok(())
+        );
+
+        other.instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        assert_eq!(
+            validate_targeted_fill_identity(&[first.clone(), other.clone()]),
+            Err(DeepXFillReportError::ConflictingOrderInstruments)
+        );
+
+        other.instrument_id = first.instrument_id;
+        other.order_side = OrderSide::Sell;
+        assert_eq!(
+            validate_targeted_fill_identity(&[first, other]),
+            Err(DeepXFillReportError::ConflictingOrderSides)
+        );
     }
 
     #[rstest]
@@ -17176,6 +19181,474 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spot_only_fill_reports_do_not_query_perpetual_trades() {
+        let response = json!({
+            "code": 200,
+            "msg": "success",
+            "data": { "items": [], "nextCursor": null, "hasNext": false },
+            "fail": false,
+        });
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&queries);
+        let router = Router::new().route(
+            "/internal/v1/account/spot/trades",
+            get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
+                    let response = response.clone();
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        observed.lock().unwrap().push(query);
+                        Json(response)
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut client = test_client();
+        assert!(client.perpetual_market_ids.is_empty());
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        let pair = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
+        client.spot_report_markets.insert(
+            instrument_id,
+            DeepXSpotReportMarket {
+                name: "ETH/USDC".to_string(),
+                pair: pair.to_string(),
+                base_symbol: "ETH".to_string(),
+                quote_symbol: "USDC".to_string(),
+                base_decimal: 18,
+                quote_decimal: 6,
+                is_paused: false,
+                maker_fee_rate: rust_decimal::Decimal::ZERO,
+                taker_fee_rate: rust_decimal::Decimal::ZERO,
+            },
+        );
+        client
+            .spot_report_instruments_by_pair
+            .insert(normalize_spot_pair(pair), instrument_id);
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+
+        assert!(reports.is_empty());
+        client.spot_report_instruments_by_pair.clear();
+        let invalid_catalog = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, invalid_catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            DeepXFillReportError::MarketIdentityMismatch.to_string(),
+        );
+        let targeted = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, targeted)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            DeepXFillReportError::SpotMarketIdentityMismatch.to_string(),
+        );
+        client
+            .spot_report_instruments_by_pair
+            .insert(normalize_spot_pair(pair), instrument_id);
+        let targeted = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            Some(VenueOrderId::from("1789627379350")),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            ExecutionClient::generate_fill_reports(&client, targeted)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let observed = queries.lock().unwrap();
+        assert_eq!(observed.len(), 3);
+        assert!(!observed[0].contains_key("orderId"));
+        for (query, side) in observed[1..].iter().zip(["Buy", "Sell"]) {
+            assert_eq!(query.get("orderId").unwrap(), "1789627379350");
+            assert_eq!(query.get("orderSide").unwrap(), side);
+            assert_eq!(query.get("pair").unwrap(), pair);
+        }
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(99, 1)]
+    #[case(100, 0)]
+    #[tokio::test]
+    async fn all_market_fill_reports_share_page_budget_with_spot(
+        #[case] perp_pages: u64,
+        #[case] expected_spot_requests: usize,
+    ) {
+        let spot_response: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+        ))
+        .unwrap();
+        let spot_requests = Arc::new(AtomicUsize::new(0));
+        let observed_spot_requests = Arc::clone(&spot_requests);
+        let perp_trade: Value = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let perp_trade = perp_trade["data"]["items"][0].clone();
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/perp/trades",
+                get(
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let mut trade = perp_trade.clone();
+                        async move {
+                            let page = query
+                                .get("cursor")
+                                .map_or(0, |cursor| cursor.parse().unwrap());
+                            trade["id"] = json!(185_971_383_000_008_u64 + page);
+                            Json(json!({
+                                "code": 200,
+                                "msg": "success",
+                                "data": {
+                                    "items": [trade],
+                                    "nextCursor": (page + 1 < perp_pages)
+                                        .then(|| (page + 1).to_string()),
+                                    "hasNext": page + 1 < perp_pages,
+                                },
+                                "fail": false,
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/internal/v1/account/spot/trades",
+                get(move || {
+                    let response = spot_response.clone();
+                    let requests = Arc::clone(&observed_spot_requests);
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        Json(response)
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut client = fill_report_test_client(json!({
+            "code": 200,
+            "msg": "success",
+            "data": { "items": [], "nextCursor": null, "hasNext": false },
+            "fail": false,
+        }))
+        .await;
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let spot_instrument = InstrumentId::from("ETH-USDC.DEEPX");
+        let pair = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
+        client.spot_report_markets.insert(
+            spot_instrument,
+            DeepXSpotReportMarket {
+                name: "ETH/USDC".to_string(),
+                pair: pair.to_string(),
+                base_symbol: "ETH".to_string(),
+                quote_symbol: "USDC".to_string(),
+                base_decimal: 18,
+                quote_decimal: 6,
+                is_paused: false,
+                maker_fee_rate: rust_decimal::Decimal::ZERO,
+                taker_fee_rate: rust_decimal::Decimal::ZERO,
+            },
+        );
+        client
+            .spot_report_instruments_by_pair
+            .insert(normalize_spot_pair(pair), spot_instrument);
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+
+        if expected_spot_requests == 0 {
+            assert_eq!(
+                error.to_string(),
+                DeepXFillReportError::PaginationBudgetExceeded.to_string(),
+            );
+        } else {
+            assert_eq!(
+                error.to_string(),
+                "DeepX HTTP pagination exceeded its limit of 1 pages",
+            );
+        }
+        assert_eq!(
+            spot_requests.load(Ordering::Relaxed),
+            expected_spot_requests,
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn spot_fill_report_rejects_exhausted_finalized_block_budget_before_rpc() {
+        let response: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+        ))
+        .unwrap();
+        let record: DeepXSpotAccountTradeRecord =
+            serde_json::from_value(response["data"]["items"][2].clone()).unwrap();
+        let client = test_client();
+        let mut remaining_blocks = 0;
+
+        let error = client
+            .verify_owned_finalized_spot_fill_records(&[record], &mut remaining_blocks)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX Spot fill report finalized block budget exceeded",
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn targeted_spot_fill_uses_order_side_filters_and_exact_values(
+        #[case] all_markets: bool,
+    ) {
+        let response: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+        ))
+        .unwrap();
+        let item = response["data"]["items"][2].clone();
+        let pair = item["pair"].as_str().unwrap().to_string();
+        let order_id = item["orderId"].as_str().unwrap().to_string();
+        let mut sell = response;
+        sell["data"]["items"] = json!([item]);
+        sell["data"]["nextCursor"] = Value::Null;
+        sell["data"]["hasNext"] = json!(false);
+        let mut buy = sell.clone();
+        buy["data"]["items"] = json!([]);
+        let expected_pair = pair.clone();
+        let router = Router::new().route(
+            "/internal/v1/account/spot/trades",
+            get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
+                    let buy = buy.clone();
+                    let sell = sell.clone();
+                    let expected_pair = expected_pair.clone();
+                    async move {
+                        assert_eq!(query["user"], TEST_SUBACCOUNT);
+                        if !query.contains_key("orderId") {
+                            assert!(!query.contains_key("orderSide"));
+                            return Json(sell);
+                        }
+                        assert_eq!(query["orderId"], "1789627349907");
+                        assert_eq!(query["pair"], expected_pair);
+                        if query["orderSide"] == "Buy" {
+                            Json(buy)
+                        } else {
+                            assert_eq!(query["orderSide"], "Sell");
+                            Json(sell)
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut client, cache) = test_client_with_cache();
+        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = InstrumentId::from("ETH-USDC.DEEPX");
+        let base = Currency::new_checked(
+            "ETH",
+            18,
+            0,
+            "ETH",
+            nautilus_model::enums::CurrencyType::Crypto,
+        )
+        .unwrap();
+        let quote = Currency::new_checked(
+            "USDC",
+            6,
+            0,
+            "USDC",
+            nautilus_model::enums::CurrencyType::Crypto,
+        )
+        .unwrap();
+        let instrument = nautilus_model::instruments::CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(nautilus_model::identifiers::Symbol::from("ETH/USDC"))
+            .base_currency(base)
+            .quote_currency(quote)
+            .price_precision(2)
+            .size_precision(4)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.0001"))
+            .min_quantity(Quantity::from("0.0001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        client.spot_report_markets.insert(
+            instrument_id,
+            DeepXSpotReportMarket {
+                name: "ETH/USDC".to_string(),
+                pair: pair.clone(),
+                base_symbol: "ETH".to_string(),
+                quote_symbol: "USDC".to_string(),
+                base_decimal: 18,
+                quote_decimal: 6,
+                is_paused: false,
+                maker_fee_rate: rust_decimal::Decimal::ZERO,
+                taker_fee_rate: rust_decimal::Decimal::new(1, 4),
+            },
+        );
+        client
+            .spot_report_instruments_by_pair
+            .insert(normalize_spot_pair(&pair), instrument_id);
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            (!all_markets).then_some(instrument_id),
+            Some(VenueOrderId::from(order_id.as_str())),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].trade_id, TradeId::from("188573374000080"));
+        assert_eq!(reports[0].order_side, OrderSide::Sell);
+        assert_eq!(reports[0].last_qty, Quantity::from("0.1209"));
+        assert_eq!(reports[0].last_px, Price::from("2443.05"));
+        assert_eq!(reports[0].commission, Money::from("0.118145 USDC"));
+        if !all_markets {
+            let budget_cmd = GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                Some(instrument_id),
+                Some(VenueOrderId::from(order_id.as_str())),
+                None,
+                None,
+                None,
+                None,
+            );
+            let mut remaining_pages = 1;
+            let mut remaining_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
+            let market = client.spot_report_markets.get(&instrument_id).unwrap();
+            let error = client
+                .collect_spot_fill_reports_for_market(
+                    TEST_SUBACCOUNT,
+                    instrument_id,
+                    market,
+                    &budget_cmd,
+                    &mut remaining_pages,
+                    &mut remaining_blocks,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                DeepXFillReportError::PaginationBudgetExceeded.to_string()
+            );
+        }
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            (!all_markets).then_some(instrument_id),
+            Some(VenueOrderId::from(order_id.as_str())),
+            None,
+            None,
+            None,
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DeepXExecutionStartupError>(),
+            Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
+        ));
+        if all_markets {
+            let unfiltered = GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let error = ExecutionClient::generate_fill_reports(&client, unfiltered)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<DeepXExecutionStartupError>(),
+                Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
+            ));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fill_report_generation_maps_taker_trades_exactly() {
         let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
         let client = fill_report_test_client(response).await;
@@ -17207,6 +19680,182 @@ mod tests {
         assert_eq!(reports[1].trade_id, TradeId::from("185971191000008"));
         assert_eq!(reports[1].order_side, OrderSide::Sell);
         assert_eq!(reports[2].trade_id, TradeId::from("185971383000008"));
+    }
+
+    #[tokio::test]
+    async fn direct_pallet_fill_reports_require_finalized_rpc_evidence() {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let mut client = fill_report_test_client(response).await;
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<DeepXExecutionStartupError>(),
+            Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_pallet_fill_reports_match_captured_wallet_events() {
+        const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+        const BLOCK: u64 = 187_071_212;
+        let wallet: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/perp_wallet_trades_page.json"
+        ))
+        .unwrap();
+        let records = wallet["data"][0]["subaccounts"][0]["trades"]["items"]
+            .as_array()
+            .unwrap()[..2]
+            .to_vec();
+        let response = json!({
+            "code": 200,
+            "msg": "success",
+            "data": { "items": records, "nextCursor": null, "hasNext": false },
+            "fail": false,
+        });
+        let mut client = fill_report_test_client(response).await;
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        client.config.subaccount_id = Some(SUBACCOUNT.to_string());
+        client.account_ownership = Some(account_ownership_proof(&client.credential, SUBACCOUNT));
+
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../test_data/runtime/testnet/finalized-events-187071212/manifest.json"
+        ))
+        .unwrap();
+        let event_fixture: Value = serde_json::from_str(include_str!(
+            "../test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json"
+        ))
+        .unwrap();
+        let metadata_fixture: Value = serde_json::from_str(include_str!(
+            "../test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
+        ))
+        .unwrap();
+        let block_hash = manifest["block_hash"].as_str().unwrap().to_string();
+        let thread_key = manifest["storage"]["threads_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let event_key = manifest["storage"]["events_map_thread_0_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let events = event_fixture["result"].as_str().unwrap().to_string();
+        let metadata = metadata_fixture["result"].as_str().unwrap().to_string();
+        let event_reads = Arc::new(AtomicUsize::new(0));
+        let observed_reads = Arc::clone(&event_reads);
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let block_hash = block_hash.clone();
+                let thread_key = thread_key.clone();
+                let event_key = event_key.clone();
+                let events = events.clone();
+                let metadata = metadata.clone();
+                let event_reads = Arc::clone(&observed_reads);
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "rpc_methods" => json!({ "methods": [
+                            "author_pendingExtrinsics", "author_submitExtrinsic",
+                            "chain_getBlock", "chain_getBlockHash", "chain_getFinalizedHead",
+                            "chain_getHeader", "eth_call", "state_call", "state_getMetadata",
+                            "state_getRuntimeVersion", "state_getStorage", "state_queryStorageAt",
+                        ] }),
+                        "chain_getFinalizedHead" | "chain_getBlockHash" => json!(block_hash),
+                        "chain_getHeader" => json!({ "number": format!("0x{BLOCK:x}") }),
+                        "state_getRuntimeVersion" => json!({
+                            "specVersion": if request["params"][0]
+                                == "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6"
+                            { 369 } else { 371 },
+                            "transactionVersion": 1,
+                        }),
+                        "state_call" => json!(format!(
+                            "0x{}",
+                            hex::encode((
+                                b"frontier-template".to_vec(),
+                                b"frontier-template".to_vec(),
+                                1_u32,
+                                369_u32,
+                                1_u32,
+                                Vec::<([u8; 8], u32)>::new(),
+                                1_u32,
+                                1_u8,
+                            ).encode()),
+                        )),
+                        "state_getMetadata" => json!(metadata),
+                        "state_getStorage" => {
+                            let key = request["params"][0].as_str().unwrap();
+                            if key == thread_key {
+                                json!("0x00")
+                            } else if key == event_key {
+                                event_reads.fetch_add(1, Ordering::SeqCst);
+                                json!(events)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        method => panic!("unexpected RPC method {method}"),
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.config.network.base_url_rpc = Some(rpc_url.clone());
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let endpoints = validate_rpc_endpoint_identities(
+            &client.config.network,
+            [
+                DeepXObservedRpcEndpoint::new(
+                    DeepXRpcRole::Submission,
+                    rpc_url.clone(),
+                    genesis_hash,
+                ),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, rpc_url, genesis_hash),
+            ],
+        )
+        .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        client.runtime_rpc_endpoints = Some(endpoints);
+        client.runtime_rpc_capabilities = Some(capabilities);
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].trade_id, TradeId::from("187071212000014"));
+        assert_eq!(reports[1].trade_id, TradeId::from("187071212000022"));
+        assert!(event_reads.load(Ordering::SeqCst) >= 2);
+        server.abort();
     }
 
     #[tokio::test]
@@ -17261,25 +19910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fill_report_generation_applies_order_and_exact_time_filters() {
-        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
-        let client = fill_report_test_client(response).await;
-        let command = GenerateFillReports::new(
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            Some(VenueOrderId::from("1789445180000")),
-            None,
-            None,
-            None,
-            None,
-        );
-        let reports = ExecutionClient::generate_fill_reports(&client, command)
-            .await
-            .unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].trade_id, TradeId::from("185971191000008"));
-
+    async fn fill_report_generation_applies_exact_time_filters() {
         let mut response: Value =
             serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
         response["data"]["items"]
@@ -17302,6 +19933,89 @@ mod tests {
             .unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].trade_id, TradeId::from("185971383000008"));
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[case(true, true)]
+    #[tokio::test]
+    async fn targeted_perp_fill_queries_both_sides_and_rejects_conflict(
+        #[case] conflict: bool,
+        #[case] all_markets: bool,
+    ) {
+        let response: Value = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let mut client = fill_report_test_client(response.clone()).await;
+        let mut sell = response.clone();
+        sell["data"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["orderId"] == "1789445180000");
+        let mut buy = response;
+        buy["data"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["isLong"] == true);
+        buy["data"]["items"].as_array_mut().unwrap().truncate(1);
+        if conflict {
+            buy["data"]["items"][0]["orderId"] = json!("1789445180000");
+        } else {
+            buy["data"]["items"] = json!([]);
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let router = Router::new().route(
+            "/internal/v1/account/perp/trades",
+            get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
+                    let buy = buy.clone();
+                    let sell = sell.clone();
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        assert_eq!(query["user"], TEST_SUBACCOUNT);
+                        assert_eq!(query["marketId"], "3");
+                        assert_eq!(query["orderId"], "1789445180000");
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        if query["isLong"] == "true" {
+                            Json(buy)
+                        } else {
+                            assert_eq!(query["isLong"], "false");
+                            Json(sell)
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            (!all_markets).then_some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            Some(VenueOrderId::from("1789445180000")),
+            None,
+            None,
+            None,
+            None,
+        );
+        let result = ExecutionClient::generate_fill_reports(&client, command).await;
+        if conflict {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                DeepXFillReportError::ConflictingOrderSides.to_string()
+            );
+        } else {
+            let reports = result.unwrap();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].trade_id, TradeId::from("185971191000008"));
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        server.abort();
     }
 
     #[tokio::test]
@@ -17357,28 +20071,73 @@ mod tests {
             client.build_fill_report(&invalid, UnixNanos::default()),
             Err(DeepXFillReportError::QuantityIncrementMismatch),
         );
+
+        for size in ["0", "-0.3"] {
+            invalid = record.clone();
+            invalid.size = size.parse().unwrap();
+            assert_eq!(
+                client.build_fill_report(&invalid, UnixNanos::default()),
+                Err(DeepXFillReportError::QuantityIncrementMismatch),
+            );
+        }
+        for price in ["0", "-2499.05"] {
+            invalid = record.clone();
+            invalid.price = price.parse().unwrap();
+            assert_eq!(
+                client.build_fill_report(&invalid, UnixNanos::default()),
+                Err(DeepXFillReportError::PriceIncrementMismatch),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_sized_perp_trade_rejects_fill_report_request_before_partial_results() {
+        let mut response: Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        response["data"]["items"][1]["size"] = json!(0);
+        let client = fill_report_test_client(response).await;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid DeepX HTTP perp account trades response: item 1 has invalid financial values",
+        );
     }
 
     #[tokio::test]
     async fn fill_report_generation_rejects_invalid_request_before_http() {
         let client = test_client();
-        let invalid_order = GenerateFillReports::new(
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            Some(VenueOrderId::from("not-decimal")),
-            None,
-            None,
-            None,
-            None,
-        );
-        let error = ExecutionClient::generate_fill_reports(&client, invalid_order)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "DeepX fill report venue order ID must be an exact decimal u64",
-        );
+        for order_id in ["not-decimal", "00"] {
+            let invalid_order = GenerateFillReports::new(
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                Some(VenueOrderId::from(order_id)),
+                None,
+                None,
+                None,
+                None,
+            );
+            let error = ExecutionClient::generate_fill_reports(&client, invalid_order)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "DeepX fill report venue order ID must be an exact decimal u64",
+            );
+        }
 
         let reversed_time = GenerateFillReports::new(
             UUID4::new(),
@@ -17398,6 +20157,26 @@ mod tests {
             "DeepX fill report start must not exceed end",
         );
 
+        let mut params = Params::new();
+        params.insert("unsupported".to_string(), serde_json::json!(true));
+        let unsupported_params = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            Some(params),
+            None,
+        );
+        let error = ExecutionClient::generate_fill_reports(&client, unsupported_params)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX fill report parameters are unsupported",
+        );
+
         let missing_catalog = GenerateFillReports::new(
             UUID4::new(),
             UnixNanos::default(),
@@ -17413,7 +20192,44 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "DeepX fill report has no validated perpetual market for ETH-USDC-PERP.DEEPX",
+            "DeepX fill report has no validated market for ETH-USDC-PERP.DEEPX",
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn all_market_fill_reports_reject_inconsistent_perp_index_before_empty_result(
+        #[case] order_filter: bool,
+    ) {
+        let mut response: Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        response["data"]["items"] = json!([]);
+        response["data"]["nextCursor"] = Value::Null;
+        response["data"]["hasNext"] = json!(false);
+        let mut client = fill_report_test_client(response).await;
+        client
+            .perpetual_instrument_ids
+            .insert(3, InstrumentId::from("WRONG-PERP.DEEPX"));
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            order_filter.then_some(VenueOrderId::from("1789445180000")),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            DeepXFillReportError::MarketIdentityMismatch.to_string()
         );
     }
 
@@ -17843,6 +20659,60 @@ mod tests {
                 )
                 .unwrap(),
             DeepXExecutionUpdateRoute::Tracked(context),
+        );
+    }
+
+    #[rstest]
+    fn replaced_order_routes_late_updates_by_previous_venue_alias() {
+        let registry = DeepXOrderContextRegistry::default();
+        let context = OrderContext::from(&test_order("1.250"));
+        let previous = VenueOrderId::from("V-DEEPX-001");
+        let replacement = VenueOrderId::from("V-DEEPX-002");
+        registry.register(context).unwrap();
+        registry
+            .bind_tracked_venue_order_id(context.identity.client_order_id, previous)
+            .unwrap();
+        registry
+            .replace_tracked_venue_order_id(
+                context.identity.client_order_id,
+                previous,
+                replacement,
+                context,
+            )
+            .unwrap();
+
+        for venue_order_id in [previous, replacement] {
+            assert_eq!(
+                registry
+                    .route(Some(context.identity.client_order_id), Some(venue_order_id))
+                    .unwrap(),
+                DeepXExecutionUpdateRoute::Tracked(context),
+            );
+        }
+        assert_eq!(
+            registry.route(
+                Some(context.identity.client_order_id),
+                Some(VenueOrderId::from("V-DEEPX-003"))
+            ),
+            Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id: context.identity.client_order_id,
+                venue_order_id: VenueOrderId::from("V-DEEPX-003"),
+            }),
+        );
+        assert_eq!(
+            registry.route(Some(ClientOrderId::from("O-DEEPX-OTHER")), Some(previous)),
+            Err(DeepXOrderContextError::UpdateIdentityConflict {
+                client_order_id: ClientOrderId::from("O-DEEPX-OTHER"),
+                venue_order_id: previous,
+            }),
+        );
+
+        registry.finish(&context.identity.client_order_id).unwrap();
+        assert_eq!(
+            registry
+                .route(Some(context.identity.client_order_id), Some(previous))
+                .unwrap(),
+            DeepXExecutionUpdateRoute::Terminal(context),
         );
     }
 
@@ -18972,6 +21842,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_owned_account_stream_revokes_ready_execution_client() {
+        let (mut client, cache) = test_client_with_cache();
+        let (state, connection, _) = advance_through_mass_reconciliation(&mut client).await;
+        register_test_account(&cache, state);
+        client.account_connection = Some(connection);
+        client.complete_owned_account_registration().unwrap();
+        assert!(client.is_connected());
+
+        client.close_account_connection().await.unwrap();
+
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 0);
+        assert!(client.account_connection.is_none());
+        assert!(client.startup_account_subscription.is_none());
+        assert!(!client.query_tasks.is_open());
+    }
+
+    async fn monitored_ready_client() -> (
+        DeepXExecutionClient,
+        tokio::sync::watch::Sender<u8>,
+        DeepXRuntimeSnapshotService,
+    ) {
+        let (mut client, cache) = test_client_with_cache();
+        client.config.websocket_timeout_secs = 1;
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        client.runtime_snapshot = Some(test_runtime_snapshot());
+        record_account_ownership(&mut client);
+        let (connection, subscription, first, control) = controllable_account_stream().await;
+        client
+            .record_account_stream_confirmed(&connection, subscription)
+            .unwrap();
+        let state = test_account_state();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        client
+            .record_account_state_initialized(&connection, &first, &state)
+            .unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::MassReconciliationCompleted)
+            .unwrap();
+        register_test_account(&cache, state);
+        client.account_connection = Some(connection);
+        client.complete_owned_account_registration().unwrap();
+        client.activate_query_tasks().await.unwrap();
+        let snapshot_service = DeepXRuntimeSnapshotService::new(test_runtime_snapshot());
+        client
+            .activate_account_monitor(snapshot_service.clone())
+            .await
+            .unwrap();
+        (client, control, snapshot_service)
+    }
+
+    #[tokio::test]
+    async fn account_monitor_revokes_ready_execution_after_remote_close() {
+        let (mut client, control, snapshot_service) = monitored_ready_client().await;
+        assert!(client.is_connected());
+
+        control.send(1).unwrap();
+        assert_eq!(client.next_account_balances().await.unwrap().timestamp(), 2);
+        control.send(2).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.is_connected() || *client.query_epoch.lock().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!ExecutionClient::is_connected(&client));
+        assert!(!*client.query_epoch.lock().unwrap());
+        assert!(snapshot_service.acquire().is_err());
+        client.close_account_connection().await.unwrap();
+        assert!(client.account_monitor_frames.is_none());
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn closing_monitored_account_stream_drains_reader_before_return() {
+        let (mut client, _control, snapshot_service) = monitored_ready_client().await;
+        assert!(client.is_connected());
+        assert!(matches!(
+            client.next_account_balances().await,
+            Err(DeepXAccountStreamReadError::Transport(_))
+        ));
+        assert!(client.is_connected());
+        assert!(snapshot_service.acquire().is_ok());
+
+        client.close_account_connection().await.unwrap();
+
+        assert!(!client.is_connected());
+        assert!(client.account_monitor_frames.is_none());
+        assert!(client.account_tasks.is_empty());
+        assert!(snapshot_service.acquire().is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_owned_account_stream_read_revokes_ready_execution_client() {
+        let (mut client, cache) = test_client_with_cache();
+        let (state, connection, _) = advance_through_mass_reconciliation(&mut client).await;
+        register_test_account(&cache, state);
+        client.account_connection = Some(connection);
+        client.complete_owned_account_registration().unwrap();
+        assert!(client.is_connected());
+        client
+            .account_connection
+            .as_mut()
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.next_account_balances().await,
+            Err(DeepXAccountStreamReadError::SubscriptionUnavailable)
+        ));
+        assert!(!client.is_connected());
+        assert_eq!(client.startup.completed_steps, 0);
+        assert!(client.account_connection.is_none());
+        assert!(client.startup_account_subscription.is_none());
+    }
+
+    #[tokio::test]
     async fn owned_account_registration_waits_for_exact_event_to_reach_cache() {
         let (mut client, cache) = test_client_with_cache();
         let (state, connection, subscription) =
@@ -18982,7 +21980,7 @@ mod tests {
             dst::time::sleep(Duration::from_millis(5)).await;
             register_test_account(&cache, state);
         };
-        let (_, result) = tokio::join!(
+        let ((), result) = tokio::join!(
             register,
             client.wait_for_owned_account_registration(Duration::from_secs(1)),
         );
@@ -19294,6 +22292,205 @@ mod tests {
     }
 
     #[rstest]
+    fn cancel_all_orders_accepts_empty_owned_cache_when_connected() {
+        let client = test_client();
+        client.core.set_connected();
+        let cmd = CancelAllOrders::new(
+            client.core.trader_id,
+            Some(client.core.client_id),
+            StrategyId::from("S-DEEPX"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        client.cancel_all_orders(cmd).unwrap();
+        assert!(client.query_tasks.is_empty());
+    }
+
+    #[rstest]
+    fn cancel_all_batch_filters_cache_and_preserves_parent_identity() {
+        let (client, cache) = test_client_with_cache();
+        let account_id = client.core.account_id;
+        let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
+        let strategy_id = StrategyId::from("S-DEEPX-001");
+        let make_order = |id: &str, instrument: InstrumentId, strategy: StrategyId, side| {
+            OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(ClientOrderId::from(id))
+                .strategy_id(strategy)
+                .instrument_id(instrument)
+                .side(side)
+                .quantity(Quantity::from("0.3"))
+                .price(Price::from("2500.00"))
+                .time_in_force(TimeInForce::Gtc)
+                .build()
+        };
+        for (id, instrument, strategy, side, account, owner) in [
+            (
+                "O-ALL-1",
+                instrument_id,
+                strategy_id,
+                OrderSide::Buy,
+                account_id,
+                client.core.client_id,
+            ),
+            (
+                "O-ALL-2",
+                instrument_id,
+                strategy_id,
+                OrderSide::Sell,
+                account_id,
+                client.core.client_id,
+            ),
+            (
+                "O-ALL-3",
+                instrument_id,
+                StrategyId::from("S-OTHER"),
+                OrderSide::Buy,
+                account_id,
+                client.core.client_id,
+            ),
+            (
+                "O-ALL-4",
+                InstrumentId::from("BTC-USDC-PERP.DEEPX"),
+                strategy_id,
+                OrderSide::Buy,
+                account_id,
+                client.core.client_id,
+            ),
+            (
+                "O-ALL-5",
+                instrument_id,
+                strategy_id,
+                OrderSide::Buy,
+                AccountId::from("DEEPX-OTHER"),
+                client.core.client_id,
+            ),
+            (
+                "O-ALL-6",
+                instrument_id,
+                strategy_id,
+                OrderSide::Buy,
+                account_id,
+                ClientId::from("OTHER"),
+            ),
+        ] {
+            let order = make_order(id, instrument, strategy, side);
+            accept_order_in_cache_for_client(
+                &cache,
+                &order,
+                account,
+                VenueOrderId::from(id),
+                owner,
+            );
+        }
+        let parent_id = UUID4::new();
+        let correlation_id = UUID4::new();
+        let mut command = CancelAllOrders::new(
+            client.core.trader_id,
+            Some(client.core.client_id),
+            strategy_id,
+            instrument_id,
+            Some(OrderSide::Buy),
+            parent_id,
+            UnixNanos::from(10),
+            None,
+            Some(correlation_id),
+        );
+        command.causation_id = Some(UUID4::new());
+        let batch = build_cancel_all_batch(
+            &client.core.cache(),
+            account_id,
+            client.core.client_id,
+            command.clone(),
+        );
+
+        assert_eq!(batch.command_id, parent_id);
+        assert_eq!(batch.correlation_id, Some(correlation_id));
+        assert_eq!(batch.causation_id, command.causation_id);
+        assert_eq!(batch.cancels.len(), 1);
+        let child = &batch.cancels[0];
+        assert_eq!(child.client_order_id, ClientOrderId::from("O-ALL-1"));
+        assert_eq!(child.venue_order_id, Some(VenueOrderId::from("O-ALL-1")));
+        assert_ne!(child.command_id, parent_id);
+        let mut child = child.clone();
+        inherit_batch_cancel_context(&mut child, &batch);
+        assert_eq!(child.causation_id, Some(parent_id));
+        assert_eq!(child.correlation_id, Some(correlation_id));
+
+        command.order_side = None;
+        let all_sides = build_cancel_all_batch(
+            &client.core.cache(),
+            account_id,
+            client.core.client_id,
+            command,
+        );
+        assert_eq!(all_sides.cancels.len(), 2);
+        assert_eq!(
+            all_sides.cancels[0].client_order_id,
+            ClientOrderId::from("O-ALL-1")
+        );
+        assert_eq!(
+            all_sides.cancels[1].client_order_id,
+            ClientOrderId::from("O-ALL-2")
+        );
+    }
+
+    #[rstest]
+    fn cancel_all_rejects_untracked_cached_orders_without_submitting() {
+        let (mut client, cache) = test_client_with_cache();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_exec_event_sender(sender);
+        ExecutionClient::start(&mut client).unwrap();
+        client.core.set_connected();
+        for (id, venue_id) in [("O-ALL-1", "1001"), ("O-ALL-2", "1002")] {
+            let order = test_order_with_id(id, "0.3");
+            accept_order_in_cache(
+                &cache,
+                &order,
+                client.core.account_id,
+                VenueOrderId::from(venue_id),
+            );
+        }
+        let cmd = CancelAllOrders::new(
+            client.core.trader_id,
+            Some(client.core.client_id),
+            StrategyId::from("S-DEEPX-001"),
+            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        client.cancel_all_orders(cmd).unwrap();
+
+        let rejected = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()];
+        assert!(receiver.try_recv().is_err());
+        let ids = rejected
+            .into_iter()
+            .map(|event| match event {
+                ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+                    event.client_order_id
+                }
+                other => panic!("expected order cancel rejection, was {other:?}"),
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([
+                ClientOrderId::from("O-ALL-1"),
+                ClientOrderId::from("O-ALL-2"),
+            ])
+        );
+        assert!(client.query_tasks.is_empty());
+    }
+
+    #[rstest]
     fn execution_client_exposes_framework_identity() {
         let client = test_client();
 
@@ -19327,6 +22524,48 @@ mod tests {
         assert!(client.core.is_stopped());
         assert!(!client.is_connected());
         assert_eq!(client.startup.completed_steps, 0);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn batch_cancel_preserves_parent_identity_in_durable_context(#[case] explicit: bool) {
+        let client = test_client();
+        let order = tracked_limit_order();
+        let child_id = UUID4::new();
+        let parent_id = UUID4::new();
+        let correlation_id = explicit.then(UUID4::new);
+        let mut cancel = CancelOrder::new(
+            order.trader_id(),
+            Some(client.core.client_id),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.venue_order_id(),
+            child_id,
+            UnixNanos::from(10),
+            None,
+            None,
+        );
+        let batch = BatchCancelOrders::new(
+            order.trader_id(),
+            Some(client.core.client_id),
+            order.strategy_id(),
+            order.instrument_id(),
+            vec![cancel.clone()],
+            parent_id,
+            UnixNanos::from(10),
+            None,
+            correlation_id,
+        );
+
+        inherit_batch_cancel_context(&mut cancel, &batch);
+        let context =
+            framework_order_context_from_cancel_order(&cancel, &order, client.core.account_id);
+
+        assert_eq!(context.command_id(), child_id);
+        assert_eq!(context.causation_id(), Some(parent_id));
+        assert_eq!(context.correlation_id(), correlation_id.or(Some(parent_id)));
     }
 
     #[rstest]

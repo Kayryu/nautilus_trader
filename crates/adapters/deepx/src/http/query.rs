@@ -103,7 +103,7 @@ pub enum DeepXQuotaBuyerType {
 }
 
 impl DeepXLiquidationType {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::LiquidatePerp => "LiquidatePerp",
             Self::LiquidateSpot => "LiquidateSpot",
@@ -127,7 +127,7 @@ impl DeepXLiquidationType {
 }
 
 impl DeepXBalanceChangeType {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Deposit => "DEPOSIT",
             Self::Withdraw => "WITHDRAW",
@@ -1201,10 +1201,7 @@ impl DeepXSpotOrderByIdRequest {
             self.name.as_deref(),
             self.pair.as_deref(),
         )?;
-        if self.order_id.is_empty()
-            || !self.order_id.bytes().all(|value| value.is_ascii_digit())
-            || self.order_id.parse::<u64>().is_err()
-        {
+        if crate::common::parse::parse_canonical_order_id(&self.order_id).is_none() {
             return Err(DeepXHttpError::InvalidRequest(
                 "spot-order-by-id order_id must be an exact decimal u64".to_string(),
             ));
@@ -1263,10 +1260,7 @@ impl DeepXSpotAccountTradesRequest {
         match (&self.order_id, self.order_side) {
             (None, None) => {}
             (Some(order_id), Some(_)) if self.name.is_some() || self.pair.is_some() => {
-                if order_id.is_empty()
-                    || !order_id.bytes().all(|value| value.is_ascii_digit())
-                    || order_id.parse::<u64>().is_err()
-                {
+                if crate::common::parse::parse_canonical_order_id(order_id).is_none() {
                     return Err(DeepXHttpError::InvalidRequest(
                         "spot-account-trades order_id must be an exact decimal u64".to_string(),
                     ));
@@ -1317,14 +1311,16 @@ impl DeepXSpotWalletOrdersRequest {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_spot_wallet_grouped_request(
             "spot-wallet-orders",
-            self.wallet.as_deref(),
-            self.name.as_deref(),
-            self.pair.as_deref(),
-            self.cursor.as_deref(),
-            self.start_ms,
-            self.end_ms,
-            self.page_size,
-            false,
+            SpotWalletGroupedValidation {
+                wallet: self.wallet.as_deref(),
+                name: self.name.as_deref(),
+                pair: self.pair.as_deref(),
+                cursor: self.cursor.as_deref(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                page_size: self.page_size,
+                require_market: false,
+            },
         )
     }
 
@@ -1347,14 +1343,16 @@ impl DeepXSpotWalletTradesRequest {
     pub(crate) fn validate(&self) -> Result<()> {
         validate_spot_wallet_grouped_request(
             "spot-wallet-trades",
-            Some(&self.wallet),
-            self.name.as_deref(),
-            self.pair.as_deref(),
-            self.cursor.as_deref(),
-            self.start_ms,
-            self.end_ms,
-            self.page_size,
-            true,
+            SpotWalletGroupedValidation {
+                wallet: Some(&self.wallet),
+                name: self.name.as_deref(),
+                pair: self.pair.as_deref(),
+                cursor: self.cursor.as_deref(),
+                start_ms: self.start_ms,
+                end_ms: self.end_ms,
+                page_size: self.page_size,
+                require_market: true,
+            },
         )
     }
 
@@ -1427,10 +1425,7 @@ impl DeepXPerpAccountTradesRequest {
         match (&self.order_id, self.is_long) {
             (None, None) => {}
             (Some(order_id), Some(_)) if self.market_id.is_some() => {
-                if order_id.is_empty()
-                    || !order_id.bytes().all(|value| value.is_ascii_digit())
-                    || order_id.parse::<u64>().is_err()
-                {
+                if crate::common::parse::parse_canonical_order_id(order_id).is_none() {
                     return Err(DeepXHttpError::InvalidRequest(
                         "perp-account-trades order_id must be an exact decimal u64".to_string(),
                     ));
@@ -1558,16 +1553,7 @@ impl DeepXPerpWalletTradesRequest {
 
 impl DeepXPerpWalletOrdersRequest {
     pub(crate) fn validate(&self) -> Result<()> {
-        validate_wallet_grouped_request(
-            "perp-wallet-orders",
-            &self.wallet,
-            self.market_name.as_deref(),
-            self.market_id,
-            self.start_ms,
-            self.end_ms,
-            self.cursor.as_deref(),
-            self.page_size,
-        )
+        validate_wallet_grouped_request("perp-wallet-orders", self)
     }
 
     pub(crate) fn as_query(&self) -> DeepXPerpWalletOrdersQuery<'_> {
@@ -2055,7 +2041,7 @@ pub struct DeepXSpotCandlesRequest {
     pub interval: DeepXSpotCandleInterval,
     /// Lower timestamp bound in Unix milliseconds.
     pub start_ms: u64,
-    /// Optional upper timestamp bound in Unix milliseconds.
+    /// Optional exclusive upper timestamp bound in Unix milliseconds.
     pub end_ms: Option<u64>,
     /// Optional maximum number of candles, from 1 through 5000.
     pub limit: Option<u32>,
@@ -2162,7 +2148,7 @@ pub struct DeepXPerpCandlesRequest {
     pub interval: DeepXPerpCandleInterval,
     /// Lower timestamp bound in Unix milliseconds.
     pub start_ms: u64,
-    /// Upper timestamp bound in Unix milliseconds.
+    /// Exclusive upper timestamp bound in Unix milliseconds.
     pub end_ms: Option<u64>,
     /// Maximum number of candles requested from the venue.
     pub limit: Option<u32>,
@@ -2177,7 +2163,7 @@ pub struct DeepXPerpMarkPriceRequest {
     pub interval: DeepXPerpCandleInterval,
     /// Lower timestamp bound in Unix milliseconds.
     pub start_ms: u64,
-    /// Upper timestamp bound in Unix milliseconds.
+    /// Exclusive upper timestamp bound in Unix milliseconds.
     pub end_ms: Option<u64>,
     /// Maximum number of observations requested from the venue.
     pub limit: Option<u32>,
@@ -2192,7 +2178,7 @@ pub struct DeepXPerpOraclePriceRequest {
     pub interval: DeepXPerpCandleInterval,
     /// Lower timestamp bound in Unix milliseconds.
     pub start_ms: u64,
-    /// Upper timestamp bound in Unix milliseconds.
+    /// Exclusive upper timestamp bound in Unix milliseconds.
     pub end_ms: Option<u64>,
     /// Maximum number of observations requested from the venue.
     pub limit: Option<u32>,
@@ -2658,17 +2644,32 @@ fn validate_spot_order_request(
     validate_cursor(endpoint, cursor)
 }
 
-fn validate_spot_wallet_grouped_request(
-    endpoint: &str,
-    wallet: Option<&str>,
-    name: Option<&str>,
-    pair: Option<&str>,
-    cursor: Option<&str>,
+#[derive(Clone, Copy)]
+struct SpotWalletGroupedValidation<'a> {
+    wallet: Option<&'a str>,
+    name: Option<&'a str>,
+    pair: Option<&'a str>,
+    cursor: Option<&'a str>,
     start_ms: Option<u64>,
     end_ms: Option<u64>,
     page_size: Option<u32>,
     require_market: bool,
+}
+
+fn validate_spot_wallet_grouped_request(
+    endpoint: &str,
+    request: SpotWalletGroupedValidation<'_>,
 ) -> Result<()> {
+    let SpotWalletGroupedValidation {
+        wallet,
+        name,
+        pair,
+        cursor,
+        start_ms,
+        end_ms,
+        page_size,
+        require_market,
+    } = request;
     if let Some(wallet) = wallet {
         validate_account_id(endpoint, wallet)?;
     }
@@ -2721,14 +2722,15 @@ fn validate_account_page_request(
 
 fn validate_wallet_grouped_request(
     endpoint: &str,
-    wallet: &str,
-    market_name: Option<&str>,
-    market_id: Option<u64>,
-    start_ms: Option<u64>,
-    end_ms: Option<u64>,
-    cursor: Option<&str>,
-    page_size: Option<u32>,
+    request: &DeepXPerpWalletOrdersRequest,
 ) -> Result<()> {
+    let wallet = &request.wallet;
+    let market_name = request.market_name.as_deref();
+    let market_id = request.market_id;
+    let start_ms = request.start_ms;
+    let end_ms = request.end_ms;
+    let cursor = request.cursor.as_deref();
+    let page_size = request.page_size;
     if wallet.len() != 42
         || !wallet.starts_with("0x")
         || !wallet.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
@@ -3609,7 +3611,7 @@ mod tests {
                 request.pair = Some(
                     "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
                         .to_string(),
-                )
+                );
             }
             "wallet" => request.wallet = Some("invalid".to_string()),
             "bounds" => request.start_ms = Some(request.end_ms.unwrap() + 1),
@@ -3798,6 +3800,7 @@ mod tests {
     )]
     #[case(Some("ETH/USDC"), None, "")]
     #[case(Some("ETH/USDC"), None, "bad")]
+    #[case(Some("ETH/USDC"), None, "00")]
     fn invalid_spot_order_by_id_request_is_rejected(
         #[case] name: Option<&str>,
         #[case] pair: Option<&str>,
@@ -3906,12 +3909,49 @@ mod tests {
         request.name = Some("ETH/USDC".to_string());
         request.order_id = Some("bad".to_string());
         assert!(request.validate().is_err());
+        request.order_id = Some("00".to_string());
+        assert!(request.validate().is_err());
         request.order_id = None;
         assert!(request.validate().is_err());
         request.order_side = None;
         request.start_ms = Some(2);
         request.end_ms = Some(1);
         assert!(request.validate().is_err());
+    }
+
+    #[rstest]
+    fn account_trade_order_filters_accept_zero_and_reject_aliases() {
+        let subaccount = "0x08bdb660e03c75954e0fcaa1e7ead150a92c891c";
+        let mut spot = DeepXSpotAccountTradesRequest {
+            subaccount: subaccount.to_string(),
+            order_id: Some("0".to_string()),
+            order_side: Some(DeepXSpotOrderSide::Buy),
+            name: Some("ETH/USDC".to_string()),
+            pair: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(100),
+        };
+        assert!(spot.validate().is_ok());
+        spot.order_id = Some("00".to_string());
+        assert!(spot.validate().is_err());
+
+        let mut perp = DeepXPerpAccountTradesRequest {
+            subaccount: subaccount.to_string(),
+            order_id: Some("0".to_string()),
+            market_id: Some(3),
+            is_long: Some(true),
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(100),
+        };
+        assert!(perp.validate().is_ok());
+        perp.order_id = Some("00".to_string());
+        assert!(perp.validate().is_err());
     }
 
     fn spot_wallet_orders_request() -> DeepXSpotWalletOrdersRequest {
@@ -3998,7 +4038,7 @@ mod tests {
                 request.pair = Some(
                     "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
                         .to_string(),
-                )
+                );
             }
             "bounds" => request.start_ms = Some(request.end_ms.unwrap() + 1),
             "timestamp" => request.end_ms = Some(u64::MAX),
@@ -4026,7 +4066,7 @@ mod tests {
                 request.pair = Some(
                     "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
                         .to_string(),
-                )
+                );
             }
             "bounds" => request.start_ms = Some(request.end_ms.unwrap() + 1),
             "timestamp" => request.end_ms = Some(u64::MAX),

@@ -15,6 +15,8 @@
 
 //! Verify bounded raw testnet trade history without private accounts or chain submission.
 
+use std::{cell::RefCell, num::NonZeroUsize, rc::Rc, time::Duration};
+
 use anyhow::{Context, ensure};
 use nautilus_common::{
     cache::Cache,
@@ -35,7 +37,6 @@ use nautilus_deepx::{
     },
 };
 use nautilus_model::identifiers::{ClientId, InstrumentId};
-use std::{cell::RefCell, num::NonZeroUsize, rc::Rc, time::Duration};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {

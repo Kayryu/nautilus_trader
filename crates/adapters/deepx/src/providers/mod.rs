@@ -91,7 +91,7 @@ impl DeepXMarketProvider {
         }
     }
 
-    /// Returns whether a complete Spot and perpetual load has succeeded.
+    /// Returns whether a complete load for the selected market scope has succeeded.
     #[must_use]
     pub const fn initialized(&self) -> bool {
         self.initialized
@@ -173,26 +173,29 @@ impl DeepXMarketProvider {
             }
             insert_unique(&mut markets, DeepXMarketMetadata::Spot(Box::new(market)))?;
         }
-        for market in perpetual {
-            let market_id = market.id;
-            let instrument_id = format_instrument_id(
-                &format!("{}-{}", market.base_symbol, market.quote_symbol),
-                &DeepXProductType::Perpetual,
-            )?;
-            if perpetual_instrument_ids
-                .insert(market_id, instrument_id)
-                .is_some()
-            {
-                bail!("duplicate DeepX perpetual market ID: {market_id}");
-            }
-            insert_unique(
-                &mut markets,
-                DeepXMarketMetadata::Perpetual(Box::new(market)),
-            )?;
-        }
+        insert_perpetuals(&mut markets, &mut perpetual_instrument_ids, perpetual)?;
 
         self.markets = markets;
         self.spot_instrument_ids = spot_instrument_ids;
+        self.perpetual_instrument_ids = perpetual_instrument_ids;
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Loads only public perpetual markets without requesting Spot metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request, identity conversion, or duplicate validation fails.
+    /// The previous catalog remains unchanged.
+    pub(crate) async fn load_perpetuals(&mut self) -> Result<()> {
+        let perpetual = self.client.get_perp_markets().await?;
+        let mut markets = BTreeMap::new();
+        let mut perpetual_instrument_ids = BTreeMap::new();
+        insert_perpetuals(&mut markets, &mut perpetual_instrument_ids, perpetual)?;
+
+        self.markets = markets;
+        self.spot_instrument_ids.clear();
         self.perpetual_instrument_ids = perpetual_instrument_ids;
         self.initialized = true;
         Ok(())
@@ -241,6 +244,28 @@ fn decode_spot_pair_id(pair: &str) -> Result<[u8; 32]> {
     hex::decode_array::<32>(pair.strip_prefix("0x").unwrap_or(pair)).with_context(|| {
         format!("invalid DeepX Spot pair '{pair}': expected 32-byte hexadecimal identity")
     })
+}
+
+fn insert_perpetuals(
+    markets: &mut BTreeMap<InstrumentId, DeepXMarketMetadata>,
+    perpetual_instrument_ids: &mut BTreeMap<u64, InstrumentId>,
+    perpetual: Vec<DeepXPerpMarket>,
+) -> Result<()> {
+    for market in perpetual {
+        let market_id = market.id;
+        let instrument_id = format_instrument_id(
+            &format!("{}-{}", market.base_symbol, market.quote_symbol),
+            &DeepXProductType::Perpetual,
+        )?;
+        if perpetual_instrument_ids
+            .insert(market_id, instrument_id)
+            .is_some()
+        {
+            bail!("duplicate DeepX perpetual market ID: {market_id}");
+        }
+        insert_unique(markets, DeepXMarketMetadata::Perpetual(Box::new(market)))?;
+    }
+    Ok(())
 }
 
 fn insert_unique(
@@ -393,6 +418,66 @@ mod tests {
         assert_eq!(provider.spot_instrument_id("0x00"), None);
         assert_eq!(provider.perpetual_instrument_id(3), Some(perp));
         assert_eq!(provider.perpetual_instrument_id(u64::MAX), None);
+    }
+
+    #[tokio::test]
+    async fn perpetual_only_load_never_requests_spot_and_replaces_prior_spot_entries() {
+        let spot_requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&spot_requests);
+        let base_url = spawn_server(
+            Router::new()
+                .route(
+                    "/internal/v1/market/spot/markets",
+                    get(move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        async { SPOT_RESPONSE }
+                    }),
+                )
+                .route(
+                    "/internal/v1/market/perp/markets",
+                    get(|| async { PERP_RESPONSE }),
+                ),
+        )
+        .await;
+        let client = DeepXHttpClient::new(base_url, Some(5), None).unwrap();
+        let mut provider = DeepXMarketProvider::new(client);
+        provider.load_all().await.unwrap();
+        assert_eq!(spot_requests.load(Ordering::SeqCst), 1);
+
+        provider.load_perpetuals().await.unwrap();
+
+        assert_eq!(spot_requests.load(Ordering::SeqCst), 1);
+        assert!(provider.initialized());
+        assert_eq!(provider.instrument_ids().len(), 1);
+        assert_eq!(
+            provider.perpetual_instrument_id(3),
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX"))
+        );
+        assert_eq!(
+            provider.spot_instrument_id(
+                "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_perpetual_only_refresh_preserves_complete_catalog() {
+        let fail_perp = Arc::new(AtomicBool::new(false));
+        let mut provider = provider(
+            Arc::clone(&fail_perp),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        provider.load_all().await.unwrap();
+        let previous = provider.instrument_ids();
+        fail_perp.store(true, Ordering::Relaxed);
+
+        assert!(provider.load_perpetuals().await.is_err());
+        assert_eq!(provider.instrument_ids(), previous);
+        assert!(provider.initialized());
     }
 
     #[tokio::test]

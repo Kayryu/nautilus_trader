@@ -1,0 +1,15 @@
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "collateral": 970.96,
+    "exactMargin": {
+      "maintMarginReq": "0",
+      "totalCollateral": "970.964181",
+      "uniMMR": null
+    },
+    "marginRatio": null,
+    "marginRequired": 0.0
+  },
+  "fail": false
+}

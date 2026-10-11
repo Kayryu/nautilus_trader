@@ -366,6 +366,12 @@ pub enum DeepXRuntimeSnapshotServiceError {
     /// New signing is blocked while a changed runtime is being validated.
     #[error("DeepX runtime snapshot refresh is in progress")]
     RefreshInProgress,
+    /// Contradictory finalized RPC evidence invalidated this service for new signing.
+    #[error("DeepX finalized RPC evidence is inconsistent; restart the runtime snapshot service")]
+    EvidenceInconsistent,
+    /// The execution client retired this runtime before a pending operation could transmit.
+    #[error("DeepX execution runtime has been retired")]
+    ClientRetired,
     /// A different runtime change was observed while refresh was already in progress.
     #[error("DeepX runtime snapshot refresh already targets a different identity")]
     ConflictingRuntimeChange,
@@ -406,6 +412,8 @@ struct RuntimeSnapshotServiceState {
     active: Arc<RuntimeSnapshot>,
     pending_identity: Option<PendingRuntimeIdentity>,
     in_flight: usize,
+    evidence_inconsistent: bool,
+    client_retired: bool,
 }
 
 #[derive(Debug)]
@@ -456,6 +464,8 @@ impl DeepXRuntimeSnapshotService {
                 active: Arc::new(snapshot),
                 pending_identity: None,
                 in_flight: 0,
+                evidence_inconsistent: false,
+                client_retired: false,
             })),
         }
     }
@@ -464,12 +474,19 @@ impl DeepXRuntimeSnapshotService {
     ///
     /// # Errors
     ///
-    /// Returns an error while runtime refresh is in progress or shared state is unavailable.
+    /// Returns an error when the client retired this service, runtime refresh is in progress, or
+    /// shared state is unavailable.
     pub fn acquire(&self) -> Result<DeepXRuntimeSnapshotPermit, DeepXRuntimeSnapshotServiceError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if state.evidence_inconsistent {
+            return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
+        }
         if state.pending_identity.is_some() {
             return Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress);
         }
@@ -482,6 +499,28 @@ impl DeepXRuntimeSnapshotService {
             service_state: Arc::clone(&self.state),
             snapshot: Arc::clone(&state.active),
         })
+    }
+
+    /// Permanently closes new permits after contradictory finalized RPC evidence.
+    pub(crate) fn halt_for_inconsistent_evidence(
+        &self,
+    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        state.evidence_inconsistent = true;
+        Ok(())
+    }
+
+    /// Revokes existing and future permits when their execution client retires.
+    pub(crate) fn retire_client(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        state.client_retired = true;
+        Ok(())
     }
 
     /// Compares an observed runtime identity and blocks new signing when it changes.
@@ -582,8 +621,8 @@ impl DeepXRuntimeSnapshotService {
     ///
     /// # Errors
     ///
-    /// Returns an error unless refresh is active, the snapshot matches the observed identity, no
-    /// old signing permits remain, and shared state is available.
+    /// Returns an error unless the service is active, refresh is in progress, the snapshot matches
+    /// the observed identity, no old signing permits remain, and shared state is available.
     pub fn install(
         &self,
         snapshot: RuntimeSnapshot,
@@ -592,6 +631,12 @@ impl DeepXRuntimeSnapshotService {
             .state
             .lock()
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if state.evidence_inconsistent {
+            return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
+        }
         let pending = state
             .pending_identity
             .as_ref()
@@ -618,8 +663,8 @@ impl DeepXRuntimeSnapshotService {
     ///
     /// # Errors
     ///
-    /// Returns an error when another runtime identity is pending, old signing permits remain, or
-    /// shared state is unavailable.
+    /// Returns an error when the client retired this service, another runtime identity is pending,
+    /// old signing permits remain, or shared state is unavailable.
     pub fn apply_validated(
         &self,
         snapshot: &RuntimeSnapshot,
@@ -628,6 +673,12 @@ impl DeepXRuntimeSnapshotService {
             .state
             .lock()
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if state.evidence_inconsistent {
+            return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
+        }
 
         if let Some(pending) = &state.pending_identity {
             if !pending.matches(snapshot.identity()) {
@@ -664,6 +715,28 @@ impl DeepXRuntimeSnapshotPermit {
     #[must_use]
     pub fn snapshot(&self) -> &RuntimeSnapshot {
         &self.snapshot
+    }
+
+    /// Verifies that this permit still belongs to an active, consistent runtime service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after contradictory RPC evidence or if shared state is unavailable.
+    pub(crate) fn ensure_active(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let state = self
+            .service_state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if state.evidence_inconsistent {
+            return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
+        }
+        if state.active.identity() != self.snapshot.identity() {
+            return Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -2166,6 +2239,73 @@ mod tests {
         assert_eq!(
             service.apply_validated(&snapshot).unwrap(),
             DeepXRuntimeSnapshotUpdate::Unchanged,
+        );
+    }
+
+    #[rstest]
+    fn inconsistent_evidence_cannot_be_cleared_by_snapshot_refresh() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let old_permit = service.acquire().unwrap();
+        assert!(old_permit.ensure_active().is_ok());
+        service.halt_for_inconsistent_evidence().unwrap();
+
+        assert_eq!(
+            old_permit.ensure_active(),
+            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
+        );
+        assert_eq!(
+            service.acquire().unwrap_err(),
+            DeepXRuntimeSnapshotServiceError::EvidenceInconsistent,
+        );
+        assert_eq!(
+            service.apply_validated(&snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
+        );
+        drop(old_permit);
+        assert_eq!(
+            service.acquire().unwrap_err(),
+            DeepXRuntimeSnapshotServiceError::EvidenceInconsistent,
+        );
+    }
+
+    #[rstest]
+    fn retired_client_revokes_existing_and_future_runtime_permits() {
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_GENESIS_HASH).unwrap(),
+            TESTNET_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata_bytes(),
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+
+        service.retire_client().unwrap();
+
+        assert_eq!(
+            permit.ensure_active(),
+            Err(DeepXRuntimeSnapshotServiceError::ClientRetired),
+        );
+        assert_eq!(
+            service.acquire().unwrap_err(),
+            DeepXRuntimeSnapshotServiceError::ClientRetired,
+        );
+        assert_eq!(
+            service.apply_validated(&snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::ClientRetired),
+        );
+        assert_eq!(
+            service.install(snapshot),
+            Err(DeepXRuntimeSnapshotServiceError::ClientRetired),
         );
     }
 

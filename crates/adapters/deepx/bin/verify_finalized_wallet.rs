@@ -19,7 +19,7 @@ use nautilus_core::hex;
 use nautilus_deepx::{
     config::DeepXDataClientConfig, http::DeepXHttpClient, map_finalized_flat_account_balances,
     observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-    observe_finalized_account_evidence,
+    observe_finalized_accounts_evidence,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -50,44 +50,30 @@ async fn main() -> anyhow::Result<()> {
         directory.addresses.len(),
     );
 
-    let mut observed = 0;
-    let mut failures = Vec::new();
-    for encoded_subaccount in &directory.addresses {
-        let decoded_subaccount = match encoded_subaccount.strip_prefix("0x") {
-            Some(value) => hex::decode_array::<20>(value)
-                .context("directory subaccount must contain exactly 20 bytes of hex"),
-            None => Err(anyhow::anyhow!("directory subaccount must be 0x-prefixed")),
-        };
-        let subaccount = match decoded_subaccount {
-            Ok(subaccount) => subaccount,
-            Err(e) => {
-                failures.push((encoded_subaccount.clone(), e.to_string()));
-                continue;
-            }
-        };
-        let evidence = match observe_finalized_account_evidence(
-            &config.network.environment,
-            &endpoints,
-            &capabilities,
-            subaccount,
-        )
-        .await
-        {
-            Ok(evidence) if evidence.subaccount() == subaccount => evidence,
-            Ok(_) => {
-                failures.push((
-                    encoded_subaccount.clone(),
-                    "finalized account evidence belongs to another subaccount".to_string(),
-                ));
-                continue;
-            }
-            Err(e) => {
-                failures.push((encoded_subaccount.clone(), format!("{e:#}")));
-                continue;
-            }
-        };
-        observed += 1;
-
+    let subaccounts = directory
+        .addresses
+        .iter()
+        .map(|encoded| {
+            let value = encoded
+                .strip_prefix("0x")
+                .context("directory subaccount must be 0x-prefixed")?;
+            hex::decode_array::<20>(value)
+                .context("directory subaccount must contain exactly 20 bytes of hex")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let evidence = observe_finalized_accounts_evidence(
+        &config.network.environment,
+        &endpoints,
+        &capabilities,
+        &subaccounts,
+    )
+    .await?;
+    let shared_block = evidence
+        .first()
+        .context("wallet account batch returned no evidence")?
+        .checkpoint()
+        .block_number();
+    for evidence in evidence {
         let checkpoint = evidence.checkpoint();
         println!(
             "subaccount=0x{} block={} hash=0x{} timestamp_ms={} initial_margin_required={} maintenance_margin_required={} lending_positions={} perp_positions={} active_perp_orders={} active_spot_orders={}",
@@ -187,23 +173,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    for (subaccount, error) in &failures {
-        println!("subaccount={subaccount} finalized_evidence_error={error}");
-    }
-    anyhow::ensure!(
-        observed > 0,
-        "no wallet subaccount produced finalized account evidence"
-    );
-
     println!(
-        "DeepX wallet finalized evidence completed observed={} failed={}; directory associations are mutable REST observations and do not prove chain-level ownership. No credentials or transactions were sent",
-        observed,
-        failures.len(),
-    );
-    anyhow::ensure!(
-        failures.is_empty(),
-        "finalized account evidence failed for {} wallet subaccount(s)",
-        failures.len()
+        "DeepX wallet finalized evidence completed observed={} block={shared_block}; directory associations are mutable REST observations and do not prove chain-level ownership. No credentials or transactions were sent",
+        subaccounts.len(),
     );
     Ok(())
 }

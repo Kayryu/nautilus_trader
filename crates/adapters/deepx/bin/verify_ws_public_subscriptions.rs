@@ -14,15 +14,17 @@
 
 //! Live read-only public subscription acknowledgement and raw data verification.
 
-use anyhow::Context;
+use std::{num::NonZeroUsize, time::Duration};
 
-use nautilus_deepx::websocket::book::DeepXWsBookStream;
-use nautilus_deepx::websocket::trades::DeepXWsTradeStream;
+use anyhow::Context;
 use nautilus_deepx::{
     config::DeepXNetworkConfig,
-    websocket::public::{DeepXWsPublicChannel, DeepXWsPublicConnection, DeepXWsPublicFrame},
+    websocket::{
+        book::DeepXWsBookStream,
+        public::{DeepXWsPublicChannel, DeepXWsPublicConnection, DeepXWsPublicFrame},
+        trades::DeepXWsTradeStream,
+    },
 };
-use std::{num::NonZeroUsize, time::Duration};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,16 +63,16 @@ async fn main() -> anyhow::Result<()> {
             {
                 if *channel == DeepXWsPublicChannel::Trades {
                     let executions = trade_stream.ingest(&frame)?;
-                    if !initial_trade_page {
+                    if initial_trade_page {
+                        println!("DeepX novel public executions={}", executions.len());
+                        trades |= !executions.is_empty();
+                    } else {
                         anyhow::ensure!(
                             executions.is_empty(),
                             "initial history was emitted as live trades"
                         );
                         initial_trade_page = true;
                         println!("DeepX initial trade history seeded without live delivery");
-                    } else {
-                        println!("DeepX novel public executions={}", executions.len());
-                        trades |= !executions.is_empty();
                     }
                 } else if *channel == DeepXWsPublicChannel::Orderbook {
                     book_stream.ingest(&frame)?;

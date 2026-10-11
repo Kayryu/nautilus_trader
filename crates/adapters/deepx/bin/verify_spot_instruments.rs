@@ -58,9 +58,10 @@ async fn main() -> anyhow::Result<()> {
                     pair.id,
                     pair.price_increment.as_decimal(),
                     pair.size_increment.as_decimal(),
-                    pair.min_quantity
-                        .map(|quantity| quantity.as_decimal().to_string())
-                        .unwrap_or_else(|| "none".to_string()),
+                    pair.min_quantity.map_or_else(
+                        || "none".to_string(),
+                        |quantity| quantity.as_decimal().to_string()
+                    ),
                 );
             }
             instrument => {
@@ -81,8 +82,7 @@ async fn main() -> anyhow::Result<()> {
     client.disconnect().await?;
     ensure!(client.is_disconnected(), "client did not disconnect");
     println!(
-        "DeepX finalized instrument discovery verified spot={} perpetual={}; no credentials or transactions sent",
-        spot_count, perpetual_count,
+        "DeepX finalized instrument discovery verified spot={spot_count} perpetual={perpetual_count}; no credentials or transactions sent",
     );
     Ok(())
 }

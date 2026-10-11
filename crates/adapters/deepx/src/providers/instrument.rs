@@ -57,6 +57,7 @@ pub struct DeepXInstrumentProvider {
     store: InstrumentStore,
     catalog: DeepXMarketProvider,
     network: Option<DeepXNetworkConfig>,
+    perpetual_only: bool,
     ts_init: nautilus_core::UnixNanos,
 }
 
@@ -66,6 +67,7 @@ impl std::fmt::Debug for DeepXInstrumentProvider {
             .field("store", &self.store)
             .field("catalog", &self.catalog)
             .field("network", &self.network)
+            .field("perpetual_only", &self.perpetual_only)
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +80,7 @@ impl DeepXInstrumentProvider {
             store: InstrumentStore::new(),
             catalog,
             network: None,
+            perpetual_only: false,
             ts_init: get_atomic_clock_realtime().get_time_ns(),
         }
     }
@@ -87,6 +90,14 @@ impl DeepXInstrumentProvider {
     pub fn with_network(catalog: DeepXMarketProvider, network: DeepXNetworkConfig) -> Self {
         let mut provider = Self::new(catalog);
         provider.network = Some(network);
+        provider
+    }
+
+    /// Creates a provider which loads only public perpetual instruments.
+    #[must_use]
+    pub(crate) fn perpetual_only(catalog: DeepXMarketProvider) -> Self {
+        let mut provider = Self::new(catalog);
+        provider.perpetual_only = true;
         provider
     }
 
@@ -117,9 +128,15 @@ impl DeepXInstrumentProvider {
     }
 
     /// Loads and converts a complete catalog without publishing partial catalog or store state.
-    async fn fetch_instruments(&self) -> Result<(DeepXMarketProvider, Vec<InstrumentAny>)> {
+    pub(crate) async fn fetch_instruments(
+        &self,
+    ) -> Result<(DeepXMarketProvider, Vec<InstrumentAny>)> {
         let mut catalog = self.catalog.clone();
-        catalog.load_all().await?;
+        if self.perpetual_only {
+            catalog.load_perpetuals().await?;
+        } else {
+            catalog.load_all().await?;
+        }
         let mut instruments = Vec::new();
         let spots = catalog
             .markets()
@@ -322,6 +339,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perpetual_only_provider_loads_without_spot_route_or_rpc() {
+        let router = Router::new().route(
+            "/internal/v1/market/perp/markets",
+            get(|| async { PERP_RESPONSE }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
+        let mut provider = DeepXInstrumentProvider::perpetual_only(DeepXMarketProvider::new(http));
+
+        provider.load_all(None).await.unwrap();
+
+        assert!(provider.store().is_initialized());
+        assert_eq!(provider.store().count(), 1);
+        assert_eq!(provider.catalog().markets().len(), 1);
+    }
+
+    #[tokio::test]
     async fn load_all_fails_closed_when_any_market_converts_invalidly() {
         // Serve a perp page whose market has a zero step size: strict instrument
         // conversion must fail and the whole load must leave the store untouched.
@@ -361,8 +397,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let http_client = DeepXHttpClient::new(format!("http://{address}"), Some(5), None).unwrap();
-        let mut network = crate::config::DeepXNetworkConfig::default();
-        network.base_url_rpc = Some("http://127.0.0.1:1".to_string());
+        let network = crate::config::DeepXNetworkConfig {
+            base_url_rpc: Some("http://127.0.0.1:1".to_string()),
+            ..Default::default()
+        };
         let mut provider =
             DeepXInstrumentProvider::with_network(DeepXMarketProvider::new(http_client), network);
 

@@ -58,16 +58,17 @@ pub(super) fn parse_bar(
     ts_init: UnixNanos,
 ) -> Result<Bar> {
     parse_bar_values(
-        candle.open,
-        candle.high,
-        candle.low,
-        candle.close,
-        candle.volume,
-        candle.time,
+        RawCandleValues {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            time: candle.time,
+        },
         bar_type,
         instrument,
         ts_init,
-        false,
     )
 }
 
@@ -78,31 +79,44 @@ pub(super) fn parse_spot_bar(
     ts_init: UnixNanos,
 ) -> Result<Bar> {
     parse_bar_values(
-        candle.open,
-        candle.high,
-        candle.low,
-        candle.close,
-        candle.volume,
-        candle.time,
+        RawCandleValues {
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: candle.volume,
+            time: candle.time,
+        },
         bar_type,
         instrument,
         ts_init,
-        true,
     )
 }
 
-fn parse_bar_values(
+#[derive(Clone, Copy)]
+struct RawCandleValues {
     open: Decimal,
     high: Decimal,
     low: Decimal,
     close: Decimal,
-    raw_volume: Decimal,
+    volume: Decimal,
     time: u64,
+}
+
+fn parse_bar_values(
+    values: RawCandleValues,
     bar_type: BarType,
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
-    validate_increments: bool,
 ) -> Result<Bar> {
+    let RawCandleValues {
+        open,
+        high,
+        low,
+        close,
+        volume: raw_volume,
+        time,
+    } = values;
     ensure!(open > Decimal::ZERO, "DeepX candle open must be positive");
     ensure!(high > Decimal::ZERO, "DeepX candle high must be positive");
     ensure!(low > Decimal::ZERO, "DeepX candle low must be positive");
@@ -119,22 +133,20 @@ fn parse_bar_values(
         volume.as_decimal() == raw_volume,
         "DeepX candle volume would lose precision"
     );
-    if validate_increments {
+    ensure!(
+        volume.as_decimal() % instrument.size_increment().as_decimal() == Decimal::ZERO,
+        "DeepX candle volume is not a multiple of the instrument step"
+    );
+    for (field, price) in [
+        ("open", open),
+        ("high", high),
+        ("low", low),
+        ("close", close),
+    ] {
         ensure!(
-            volume.as_decimal() % instrument.size_increment().as_decimal() == Decimal::ZERO,
-            "DeepX candle volume is not a multiple of the instrument step"
+            price.as_decimal() % instrument.price_increment().as_decimal() == Decimal::ZERO,
+            "DeepX candle {field} is not a multiple of the instrument tick"
         );
-        for (field, price) in [
-            ("open", open),
-            ("high", high),
-            ("low", low),
-            ("close", close),
-        ] {
-            ensure!(
-                price.as_decimal() % instrument.price_increment().as_decimal() == Decimal::ZERO,
-                "DeepX candle {field} is not a multiple of the instrument tick"
-            );
-        }
     }
     let timestamp_ns = time
         .checked_mul(NANOSECONDS_IN_MILLISECOND)
@@ -247,10 +259,10 @@ mod tests {
         let bar_type = spot_bar_type();
         let candle = DeepXSpotCandle {
             volume: Decimal::new(12_345, 4),
-            high: Decimal::new(2_435_55, 2),
-            low: Decimal::new(2_434_86, 2),
-            open: Decimal::new(2_435_54, 2),
-            close: Decimal::new(2_434_86, 2),
+            high: Decimal::new(243_555, 2),
+            low: Decimal::new(243_486, 2),
+            open: Decimal::new(243_554, 2),
+            close: Decimal::new(243_486, 2),
             time: 1_789_616_280_000,
         };
 
@@ -267,11 +279,11 @@ mod tests {
         let instrument = spot_instrument();
         let bar_type = spot_bar_type();
         let candle = DeepXSpotCandle {
-            volume: Decimal::new(12_345_6, 5),
-            high: Decimal::new(2_435_55, 2),
-            low: Decimal::new(2_434_86, 2),
-            open: Decimal::new(2_435_54, 2),
-            close: Decimal::new(2_434_86, 2),
+            volume: Decimal::new(123_456, 5),
+            high: Decimal::new(243_555, 2),
+            low: Decimal::new(243_486, 2),
+            open: Decimal::new(243_554, 2),
+            close: Decimal::new(243_486, 2),
             time: 1_789_616_280_000,
         };
 
@@ -305,10 +317,10 @@ mod tests {
         let bar_type = spot_bar_type();
         let candle = DeepXSpotCandle {
             volume: Decimal::new(12_346, 4),
-            high: Decimal::new(2_435_55, 2),
-            low: Decimal::new(2_434_86, 2),
-            open: Decimal::new(2_435_54, 2),
-            close: Decimal::new(2_434_86, 2),
+            high: Decimal::new(243_555, 2),
+            low: Decimal::new(243_486, 2),
+            open: Decimal::new(243_554, 2),
+            close: Decimal::new(243_486, 2),
             time: 1_789_616_280_000,
         };
 
@@ -327,10 +339,10 @@ mod tests {
         pair.price_increment = Price::from("0.05");
         let candle = DeepXSpotCandle {
             volume: Decimal::new(12_345, 4),
-            high: Decimal::new(2_435_55, 2),
-            low: Decimal::new(2_434_86, 2),
-            open: Decimal::new(2_435_54, 2),
-            close: Decimal::new(2_434_86, 2),
+            high: Decimal::new(243_555, 2),
+            low: Decimal::new(243_486, 2),
+            open: Decimal::new(243_554, 2),
+            close: Decimal::new(243_486, 2),
             time: 1_789_616_280_000,
         };
 

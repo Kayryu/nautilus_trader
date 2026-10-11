@@ -24,6 +24,7 @@ use std::{
     },
 };
 
+use alloy::primitives::U256;
 use nautilus_network::{
     http::{HttpClient, HttpRedirectPolicy, Method},
     retry::{RetryConfig, RetryManager},
@@ -51,9 +52,10 @@ use super::{
         DeepXSpotOrderRecord, DeepXSpotTrade, DeepXSpotTradesPage, DeepXSpotVolume,
         DeepXSpotWalletOrderMarket, DeepXSpotWalletOrdersPage, DeepXSpotWalletTradeMarket,
         DeepXSpotWalletTradesPage, DeepXSubaccountBalances, DeepXSubaccountDirectoryRecord,
-        DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountProfile,
-        DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
-        DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
+        DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountPerpPositions,
+        DeepXSubaccountProfile, DeepXSubaccountSnapshot, DeepXUserStats,
+        DeepXWalletAccountSnapshot, DeepXWalletDelegateAccounts, DeepXWalletPerpPositions,
+        DeepXWalletSubaccounts,
     },
     pagination::{CursorPagination, PaginationDecision, validate_cursor_page},
     query::{
@@ -131,6 +133,7 @@ const PERP_POSITIONS_PATH: &str = "/internal/v1/account/position";
 const BALANCE_CHANGES_PATH: &str = "/internal/v1/account/balance-changes";
 const LIQUIDATION_RECORDS_PATH: &str = "/internal/v1/account/subaccounts/liquidation-records";
 const LIQUIDATION_ADL_RECORDS_PATH: &str = "/internal/v1/liquidation/adl-records";
+const LIQUIDATION_EXECUTION_RECORDS_PATH: &str = "/internal/v1/liquidation/records";
 const LIQUIDATION_CRANKER_RECORDS_PATH: &str = "/internal/v1/liquidation/cranker-records";
 const LIQUIDATION_KEEPER_STATE_PATH: &str = "/internal/v1/liquidation/keeper-state";
 const LIQUIDATION_TP_SL_RECORDS_PATH: &str = "/internal/v1/liquidation/tp-sl-records";
@@ -774,7 +777,7 @@ impl DeepXHttpClient {
         }
     }
 
-    /// Returns one ascending page of perpetual open-interest history.
+    /// Returns one validated ascending page of perpetual open-interest history.
     ///
     /// # Errors
     ///
@@ -786,8 +789,129 @@ impl DeepXHttpClient {
     ) -> Result<DeepXOpenInterestPage> {
         request.validate()?;
         let query = request.as_query();
-        self.get_json_with_query(PERP_OPEN_INTEREST_PATH, &query)
-            .await
+        let page = self
+            .get_json_with_query(PERP_OPEN_INTEREST_PATH, &query)
+            .await?;
+        validate_open_interest_page(&page, request)?;
+        Ok(page)
+    }
+
+    /// Returns complete bounded ascending open-interest history using one-minute time cursors.
+    ///
+    /// The venue rounds bounds down to minutes and excludes the `end` minute. The collector rounds
+    /// the requested interval outward to return only buckets within the caller's inclusive bounds.
+    /// Each continuation starts at the minute after the preceding page's final observation.
+    /// No partial result is returned on budget exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing bounds, invalid pages, changed market identity, repeated or
+    /// out-of-range buckets, or a history exceeding the page budget.
+    pub async fn get_perp_open_interest_history(
+        &self,
+        request: &DeepXOpenInterestRequest,
+        max_pages: usize,
+    ) -> Result<DeepXOpenInterestPage> {
+        request.validate()?;
+        let end_ms = request.end_ms.ok_or_else(|| {
+            DeepXHttpError::InvalidRequest("open-interest history requires end_ms".to_string())
+        })?;
+        if max_pages == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "open-interest history requires a positive page budget".to_string(),
+            ));
+        }
+        let page_size = request.limit.unwrap_or(100) as usize;
+        if page_size > 5_000 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "open-interest page size exceeds 5000".to_string(),
+            ));
+        }
+        let next_minute = |timestamp: u64| {
+            timestamp
+                .checked_div(60_000)
+                .and_then(|minute| minute.checked_add(1))
+                .and_then(|minute| minute.checked_mul(60_000))
+                .ok_or_else(|| {
+                    DeepXHttpError::InvalidRequest(
+                        "open-interest time bound overflows minute range".to_string(),
+                    )
+                })
+        };
+        let first_minute = if request.start_ms.is_multiple_of(60_000) {
+            request.start_ms
+        } else {
+            next_minute(request.start_ms)?
+        };
+        if first_minute > end_ms {
+            return Err(DeepXHttpError::InvalidRequest(
+                "open-interest history range contains no minute bucket".to_string(),
+            ));
+        }
+        let venue_end = next_minute(end_ms)?;
+        let mut page_request = request.clone();
+        page_request.start_ms = first_minute;
+        page_request.end_ms = Some(venue_end);
+        page_request.limit = Some(page_size as u32);
+        let mut pair = None;
+        let mut details = Vec::new();
+        let mut previous_time = None;
+        for _ in 0..max_pages {
+            let page = self.get_perp_open_interest(&page_request).await?;
+            let invalid = |message| DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "perp open-interest",
+                message,
+            };
+            if page.pair.trim().is_empty()
+                || pair.as_ref().is_some_and(|expected| expected != &page.pair)
+            {
+                return Err(invalid("market pair changed or is empty".to_string()));
+            }
+            if page.details.len() > page_size {
+                return Err(invalid("page exceeds requested limit".to_string()));
+            }
+            if pair.is_none() {
+                pair = Some(page.pair);
+            }
+            for record in &page.details {
+                if !record.statistic_time.is_multiple_of(60_000)
+                    || record.statistic_time < page_request.start_ms
+                    || record.statistic_time < request.start_ms
+                    || record.statistic_time > end_ms
+                    || previous_time.is_some_and(|previous| record.statistic_time <= previous)
+                    || record.total_oi < Decimal::ZERO
+                    || record.long_short_ratio < Decimal::ZERO
+                {
+                    return Err(invalid(
+                        "invalid or out-of-order open-interest record".to_string(),
+                    ));
+                }
+                previous_time = Some(record.statistic_time);
+            }
+            let page_len = page.details.len();
+            let last_time = page.details.last().map(|record| record.statistic_time);
+            details.extend(page.details);
+            if page_len < page_size || last_time == Some(end_ms) {
+                return Ok(DeepXOpenInterestPage {
+                    pair: pair.ok_or_else(|| invalid("missing market pair".to_string()))?,
+                    details,
+                });
+            }
+            let next_start = last_time
+                .ok_or_else(|| invalid("full page has no last record".to_string()))?
+                .checked_add(60_000)
+                .ok_or_else(|| invalid("open-interest cursor overflows".to_string()))?;
+            if next_start > end_ms {
+                return Ok(DeepXOpenInterestPage {
+                    pair: pair.ok_or_else(|| invalid("missing market pair".to_string()))?,
+                    details,
+                });
+            }
+            page_request.start_ms = next_start;
+        }
+        Err(DeepXHttpError::InvalidRequest(
+            "open-interest history page budget exceeded".to_string(),
+        ))
     }
 
     /// Returns one descending page of raw perpetual trades.
@@ -1448,6 +1572,14 @@ impl DeepXHttpClient {
         market_id: u64,
         order_id: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OrderQuery<'a> {
+            user: &'a str,
+            market_id: u64,
+            oid: &'a str,
+        }
+
         if user.len() != 42
             || !user.starts_with("0x")
             || !user.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
@@ -1458,13 +1590,6 @@ impl DeepXHttpClient {
                 "perp-order-by-id requires a 20-byte hex subaccount, positive market_id, and nonempty order_id"
                     .to_string(),
             ));
-        }
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderQuery<'a> {
-            user: &'a str,
-            market_id: u64,
-            oid: &'a str,
         }
         self.get_json_with_query(
             "/internal/v1/account/perp/order-by-id",
@@ -1493,10 +1618,7 @@ impl DeepXHttpClient {
         market_id: u64,
         order_id: &str,
     ) -> Result<DeepXPerpOrderRecord> {
-        if order_id.is_empty()
-            || !order_id.bytes().all(|value| value.is_ascii_digit())
-            || order_id.parse::<u64>().is_err()
-        {
+        if crate::common::parse::parse_canonical_order_id(order_id).is_none() {
             return Err(DeepXHttpError::InvalidRequest(
                 "perp-order-by-id requires a decimal u64 order_id".to_string(),
             ));
@@ -1527,6 +1649,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
     /// record fields, or a response transaction hash that differs from the request.
     pub async fn get_perp_order_by_tx(&self, tx_hash: &str) -> Result<DeepXPerpOrderRecord> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OrderByTxQuery<'a> {
+            tx_hash: &'a str,
+        }
+
         let expected_hash = tx_hash
             .strip_prefix("0x")
             .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
@@ -1535,11 +1663,6 @@ impl DeepXHttpClient {
                     "perp-order-by-tx requires a 0x-prefixed 32-byte tx_hash".to_string(),
                 )
             })?;
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderByTxQuery<'a> {
-            tx_hash: &'a str,
-        }
         let order: DeepXPerpOrderRecord = self
             .get_json_with_query(PERP_ORDER_BY_TX_PATH, &OrderByTxQuery { tx_hash })
             .await?;
@@ -1629,6 +1752,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
     /// record fields, or a response transaction hash that differs from the request.
     pub async fn get_spot_order_by_tx(&self, tx_hash: &str) -> Result<DeepXSpotOrderRecord> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OrderByTxQuery<'a> {
+            tx_hash: &'a str,
+        }
+
         let expected_hash = tx_hash
             .strip_prefix("0x")
             .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
@@ -1637,11 +1766,6 @@ impl DeepXHttpClient {
                     "spot-order-by-tx requires a 0x-prefixed 32-byte tx_hash".to_string(),
                 )
             })?;
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderByTxQuery<'a> {
-            tx_hash: &'a str,
-        }
         let order: DeepXSpotOrderRecord = self
             .get_json_with_query(SPOT_ORDER_BY_TX_PATH, &OrderByTxQuery { tx_hash })
             .await?;
@@ -1743,8 +1867,8 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns the raw reader errors or an error for malformed record fields, ownership, market or
-    /// side mismatches, invalid financial values or timestamps, ordering violations, duplicates,
-    /// or an oversized page.
+    /// side mismatches, terminal or inconsistent order state, invalid financial values or
+    /// timestamps, ordering violations, duplicates, or an oversized page.
     pub async fn get_perp_open_orders(
         &self,
         request: &DeepXPerpOpenOrdersRequest,
@@ -1774,7 +1898,7 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns the raw collector errors or a typed record validation error. No partial typed
-    /// result is returned when any page or record is invalid.
+    /// result is returned when any page or record is invalid, and invalid pages stop pagination.
     pub async fn get_perp_open_order_pages(
         &self,
         request: &DeepXPerpOpenOrdersRequest,
@@ -2088,8 +2212,8 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns the raw reader errors or an error for malformed record fields, ownership or market
-    /// mismatches, invalid financial values, timestamps, duplicates, ordering, or an oversized
-    /// page.
+    /// mismatches, terminal or inconsistent order state, invalid financial values, timestamps,
+    /// duplicates, ordering, or an oversized page.
     pub async fn get_spot_open_orders(
         &self,
         request: &DeepXSpotOpenOrdersRequest,
@@ -2111,6 +2235,7 @@ impl DeepXHttpClient {
                     request.pair.as_deref(),
                     request.order_side,
                 )?;
+                validate_spot_open_order_state(index, order)?;
                 validate_spot_order_sequence(
                     "spot open orders",
                     index,
@@ -2169,6 +2294,7 @@ impl DeepXHttpClient {
                         request.pair.as_deref(),
                         request.order_side,
                     )?;
+                    validate_spot_open_order_state(index, order)?;
                     validate_spot_order_sequence(
                         "spot open orders",
                         index,
@@ -2632,12 +2758,13 @@ impl DeepXHttpClient {
     ) -> Result<DeepXAccountPage<DeepXPerpAccountTradeRecord>> {
         let page = self.get_perp_account_trades_raw(request).await?;
         let mut trade_ids = HashSet::new();
+        let mut previous = None;
         decode_account_page(
             "perp account trades",
             page,
             request.page_size,
             |index, trade| {
-                validate_perp_account_trade_record(index, trade, request)?;
+                validate_perp_account_trade_record(index, trade, request, &mut previous)?;
                 validate_unique_account_identity(
                     "perp account trades",
                     index,
@@ -2661,6 +2788,7 @@ impl DeepXHttpClient {
         max_pages: usize,
     ) -> Result<Vec<DeepXAccountPage<DeepXPerpAccountTradeRecord>>> {
         let mut trade_ids = HashSet::new();
+        let mut previous = None;
         self.get_perp_account_trade_pages_raw(request, max_pages)
             .await?
             .into_iter()
@@ -2670,7 +2798,7 @@ impl DeepXHttpClient {
                     page,
                     request.page_size,
                     |index, trade| {
-                        validate_perp_account_trade_record(index, trade, request)?;
+                        validate_perp_account_trade_record(index, trade, request, &mut previous)?;
                         validate_unique_account_identity(
                             "perp account trades",
                             index,
@@ -2907,6 +3035,99 @@ impl DeepXHttpClient {
             }
         }
         Ok(groups)
+    }
+
+    /// Returns bounded trade pages for one subaccount in a wallet-grouped perpetual market.
+    ///
+    /// The venue supplies an independent cursor for each subaccount group. A continuation request
+    /// can repeat other groups, so only the selected group's cursor and records advance this
+    /// collector. The response does not prove wallet ownership or a stable historical snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request, missing selected group, malformed or repeated
+    /// trades, a market name differing from `expected_market_name`, time-order violations,
+    /// cursor failures, or page-budget exhaustion. No partial pages are returned.
+    pub async fn get_perp_wallet_trade_pages_for_subaccount(
+        &self,
+        request: &DeepXPerpWalletTradesRequest,
+        subaccount: &str,
+        expected_market_name: &str,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXAccountPage<DeepXPerpAccountTradeRecord>>> {
+        request.validate()?;
+        validate_account_address("perp wallet trades", "subaccount", subaccount)?;
+        let market_id = request.market_id.ok_or_else(|| {
+            DeepXHttpError::InvalidRequest(
+                "perp wallet trade pagination requires a market ID".to_string(),
+            )
+        })?;
+        if expected_market_name.trim().is_empty() {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp wallet trade pagination requires a market name".to_string(),
+            ));
+        }
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
+        let mut trade_ids = HashSet::new();
+        let mut previous = None;
+        let mut pages = Vec::new();
+        loop {
+            let markets = self.get_perp_wallet_trades(&next_request).await?;
+            let market = markets
+                .iter()
+                .find(|market| market.market_id == market_id)
+                .ok_or_else(|| {
+                    invalid_account_response(
+                        "perp wallet trades",
+                        "selected market group is missing".to_string(),
+                    )
+                })?;
+            if market.market_name != expected_market_name {
+                return Err(invalid_account_response(
+                    "perp wallet trades",
+                    "selected market name differs from expected identity".to_string(),
+                ));
+            }
+            let group = market
+                .subaccounts
+                .iter()
+                .find(|group| group.subaccount.eq_ignore_ascii_case(subaccount))
+                .ok_or_else(|| {
+                    invalid_account_response(
+                        "perp wallet trades",
+                        "selected subaccount group is missing".to_string(),
+                    )
+                })?;
+            for (index, trade) in group.trades.items.iter().enumerate() {
+                validate_perp_wallet_trade_record(
+                    index,
+                    trade,
+                    &next_request,
+                    market_id,
+                    &mut previous,
+                )?;
+                validate_unique_account_identity(
+                    "perp wallet trades",
+                    index,
+                    &mut trade_ids,
+                    trade.id,
+                    "trade ID",
+                )?;
+            }
+            let decision = pagination.observe_response_page(
+                "perp wallet trades",
+                group.trades.items.len(),
+                group.trades.has_next,
+                group.trades.next_cursor.as_deref(),
+            )?;
+            pages.push(group.trades.clone());
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
     }
 
     /// Returns one page of uninterpreted perpetual funding fees for a subaccount.
@@ -3335,28 +3556,41 @@ impl DeepXHttpClient {
         request: &DeepXPerpPositionsRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXAccountPage<DeepXPerpPositionRecord>>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
         let mut position_ids = HashSet::new();
-        self.get_perp_position_pages_raw(request, max_pages)
-            .await?
-            .into_iter()
-            .map(|page| {
-                decode_account_page(
-                    "perp positions",
-                    page,
-                    request.page_size,
-                    |index, position| {
-                        validate_perp_position_record(index, position, request)?;
-                        validate_unique_account_identity(
-                            "perp positions",
-                            index,
-                            &mut position_ids,
-                            position.id,
-                            "position ID",
-                        )
-                    },
-                )
-            })
-            .collect()
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_perp_positions_raw(&next_request).await?;
+            let page = decode_account_page(
+                "perp positions",
+                page,
+                request.page_size,
+                |index, position| {
+                    validate_perp_position_record(index, position, request)?;
+                    validate_unique_account_identity(
+                        "perp positions",
+                        index,
+                        &mut position_ids,
+                        position.id,
+                        "position ID",
+                    )
+                },
+            )?;
+            let decision = pagination.observe_response_page(
+                "perp positions",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
     }
 
     /// Returns the uninterpreted lending deposit and borrow balance payload for a subaccount.
@@ -3372,11 +3606,12 @@ impl DeepXHttpClient {
         &self,
         subaccount: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        validate_account_address("subaccount balances", "subaccount", subaccount)?;
         #[derive(Serialize)]
         struct BalancesQuery<'a> {
             subaccount: &'a str,
         }
+
+        validate_account_address("subaccount balances", "subaccount", subaccount)?;
         self.get_json_with_query(SUBACCOUNT_BALANCES_PATH, &BalancesQuery { subaccount })
             .await
     }
@@ -3472,34 +3707,47 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns the raw collector or typed-record errors. Duplicate identities across pages fail
-    /// without returning a partial typed collection.
+    /// without returning a partial typed collection. Invalid pages stop pagination immediately.
     pub async fn get_balance_change_pages(
         &self,
         request: &DeepXBalanceChangesRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXAccountPage<DeepXBalanceChangeRecord>>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
         let mut ids = HashSet::new();
-        self.get_balance_change_pages_raw(request, max_pages)
-            .await?
-            .into_iter()
-            .map(|page| {
-                decode_account_page(
-                    "balance changes",
-                    page,
-                    request.page_size,
-                    |index, record| {
-                        validate_balance_change_record(index, record, request)?;
-                        validate_unique_account_identity(
-                            "balance changes",
-                            index,
-                            &mut ids,
-                            record.id,
-                            "record ID",
-                        )
-                    },
-                )
-            })
-            .collect()
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_balance_changes_raw(&next_request).await?;
+            let page = decode_account_page(
+                "balance changes",
+                page,
+                request.page_size,
+                |index, record| {
+                    validate_balance_change_record(index, record, request)?;
+                    validate_unique_account_identity(
+                        "balance changes",
+                        index,
+                        &mut ids,
+                        record.id,
+                        "record ID",
+                    )
+                },
+            )?;
+            let decision = pagination.observe_response_page(
+                "balance changes",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
     }
 
     /// Returns the uninterpreted response data for spot ADL candidate discovery.
@@ -3602,6 +3850,47 @@ impl DeepXHttpClient {
         }
     }
 
+    /// Returns one raw page of ordinary liquidation execution records.
+    ///
+    /// Item fields remain uninterpreted because OpenAPI provides an example rather than a stable
+    /// schema. This mutable read does not prove chain inclusion or finality.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters or cursor metadata, transport or HTTP failures,
+    /// malformed responses, or a venue-level failure envelope.
+    pub async fn get_liquidation_execution_records_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+    ) -> Result<DeepXRawAccountPage> {
+        self.get_liquidation_execution_records_raw_at(
+            LIQUIDATION_EXECUTION_RECORDS_PATH,
+            "liquidation execution records",
+            request,
+        )
+        .await
+    }
+
+    /// Returns all ordinary liquidation execution pages within an explicit page budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid filters or page budget, malformed pages, repeated cursors,
+    /// transport or venue failures, or history exceeding the budget.
+    pub async fn get_liquidation_execution_record_pages_raw(
+        &self,
+        request: &DeepXLiquidationExecutionRecordsRequest,
+        max_pages: usize,
+    ) -> Result<Vec<DeepXRawAccountPage>> {
+        self.get_liquidation_execution_record_pages_raw_at(
+            LIQUIDATION_EXECUTION_RECORDS_PATH,
+            "liquidation execution records",
+            request,
+            max_pages,
+        )
+        .await
+    }
+
     /// Returns one raw page of cranker execution records.
     ///
     /// Record fields remain uninterpreted because OpenAPI documents examples rather than a stable
@@ -3615,7 +3904,7 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        self.get_liquidation_execution_records_raw(
+        self.get_liquidation_execution_records_raw_at(
             LIQUIDATION_CRANKER_RECORDS_PATH,
             "liquidation cranker records",
             request,
@@ -3629,7 +3918,7 @@ impl DeepXHttpClient {
         request: &DeepXLiquidationExecutionRecordsRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
-        self.get_liquidation_execution_record_pages_raw(
+        self.get_liquidation_execution_record_pages_raw_at(
             LIQUIDATION_CRANKER_RECORDS_PATH,
             "liquidation cranker records",
             request,
@@ -3651,7 +3940,7 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        self.get_liquidation_execution_records_raw(
+        self.get_liquidation_execution_records_raw_at(
             LIQUIDATION_TP_SL_RECORDS_PATH,
             "liquidation TP/SL records",
             request,
@@ -3665,7 +3954,7 @@ impl DeepXHttpClient {
         request: &DeepXLiquidationExecutionRecordsRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
-        self.get_liquidation_execution_record_pages_raw(
+        self.get_liquidation_execution_record_pages_raw_at(
             LIQUIDATION_TP_SL_RECORDS_PATH,
             "liquidation TP/SL records",
             request,
@@ -3674,7 +3963,7 @@ impl DeepXHttpClient {
         .await
     }
 
-    async fn get_liquidation_execution_records_raw(
+    async fn get_liquidation_execution_records_raw_at(
         &self,
         path: &str,
         endpoint: &'static str,
@@ -3682,11 +3971,17 @@ impl DeepXHttpClient {
     ) -> Result<DeepXRawAccountPage> {
         request.validate()?;
         let page: DeepXRawAccountPage = self.get_json_with_query(path, &request.as_query()).await?;
+        if page.items.len() > request.page_size.unwrap_or(20) as usize {
+            return Err(invalid_account_response(
+                endpoint,
+                "page exceeds requested page size".to_string(),
+            ));
+        }
         validate_cursor_page(endpoint, page.has_next, page.next_cursor.as_deref())?;
         Ok(page)
     }
 
-    async fn get_liquidation_execution_record_pages_raw(
+    async fn get_liquidation_execution_record_pages_raw_at(
         &self,
         path: &str,
         endpoint: &'static str,
@@ -3700,7 +3995,7 @@ impl DeepXHttpClient {
         let mut pages = Vec::new();
         loop {
             let page = self
-                .get_liquidation_execution_records_raw(path, endpoint, &next_request)
+                .get_liquidation_execution_records_raw_at(path, endpoint, &next_request)
                 .await?;
             let decision = pagination.observe_response_page(
                 endpoint,
@@ -3731,18 +4026,19 @@ impl DeepXHttpClient {
         subaccount: &str,
         chain_id: Option<&str>,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        validate_account_address("liquidation keeper state", "subaccount", subaccount)?;
-        if chain_id.is_some_and(|value| value.trim().is_empty()) {
-            return Err(DeepXHttpError::InvalidRequest(
-                "liquidation keeper state chain_id must not be empty".to_string(),
-            ));
-        }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct KeeperStateQuery<'a> {
             subaccount: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             chain_id: Option<&'a str>,
+        }
+
+        validate_account_address("liquidation keeper state", "subaccount", subaccount)?;
+        if chain_id.is_some_and(|value| value.trim().is_empty()) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "liquidation keeper state chain_id must not be empty".to_string(),
+            ));
         }
         self.get_json_with_query(
             LIQUIDATION_KEEPER_STATE_PATH,
@@ -3847,34 +4143,48 @@ impl DeepXHttpClient {
     ///
     /// Returns the raw collector or typed-record errors. Duplicate identities or ordering
     /// violations across page boundaries fail without returning a partial typed collection.
+    /// Invalid pages stop pagination immediately.
     pub async fn get_liquidation_record_pages(
         &self,
         request: &DeepXLiquidationRecordsRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXAccountPage<DeepXLiquidationRecord>>> {
+        request.validate()?;
+        let mut pagination =
+            CursorPagination::new_with_cursor(max_pages, request.cursor.as_deref())?;
+        let mut next_request = request.clone();
         let mut ids = HashSet::new();
         let mut previous = None;
-        self.get_liquidation_record_pages_raw(request, max_pages)
-            .await?
-            .into_iter()
-            .map(|page| {
-                decode_account_page(
-                    "liquidation records",
-                    page,
-                    request.page_size,
-                    |index, record| {
-                        validate_liquidation_record(index, record, request, &mut previous)?;
-                        validate_unique_account_identity(
-                            "liquidation records",
-                            index,
-                            &mut ids,
-                            record.id,
-                            "record ID",
-                        )
-                    },
-                )
-            })
-            .collect()
+        let mut pages = Vec::new();
+        loop {
+            let page = self.get_liquidation_records_raw(&next_request).await?;
+            let page = decode_account_page(
+                "liquidation records",
+                page,
+                request.page_size,
+                |index, record| {
+                    validate_liquidation_record(index, record, request, &mut previous)?;
+                    validate_unique_account_identity(
+                        "liquidation records",
+                        index,
+                        &mut ids,
+                        record.id,
+                        "record ID",
+                    )
+                },
+            )?;
+            let decision = pagination.observe_response_page(
+                "liquidation records",
+                page.items.len(),
+                page.has_next,
+                page.next_cursor.as_deref(),
+            )?;
+            pages.push(page);
+            match decision {
+                PaginationDecision::Complete => return Ok(pages),
+                PaginationDecision::Continue(cursor) => next_request.cursor = Some(cursor),
+            }
+        }
     }
 
     /// Returns a validated nullable liquidation price for one subaccount and perpetual market.
@@ -3908,11 +4218,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, invalid or duplicate subaccounts, inconsistent counters, or a negative amount.
     pub async fn get_user_stats(&self, address: &str) -> Result<DeepXUserStats> {
-        validate_account_address("user stats", "wallet", address)?;
         #[derive(Serialize)]
         struct UserStatsQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("user stats", "wallet", address)?;
         let stats: DeepXUserStats = self
             .get_json_with_query(USER_STATS_PATH, &UserStatsQuery { address })
             .await?;
@@ -3927,7 +4238,6 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// data, or a response for another address.
     pub async fn get_invitation_status(&self, address: &str) -> Result<DeepXInvitationStatus> {
-        validate_account_address("invitation status", "wallet", address)?;
         #[derive(Serialize)]
         struct InvitationStatusQuery<'a> {
             address: &'a str,
@@ -3940,6 +4250,8 @@ impl DeepXHttpClient {
             /// OpenAPI-documented response example shape.
             Detailed(DeepXInvitationStatus),
         }
+
+        validate_account_address("invitation status", "wallet", address)?;
         let status: InvitationStatusData = self
             .get_json_with_query(INVITATION_CHECK_PATH, &InvitationStatusQuery { address })
             .await?;
@@ -3970,11 +4282,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet, transport or HTTP failures, malformed responses,
     /// empty or duplicate codes, or a venue-level failure envelope.
     pub async fn get_invitation_codes(&self, address: &str) -> Result<Vec<String>> {
-        validate_account_address("invitation codes", "wallet", address)?;
         #[derive(Serialize)]
         struct InvitationCodesQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("invitation codes", "wallet", address)?;
         let codes: Vec<String> = self
             .get_json_with_query(INVITATION_CODE_PATH, &InvitationCodesQuery { address })
             .await?;
@@ -4006,11 +4319,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, identity or timestamp mismatches, negative volumes, or an inconsistent total.
     pub async fn get_quota_summary(&self, wallet: &str) -> Result<DeepXQuotaSummary> {
-        validate_account_address("quota summary", "wallet", wallet)?;
         #[derive(Serialize)]
         struct QuotaSummaryQuery<'a> {
             wallet: &'a str,
         }
+
+        validate_account_address("quota summary", "wallet", wallet)?;
         let summary: DeepXQuotaSummary = self
             .get_json_with_query(QUOTA_SUMMARY_PATH, &QuotaSummaryQuery { wallet })
             .await?;
@@ -4021,27 +4335,45 @@ impl DeepXHttpClient {
     /// Returns the raw backend state for one asynchronous quota claim task.
     ///
     /// OpenAPI documents a generic response envelope and an example, but no stable claim item
-    /// schema. The returned task state is left uninterpreted and is not chain-finality evidence.
+    /// schema. Only the returned claim ID is bound to the request; the task state remains
+    /// uninterpreted and is not chain-finality evidence.
     ///
     /// # Errors
     ///
-    /// Returns an error for a zero claim ID, transport or HTTP failures, malformed responses, or
-    /// a venue-level failure envelope.
+    /// Returns an error for a zero claim ID, transport or HTTP failures, malformed responses,
+    /// a venue-level failure envelope, or a response for a different claim.
     pub async fn get_quota_claim_raw(
         &self,
         claim_id: u64,
     ) -> Result<Box<serde_json::value::RawValue>> {
+        #[derive(Serialize)]
+        struct QuotaClaimQuery {
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct QuotaClaimIdentity {
+            id: u64,
+        }
+
         if claim_id == 0 {
             return Err(DeepXHttpError::InvalidRequest(
                 "quota-claim id must be greater than zero".to_string(),
             ));
         }
-        #[derive(Serialize)]
-        struct QuotaClaimQuery {
-            id: u64,
+        let raw: Box<serde_json::value::RawValue> = self
+            .get_json_with_query(QUOTA_CLAIM_PATH, &QuotaClaimQuery { id: claim_id })
+            .await?;
+        let identity: QuotaClaimIdentity = serde_json::from_str(raw.get())?;
+        if identity.id != claim_id {
+            return Err(invalid_account_state_response(
+                "quota claim",
+                format!(
+                    "claim ID mismatch: expected {claim_id}, received {}",
+                    identity.id
+                ),
+            ));
         }
-        self.get_json_with_query(QUOTA_CLAIM_PATH, &QuotaClaimQuery { id: claim_id })
-            .await
+        Ok(raw)
     }
 
     /// Returns one raw chain-confirmed wallet quota-history page.
@@ -4218,11 +4550,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or HTTP failures, malformed
     /// responses, venue-level failures, invalid returned addresses, or duplicate subaccounts.
     pub async fn get_wallet_subaccounts(&self, address: &str) -> Result<DeepXWalletSubaccounts> {
-        validate_account_address("wallet subaccounts", "wallet", address)?;
         #[derive(Serialize)]
         struct SubaccountsQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("wallet subaccounts", "wallet", address)?;
         let addresses: Vec<String> = self
             .get_json_with_query(WALLET_SUBACCOUNTS_PATH, &SubaccountsQuery { address })
             .await?;
@@ -4231,22 +4564,52 @@ impl DeepXHttpClient {
         Ok(subaccounts)
     }
 
-    /// Returns validated profile, balance, and equity reads for every wallet subaccount.
+    async fn get_wallet_directory_and_stats(
+        &self,
+        address: &str,
+        endpoint: &'static str,
+    ) -> Result<(DeepXWalletSubaccounts, DeepXUserStats)> {
+        let directory = self.get_wallet_subaccounts(address).await?;
+        let stats = self.get_user_stats(address).await?;
+        let directory_set: HashSet<_> = directory
+            .addresses
+            .iter()
+            .map(|subaccount| subaccount.to_ascii_lowercase())
+            .collect();
+        let stats_set: HashSet<_> = stats
+            .subaccounts
+            .iter()
+            .map(|subaccount| subaccount.to_ascii_lowercase())
+            .collect();
+        if directory_set != stats_set {
+            return Err(invalid_account_state_response(
+                endpoint,
+                "user stats subaccounts differ from wallet directory".to_string(),
+            ));
+        }
+        Ok((directory, stats))
+    }
+
+    /// Returns validated directory, statistics, and account reads for every wallet subaccount.
     ///
-    /// Subaccounts retain directory order. Each profile must identify the requested wallet as its
-    /// authority, and every balance and equity payload must identify the corresponding subaccount.
+    /// Statistics must report the same subaccount set as the directory. Subaccounts retain
+    /// directory order. Each profile must identify the requested wallet as its authority, and
+    /// every balance and equity payload must identify the corresponding subaccount.
+    /// A final directory read rejects membership changes during collection.
     /// No partial collection is returned if any request or validation fails. The REST responses
     /// are not block-pinned, so this does not assert cross-request venue snapshot atomicity.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid wallet, directory failure, or any failed or inconsistent
-    /// subaccount profile, balance, or equity response.
+    /// Returns an error for an invalid wallet, inconsistent directory or statistics, or any failed
+    /// or inconsistent subaccount profile, balance, equity, or margin response.
     pub async fn get_wallet_account_snapshot(
         &self,
         address: &str,
     ) -> Result<DeepXWalletAccountSnapshot> {
-        let directory = self.get_wallet_subaccounts(address).await?;
+        let (directory, stats) = self
+            .get_wallet_directory_and_stats(address, "wallet account snapshot")
+            .await?;
         let mut subaccounts = Vec::with_capacity(directory.addresses.len());
         for subaccount in &directory.addresses {
             let profile = self.get_subaccount_info(subaccount, Some(address)).await?;
@@ -4260,8 +4623,118 @@ impl DeepXHttpClient {
                 margin_ratio,
             });
         }
+        let final_directory = self.get_wallet_subaccounts(address).await?;
+        let initial_set: HashSet<_> = directory
+            .addresses
+            .iter()
+            .map(|subaccount| subaccount.to_ascii_lowercase())
+            .collect();
+        let final_set: HashSet<_> = final_directory
+            .addresses
+            .iter()
+            .map(|subaccount| subaccount.to_ascii_lowercase())
+            .collect();
+        if initial_set != final_set {
+            return Err(invalid_account_state_response(
+                "wallet account snapshot",
+                "wallet directory changed during account collection".to_string(),
+            ));
+        }
         Ok(DeepXWalletAccountSnapshot {
             directory,
+            stats,
+            subaccounts,
+        })
+    }
+
+    /// Returns bounded position lifecycle pages for every validated wallet subaccount.
+    ///
+    /// The directory and statistics must agree, every profile must bind the requested wallet,
+    /// and position IDs must be unique across all pages and subaccounts. A final directory read
+    /// catches a changed membership during collection. These mutable REST reads do not establish
+    /// a block-pinned snapshot or finalized position state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits or filters, inconsistent account identity, duplicate
+    /// position IDs, failed pages, or changed directory membership. No partial result is returned.
+    pub async fn get_wallet_perp_positions(
+        &self,
+        wallet: &str,
+        max_subaccounts: usize,
+        max_pages_per_subaccount: usize,
+        market_id: Option<u64>,
+        only_closed: Option<bool>,
+        page_size: Option<u32>,
+    ) -> Result<DeepXWalletPerpPositions> {
+        if max_subaccounts == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "max_subaccounts must be greater than zero".to_string(),
+            ));
+        }
+        if max_pages_per_subaccount == 0 {
+            return Err(DeepXHttpError::InvalidPaginationLimit);
+        }
+        validate_account_address("wallet perp positions", "wallet", wallet)?;
+        let request_template = DeepXPerpPositionsRequest {
+            subaccount: wallet.to_string(),
+            market_id,
+            only_closed,
+            cursor: None,
+            page_size,
+        };
+        request_template.validate()?;
+        let (directory, stats) = self
+            .get_wallet_directory_and_stats(wallet, "wallet perp positions")
+            .await?;
+        if directory.addresses.len() > max_subaccounts {
+            return Err(DeepXHttpError::InvalidRequest(format!(
+                "wallet directory exceeds max_subaccounts limit of {max_subaccounts}"
+            )));
+        }
+        let mut subaccounts = Vec::with_capacity(directory.addresses.len());
+        let mut position_ids = HashSet::new();
+        for address in &directory.addresses {
+            let profile = self.get_subaccount_info(address, Some(wallet)).await?;
+            let request = DeepXPerpPositionsRequest {
+                subaccount: address.clone(),
+                ..request_template.clone()
+            };
+            let pages = self
+                .get_perp_position_pages(&request, max_pages_per_subaccount)
+                .await?;
+            for page in &pages {
+                for position in &page.items {
+                    if !position_ids.insert(position.id) {
+                        return Err(invalid_account_state_response(
+                            "wallet perp positions",
+                            format!("position ID {} repeats across subaccounts", position.id),
+                        ));
+                    }
+                }
+            }
+            subaccounts.push(DeepXSubaccountPerpPositions { profile, pages });
+        }
+        let final_directory = self.get_wallet_subaccounts(wallet).await?;
+        let initial_set: HashSet<_> = directory
+            .addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        let final_set: HashSet<_> = final_directory
+            .addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        if initial_set != final_set {
+            return Err(invalid_account_state_response(
+                "wallet perp positions",
+                "wallet directory changed during position collection".to_string(),
+            ));
+        }
+        Ok(DeepXWalletPerpPositions {
+            directory,
+            stats,
             subaccounts,
         })
     }
@@ -4280,13 +4753,14 @@ impl DeepXHttpClient {
         address: &str,
         expected_authority: Option<&str>,
     ) -> Result<DeepXSubaccountProfile> {
-        validate_account_address("subaccount info", "subaccount", address)?;
-        if let Some(authority) = expected_authority {
-            validate_account_address("subaccount info", "expected authority", authority)?;
-        }
         #[derive(Serialize)]
         struct SubaccountInfoQuery<'a> {
             address: &'a str,
+        }
+
+        validate_account_address("subaccount info", "subaccount", address)?;
+        if let Some(authority) = expected_authority {
+            validate_account_address("subaccount info", "expected authority", authority)?;
         }
         let profile: DeepXSubaccountProfile = self
             .get_json_with_query(SUBACCOUNT_INFO_PATH, &SubaccountInfoQuery { address })
@@ -4298,12 +4772,14 @@ impl DeepXHttpClient {
     /// Queries and verifies signer ownership of one configured subaccount.
     ///
     /// The wallet directory query is derived from `key`; the returned profile must bind the same
-    /// wallet authority and exact configured subaccount before an opaque proof is returned.
+    /// wallet authority and exact configured subaccount. A final directory read must retain the
+    /// same membership before an opaque proof is returned.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid key or subaccount, failed REST reads, inconsistent account
-    /// directory or profile identities, duplicate subaccounts, or an inactive profile.
+    /// directory or profile identities, changed membership, duplicate subaccounts, or an inactive
+    /// profile.
     pub async fn get_account_ownership_proof(
         &self,
         key: &DeepXPrivateKey,
@@ -4313,7 +4789,22 @@ impl DeepXHttpClient {
         let wallet = format!("0x{}", nautilus_core::hex::encode(signer));
         let directory = self.get_wallet_subaccounts(&wallet).await?;
         let profile = self.get_subaccount_info(subaccount, Some(&wallet)).await?;
-        verify_account_ownership(key, subaccount, &directory, &profile)
+        let proof = verify_account_ownership(key, subaccount, &directory, &profile)?;
+        let final_directory = self.get_wallet_subaccounts(&wallet).await?;
+        let initial_set: HashSet<_> = directory
+            .addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        let final_set: HashSet<_> = final_directory
+            .addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        if initial_set != final_set {
+            return Err(DeepXAccountOwnershipError::DirectoryChanged);
+        }
+        Ok(proof)
     }
 
     /// Returns validated exact lending balances for a subaccount.
@@ -4326,11 +4817,12 @@ impl DeepXHttpClient {
         &self,
         subaccount: &str,
     ) -> Result<DeepXSubaccountBalances> {
-        validate_account_address("subaccount balances", "subaccount", subaccount)?;
         #[derive(Serialize)]
         struct BalancesQuery<'a> {
             subaccount: &'a str,
         }
+
+        validate_account_address("subaccount balances", "subaccount", subaccount)?;
         let balances: DeepXSubaccountBalances = self
             .get_json_with_query(SUBACCOUNT_BALANCES_PATH, &BalancesQuery { subaccount })
             .await?;
@@ -4345,11 +4837,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid subaccount address, transport or HTTP failures, malformed
     /// responses, venue-level failures, identity mismatches, or invalid nonnegative totals.
     pub async fn get_subaccount_equity(&self, address: &str) -> Result<DeepXSubaccountEquity> {
-        validate_account_address("subaccount equity", "subaccount", address)?;
         #[derive(Serialize)]
         struct EquityQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("subaccount equity", "subaccount", address)?;
         let equity: DeepXSubaccountEquity = self
             .get_json_with_query(SUBACCOUNT_EQUITY_PATH, &EquityQuery { address })
             .await?;
@@ -4357,25 +4850,25 @@ impl DeepXHttpClient {
         Ok(equity)
     }
 
-    /// Returns exact account-wide collateral and margin-ratio data for a subaccount.
+    /// Returns account-wide displays and exact margin data for a subaccount.
     ///
-    /// The endpoint does not identify whether its margin requirement uses initial or maintenance
-    /// weights. This method therefore preserves the venue fields without constructing a Nautilus
-    /// margin balance or deriving free collateral.
+    /// The legacy numeric fields are rounded displays. The current response's exact fields identify
+    /// a maintenance requirement, but do not establish initial margin or free collateral.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid subaccount address, transport or HTTP failures, malformed
-    /// responses, venue-level failures, or negative financial values.
+    /// responses, venue-level failures, missing exact values, or inconsistent financial values.
     pub async fn get_subaccount_margin_ratio(
         &self,
         address: &str,
     ) -> Result<DeepXSubaccountMarginRatio> {
-        validate_account_address("subaccount margin ratio", "subaccount", address)?;
         #[derive(Serialize)]
         struct MarginRatioQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("subaccount margin ratio", "subaccount", address)?;
         let margin_ratio: DeepXSubaccountMarginRatio = self
             .get_json_with_query(SUBACCOUNT_MARGIN_RATIO_PATH, &MarginRatioQuery { address })
             .await?;
@@ -4395,11 +4888,12 @@ impl DeepXHttpClient {
         &self,
         address: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        validate_account_address("delegate accounts", "wallet", address)?;
         #[derive(Serialize)]
         struct DelegateQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("delegate accounts", "wallet", address)?;
         self.get_json_with_query(DELEGATE_ACCOUNTS_PATH, &DelegateQuery { address })
             .await
     }
@@ -4414,11 +4908,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, invalid or duplicate delegate addresses, or inconsistent timestamps.
     pub async fn get_delegate_accounts(&self, wallet: &str) -> Result<DeepXWalletDelegateAccounts> {
-        validate_account_address("delegate accounts", "wallet", wallet)?;
         #[derive(Serialize)]
         struct DelegateQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("delegate accounts", "wallet", wallet)?;
         let accounts: Vec<DeepXDelegateAccount> = self
             .get_json_with_query(DELEGATE_ACCOUNTS_PATH, &DelegateQuery { address: wallet })
             .await?;
@@ -4437,11 +4932,12 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid delegate address, transport or venue failures, malformed
     /// responses, invalid returned wallet addresses, or duplicate wallets.
     pub async fn get_delegator_accounts(&self, delegate: &str) -> Result<DeepXDelegateWallets> {
-        validate_account_address("delegator accounts", "delegate", delegate)?;
         #[derive(Serialize)]
         struct DelegatorQuery<'a> {
             address: &'a str,
         }
+
+        validate_account_address("delegator accounts", "delegate", delegate)?;
         let wallets: Vec<String> = self
             .get_json_with_query(
                 DELEGATOR_ACCOUNTS_PATH,
@@ -4867,6 +5363,35 @@ fn validate_perp_open_order_record(
         &request.subaccount,
         request.market_id,
     )?;
+    let size_accounted = order
+        .size_filled
+        .checked_add(order.size_remain)
+        .is_some_and(|size| size == order.size);
+    let active = match order.status.as_str() {
+        "Open" => {
+            order.size_filled.is_zero()
+                && order.size_remain == order.size
+                && order.avg_fill_price.is_none()
+        }
+        "PartiallyFilled" => {
+            !order.size_filled.is_zero()
+                && !order.size_remain.is_zero()
+                && size_accounted
+                && order
+                    .avg_fill_price
+                    .is_some_and(|price| price > Decimal::ZERO)
+        }
+        _ => false,
+    };
+    if !active {
+        return Err(invalid_account_response(
+            endpoint,
+            format!(
+                "item {index} order {} has invalid active state or quantities",
+                order.order_id
+            ),
+        ));
+    }
     if request
         .is_long
         .is_some_and(|is_long| order.is_long != is_long)
@@ -4983,6 +5508,32 @@ fn validate_spot_order_record(
     u64::try_from(created.as_millisecond())
         .map_err(|_| invalid(format!("item {index} timestamp is before the Unix epoch")))?;
     Ok(created)
+}
+
+fn validate_spot_open_order_state(index: usize, order: &DeepXSpotOrderRecord) -> Result<()> {
+    let active = match order.status.as_str() {
+        "Open" => {
+            order.base_remaining_amount == order.base_amount && order.avg_fill_price.is_none()
+        }
+        "PartiallyFilled" => {
+            order.base_remaining_amount > Decimal::ZERO
+                && order.base_remaining_amount < order.base_amount
+                && order
+                    .avg_fill_price
+                    .is_some_and(|price| price > Decimal::ZERO)
+        }
+        _ => false,
+    };
+    if !active {
+        return Err(invalid_account_response(
+            "spot open orders",
+            format!(
+                "item {index} order {} has invalid active state or quantities",
+                order.order_id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_spot_order_sequence(
@@ -5610,7 +6161,14 @@ fn validate_perp_account_trade_record(
     index: usize,
     trade: &DeepXPerpAccountTradeRecord,
     request: &DeepXPerpAccountTradesRequest,
+    previous: &mut Option<jiff::Timestamp>,
 ) -> Result<()> {
+    if trade.id == 0 {
+        return Err(invalid_account_response(
+            "perp account trades",
+            format!("item {index} has an invalid trade ID"),
+        ));
+    }
     if trade.market_id == 0
         || request
             .market_id
@@ -5666,6 +6224,19 @@ fn validate_perp_account_trade_record(
             format!("item {index} is outside the requested time range"),
         ));
     }
+    let out_of_order = previous
+        .as_ref()
+        .is_some_and(|previous| match request.sort {
+            DeepXAccountSortOrder::Ascending => created < *previous,
+            DeepXAccountSortOrder::Descending => created > *previous,
+        });
+    if out_of_order {
+        return Err(invalid_account_response(
+            "perp account trades",
+            format!("item {index} violates the requested time order"),
+        ));
+    }
+    *previous = Some(created);
     Ok(())
 }
 
@@ -6097,10 +6668,7 @@ fn validate_account_record_scope(
 }
 
 fn validate_decimal_order_id(endpoint: &'static str, index: usize, order_id: &str) -> Result<()> {
-    if order_id.is_empty()
-        || !order_id.bytes().all(|value| value.is_ascii_digit())
-        || order_id.parse::<u64>().is_err()
-    {
+    if crate::common::parse::parse_canonical_order_id(order_id).is_none() {
         return Err(invalid_account_response(
             endpoint,
             format!("item {index} has an invalid decimal order ID"),
@@ -6708,6 +7276,48 @@ fn validate_subaccount_margin_ratio(margin: &DeepXSubaccountMarginRatio) -> Resu
             "margin ratio response has negative financial values".to_string(),
         ));
     }
+    let exact = margin.exact_margin.as_ref().ok_or_else(|| {
+        invalid_account_state_response(
+            "subaccount margin ratio",
+            "margin ratio response lacks exact margin values".to_string(),
+        )
+    })?;
+    if exact.total_collateral.is_sign_negative()
+        || exact.maint_margin_req.is_sign_negative()
+        || exact.uni_mmr.is_some_and(|ratio| ratio.is_sign_negative())
+        || exact.uni_mmr.is_none() != exact.maint_margin_req.is_zero()
+    {
+        return Err(invalid_account_state_response(
+            "subaccount margin ratio",
+            "margin ratio response has invalid exact margin values".to_string(),
+        ));
+    }
+    if let Some(ratio) = exact.uni_mmr {
+        let scaled = |value: Decimal, places| {
+            let mut result = U256::from(u128::try_from(value.mantissa()).ok()?);
+            for _ in 0..places {
+                result = result.checked_mul(U256::from(10))?;
+            }
+            Some::<U256>(result)
+        };
+        let normalized = ratio.normalize();
+        let expected = scaled(exact.total_collateral, exact.maint_margin_req.scale() + 8)
+            .zip(scaled(
+                exact.maint_margin_req,
+                exact.total_collateral.scale(),
+            ))
+            .map(|(numerator, denominator)| numerator / denominator);
+        let observed = (normalized.scale() <= 8)
+            .then(|| scaled(normalized, 8 - normalized.scale()))
+            .flatten();
+        if expected.is_none() || expected != observed {
+            return Err(invalid_account_state_response(
+                "subaccount margin ratio",
+                "exact margin ratio disagrees with collateral and maintenance requirement"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -6802,9 +7412,7 @@ where
     let mut pair = None;
     let mut details = Vec::new();
     for page_index in 0..max_pages {
-        let remaining = total_limit
-            .map(|limit| limit as usize - details.len())
-            .unwrap_or(usize::MAX);
+        let remaining = total_limit.map_or(usize::MAX, |limit| limit as usize - details.len());
         if remaining == 0 {
             break;
         }
@@ -6840,7 +7448,7 @@ where
                     endpoint,
                     message: "timestamp cursor overflowed".to_string(),
                 })?;
-        if end_ms.is_some_and(|end| next_start > end) {
+        if end_ms.is_some_and(|end| next_start >= end) {
             break;
         }
         if page_index + 1 == max_pages {
@@ -6849,6 +7457,47 @@ where
     }
 
     Ok(Page::from_parts(pair.unwrap_or_default(), details))
+}
+
+fn validate_open_interest_page(
+    page: &DeepXOpenInterestPage,
+    request: &DeepXOpenInterestRequest,
+) -> Result<()> {
+    let invalid = |message: String| DeepXHttpError::InvalidHistoryResponse {
+        endpoint: "perp open-interest",
+        message,
+    };
+    if page.pair.trim().is_empty() {
+        return Err(invalid("missing pair identity".to_string()));
+    }
+    if page.details.len() > 5_000
+        || request
+            .limit
+            .is_some_and(|limit| page.details.len() > limit as usize)
+    {
+        return Err(invalid("page exceeds requested limit".to_string()));
+    }
+    let first_bucket = request.start_ms / 60_000 * 60_000;
+    let end_bucket = request.end_ms.map(|end| end / 60_000 * 60_000);
+    let mut previous = None;
+    for (index, record) in page.details.iter().enumerate() {
+        if !record.statistic_time.is_multiple_of(60_000)
+            || record.statistic_time < first_bucket
+            || end_bucket.is_some_and(|end| record.statistic_time >= end)
+            || previous.is_some_and(|time| record.statistic_time <= time)
+        {
+            return Err(invalid(format!(
+                "record {index} is outside the requested minute range or order"
+            )));
+        }
+        if record.total_oi < Decimal::ZERO || record.long_short_ratio < Decimal::ZERO {
+            return Err(invalid(format!(
+                "record {index} has negative financial values"
+            )));
+        }
+        previous = Some(record.statistic_time);
+    }
+    Ok(())
 }
 
 fn validate_candle_page(
@@ -6870,7 +7519,7 @@ fn validate_candle_page(
     }
     let mut previous = None;
     for (index, candle) in page.details.iter().enumerate() {
-        if candle.time < start_ms || end_ms.is_some_and(|end_ms| candle.time > end_ms) {
+        if candle.time < start_ms || end_ms.is_some_and(|end_ms| candle.time >= end_ms) {
             return Err(invalid(format!(
                 "candle {index} timestamp is outside the requested bounds"
             )));
@@ -6918,7 +7567,7 @@ fn validate_spot_candle_page(
     }
     let mut previous = None;
     for (index, candle) in page.details.iter().enumerate() {
-        if candle.time < request.start_ms || request.end_ms.is_some_and(|end| candle.time > end) {
+        if candle.time < request.start_ms || request.end_ms.is_some_and(|end| candle.time >= end) {
             return Err(invalid(format!(
                 "candle {index} timestamp is outside the requested bounds"
             )));
@@ -7580,7 +8229,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::http::{DeepXPerpCandleInterval, DeepXPerpVolumePeriod, models::DeepXResponseCode};
+    use crate::http::{
+        DeepXOpenInterestRecord, DeepXPerpCandleInterval, DeepXPerpVolumePeriod,
+        models::DeepXResponseCode,
+    };
 
     const PERP_VOLUME_1H_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_volume_1h.json");
@@ -7604,6 +8256,18 @@ mod tests {
         include_str!("../../test_data/http/testnet/perp_market_eth_usdc_by_id.json");
     const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_history_orders_account_market_3.json");
+
+    fn active_perp_open_order_fixture() -> serde_json::Value {
+        let mut response: serde_json::Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        for item in response["data"]["items"].as_array_mut().unwrap() {
+            item["status"] = json!("Open");
+            item["sizeFilled"] = json!(0);
+            item["sizeRemain"] = item["size"].clone();
+            item["avgFillPrice"] = serde_json::Value::Null;
+        }
+        response
+    }
     const SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/spot_history_orders_eth_usdc_page_1.json");
     const SPOT_ACCOUNT_TRADES_ETH_USDC_RESPONSE: &str =
@@ -7649,7 +8313,7 @@ mod tests {
     const SUBACCOUNT_EQUITY_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/subaccount_equity.json");
     const SUBACCOUNT_MARGIN_RATIO_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/subaccount_margin_ratio.json");
+        include_str!("../../test_data/http/testnet/subaccount_margin_ratio_exact.json");
     const WALLET_BALANCE_CHANGES_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/wallet_balance_changes_page_2.json");
     const WALLET_LIQUIDATION_RECORDS_RESPONSE: &str =
@@ -8370,8 +9034,7 @@ mod tests {
 
     #[tokio::test]
     async fn perp_open_order_pages_follow_cursor_and_reject_cross_page_duplicates() {
-        let captured: serde_json::Value =
-            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let captured = active_perp_open_order_fixture();
         let first_item = captured["data"]["items"][0].clone();
         let second_item = captured["data"]["items"][1].clone();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -8446,7 +9109,49 @@ mod tests {
     }
 
     #[rstest]
+    #[case("Open", "0", "0.3", "null", true)]
+    #[case("PartiallyFilled", "0.1", "0.2", "2499.6", true)]
+    #[case("Filled", "0.3", "0", "2499.6", false)]
+    #[case("Canceled", "0", "0.3", "null", false)]
+    #[case("Rejected", "0", "0.3", "null", false)]
+    #[case("Expired", "0", "0.3", "null", false)]
+    #[case("Unknown", "0", "0.3", "null", false)]
+    #[case("Open", "0.1", "0.2", "2499.6", false)]
+    #[case("Open", "0", "0.3", "2499.6", false)]
+    #[case("PartiallyFilled", "0.3", "0", "2499.6", false)]
+    #[case("PartiallyFilled", "0.1", "0.1", "2499.6", false)]
+    #[case("PartiallyFilled", "0.1", "0.2", "null", false)]
+    fn perp_open_orders_require_active_status_and_exact_size_accounting(
+        #[case] status: &str,
+        #[case] filled: &str,
+        #[case] remaining: &str,
+        #[case] average: &str,
+        #[case] expected: bool,
+    ) {
+        let mut item = active_perp_open_order_fixture()["data"]["items"][0].clone();
+        item["status"] = json!(status);
+        item["sizeFilled"] = serde_json::from_str(filled).unwrap();
+        item["sizeRemain"] = serde_json::from_str(remaining).unwrap();
+        item["avgFillPrice"] = serde_json::from_str(average).unwrap();
+        let order: DeepXPerpOrderRecord = serde_json::from_value(item).unwrap();
+        let request = DeepXPerpOpenOrdersRequest {
+            subaccount: order.owner.clone(),
+            market_id: Some(order.market_id),
+            is_long: None,
+            cursor: None,
+            page_size: Some(10),
+            sort: DeepXAccountSortOrder::Descending,
+        };
+
+        assert_eq!(
+            validate_perp_open_order_record(0, &order, &request, &mut None).is_ok(),
+            expected
+        );
+    }
+
+    #[rstest]
     fn perp_order_pages_reject_side_and_time_order_mismatches() {
+        let open_response = active_perp_open_order_fixture().to_string();
         let request = DeepXPerpOpenOrdersRequest {
             subaccount: "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string(),
             market_id: Some(3),
@@ -8458,7 +9163,7 @@ mod tests {
         let mut previous = None;
         let side_error = decode_account_page::<DeepXPerpOrderRecord, _>(
             "perp open orders",
-            raw_account_fixture(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE),
+            raw_account_fixture(&open_response),
             request.page_size,
             |index, order| validate_perp_open_order_record(index, order, &request, &mut previous),
         )
@@ -8471,8 +9176,7 @@ mod tests {
             }
         ));
 
-        let mut reversed: serde_json::Value =
-            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut reversed = active_perp_open_order_fixture();
         reversed["data"]["items"].as_array_mut().unwrap().reverse();
         let reversed_page =
             serde_json::from_value::<DeepXRawAccountPage>(reversed["data"].clone()).unwrap();
@@ -8592,6 +9296,103 @@ mod tests {
         assert_eq!(history.items[0].price, Decimal::new(245_605, 2));
         assert_eq!(history.items[0].base_amount, Decimal::new(8_849, 4));
         assert_eq!(history.items[0].fee, Decimal::ZERO);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case("Open", "0.8849", "null", true)]
+    #[case("PartiallyFilled", "0.4", "2456.05", true)]
+    #[case("Filled", "0", "2456.05", false)]
+    #[case("Canceled", "0.8849", "null", false)]
+    #[case("Rejected", "0.8849", "null", false)]
+    #[case("Expired", "0.8849", "null", false)]
+    #[case("Unknown", "0.8849", "null", false)]
+    #[case("Open", "0.4", "2456.05", false)]
+    #[case("Open", "0.8849", "2456.05", false)]
+    #[case("PartiallyFilled", "0.8849", "2456.05", false)]
+    #[case("PartiallyFilled", "0", "2456.05", false)]
+    #[case("PartiallyFilled", "0.4", "null", false)]
+    fn spot_open_orders_require_active_status_and_remaining_quantity(
+        #[case] status: &str,
+        #[case] remaining: &str,
+        #[case] average: &str,
+        #[case] expected: bool,
+    ) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE).unwrap();
+        let mut item = fixture["data"]["items"][0].clone();
+        item["status"] = json!(status);
+        item["baseRemainingAmount"] = serde_json::from_str(remaining).unwrap();
+        item["avgFillPrice"] = serde_json::from_str(average).unwrap();
+        let order: DeepXSpotOrderRecord = serde_json::from_value(item).unwrap();
+
+        assert_eq!(validate_spot_open_order_state(0, &order).is_ok(), expected);
+    }
+
+    #[tokio::test]
+    async fn spot_active_endpoint_rejects_closed_record_without_restricting_history() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE).unwrap();
+        fixture["data"]["items"] = json!([fixture["data"]["items"][0].clone()]);
+        fixture["data"]["items"][0]["status"] = json!("Canceled");
+        fixture["data"]["hasNext"] = json!(false);
+        fixture["data"]["nextCursor"] = serde_json::Value::Null;
+        let app = Router::new()
+            .route(
+                SPOT_OPEN_ORDERS_PATH,
+                get({
+                    let response = fixture.clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            )
+            .route(
+                SPOT_HISTORY_ORDERS_PATH,
+                get(move || {
+                    let response = fixture.clone();
+                    async move { Json(response) }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let subaccount = "0x08bdb660e03c75954e0fcaa1e7ead150a92c891c".to_string();
+
+        let open = client
+            .get_spot_open_orders(&DeepXSpotOpenOrdersRequest {
+                subaccount: subaccount.clone(),
+                name: Some("ETH/USDC".to_string()),
+                pair: None,
+                order_side: None,
+                cursor: None,
+                sort: DeepXAccountSortOrder::Descending,
+                page_size: Some(3),
+            })
+            .await;
+        assert!(matches!(
+            open,
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "spot open orders",
+                ..
+            })
+        ));
+
+        let history = client
+            .get_spot_history_orders(&DeepXSpotHistoryOrdersRequest {
+                subaccount,
+                name: Some("ETH/USDC".to_string()),
+                pair: None,
+                order_side: None,
+                cursor: None,
+                sort: DeepXAccountSortOrder::Descending,
+                page_size: Some(3),
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.items[0].status, "Canceled");
         server.abort();
     }
 
@@ -9589,11 +10390,19 @@ mod tests {
             |index, order| validate_perp_order_record(index, order, &orders_request),
         )
         .unwrap();
+        let mut previous_trade = None;
         let trades = decode_account_page(
             "perp account trades",
             raw_account_fixture(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE),
             trades_request.page_size,
-            |index, trade| validate_perp_account_trade_record(index, trade, &trades_request),
+            |index, trade| {
+                validate_perp_account_trade_record(
+                    index,
+                    trade,
+                    &trades_request,
+                    &mut previous_trade,
+                )
+            },
         )
         .unwrap();
         let positions = decode_account_page(
@@ -9612,6 +10421,68 @@ mod tests {
             positions.items[0].pnl,
             Decimal::new(-4_018_472_999_999_176, 16)
         );
+    }
+
+    #[rstest]
+    fn perp_account_trade_rejects_zero_trade_id() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let mut trade: DeepXPerpAccountTradeRecord =
+            serde_json::from_value(fixture["data"]["items"][0].clone()).unwrap();
+        trade.id = 0;
+        let request = DeepXPerpAccountTradesRequest {
+            subaccount: "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string(),
+            order_id: None,
+            market_id: Some(3),
+            is_long: None,
+            cursor: None,
+            sort: crate::http::DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(10),
+        };
+
+        let error = validate_perp_account_trade_record(0, &trade, &request, &mut None).unwrap_err();
+        assert!(error.to_string().contains("item 0 has an invalid trade ID"));
+    }
+
+    #[rstest]
+    fn perp_account_trade_page_boundaries_preserve_requested_time_order() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let newer: DeepXPerpAccountTradeRecord =
+            serde_json::from_value(fixture["data"]["items"][0].clone()).unwrap();
+        let older: DeepXPerpAccountTradeRecord =
+            serde_json::from_value(fixture["data"]["items"][1].clone()).unwrap();
+        let mut request = DeepXPerpAccountTradesRequest {
+            subaccount: "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string(),
+            order_id: None,
+            market_id: Some(3),
+            is_long: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(1),
+        };
+        let mut previous = None;
+        validate_perp_account_trade_record(0, &newer, &request, &mut previous).unwrap();
+        validate_perp_account_trade_record(0, &older, &request, &mut previous).unwrap();
+        let boundary = previous;
+        assert!(matches!(
+            validate_perp_account_trade_record(0, &newer, &request, &mut previous),
+            Err(DeepXHttpError::InvalidHistoryResponse { .. })
+        ));
+        assert_eq!(previous, boundary);
+
+        request.sort = DeepXAccountSortOrder::Ascending;
+        previous = None;
+        validate_perp_account_trade_record(0, &older, &request, &mut previous).unwrap();
+        validate_perp_account_trade_record(0, &newer, &request, &mut previous).unwrap();
+        assert!(matches!(
+            validate_perp_account_trade_record(0, &older, &request, &mut previous),
+            Err(DeepXHttpError::InvalidHistoryResponse { .. })
+        ));
     }
 
     #[rstest]
@@ -9647,11 +10518,19 @@ mod tests {
             end_ms: None,
             page_size: Some(10),
         };
+        let mut previous_trade = None;
         let trade_error = decode_account_page::<DeepXPerpAccountTradeRecord, _>(
             "perp account trades",
             raw_account_fixture(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE),
             trades_request.page_size,
-            |index, trade| validate_perp_account_trade_record(index, trade, &trades_request),
+            |index, trade| {
+                validate_perp_account_trade_record(
+                    index,
+                    trade,
+                    &trades_request,
+                    &mut previous_trade,
+                )
+            },
         )
         .unwrap_err();
         assert!(matches!(
@@ -9696,6 +10575,7 @@ mod tests {
         let duplicate_page =
             serde_json::from_value::<DeepXRawAccountPage>(duplicate["data"].clone()).unwrap();
         let mut trade_ids = HashSet::new();
+        let mut previous_trade = None;
         let duplicate_error = decode_account_page::<DeepXPerpAccountTradeRecord, _>(
             "perp account trades",
             duplicate_page,
@@ -9715,6 +10595,7 @@ mod tests {
                         end_ms: None,
                         page_size: Some(10),
                     },
+                    &mut previous_trade,
                 )?;
                 validate_unique_account_identity(
                     "perp account trades",
@@ -9734,10 +10615,14 @@ mod tests {
 
     #[tokio::test]
     async fn typed_account_readers_validate_captured_transport_responses() {
+        let open_response = active_perp_open_order_fixture();
         let app = Router::new()
             .route(
                 PERP_OPEN_ORDERS_PATH,
-                get(|| async { PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE }),
+                get(move || {
+                    let response = open_response.clone();
+                    async move { Json(response) }
+                }),
             )
             .route(
                 PERP_HISTORY_ORDERS_PATH,
@@ -9782,7 +10667,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(open_orders.items, orders.items);
+        assert_eq!(open_orders.items.len(), orders.items.len());
+        assert!(open_orders.items.iter().all(|order| order.status == "Open"));
         let trades = client
             .get_perp_account_trades(&DeepXPerpAccountTradesRequest {
                 subaccount: subaccount.to_string(),
@@ -9890,6 +10776,14 @@ mod tests {
         assert_eq!(margin.collateral, Decimal::new(97_096, 2));
         assert_eq!(margin.margin_required, Decimal::ZERO);
         assert_eq!(margin.margin_ratio, None);
+        assert_eq!(
+            margin.exact_margin.as_ref().unwrap().total_collateral,
+            Decimal::new(970_964_181, 6)
+        );
+        assert_eq!(
+            margin.exact_margin.as_ref().unwrap().maint_margin_req,
+            Decimal::ZERO
+        );
         server.abort();
     }
 
@@ -10127,6 +11021,42 @@ mod tests {
         server.abort();
     }
 
+    #[rstest]
+    #[case(r#"{"id":42,"status":"submitted"}"#, "valid")]
+    #[case(r#"{"id":43,"status":"submitted"}"#, "mismatch")]
+    #[case(r#"{"status":"submitted"}"#, "decode")]
+    #[case(r#"{"id":"42","status":"submitted"}"#, "decode")]
+    #[tokio::test]
+    async fn quota_claim_raw_binds_requested_identity(#[case] data: &str, #[case] outcome: &str) {
+        use axum::extract::RawQuery;
+
+        let response = format!(r#"{{"code":200,"data":{data},"fail":false,"msg":"success"}}"#);
+        let app = Router::new().route(
+            QUOTA_CLAIM_PATH,
+            get(move |RawQuery(query): RawQuery| {
+                let response = response.clone();
+                async move {
+                    assert_eq!(query.as_deref(), Some("id=42"));
+                    response
+                }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(app).await, Some(2), None).unwrap();
+        let result = client.get_quota_claim_raw(42).await;
+        match outcome {
+            "valid" => assert_eq!(result.unwrap().get(), data),
+            "mismatch" => assert!(matches!(
+                result,
+                Err(DeepXHttpError::InvalidAccountResponse {
+                    endpoint: "quota claim",
+                    ..
+                })
+            )),
+            "decode" => assert!(matches!(result, Err(DeepXHttpError::Decode(_)))),
+            _ => panic!("unexpected quota-claim test case"),
+        }
+    }
+
     #[tokio::test]
     async fn quota_history_reader_validates_captured_purchase() {
         let app = Router::new().route(
@@ -10168,13 +11098,13 @@ mod tests {
         match mutation {
             "id" => record.id.clear(),
             "owner" => {
-                record.owner_address = "0x1111111111111111111111111111111111111111".to_string()
+                record.owner_address = "0x1111111111111111111111111111111111111111".to_string();
             }
             "type-filter" => request.history_type = Some(DeepXQuotaHistoryType::Free),
             "buyer-missing" => record.buyer_address = None,
             "buyer-filter" => {
                 request.buyer_address =
-                    Some("0x1111111111111111111111111111111111111111".to_string())
+                    Some("0x1111111111111111111111111111111111111111".to_string());
             }
             "quota" => record.quota = 0,
             "block" => record.block_number = 0,
@@ -10323,7 +11253,7 @@ mod tests {
             serde_json::from_str(WALLET_QUOTA_SUMMARY_RESPONSE).unwrap();
         match mutation {
             "owner" => {
-                response["data"]["owner"] = json!("0x1111111111111111111111111111111111111111")
+                response["data"]["owner"] = json!("0x1111111111111111111111111111111111111111");
             }
             "spot-volume" => response["data"]["spotVolumeUsd"] = json!("-1"),
             "perp-volume" => response["data"]["perpVolumeUsd"] = json!("-1"),
@@ -10405,7 +11335,7 @@ mod tests {
             serde_json::from_str(PERP_LIQUIDATION_PRICE_RESPONSE).unwrap();
         match mutation {
             "address" => {
-                response["data"]["address"] = json!("0x1111111111111111111111111111111111111111")
+                response["data"]["address"] = json!("0x1111111111111111111111111111111111111111");
             }
             "market-id" => response["data"]["marketId"] = json!(4),
             "market-name" => response["data"]["marketName"] = json!(""),
@@ -10651,6 +11581,218 @@ mod tests {
             client.get_liquidation_records_raw(&request).await,
             Err(DeepXHttpError::InvalidRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_liquidation_execution_pages_use_documented_route_and_global_cursor() {
+        const WALLET: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
+        let app = Router::new().route(
+            LIQUIDATION_EXECUTION_RECORDS_PATH,
+            get(
+                |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(query["wallet"], WALLET);
+                    assert_eq!(query["sort"], "DESC");
+                    assert_eq!(query["pageSize"], "1");
+                    assert!(!query.contains_key("subaccount"));
+                    if query
+                        .get("status")
+                        .is_some_and(|status| status == "oversized")
+                    {
+                        return Json(json!({
+                            "code": 200,
+                            "msg": "success",
+                            "fail": false,
+                            "data": {
+                                "items": [{"id": 1}, {"id": 2}],
+                                "hasNext": false,
+                                "nextCursor": null,
+                            },
+                        }));
+                    }
+                    if let Some(cursor) = query.get("cursor") {
+                        assert_eq!(cursor, "next-1");
+                        Json(json!({
+                            "code": 200,
+                            "msg": "success",
+                            "fail": false,
+                            "data": {
+                                "items": [{"id": 2, "taskType": "liquidation"}],
+                                "hasNext": false,
+                                "nextCursor": null,
+                            },
+                        }))
+                    } else {
+                        Json(json!({
+                            "code": 200,
+                            "msg": "success",
+                            "fail": false,
+                            "data": {
+                                "items": [{
+                                    "id": 1,
+                                    "taskType": "liquidation",
+                                    "rawAmount": 9_007_199_254_740_993_u64,
+                                }],
+                                "hasNext": true,
+                                "nextCursor": "next-1",
+                            },
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let request = DeepXLiquidationExecutionRecordsRequest {
+            wallet: Some(WALLET.to_string()),
+            subaccount: None,
+            status: None,
+            reason: None,
+            tx_hash: None,
+            extrinsic_hash: None,
+            trigger_block_from: None,
+            trigger_block_to: None,
+            start_ms: None,
+            end_ms: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            page_size: Some(1),
+        };
+
+        let first = client
+            .get_liquidation_execution_records_raw(&request)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert!(first.items[0].get().contains("9007199254740993"));
+        let pages = client
+            .get_liquidation_execution_record_pages_raw(&request, 2)
+            .await
+            .unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1].items.len(), 1);
+        assert!(matches!(
+            client
+                .get_liquidation_execution_record_pages_raw(&request, 1)
+                .await,
+            Err(DeepXHttpError::PaginationLimitExceeded { max_pages: 1 })
+        ));
+        let mut oversized = request.clone();
+        oversized.status = Some("oversized".to_string());
+        assert!(matches!(
+            client
+                .get_liquidation_execution_records_raw(&oversized)
+                .await,
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "liquidation execution records",
+                ..
+            })
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ordinary_liquidation_execution_accepts_observed_empty_wallet_page() {
+        let app = Router::new().route(
+            LIQUIDATION_EXECUTION_RECORDS_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {"items": [], "nextCursor": null, "hasNext": false},
+                    "fail": false,
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let page = client
+            .get_liquidation_execution_records_raw(&DeepXLiquidationExecutionRecordsRequest {
+                wallet: Some("0x781ed35b167068c93dfadab41dfb680edaca4e50".to_string()),
+                subaccount: None,
+                status: None,
+                reason: None,
+                tx_hash: None,
+                extrinsic_hash: None,
+                trigger_block_from: None,
+                trigger_block_to: None,
+                start_ms: None,
+                end_ms: None,
+                cursor: None,
+                sort: DeepXAccountSortOrder::Descending,
+                page_size: Some(100),
+            })
+            .await
+            .unwrap();
+
+        assert!(page.items.is_empty());
+        assert!(!page.has_next);
+        assert!(page.next_cursor.is_none());
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(LIQUIDATION_CRANKER_RECORDS_PATH, "liquidation cranker records")]
+    #[case(LIQUIDATION_TP_SL_RECORDS_PATH, "liquidation TP/SL records")]
+    #[tokio::test]
+    async fn execution_record_routes_reject_pages_larger_than_requested(
+        #[case] path: &'static str,
+        #[case] endpoint: &'static str,
+    ) {
+        let app = Router::new().route(
+            path,
+            get(
+                |Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(query["pageSize"], "1");
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "fail": false,
+                        "data": {
+                            "items": [{"id": 1}, {"id": 2}],
+                            "hasNext": false,
+                            "nextCursor": null,
+                        },
+                    }))
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let request = DeepXLiquidationExecutionRecordsRequest {
+            wallet: Some("0x781ed35b167068c93dfadab41dfb680edaca4e50".to_string()),
+            subaccount: None,
+            status: None,
+            reason: None,
+            tx_hash: None,
+            extrinsic_hash: None,
+            trigger_block_from: None,
+            trigger_block_to: None,
+            start_ms: None,
+            end_ms: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            page_size: Some(1),
+        };
+        let result = if path == LIQUIDATION_CRANKER_RECORDS_PATH {
+            client.get_liquidation_cranker_records_raw(&request).await
+        } else {
+            client.get_liquidation_tp_sl_records_raw(&request).await
+        };
+        assert!(matches!(
+            result,
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: found,
+                ..
+            }) if found == endpoint
+        ));
+        server.abort();
     }
 
     #[rstest]
@@ -11043,6 +12185,113 @@ mod tests {
     }
 
     #[rstest]
+    #[case::complete("complete")]
+    #[case::duplicate("duplicate")]
+    #[case::reversed_time("reversed-time")]
+    #[case::changed_market_name("changed-market-name")]
+    #[case::missing_group("missing-group")]
+    #[case::repeated_cursor("repeated-cursor")]
+    #[case::budget("budget")]
+    #[tokio::test]
+    async fn perp_wallet_trade_collector_follows_only_selected_group_cursor(#[case] outcome: &str) {
+        let mut first: serde_json::Value =
+            serde_json::from_str(PERP_WALLET_TRADES_RESPONSE).unwrap();
+        first["data"].as_array_mut().unwrap().truncate(1);
+        let selected = "0x977654069311fa41b88f7901dc65fae9a76fd60b";
+        let cursor = first["data"][0]["subaccounts"][2]["trades"]["nextCursor"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut terminal = first.clone();
+        let group = &mut terminal["data"][0]["subaccounts"][2];
+        for (index, trade) in group["trades"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            trade["id"] = json!(52_780_136_000_283_u64 - index as u64 * 9);
+        }
+        group["trades"]["nextCursor"] = serde_json::Value::Null;
+        group["trades"]["hasNext"] = json!(false);
+        match outcome {
+            "duplicate" => {
+                group["trades"]["items"][0]["id"] =
+                    first["data"][0]["subaccounts"][2]["trades"]["items"][4]["id"].clone();
+            }
+            "reversed-time" => {
+                group["trades"]["items"][0]["createdAt"] = json!("2026-06-01T00:00:00Z");
+            }
+            "changed-market-name" => {
+                terminal["data"][0]["marketName"] = json!("OTHER-USDC");
+            }
+            "missing-group" => {
+                terminal["data"][0]["subaccounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(2);
+            }
+            "repeated-cursor" => group["trades"]["nextCursor"] = json!(cursor.clone()),
+            "complete" | "budget" => {}
+            _ => unreachable!(),
+        }
+        if outcome == "repeated-cursor" {
+            terminal["data"][0]["subaccounts"][2]["trades"]["hasNext"] = json!(true);
+        }
+        let app = Router::new().route(
+            PERP_WALLET_TRADES_PATH,
+            get(
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let first = first.clone();
+                    let terminal = terminal.clone();
+                    let cursor = cursor.clone();
+                    async move {
+                        if let Some(received) = query.get("cursor") {
+                            assert_eq!(received, &cursor);
+                            Json(terminal)
+                        } else {
+                            Json(first)
+                        }
+                    }
+                },
+            ),
+        );
+        let client = DeepXHttpClient::new(spawn_server(app).await, Some(5), None).unwrap();
+        let mut request = perp_wallet_trades_request();
+        request.market_id = Some(3);
+        let result = client
+            .get_perp_wallet_trade_pages_for_subaccount(
+                &request,
+                selected,
+                "ETH-USDC",
+                if outcome == "budget" { 1 } else { 2 },
+            )
+            .await;
+        match outcome {
+            "complete" => {
+                let pages = result.unwrap();
+                assert_eq!(pages.len(), 2);
+                assert_eq!(pages[0].items.len(), 5);
+                assert_eq!(pages[1].items.len(), 5);
+                assert_eq!(pages[1].items[0].id, 52_780_136_000_283);
+                assert!(!pages[1].has_next);
+            }
+            "repeated-cursor" => assert!(matches!(
+                result,
+                Err(DeepXHttpError::RepeatedPaginationCursor { .. })
+            )),
+            "budget" => assert!(matches!(
+                result,
+                Err(DeepXHttpError::PaginationLimitExceeded { .. })
+            )),
+            _ => assert!(matches!(
+                result,
+                Err(DeepXHttpError::InvalidHistoryResponse { .. })
+            )),
+        }
+    }
+
+    #[rstest]
     #[case("duplicate-market")]
     #[case("empty-subaccounts")]
     #[case("invalid-subaccount")]
@@ -11378,8 +12627,10 @@ mod tests {
 
     #[rstest]
     #[case("valid")]
+    #[case("foreign-stats")]
     #[case("foreign-equity")]
     #[case("negative-margin")]
+    #[case("changed-directory")]
     #[tokio::test]
     async fn wallet_account_snapshot_is_complete_or_returns_no_value(#[case] scenario: &str) {
         let wallet = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
@@ -11390,6 +12641,16 @@ mod tests {
             "data": [subaccount],
             "fail": false,
         });
+        let directory_reads = Arc::new(AtomicUsize::new(0));
+        let changed_directory = scenario == "changed-directory";
+        let mut stats: serde_json::Value =
+            serde_json::from_str(WALLET_USER_STATS_RESPONSE).unwrap();
+        stats["data"]["subaccounts"] = json!([if scenario == "foreign-stats" {
+            "0x1111111111111111111111111111111111111111"
+        } else {
+            subaccount
+        }]);
+        stats["data"]["numberOfSubAccounts"] = json!(1);
         let mut equity: serde_json::Value =
             serde_json::from_str(SUBACCOUNT_EQUITY_RESPONSE).unwrap();
         if scenario == "foreign-equity" {
@@ -11405,7 +12666,21 @@ mod tests {
                 WALLET_SUBACCOUNTS_PATH,
                 get(move || {
                     let directory = directory.clone();
-                    async move { Json(directory) }
+                    let directory_reads = directory_reads.clone();
+                    async move {
+                        let mut response = directory;
+                        if changed_directory && directory_reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                            response["data"] = json!([]);
+                        }
+                        Json(response)
+                    }
+                }),
+            )
+            .route(
+                USER_STATS_PATH,
+                get(move || {
+                    let stats = stats.clone();
+                    async move { Json(stats) }
                 }),
             )
             .route(
@@ -11437,7 +12712,15 @@ mod tests {
 
         let result = client.get_wallet_account_snapshot(wallet).await;
 
-        if scenario == "foreign-equity" {
+        if scenario == "foreign-stats" {
+            assert!(matches!(
+                result,
+                Err(DeepXHttpError::InvalidAccountResponse {
+                    endpoint: "wallet account snapshot",
+                    ..
+                })
+            ));
+        } else if scenario == "foreign-equity" {
             assert!(matches!(
                 result,
                 Err(DeepXHttpError::InvalidAccountResponse {
@@ -11453,10 +12736,19 @@ mod tests {
                     ..
                 })
             ));
+        } else if scenario == "changed-directory" {
+            assert!(matches!(
+                result,
+                Err(DeepXHttpError::InvalidAccountResponse {
+                    endpoint: "wallet account snapshot",
+                    ..
+                })
+            ));
         } else {
             let snapshot = result.unwrap();
             assert_eq!(snapshot.directory.wallet(), wallet);
             assert_eq!(snapshot.directory.addresses, [subaccount]);
+            assert_eq!(snapshot.stats.subaccounts, [subaccount]);
             assert_eq!(snapshot.subaccounts.len(), 1);
             assert_eq!(snapshot.subaccounts[0].profile.address, subaccount);
             assert_eq!(snapshot.subaccounts[0].balances.address, subaccount);
@@ -11469,8 +12761,13 @@ mod tests {
         server.abort();
     }
 
+    #[rstest]
+    #[case::stable(false)]
+    #[case::changed(true)]
     #[tokio::test]
-    async fn account_ownership_proof_queries_the_derived_wallet_and_configured_subaccount() {
+    async fn account_ownership_proof_queries_the_derived_wallet_and_configured_subaccount(
+        #[case] changed: bool,
+    ) {
         let key = crate::common::DeepXPrivateKey::new(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             &crate::common::DeepXKeyScheme::Secp256k1,
@@ -11481,6 +12778,8 @@ mod tests {
         let subaccount = "0x1111111111111111111111111111111111111111".to_string();
         let directory_wallet = wallet.clone();
         let directory_subaccount = subaccount.clone();
+        let directory_reads = Arc::new(AtomicUsize::new(0));
+        let observed_directory_reads = directory_reads.clone();
         let profile_wallet = wallet.clone();
         let profile_subaccount = subaccount.clone();
         let app = Router::new()
@@ -11490,12 +12789,19 @@ mod tests {
                     move |Query(query): Query<std::collections::HashMap<String, String>>| {
                         let wallet = directory_wallet.clone();
                         let subaccount = directory_subaccount.clone();
+                        let directory_reads = directory_reads.clone();
                         async move {
                             assert_eq!(query.get("address"), Some(&wallet));
+                            let read_index = directory_reads.fetch_add(1, Ordering::SeqCst);
+                            let addresses = if changed && read_index > 0 {
+                                vec![]
+                            } else {
+                                vec![subaccount]
+                            };
                             Json(json!({
                                 "code": 200,
                                 "msg": "success",
-                                "data": [subaccount],
+                                "data": addresses,
                                 "fail": false,
                             }))
                         }
@@ -11536,13 +12842,19 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
 
-        let proof = client
-            .get_account_ownership_proof(&key, &subaccount)
-            .await
-            .unwrap();
+        let result = client.get_account_ownership_proof(&key, &subaccount).await;
 
-        assert_eq!(proof.signer(), signer);
-        assert_eq!(proof.subaccount(), [0x11; 20]);
+        if changed {
+            assert!(matches!(
+                result,
+                Err(DeepXAccountOwnershipError::DirectoryChanged)
+            ));
+        } else {
+            let proof = result.unwrap();
+            assert_eq!(proof.signer(), signer);
+            assert_eq!(proof.subaccount(), [0x11; 20]);
+        }
+        assert_eq!(observed_directory_reads.load(Ordering::SeqCst), 2);
         server.abort();
     }
 
@@ -11621,6 +12933,44 @@ mod tests {
         .unwrap()
         .data;
         margin.margin_required = Decimal::NEGATIVE_ONE;
+        assert!(matches!(
+            validate_subaccount_margin_ratio(&margin),
+            Err(DeepXHttpError::InvalidAccountResponse { .. })
+        ));
+
+        margin.margin_required = Decimal::ZERO;
+        margin.exact_margin.as_mut().unwrap().maint_margin_req = Decimal::ONE;
+        assert!(matches!(
+            validate_subaccount_margin_ratio(&margin),
+            Err(DeepXHttpError::InvalidAccountResponse { .. })
+        ));
+        margin.exact_margin.as_mut().unwrap().total_collateral = Decimal::ZERO;
+        margin.exact_margin.as_mut().unwrap().uni_mmr = Some(Decimal::ZERO);
+        assert!(validate_subaccount_margin_ratio(&margin).is_ok());
+        margin.exact_margin.as_mut().unwrap().total_collateral = Decimal::ONE;
+        margin.exact_margin.as_mut().unwrap().maint_margin_req = Decimal::new(3, 0);
+        margin.exact_margin.as_mut().unwrap().uni_mmr = Some(Decimal::new(33_333_333, 8));
+        assert!(validate_subaccount_margin_ratio(&margin).is_ok());
+        margin.exact_margin.as_mut().unwrap().total_collateral = Decimal::new(101, 2);
+        margin.exact_margin.as_mut().unwrap().uni_mmr = Some(Decimal::new(33_666_666, 8));
+        assert!(validate_subaccount_margin_ratio(&margin).is_ok());
+        margin.exact_margin.as_mut().unwrap().uni_mmr = Some(Decimal::new(33_666_667, 8));
+        assert!(matches!(
+            validate_subaccount_margin_ratio(&margin),
+            Err(DeepXHttpError::InvalidAccountResponse { .. })
+        ));
+        margin.exact_margin.as_mut().unwrap().maint_margin_req = Decimal::ZERO;
+        assert!(matches!(
+            validate_subaccount_margin_ratio(&margin),
+            Err(DeepXHttpError::InvalidAccountResponse { .. })
+        ));
+        margin.exact_margin.as_mut().unwrap().uni_mmr = None;
+        margin.exact_margin.as_mut().unwrap().total_collateral = Decimal::NEGATIVE_ONE;
+        assert!(matches!(
+            validate_subaccount_margin_ratio(&margin),
+            Err(DeepXHttpError::InvalidAccountResponse { .. })
+        ));
+        margin.exact_margin = None;
         assert!(matches!(
             validate_subaccount_margin_ratio(&margin),
             Err(DeepXHttpError::InvalidAccountResponse { .. })
@@ -13313,9 +14663,7 @@ mod tests {
                 get(|RawQuery(query): RawQuery| async move {
                     assert_eq!(
                         query.as_deref(),
-                        Some(concat!(
-                            "pair=0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
-                        ))
+                        Some("pair=0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
                     );
                     SPOT_MARKET_ETH_USDC_RESPONSE
                 }),
@@ -13694,6 +15042,7 @@ mod tests {
     #[case("order")]
     #[case("price")]
     #[case("volume")]
+    #[case("end")]
     fn spot_candles_reject_invalid_response_semantics(#[case] mutation: &str) {
         let response: DeepXApiResponse<DeepXSpotCandlesPage> =
             serde_json::from_str(SPOT_CANDLES_ETH_USDC_RESPONSE).unwrap();
@@ -13712,6 +15061,7 @@ mod tests {
             "order" => page.details[1].time = page.details[0].time,
             "price" => page.details[0].low = Decimal::ZERO,
             "volume" => page.details[0].volume = Decimal::NEGATIVE_ONE,
+            "end" => request.end_ms = Some(page.details.last().unwrap().time),
             _ => unreachable!(),
         }
 
@@ -14626,7 +15976,7 @@ mod tests {
             market_id: 3,
             interval: DeepXPerpCandleInterval::OneMinute,
             start_ms: 1_000,
-            end_ms: Some(6_001),
+            end_ms: Some(6_002),
             limit: None,
         };
 
@@ -14642,6 +15992,42 @@ mod tests {
         assert_eq!(history.details[5_000].time, 6_000);
         assert_eq!(history.details[5_001].time, 6_001);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn exclusive_candle_end_stops_after_a_full_final_page() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let page = DeepXPerpCandlesPage {
+            pair: "ETH-USDC".to_string(),
+            details: (1_000..6_000)
+                .map(|time| DeepXPerpCandle {
+                    volume: Decimal::ONE,
+                    high: Decimal::ONE,
+                    low: Decimal::ONE,
+                    open: Decimal::ONE,
+                    close: Decimal::ONE,
+                    time,
+                })
+                .collect(),
+        };
+        let fetched = collect_candle_history(
+            "perp candle history",
+            1_000,
+            Some(6_000),
+            None,
+            1,
+            |start, limit| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(start, 1_000);
+                assert_eq!(limit, CANDLE_PAGE_SIZE);
+                let page = page.clone();
+                async move { Ok(page) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.details.len(), CANDLE_PAGE_SIZE as usize);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -14696,7 +16082,7 @@ mod tests {
             pair: None,
             interval: DeepXPerpCandleInterval::OneMinute,
             start_ms: 1_000,
-            end_ms: Some(6_001),
+            end_ms: Some(6_002),
             limit: None,
         };
 
@@ -14770,7 +16156,10 @@ mod tests {
         candle.time += 180_000;
         candle.volume = Decimal::ZERO;
         page.details.push(candle);
-        validate_candle_page("test history", &page, 60_000, Some(240_000), Some(2)).unwrap();
+        validate_candle_page("test history", &page, 60_000, Some(240_001), Some(2)).unwrap();
+        assert!(
+            validate_candle_page("test history", &page, 60_000, Some(240_000), Some(2),).is_err()
+        );
         assert_eq!(page.details[0].volume.to_string(), "1.000000000000000001");
         page.details.clear();
         validate_candle_page("test history", &page, 60_000, Some(240_000), None).unwrap();
@@ -15195,6 +16584,268 @@ mod tests {
         assert_eq!(page.details[0].statistic_time, 1_788_251_280_000);
     }
 
+    #[rstest]
+    #[case("pair")]
+    #[case("duplicate")]
+    #[case("descending")]
+    #[case("before-start")]
+    #[case("at-end")]
+    #[case("negative-oi")]
+    #[case("negative-ratio")]
+    fn open_interest_page_rejects_invalid_scope_order_and_values(#[case] mutation: &str) {
+        const START: u64 = 1_788_251_280_000;
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: START + 1,
+            end_ms: Some(START + 180_001),
+            limit: Some(2),
+        };
+        let mut page = DeepXOpenInterestPage {
+            pair: "ETH-USDC".to_string(),
+            details: [START + 60_000, START + 120_000]
+                .into_iter()
+                .map(|statistic_time| DeepXOpenInterestRecord {
+                    total_oi: Decimal::ONE,
+                    long_short_ratio: Decimal::ONE,
+                    long_position_count: 1,
+                    short_position_count: 1,
+                    statistic_time,
+                })
+                .collect(),
+        };
+        assert!(validate_open_interest_page(&page, &request).is_ok());
+        match mutation {
+            "pair" => page.pair.clear(),
+            "duplicate" => page.details[1].statistic_time = page.details[0].statistic_time,
+            "descending" => page.details.swap(0, 1),
+            "before-start" => page.details[0].statistic_time = START - 60_000,
+            "at-end" => page.details[1].statistic_time = START + 180_000,
+            "negative-oi" => page.details[0].total_oi = Decimal::NEGATIVE_ONE,
+            "negative-ratio" => page.details[0].long_short_ratio = Decimal::NEGATIVE_ONE,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            validate_open_interest_page(&page, &request),
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "perp open-interest",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn collects_open_interest_with_minute_aligned_continuation() {
+        const START: u64 = 1_788_251_280_000;
+        let router = Router::new().route(
+            PERP_OPEN_INTEREST_PATH,
+            get(|Query(query): Query<OpenInterestQuery>| async move {
+                assert_eq!(query.market_id, 3);
+                assert_eq!(query.end, START + 240_000);
+                assert_eq!(query.limit, 2);
+                assert_eq!(query.sort, "ASC");
+                let times = match query.start {
+                    START => vec![START, START + 60_000],
+                    value if value == START + 120_000 => {
+                        vec![START + 120_000, START + 180_000]
+                    }
+                    value => panic!("unexpected open-interest continuation {value}"),
+                };
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "pair": "ETH-USDC",
+                        "details": times.into_iter().map(|statistic_time| json!({
+                            "total_oi": "3393.618",
+                            "long_short_ratio": "1.8456014362657092",
+                            "long_position_count": 2056,
+                            "short_position_count": 1114,
+                            "statistic_time": statistic_time,
+                        })).collect::<Vec<_>>(),
+                    },
+                    "fail": false,
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: START,
+            end_ms: Some(START + 180_000),
+            limit: Some(2),
+        };
+
+        let history = client
+            .get_perp_open_interest_history(&request, 2)
+            .await
+            .unwrap();
+        assert_eq!(history.pair, "ETH-USDC");
+        assert_eq!(
+            history
+                .details
+                .iter()
+                .map(|record| record.statistic_time)
+                .collect::<Vec<_>>(),
+            vec![START, START + 60_000, START + 120_000, START + 180_000]
+        );
+        assert_eq!(
+            history.details[0].total_oi,
+            "3393.618".parse::<Decimal>().unwrap()
+        );
+        assert!(matches!(
+            client.get_perp_open_interest_history(&request, 1).await,
+            Err(DeepXHttpError::InvalidRequest(message))
+                if message == "open-interest history page budget exceeded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_interest_history_rounds_midminute_bounds_without_extra_buckets() {
+        const START: u64 = 1_788_251_280_000;
+        let router = Router::new().route(
+            PERP_OPEN_INTEREST_PATH,
+            get(|Query(query): Query<OpenInterestQuery>| async move {
+                assert_eq!(query.start, START + 60_000);
+                assert_eq!(query.end, START + 180_000);
+                let details = [START + 60_000, START + 120_000]
+                    .into_iter()
+                    .map(|statistic_time| {
+                        json!({
+                            "total_oi": "3393.618",
+                            "long_short_ratio": "1.8456014362657092",
+                            "long_position_count": 2056,
+                            "short_position_count": 1114,
+                            "statistic_time": statistic_time,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "pair": "ETH-USDC",
+                        "details": details,
+                    },
+                    "fail": false,
+                }))
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: START + 1,
+            end_ms: Some(START + 120_001),
+            limit: Some(2),
+        };
+
+        let history = client
+            .get_perp_open_interest_history(&request, 1)
+            .await
+            .unwrap();
+        assert_eq!(history.details.len(), 2);
+        assert_eq!(history.details[0].statistic_time, START + 60_000);
+        assert_eq!(history.details[1].statistic_time, START + 120_000);
+    }
+
+    #[tokio::test]
+    async fn open_interest_history_rejects_oversized_page_before_transport() {
+        let client = DeepXHttpClient::new("http://127.0.0.1:1", Some(1), None).unwrap();
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: 1_788_251_280_000,
+            end_ms: Some(1_788_254_880_000),
+            limit: Some(5_001),
+        };
+
+        assert!(matches!(
+            client.get_perp_open_interest_history(&request, 1).await,
+            Err(DeepXHttpError::InvalidRequest(message))
+                if message == "open-interest page size exceeds 5000"
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_interest_history_rejects_range_without_minute_bucket_before_transport() {
+        const START: u64 = 1_788_251_280_000;
+        let client = DeepXHttpClient::new("http://127.0.0.1:1", Some(1), None).unwrap();
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: START + 1,
+            end_ms: Some(START + 59_999),
+            limit: Some(2),
+        };
+
+        assert!(matches!(
+            client.get_perp_open_interest_history(&request, 1).await,
+            Err(DeepXHttpError::InvalidRequest(message))
+                if message == "open-interest history range contains no minute bucket"
+        ));
+    }
+
+    #[rstest]
+    #[case("duplicate")]
+    #[case("pair")]
+    #[case("within-page-order")]
+    #[tokio::test]
+    async fn open_interest_history_rejects_inconsistent_pages(#[case] scenario: &str) {
+        const START: u64 = 1_788_251_280_000;
+        let scenario = scenario.to_string();
+        let router = Router::new().route(
+            PERP_OPEN_INTEREST_PATH,
+            get(move |Query(query): Query<OpenInterestQuery>| {
+                let scenario = scenario.clone();
+                async move {
+                    let second_page = query.start == START + 120_000;
+                    let times = if second_page {
+                        vec![if scenario == "duplicate" {
+                            START + 60_000
+                        } else {
+                            START + 120_000
+                        }]
+                    } else if scenario == "within-page-order" {
+                        vec![START + 60_000, START]
+                    } else {
+                        vec![START, START + 60_000]
+                    };
+                    Json(json!({
+                        "code": 200,
+                        "msg": "success",
+                        "data": {
+                            "pair": if second_page && scenario == "pair" {
+                                "BTC-USDC"
+                            } else {
+                                "ETH-USDC"
+                            },
+                            "details": times.into_iter().map(|statistic_time| json!({
+                                "total_oi": "3393.618",
+                                "long_short_ratio": "1.8456014362657092",
+                                "long_position_count": 2056,
+                                "short_position_count": 1114,
+                                "statistic_time": statistic_time,
+                            })).collect::<Vec<_>>(),
+                        },
+                        "fail": false,
+                    }))
+                }
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(router).await, Some(5), None).unwrap();
+        let request = DeepXOpenInterestRequest {
+            market_id: 3,
+            start_ms: START,
+            end_ms: Some(START + 180_000),
+            limit: Some(2),
+        };
+
+        assert!(matches!(
+            client.get_perp_open_interest_history(&request, 2).await,
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "perp open-interest",
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn rejects_invalid_open_interest_market_before_transport() {
         let client = DeepXHttpClient::new("http://127.0.0.1:1", Some(1), None).unwrap();
@@ -15374,7 +17025,10 @@ mod tests {
     async fn fails_over_to_next_endpoint_after_transport_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let failed_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
         let secondary = spawn_server(
             Router::new().route("/health", get(|| async { Json(json!({ "status": "ok" })) })),
         )
@@ -15389,6 +17043,7 @@ mod tests {
 
         let response = client.get_json::<HealthResponse>("/health").await.unwrap();
 
+        failed_server.await.unwrap();
         assert_eq!(response.status, "ok");
     }
 
@@ -15521,5 +17176,17 @@ mod tests {
             validate_path(path),
             Err(DeepXHttpError::InvalidPath(_)),
         ));
+    }
+
+    #[rstest]
+    #[case("0", true)]
+    #[case("1", true)]
+    #[case("18446744073709551615", true)]
+    #[case("00", false)]
+    #[case("01", false)]
+    #[case("1.0", false)]
+    #[case("18446744073709551616", false)]
+    fn typed_order_ids_use_one_decimal_spelling(#[case] value: &str, #[case] valid: bool) {
+        assert_eq!(validate_decimal_order_id("test", 0, value).is_ok(), valid);
     }
 }

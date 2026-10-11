@@ -25,10 +25,11 @@ use anyhow::Context;
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
-    data::{Data, OrderBookDelta, OrderBookDeltas},
+    data::{Data, OrderBookDelta, OrderBookDeltas, OrderBookDepth10},
     enums::RecordFlag,
     instruments::{Instrument, InstrumentAny},
 };
+use nautilus_network::transport::Message;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,92 @@ const MAX_RECONNECT_ATTEMPTS: usize = 5;
 const MAX_RPC_DEPTH: usize = 1000;
 const SUBSCRIBE_REQUEST_ID: u64 = 1;
 const UNSUBSCRIBE_REQUEST_ID: u64 = 2;
+
+struct SubscriptionGuard(TradeSubscription);
+
+impl Drop for SubscriptionGuard {
+    fn drop(&mut self) {
+        self.0.retire();
+    }
+}
+
+pub(super) async fn request_spot_book_depth10(
+    network: DeepXNetworkConfig,
+    proxy_url: Option<String>,
+    timeout: Duration,
+    market: DeepXSpotMarket,
+    instrument: InstrumentAny,
+    depth: NonZeroUsize,
+) -> anyhow::Result<OrderBookDepth10> {
+    let url = orderbook_rpc::websocket_url(&network)?;
+    let mut connection =
+        DeepXWsReadConnection::connect_url(&url, proxy_url.as_deref(), timeout).await?;
+    let result = async {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": SUBSCRIBE_REQUEST_ID,
+            "method": "orderbook_subscribe",
+            "params": [[market.pair], [], depth.get()],
+        });
+        connection.send_json_rpc_text(request.to_string()).await?;
+        tokio::time::timeout(timeout, async {
+            let mut subscription_id = None;
+            loop {
+                let message = match connection.receive().await {
+                    Err(e)
+                        if e.downcast_ref::<DeepXWsError>()
+                            == Some(&DeepXWsError::ReceiveTimeout) =>
+                    {
+                        continue;
+                    }
+                    other => other?,
+                };
+                let message =
+                    message.ok_or_else(|| anyhow::anyhow!("DeepX Spot depth connection closed"))?;
+                if matches!(message, Message::Ping(_) | Message::Pong(_)) {
+                    continue;
+                }
+                let text = message
+                    .as_text()
+                    .ok_or_else(|| anyhow::anyhow!("DeepX Spot depth received non-text data"))?;
+                let value: Value = serde_json::from_str(text)?;
+                if subscription_id.is_none() {
+                    anyhow::ensure!(
+                        value.get("id").is_some(),
+                        "DeepX Spot depth notification preceded its acknowledgement"
+                    );
+                    subscription_id = Some(orderbook_rpc::parse_subscribe_ack(
+                        &value,
+                        SUBSCRIBE_REQUEST_ID,
+                    )?);
+                    continue;
+                }
+                let snapshot = orderbook_rpc::parse_notification(
+                    &value,
+                    subscription_id.as_deref().expect("acknowledged above"),
+                )?;
+                let pair = book::spot_rpc_pair(&snapshot, &market)?;
+                anyhow::ensure!(
+                    pair.bids.len() <= depth.get() && pair.asks.len() <= depth.get(),
+                    "DeepX Spot depth snapshot exceeds requested depth"
+                );
+                let ts_init = get_atomic_clock_realtime().get_time_ns();
+                return book::parse_spot_rpc_book_depth10(
+                    &snapshot,
+                    &market,
+                    &instrument,
+                    1,
+                    ts_init,
+                );
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("DeepX Spot depth initial data deadline exceeded"))?
+    }
+    .await;
+    let close = connection.close().await;
+    result.and_then(|depth| close.map(|()| depth))
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum SpotBookOutputKind {
@@ -67,10 +154,11 @@ pub(super) struct SpotBookTask {
 
 impl SpotBookTask {
     pub(super) async fn run(self) {
+        let _guard = SubscriptionGuard(self.subscription.clone());
         let cancellation = self.subscription.cancellation_token();
         for attempt in 0..=MAX_RECONNECT_ATTEMPTS {
             let result = self.run_connection(&cancellation).await;
-            if cancellation.is_cancelled() {
+            if cancellation.is_cancelled() || self.sender.is_closed() {
                 return;
             }
             if let Err(e) = result {
@@ -88,6 +176,7 @@ impl SpotBookTask {
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => return,
+                    () = self.sender.closed() => return,
                     () = tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))) => {}
                 }
             }
@@ -103,6 +192,7 @@ impl SpotBookTask {
         let mut connection = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(()),
+            () = self.sender.closed() => return Ok(()),
             result = DeepXWsReadConnection::connect_url(&url, self.proxy_url.as_deref(), self.timeout) => result?,
         };
         let pair = self
@@ -138,6 +228,7 @@ impl SpotBookTask {
                     }
                     return Ok(());
                 }
+                () = self.sender.closed() => return Ok(()),
                 result = tokio::time::timeout(self.timeout, connection.receive()) => {
                     match result {
                         Err(_) => anyhow::bail!("DeepX Spot book RPC receive timed out"),
@@ -347,10 +438,10 @@ mod tests {
                             .unwrap();
                         if let Some(Ok(ServerMessage::Text(unsubscribe))) = socket.recv().await {
                             let request: Value = serde_json::from_str(&unsubscribe).unwrap();
-                            if request["method"] == "orderbook_unsubscribe" {
-                                if let Some(sender) = unsubscribe_sender.lock().await.take() {
-                                    let _ = sender.send(());
-                                }
+                            if request["method"] == "orderbook_unsubscribe"
+                                && let Some(sender) = unsubscribe_sender.lock().await.take()
+                            {
+                                let _ = sender.send(());
                             }
                         }
                     })
@@ -362,8 +453,10 @@ mod tests {
         let server = Server(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         }));
-        let mut network = DeepXNetworkConfig::default();
-        network.base_url_rpc_watch = Some(format!("http://{address}/rpc"));
+        let network = DeepXNetworkConfig {
+            base_url_rpc_watch: Some(format!("http://{address}/rpc")),
+            ..Default::default()
+        };
         let subscription = TradeSubscription::new();
         let (sender, mut receiver) = unbounded_channel();
         let task = SpotBookTask {
@@ -395,5 +488,187 @@ mod tests {
             .unwrap();
         task.await.unwrap();
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn idle_spot_book_stops_when_receiver_closes() {
+        use axum::{
+            Router,
+            extract::ws::{Message as ServerMessage, WebSocketUpgrade},
+            routing::get,
+        };
+
+        let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let market = response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_on_connect = Arc::clone(&entered);
+        let app = Router::new().route(
+            "/rpc",
+            get(move |upgrade: WebSocketUpgrade| {
+                let entered = Arc::clone(&entered_on_connect);
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(ServerMessage::Text(_))) = socket.recv().await else {
+                            return;
+                        };
+                        entered.notify_one();
+                        while socket.recv().await.is_some() {}
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let (sender, receiver) = unbounded_channel();
+        let subscription = TradeSubscription::new();
+        let task = tokio::spawn(
+            SpotBookTask {
+                instrument: spot_instrument(),
+                market: Box::new(market),
+                depth: NonZeroUsize::new(2).unwrap(),
+                output: SpotBookOutputKind::Deltas,
+                network: DeepXNetworkConfig {
+                    base_url_rpc_watch: Some(format!("http://{address}/rpc")),
+                    ..Default::default()
+                },
+                proxy_url: None,
+                timeout: Duration::from_secs(30),
+                sender,
+                connection_epoch: Arc::new(Mutex::new(true)),
+                subscription: subscription.clone(),
+            }
+            .run(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!subscription.is_active());
+        drop(server);
+    }
+
+    #[rstest::rstest]
+    #[case(1, false, false)]
+    #[case(1, true, false)]
+    #[case(1, false, true)]
+    #[case(10, false, false)]
+    #[case(10, true, false)]
+    #[tokio::test]
+    async fn one_shot_depth_requires_ack_and_preserves_order_counts(
+        #[case] requested_depth: usize,
+        #[case] premature: bool,
+        #[case] oversized: bool,
+    ) {
+        use axum::{
+            Router,
+            extract::ws::{Message as ServerMessage, WebSocketUpgrade},
+            routing::get,
+        };
+
+        let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let market = response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let pair = market.pair.clone();
+        let app = Router::new().route(
+            "/rpc",
+            get(move |upgrade: WebSocketUpgrade| {
+                let pair = pair.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(ServerMessage::Text(request))) = socket.recv().await else {
+                            return;
+                        };
+                        let request: Value = serde_json::from_str(&request).unwrap();
+                        assert_eq!(request["method"], "orderbook_subscribe");
+                        assert_eq!(request["params"][0][0], pair);
+                        assert_eq!(request["params"][2], requested_depth);
+                        let ack = json!({"jsonrpc":"2.0","id":1,"result":"depth-1"});
+                        let mut snapshot = json!({
+                            "jsonrpc":"2.0",
+                            "method":"orderbook_subscribe",
+                            "params":{
+                                "subscription":"depth-1",
+                                "result":{
+                                    "spot":{
+                                        (pair.clone()):{
+                                            "bids":[{"price":"0x912d5ff0","amount":"0xc8819b7382d8000","order_count":3}],
+                                            "asks":[{"price":"0x912fa9e0","amount":"0x1647e1be62e3c000","order_count":4}]
+                                        }
+                                    },
+                                    "perp":{}
+                                }
+                            }
+                        });
+                        if oversized {
+                            let bid = snapshot["params"]["result"]["spot"][&pair]["bids"][0]
+                                .clone();
+                            snapshot["params"]["result"]["spot"][&pair]["bids"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(bid);
+                        }
+                        if !premature {
+                            socket
+                                .send(ServerMessage::Ping(vec![1].into()))
+                                .await
+                                .unwrap();
+                        }
+                        for value in if premature {
+                            [snapshot, ack]
+                        } else {
+                            [ack, snapshot]
+                        } {
+                            let _ = socket
+                                .send(ServerMessage::Text(value.to_string().into()))
+                                .await;
+                        }
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let network = DeepXNetworkConfig {
+            base_url_rpc_watch: Some(format!("http://{address}/rpc")),
+            ..Default::default()
+        };
+        let result = request_spot_book_depth10(
+            network,
+            None,
+            Duration::from_secs(2),
+            market,
+            spot_instrument(),
+            NonZeroUsize::new(requested_depth).unwrap(),
+        )
+        .await;
+        if premature || oversized {
+            assert!(result.is_err());
+        } else {
+            let depth = result.unwrap();
+            assert_eq!(depth.bid_counts[0], 3);
+            assert_eq!(depth.ask_counts[0], 4);
+            assert_eq!(depth.bids[0].price, Price::from("2435.67"));
+            assert_eq!(depth.asks[0].price, Price::from("2435.82"));
+        }
     }
 }

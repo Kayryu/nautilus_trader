@@ -68,7 +68,7 @@ impl TradeSubscription {
 
     pub(super) fn next_book_sequence(&self) -> anyhow::Result<u64> {
         self.book_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |sequence| {
                 sequence.checked_add(1)
             })
             .map(|sequence| sequence + 1)
@@ -177,7 +177,7 @@ impl TradeTask {
             else {
                 return;
             };
-            if self.subscription.cancellation.is_cancelled() {
+            if self.subscription.cancellation.is_cancelled() || self.sender.is_closed() {
                 return;
             }
             if (!self.kind.is_book() && !retry_transport) || attempt == 5 {
@@ -190,6 +190,7 @@ impl TradeTask {
             tokio::select! {
                 biased;
                 () = self.subscription.cancellation.cancelled() => return,
+                () = self.sender.closed() => return,
                 () = tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))) => {},
             }
         }
@@ -205,6 +206,7 @@ impl TradeTask {
         let mut connection = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(()),
+            () = self.sender.closed() => return Ok(()),
             result = DeepXWsPublicConnection::connect(&self.network, self.proxy_url.as_deref(),
                 self.timeout, NonZeroUsize::new(32).expect("nonzero capacity")) => match result {
                     Ok(connection) => connection,
@@ -214,6 +216,7 @@ impl TradeTask {
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Ok(()),
+            () = self.sender.closed() => Ok(()),
             result = async {
                 let acknowledgement = match self.kind.channel() {
                     Some(channel) => connection.subscribe(self.market_id, vec![channel]).await,

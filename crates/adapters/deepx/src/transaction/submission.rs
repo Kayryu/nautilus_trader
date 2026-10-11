@@ -23,7 +23,7 @@ use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 use thiserror::Error;
 
 use super::{DeepXSubmissionFailure, DeepXSubmissionPermit};
-use crate::signing::SignedPalletExtrinsic;
+use crate::signing::{DeepXRuntimeSnapshotPermit, SignedPalletExtrinsic};
 
 /// REST acknowledgement, not verified inclusion, finality, or business success.
 #[derive(Debug)]
@@ -45,19 +45,21 @@ pub enum DeepXRestSubmissionError {
     ReconciliationRequired(String),
 }
 
-fn rest_action(operation: &super::DeepXTransactionOperation) -> (&'static str, &'static str) {
+fn rest_action(
+    operation: &super::DeepXTransactionOperation,
+) -> Option<(&'static str, &'static str)> {
     use super::DeepXTransactionOperation;
-    match operation {
+    Some(match operation {
         DeepXTransactionOperation::PerpPlace { .. } => ("Perp", "PlaceOrder"),
         DeepXTransactionOperation::PerpCancel { .. } => ("Perp", "CancelOrder"),
-        DeepXTransactionOperation::PerpModify { .. } => ("Perp", "ModifyOrder"),
+        DeepXTransactionOperation::PerpModify { .. } => return None,
         DeepXTransactionOperation::PerpClose { .. } => ("Perp", "ClosePosition"),
         DeepXTransactionOperation::PerpProfitAndLossPoint { .. } => {
             ("Perp", "SetProfitAndLossPoint")
         }
         DeepXTransactionOperation::SpotPlace { .. } => ("Spot", "PlaceOrder"),
         DeepXTransactionOperation::SpotCancel { .. } => ("Spot", "CancelOrder"),
-    }
+    })
 }
 
 fn verify_rest_acknowledgement(
@@ -101,16 +103,31 @@ fn verify_rest_acknowledgement(
 ///
 /// # Errors
 ///
-/// Returns `NotSent` for local validation failures and `ReconciliationRequired` for every failure
-/// after starting the HTTP request, including runtime reverts and invalid returned hashes.
+/// Returns `NotSent` for local validation failures, including a mismatched or revoked runtime
+/// permit, and `ReconciliationRequired` for every failure after starting the HTTP request,
+/// including runtime reverts and invalid returned hashes.
 pub async fn submit_rest_transaction_once(
     client: &crate::http::client::DeepXHttpClient,
     prepared: super::DeepXPreparedSubmission,
+    runtime_permit: &DeepXRuntimeSnapshotPermit,
 ) -> Result<DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError> {
+    if prepared.record().identity().runtime()
+        != &crate::transaction::DeepXDirectRuntimeIdentity::from(
+            runtime_permit.snapshot().identity(),
+        )
+    {
+        return Err(DeepXRestSubmissionError::NotSent(
+            "runtime permit does not match the durable transaction".to_string(),
+        ));
+    }
     let operation = prepared.record().identity().operation().ok_or_else(|| {
         DeepXRestSubmissionError::NotSent("missing durable operation".to_string())
     })?;
-    let (market_type, action) = rest_action(operation);
+    let (market_type, action) = rest_action(operation).ok_or_else(|| {
+        DeepXRestSubmissionError::NotSent(
+            "perpetual modification has no documented REST transact action".to_string(),
+        )
+    })?;
     let (bytes, expected_hash) = prepared.into_permit().into_payload();
     verify_submission_hash(&bytes, expected_hash, expected_hash)
         .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
@@ -120,6 +137,9 @@ pub async fn submit_rest_transaction_once(
         "signedExtrinsic": format!("0x{}", hex::encode(&bytes)),
     }))
     .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
+    runtime_permit
+        .ensure_active()
+        .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
     let response = client
         .post_transaction_once(body)
         .await
@@ -343,6 +363,30 @@ where
             failure: failure.into(),
         },
     }
+}
+
+/// Rechecks a retained runtime permit before one classified submission attempt.
+///
+/// A revoked permit returns `NotSent` with the original durable context and never invokes the
+/// transport. This check occurs immediately before the transport begins; an observation racing
+/// after that point remains an in-flight attempt requiring normal reconciliation.
+pub(crate) async fn submit_once_with_runtime_guard<C, F, Fut>(
+    context: C,
+    permit: DeepXSubmissionPermit,
+    runtime_permit: &DeepXRuntimeSnapshotPermit,
+    submit: F,
+) -> DeepXSubmissionAttemptOutcome<C>
+where
+    F: FnOnce(Vec<u8>, [u8; 32]) -> Fut,
+    Fut: Future<Output = Result<[u8; 32], DeepXSubmissionFailure>>,
+{
+    submit_once_preserving_context(context, permit, move |bytes, expected_hash| async move {
+        runtime_permit
+            .ensure_active()
+            .map_err(|e| DeepXSubmissionFailure::NotSent(e.to_string()))?;
+        submit(bytes, expected_hash).await
+    })
+    .await
 }
 
 /// Consumes one durable submission permit and retries only explicitly ambiguous outcomes.
@@ -615,7 +659,7 @@ mod tests {
         server.abort();
     }
 
-    fn signed_remark() -> Result<SignedPalletExtrinsic, SigningError> {
+    fn runtime_service() -> DeepXRuntimeSnapshotService {
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
@@ -638,7 +682,11 @@ mod tests {
             &bytes,
         )
         .unwrap();
-        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        DeepXRuntimeSnapshotService::new(snapshot)
+    }
+
+    fn signed_remark() -> Result<SignedPalletExtrinsic, SigningError> {
+        let service = runtime_service();
         let permit = service.acquire().unwrap();
         sign_dynamic_pallet_call(
             &permit,
@@ -728,6 +776,45 @@ mod tests {
             bytes: extrinsic.bytes().to_vec(),
             extrinsic_hash: extrinsic.extrinsic_hash(),
         }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn revoked_runtime_permit_retains_context_without_calling_transport(
+        #[case] client_retired: bool,
+    ) {
+        let service = runtime_service();
+        let runtime_permit = service.acquire().unwrap();
+        let extrinsic = signed_remark().unwrap();
+        if client_retired {
+            service.retire_client().unwrap();
+        } else {
+            service.halt_for_inconsistent_evidence().unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+
+        let outcome = submit_once_with_runtime_guard(
+            "durable-context",
+            submission_permit(&extrinsic),
+            &runtime_permit,
+            move |_, _| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                ready(Ok(extrinsic.extrinsic_hash()))
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            DeepXSubmissionAttemptOutcome::Unresolved {
+                context: "durable-context",
+                failure: DeepXSubmissionAttemptFailure::NotSent(_),
+            },
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

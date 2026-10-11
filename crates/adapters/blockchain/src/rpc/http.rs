@@ -143,6 +143,24 @@ impl BlockchainHttpRpcClient {
         self.execute_rpc_call_with_timeout(rpc_request, None).await
     }
 
+    /// Executes a JSON-RPC request and returns its structured result or error envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized as a
+    /// JSON-RPC envelope. Callers validate required envelope fields.
+    pub async fn execute_rpc_response<T: DeserializeOwned>(
+        &self,
+        rpc_request: serde_json::Value,
+    ) -> anyhow::Result<RpcNodeHttpResponse<T>> {
+        let bytes = self
+            .send_rpc_request(rpc_request, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to execute RPC request: {e}"))?;
+        serde_json::from_slice(bytes.as_ref())
+            .map_err(|e| anyhow::anyhow!("Failed to parse RPC response: {e}"))
+    }
+
     /// Executes a JSON-RPC call whose successful result may legitimately be `null`.
     ///
     /// # Errors
@@ -1089,6 +1107,29 @@ pub(crate) mod tests {
             preview,
             format!("{}... (truncated, 501 bytes total)", "a".repeat(499))
         );
+    }
+
+    #[tokio::test]
+    async fn rpc_response_preserves_structured_json_rpc_error() {
+        let (client, _) = client_for(MockRpcState::default().with_response(
+            "eth_call",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unknown block"}}"#,
+        ))
+        .await;
+
+        let response: RpcNodeHttpResponse<String> = client
+            .execute_rpc_response(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [],
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response.id, Some(1));
+        assert!(response.result.is_none());
+        assert_eq!(response.error.unwrap().code, -32000);
     }
 
     #[cfg(feature = "hypersync")]

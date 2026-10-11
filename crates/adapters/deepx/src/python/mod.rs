@@ -18,6 +18,22 @@
 pub mod config;
 pub mod factories;
 
+mod account;
+mod balance_changes;
+mod delegates;
+mod funding_fees;
+mod hourly_funding;
+mod lending;
+mod liquidations;
+mod order_lookup;
+mod perp_orders;
+mod positions;
+mod quota;
+mod spot_orders;
+mod spot_trades;
+mod trades;
+mod transaction_status;
+
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_system::get_global_pyo3_registry;
@@ -30,6 +46,23 @@ use crate::{
         DeepXNetworkConfig,
     },
     factories::{DeepXDataClientFactory, DeepXExecutionClientFactory},
+    http::{
+        DeepXBalanceChangePosition, DeepXBalanceChangeRecord, DeepXDelegateAccount,
+        DeepXDelegateWallets, DeepXHourlyUnsettledFundingRecord, DeepXLendingAsset,
+        DeepXLendingInterestRateParams, DeepXLendingInterestRateRecord, DeepXLendingStatusRecord,
+        DeepXLiquidationRecord, DeepXPerpAccountTradeRecord, DeepXPerpFundingFeeRecord,
+        DeepXPerpLiquidationPrice, DeepXPerpOrderRecord, DeepXPerpPositionRecord,
+        DeepXPerpWalletOrderMarket, DeepXPerpWalletOrdersPage, DeepXPerpWalletSubaccountOrders,
+        DeepXPerpWalletSubaccountTrades, DeepXPerpWalletTradeMarket, DeepXQuotaHistoryRecord,
+        DeepXQuotaSummary, DeepXSpotAccountTradeRecord, DeepXSpotOrderRecord,
+        DeepXSpotWalletOrderMarket, DeepXSpotWalletOrdersPage, DeepXSpotWalletSubaccountOrders,
+        DeepXSpotWalletSubaccountTrades, DeepXSpotWalletTradeMarket, DeepXSpotWalletTradesPage,
+        DeepXSubaccountBalanceAsset, DeepXSubaccountBalances, DeepXSubaccountEquity,
+        DeepXSubaccountMarginRatio, DeepXSubaccountPerpPositions, DeepXSubaccountProfile,
+        DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
+        DeepXWalletDelegateAccounts, DeepXWalletPerpPositions, DeepXWalletSubaccounts,
+    },
+    transaction::DeepXRestTransactionStatus,
 };
 
 #[expect(clippy::needless_pass_by_value)]
@@ -98,6 +131,232 @@ pub fn deepx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DeepXDataClientFactory>()?;
     m.add_class::<DeepXExecutionClientConfig>()?;
     m.add_class::<DeepXExecutionClientFactory>()?;
+    m.add_class::<DeepXQuotaSummary>()?;
+    m.add_class::<DeepXBalanceChangePosition>()?;
+    m.add_class::<DeepXBalanceChangeRecord>()?;
+    m.add_class::<balance_changes::DeepXBalanceChangesPage>()?;
+    m.add_class::<DeepXWalletSubaccounts>()?;
+    m.add_class::<DeepXUserStats>()?;
+    m.add_class::<DeepXPerpLiquidationPrice>()?;
+    m.add_class::<DeepXLiquidationRecord>()?;
+    m.add_class::<liquidations::DeepXLiquidationRecordsPage>()?;
+    m.add_class::<DeepXPerpPositionRecord>()?;
+    m.add_class::<DeepXPerpOrderRecord>()?;
+    m.add_class::<perp_orders::DeepXPerpHistoryOrdersPage>()?;
+    m.add_class::<perp_orders::DeepXPerpOpenOrdersPage>()?;
+    m.add_class::<perp_orders::DeepXPerpWalletOrderItemsPage>()?;
+    m.add_class::<DeepXPerpWalletSubaccountOrders>()?;
+    m.add_class::<DeepXPerpWalletOrderMarket>()?;
+    m.add_class::<DeepXPerpWalletOrdersPage>()?;
+    m.add_class::<DeepXPerpAccountTradeRecord>()?;
+    m.add_class::<trades::DeepXPerpAccountTradesPage>()?;
+    m.add_class::<DeepXPerpFundingFeeRecord>()?;
+    m.add_class::<funding_fees::DeepXPerpFundingFeesPage>()?;
+    m.add_class::<funding_fees::DeepXWalletFundingFeesPage>()?;
+    m.add_class::<DeepXHourlyUnsettledFundingRecord>()?;
+    m.add_class::<DeepXRestTransactionStatus>()?;
+    m.add_class::<transaction_status::DeepXRestStatusPollResult>()?;
+    m.add_class::<transaction_status::DeepXRestStatusPoller>()?;
+    m.add_class::<DeepXLendingAsset>()?;
+    m.add_class::<DeepXLendingInterestRateParams>()?;
+    m.add_class::<DeepXLendingInterestRateRecord>()?;
+    m.add_class::<DeepXLendingStatusRecord>()?;
+    m.add_class::<lending::DeepXLendingService>()?;
+    m.add_class::<DeepXSpotAccountTradeRecord>()?;
+    m.add_class::<spot_trades::DeepXSpotAccountTradesPage>()?;
+    m.add_class::<spot_trades::DeepXSpotWalletTradeItemsPage>()?;
+    m.add_class::<DeepXSpotWalletSubaccountTrades>()?;
+    m.add_class::<DeepXSpotWalletTradeMarket>()?;
+    m.add_class::<DeepXSpotWalletTradesPage>()?;
+    m.add_class::<DeepXSpotOrderRecord>()?;
+    m.add_class::<spot_orders::DeepXSpotHistoryOrdersPage>()?;
+    m.add_class::<spot_orders::DeepXSpotOpenOrdersPage>()?;
+    m.add_class::<spot_orders::DeepXSpotWalletOrderItemsPage>()?;
+    m.add_class::<DeepXSpotWalletSubaccountOrders>()?;
+    m.add_class::<DeepXSpotWalletOrderMarket>()?;
+    m.add_class::<DeepXSpotWalletOrdersPage>()?;
+    m.add_class::<trades::DeepXPerpWalletTradesPage>()?;
+    m.add_class::<DeepXPerpWalletSubaccountTrades>()?;
+    m.add_class::<DeepXPerpWalletTradeMarket>()?;
+    m.add_class::<positions::DeepXPerpPositionsPage>()?;
+    m.add_class::<DeepXSubaccountPerpPositions>()?;
+    m.add_class::<DeepXWalletPerpPositions>()?;
+    m.add_class::<DeepXSubaccountProfile>()?;
+    m.add_class::<DeepXSubaccountBalanceAsset>()?;
+    m.add_class::<DeepXSubaccountBalances>()?;
+    m.add_class::<DeepXSubaccountEquity>()?;
+    m.add_class::<DeepXSubaccountMarginRatio>()?;
+    m.add_class::<DeepXSubaccountSnapshot>()?;
+    m.add_class::<DeepXWalletAccountSnapshot>()?;
+    m.add_class::<DeepXQuotaHistoryRecord>()?;
+    m.add_class::<quota::DeepXQuotaHistoryPage>()?;
+    m.add_class::<DeepXDelegateAccount>()?;
+    m.add_class::<DeepXWalletDelegateAccounts>()?;
+    m.add_class::<DeepXDelegateWallets>()?;
+    m.add_function(wrap_pyfunction!(quota::py_get_deepx_quota_summary, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        balance_changes::py_get_deepx_balance_changes,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        balance_changes::py_get_deepx_balance_change_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        liquidations::py_get_deepx_liquidation_records,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        liquidations::py_get_deepx_liquidation_record_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(quota::py_get_deepx_quota_history, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        quota::py_get_deepx_quota_history_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        account::py_get_deepx_wallet_subaccounts,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        account::py_get_deepx_wallet_account_snapshot,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(account::py_get_deepx_user_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        account::py_get_deepx_perp_liquidation_price,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(positions::py_get_deepx_perp_positions, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_open_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_open_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_history_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_history_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_wallet_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        order_lookup::py_get_deepx_perp_order_by_tx,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        order_lookup::py_get_deepx_spot_order_by_tx,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        transaction_status::py_get_deepx_rest_transaction_status,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        perp_orders::py_get_deepx_perp_wallet_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        positions::py_get_deepx_perp_position_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        positions::py_get_deepx_wallet_perp_positions,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        trades::py_get_deepx_perp_account_trades,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        trades::py_get_deepx_perp_account_trade_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        trades::py_get_deepx_perp_wallet_trades,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        trades::py_get_deepx_perp_wallet_trade_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        funding_fees::py_get_deepx_perp_funding_fees,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        funding_fees::py_get_deepx_perp_funding_fee_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        funding_fees::py_get_deepx_wallet_funding_fees,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        funding_fees::py_get_deepx_wallet_funding_fee_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        hourly_funding::py_get_deepx_hourly_unsettled_funding_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_trades::py_get_deepx_spot_account_trades,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_trades::py_get_deepx_spot_account_trade_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_trades::py_get_deepx_spot_wallet_trades,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_trades::py_get_deepx_spot_wallet_trade_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_history_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_history_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_open_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_open_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_wallet_orders,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        spot_orders::py_get_deepx_spot_wallet_order_pages,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        delegates::py_get_deepx_delegate_accounts,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        delegates::py_get_deepx_delegator_accounts,
+        m
+    )?)?;
 
     let registry = get_global_pyo3_registry();
     registry

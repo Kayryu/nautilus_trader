@@ -28,7 +28,7 @@ const MAX_PAGES: usize = 100;
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let kind = args.next().context(
-        "usage: deepx-verify-rest-liquidation-execution-records <cranker|tp-sl> <wallet|subaccount> <account-id20>",
+        "usage: deepx-verify-rest-liquidation-execution-records <liquidation|cranker|tp-sl> <wallet|subaccount> <account-id20>",
     )?;
     let scope = args.next().context("missing scope: wallet or subaccount")?;
     let address = args.next().context("missing account-id20")?;
@@ -61,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
         config.proxy_url,
     )?;
     let pages = match kind.as_str() {
+        "liquidation" => {
+            client
+                .get_liquidation_execution_record_pages_raw(&request, MAX_PAGES)
+                .await?
+        }
         "cranker" => {
             client
                 .get_liquidation_cranker_record_pages_raw(&request, MAX_PAGES)
@@ -71,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
                 .get_liquidation_tp_sl_record_pages_raw(&request, MAX_PAGES)
                 .await?
         }
-        _ => anyhow::bail!("kind must be 'cranker' or 'tp-sl'"),
+        _ => anyhow::bail!("kind must be 'liquidation', 'cranker', or 'tp-sl'"),
     };
     let records = pages.iter().map(|page| page.items.len()).sum::<usize>();
     println!(
