@@ -25,6 +25,7 @@ pub use evm::{
     DeepXOfflinePerpPnlEvmParams, sign_offline_evm_transact_extrinsic,
     sign_offline_evm_transaction, sign_offline_perp_pnl_evm_transact_extrinsic,
 };
+use parity_scale_codec::Decode;
 pub use quota::{DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError, sign_quota_claim};
 use serde::{Deserialize, Serialize};
 pub use snapshot::{
@@ -35,10 +36,15 @@ pub use snapshot::{
 };
 use subxt_core::{
     Config,
-    config::{DefaultExtrinsicParamsBuilder, Hasher, substrate::BlakeTwo256},
+    client::ClientState,
+    config::{
+        DefaultExtrinsicParamsBuilder, ExtrinsicParams, ExtrinsicParamsEncoder, Hasher,
+        TransactionExtension, substrate::BlakeTwo256, transaction_extensions,
+    },
     dynamic::Value,
+    error::ExtrinsicParamsError,
     tx,
-    utils::AccountId20,
+    utils::{AccountId20, H256, Static},
 };
 use subxt_signer::eth::{Keypair, Signature};
 use thiserror::Error;
@@ -49,13 +55,69 @@ use crate::common::DeepXPrivateKey;
 #[derive(Clone, Copy, Debug)]
 pub enum DeepXRuntimeConfig {}
 
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CheckNonceEra {
+    genesis_hash: H256,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Decode)]
+pub enum DeepXNonceEra {
+    Immortal,
+    Mortal(u64),
+}
+
+impl ExtrinsicParams<DeepXRuntimeConfig> for CheckNonceEra {
+    type Params = ();
+
+    fn new(client: &ClientState<DeepXRuntimeConfig>, (): ()) -> Result<Self, ExtrinsicParamsError> {
+        Ok(Self {
+            genesis_hash: client.genesis_hash,
+        })
+    }
+}
+
+impl ExtrinsicParamsEncoder for CheckNonceEra {
+    fn encode_value_to(&self, bytes: &mut Vec<u8>) {
+        // The captured CheckNonceEra extra encodes Immortal as variant index zero
+        bytes.push(0);
+    }
+
+    fn encode_implicit_to(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.genesis_hash.0);
+    }
+}
+
+impl TransactionExtension<DeepXRuntimeConfig> for CheckNonceEra {
+    type Decoded = Static<DeepXNonceEra>;
+
+    fn matches(identifier: &str, _: u32, _: &scale_info::PortableRegistry) -> bool {
+        identifier == "CheckNonceEra"
+    }
+}
+
 impl Config for DeepXRuntimeConfig {
     type AccountId = AccountId20;
     type Address = AccountId20;
     type Signature = Signature;
     type Hasher = BlakeTwo256;
     type Header = subxt_core::config::substrate::SubstrateHeader<u32, Self::Hasher>;
-    type ExtrinsicParams = subxt_core::config::SubstrateExtrinsicParams<Self>;
+    type ExtrinsicParams = transaction_extensions::AnyOf<
+        Self,
+        (
+            transaction_extensions::VerifySignature<Self>,
+            transaction_extensions::CheckSpecVersion,
+            transaction_extensions::CheckTxVersion,
+            transaction_extensions::CheckNonce,
+            transaction_extensions::CheckGenesis<Self>,
+            transaction_extensions::CheckMortality<Self>,
+            transaction_extensions::ChargeAssetTxPayment<Self>,
+            transaction_extensions::ChargeTransactionPayment,
+            transaction_extensions::CheckMetadataHash,
+            CheckNonceEra,
+        ),
+    >;
     type AssetId = u32;
 }
 
@@ -1176,6 +1238,35 @@ pub fn sign_no_op(
     )
 }
 
+fn immortal_params(nonce: u64) -> subxt_core::config::ParamsFor<DeepXRuntimeConfig> {
+    let (
+        signature,
+        spec,
+        tx_version,
+        nonce_param,
+        genesis,
+        mortality,
+        asset_payment,
+        payment,
+        metadata_hash,
+    ) = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
+        .nonce(nonce)
+        .immortal()
+        .build();
+    (
+        signature,
+        spec,
+        tx_version,
+        nonce_param,
+        genesis,
+        mortality,
+        asset_payment,
+        payment,
+        metadata_hash,
+        (),
+    )
+}
+
 pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     snapshot: &RuntimeSnapshot,
     key: &DeepXPrivateKey,
@@ -1189,12 +1280,9 @@ pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
     let account_id = derive_signer_account_id(key)?;
     let payload = subxt_core::dynamic::tx(pallet, call, arguments);
-    let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
-        .nonce(nonce)
-        .immortal()
-        .build();
     let transaction =
-        tx::create_v4_signed(&payload, snapshot.client_state(), params)?.sign(&signer);
+        tx::create_v4_signed(&payload, snapshot.client_state(), immortal_params(nonce))?
+            .sign(&signer);
     let hash = transaction.hash_with(BlakeTwo256);
 
     Ok(SignedPalletExtrinsic {
@@ -1285,6 +1373,105 @@ mod tests {
             &DeepXKeyScheme::Secp256k1,
         )
         .unwrap()
+    }
+
+    fn assert_new_genesis_immortal_extrinsics_match_pinned_sdk(
+        metadata_response: &str,
+        spec_version: u32,
+        expected: [&str; 3],
+    ) {
+        let response: RpcResponse = serde_json::from_str(metadata_response).unwrap();
+        let metadata = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let client_state = ClientState::<DeepXRuntimeConfig> {
+            metadata: subxt_core::metadata::decode_from(&metadata).unwrap(),
+            genesis_hash: H256::from(
+                hex::decode_array::<32>(
+                    "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
+                )
+                .unwrap(),
+            ),
+            runtime_version: subxt_core::client::RuntimeVersion {
+                spec_version,
+                transaction_version: 1,
+            },
+        };
+        let cases = [
+            (
+                "Subaccount",
+                "no_op",
+                Vec::new(),
+                1_725_000_000_124,
+                expected[0],
+            ),
+            (
+                "System",
+                "remark",
+                vec![Value::from_bytes(b"deepx-offline-signing-check")],
+                1_725_000_000_123,
+                expected[1],
+            ),
+            (
+                "PerpMarket",
+                "place_order",
+                DeepXPerpPlaceParams {
+                    subaccount: [0x11; 20],
+                    market_id: 7,
+                    is_long: true,
+                    size: u128::MAX,
+                    price: u128::MAX,
+                    order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+                    take_profit: Some(u128::MAX),
+                    stop_loss: None,
+                    reduce_only: false,
+                    post_only: DeepXPostOnlyParam::None,
+                }
+                .into_dynamic_arguments(),
+                1_725_000_000_125,
+                expected[2],
+            ),
+        ];
+        let signer = Keypair::from_secret_key(*key().as_bytes()).unwrap();
+        for (pallet, call, arguments, nonce, expected) in cases {
+            let payload = subxt_core::dynamic::tx(pallet, call, arguments);
+            let signed = tx::create_v4_signed(&payload, &client_state, immortal_params(nonce))
+                .unwrap()
+                .sign(&signer);
+            assert_eq!(signed.into_encoded(), hex::decode(expected).unwrap());
+        }
+    }
+
+    #[rstest]
+    fn spec375_immortal_extrinsics_match_pinned_sdk() {
+        assert_new_genesis_immortal_extrinsics_match_pinned_sdk(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test_data/runtime/testnet/",
+                "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b/metadata.json",
+            )),
+            375,
+            [
+                "850184fcad0b19bb29d4674531d6f115237e16afce377cfbb9fe3775f21a50a9dbb360f147aa70386831b788745b64f390835f7571364d468699bd25dc1c8e537a1ab207f60d1db5418bf9448d4b7489b0bacf38706dcb01000b7c2203a2910100131c",
+                "f50184fcad0b19bb29d4674531d6f115237e16afce377ceff65a89cf1f5b73cd93df6cee3570cc2679938c7df7bbce31b639abfd4b104c3507d28068a518ee653b05d64205fa485eecc665456905038dbfdea47b24082b00000b7b2203a291010000006c64656570782d6f66666c696e652d7369676e696e672d636865636b",
+                "b90284fcad0b19bb29d4674531d6f115237e16afce377cfbdb209cfba4946a71fa1080c364e3368ff3c428173538dbcd18e3da6e38739721d3ad5433e8a20660f5a88ee52dd46f64f278ad9cdf38a1ac1ac302a4042fe600000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+            ],
+        );
+    }
+
+    #[rstest]
+    fn spec376_immortal_extrinsics_match_pinned_sdk() {
+        assert_new_genesis_immortal_extrinsics_match_pinned_sdk(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test_data/runtime/testnet/",
+                "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448/metadata.json",
+            )),
+            376,
+            [
+                "850184fcad0b19bb29d4674531d6f115237e16afce377ccd76f6b9583b6dfd829576bc6888f00fa985b12eb69488d9215ad76133b8792113e341e9f2dc4a0e073af90495f8926c9d4c9e817f29ee384e83fb3dd18d78f600000b7c2203a2910100131c",
+                "f50184fcad0b19bb29d4674531d6f115237e16afce377cdd2abfbe77653eff8459e3105b30feb8295341991ff6cd015b5a94ca0ae27bf30f2be47c10c8a8f926f0ba538bd72d5ddb9a6eb38549961dfb0fa8e96433bc6f01000b7b2203a291010000006c64656570782d6f66666c696e652d7369676e696e672d636865636b",
+                "b90284fcad0b19bb29d4674531d6f115237e16afce377c6476e0a03c23f5e2d94326d35a5d1db1a3b03e19e7270548a4781c5ffcd9c63f13f98e79b13089f1010035607eff80c9990aa7dcbbeb35fee0fb7bae24df0b2401000b7d2203a291010016021111111111111111111111111111111111111111070001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff000001ffffffffffffffffffffffffffffffff000000",
+            ],
+        );
     }
 
     #[rstest]
@@ -3019,12 +3206,13 @@ mod tests {
             "remark",
             vec![Value::from_bytes(b"deepx-offline-signing-check")],
         );
-        let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
-            .nonce(1_725_000_000_123)
-            .build();
-        let signer_payload = tx::create_v4_signed(&payload, snapshot.client_state(), params)
-            .unwrap()
-            .signer_payload();
+        let signer_payload = tx::create_v4_signed(
+            &payload,
+            snapshot.client_state(),
+            immortal_params(1_725_000_000_123),
+        )
+        .unwrap()
+        .signer_payload();
         assert_eq!(
             hex::encode(signer_payload),
             "00006c64656570782d6f66666c696e652d7369676e696e672d636865636b000b7b2203a29101006e0100000100000086604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
@@ -3071,12 +3259,13 @@ mod tests {
     fn no_op_signing_matches_fixed_testnet_regression_vector() {
         let snapshot = snapshot();
         let payload = subxt_core::dynamic::tx("Subaccount", "no_op", Vec::<Value>::new());
-        let params = DefaultExtrinsicParamsBuilder::<DeepXRuntimeConfig>::new()
-            .nonce(1_725_000_000_124)
-            .build();
-        let signer_payload = tx::create_v4_signed(&payload, snapshot.client_state(), params)
-            .unwrap()
-            .signer_payload();
+        let signer_payload = tx::create_v4_signed(
+            &payload,
+            snapshot.client_state(),
+            immortal_params(1_725_000_000_124),
+        )
+        .unwrap()
+        .signer_payload();
         assert_eq!(
             hex::encode(signer_payload),
             "131c000b7c2203a29101006e0100000100000086604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",

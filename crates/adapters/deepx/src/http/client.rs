@@ -31,6 +31,7 @@ use nautilus_network::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 
 use super::{
     error::{DeepXHttpError, Result},
@@ -4969,9 +4970,12 @@ impl DeepXHttpClient {
                     let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
                     async move {
                         let response = self
-                            .get_json_once::<DeepXApiResponse<T>>(&self.base_urls[index], path)
+                            .get_json_once::<DeepXApiResponse<Box<RawValue>>>(
+                                &self.base_urls[index],
+                                path,
+                            )
                             .await?;
-                        into_api_data(response)
+                        decode_api_data(response)
                     }
                 },
                 should_retry_http_error,
@@ -4994,13 +4998,13 @@ impl DeepXHttpClient {
                     let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
                     async move {
                         let response = self
-                            .get_json_once_with_query::<DeepXApiResponse<T>, _>(
+                            .get_json_once_with_query::<DeepXApiResponse<Box<RawValue>>, _>(
                                 &self.base_urls[index],
                                 path,
                                 query,
                             )
                             .await?;
-                        into_api_data(response)
+                        decode_api_data(response)
                     }
                 },
                 should_retry_http_error,
@@ -7339,6 +7343,11 @@ fn into_api_data<T>(response: DeepXApiResponse<T>) -> Result<T> {
     Ok(response.data)
 }
 
+fn decode_api_data<T: DeserializeOwned>(response: DeepXApiResponse<Box<RawValue>>) -> Result<T> {
+    let data = into_api_data(response)?;
+    Ok(serde_json::from_str(data.get())?)
+}
+
 trait CandleHistoryRecord {
     fn time_ms(&self) -> u64;
 }
@@ -7812,7 +7821,13 @@ fn validate_spot_order_book(
         ));
     }
     validate_spot_order_book_side(endpoint, "bid", &book.order_buy_list, false)?;
-    validate_spot_order_book_side(endpoint, "ask", &book.order_sell_list, true)
+    validate_spot_order_book_side(endpoint, "ask", &book.order_sell_list, true)?;
+    if let (Some(bid), Some(ask)) = (book.order_buy_list.first(), book.order_sell_list.first())
+        && bid.price >= ask.price
+    {
+        return Err(invalid("response has a crossed or locked book".to_string()));
+    }
+    Ok(())
 }
 
 fn validate_perp_order_book(
@@ -10785,6 +10800,29 @@ mod tests {
             Decimal::ZERO
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn wallet_subaccounts_preserves_api_error_with_null_data() {
+        let app = Router::new().route(
+            WALLET_SUBACCOUNTS_PATH,
+            get(|| async {
+                r#"{"code":10009,"msg":"Subaccount not found.","data":null,"fail":true}"#
+            }),
+        );
+        let client = DeepXHttpClient::new(spawn_server(app).await, Some(2), None).unwrap();
+
+        let result = client
+            .get_wallet_subaccounts("0x781ed35b167068c93dfadab41dfb680edaca4e50")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10009),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -14999,6 +15037,7 @@ mod tests {
     #[case("bid-value")]
     #[case("bid-order")]
     #[case("ask-order")]
+    #[case("crossed")]
     fn spot_order_book_rejects_invalid_response_semantics(#[case] mutation: &str) {
         let response: DeepXApiResponse<DeepXSpotOrderBook> =
             serde_json::from_str(SPOT_ORDER_BOOK_ETH_USDC_RESPONSE).unwrap();
@@ -15024,6 +15063,7 @@ mod tests {
             "bid-value" => book.order_buy_list[0].value = Decimal::NEGATIVE_ONE,
             "bid-order" => book.order_buy_list[1].price = book.order_buy_list[0].price,
             "ask-order" => book.order_sell_list[1].price = book.order_sell_list[0].price,
+            "crossed" => book.order_buy_list[0].price = book.order_sell_list[0].price,
             _ => unreachable!(),
         }
 

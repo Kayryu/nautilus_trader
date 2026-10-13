@@ -25,6 +25,7 @@ mod funding_fees;
 mod hourly_funding;
 mod lending;
 mod liquidations;
+mod market_data;
 mod order_lookup;
 mod perp_orders;
 mod positions;
@@ -194,6 +195,14 @@ pub fn deepx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DeepXWalletDelegateAccounts>()?;
     m.add_class::<DeepXDelegateWallets>()?;
     m.add_function(wrap_pyfunction!(quota::py_get_deepx_quota_summary, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        market_data::py_load_deepx_perp_trade_ticks,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        market_data::py_load_deepx_spot_trade_ticks,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         balance_changes::py_get_deepx_balance_changes,
         m

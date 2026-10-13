@@ -118,6 +118,8 @@ __all__ = [
     "get_deepx_wallet_funding_fees",
     "get_deepx_wallet_perp_positions",
     "get_deepx_wallet_subaccounts",
+    "load_deepx_perp_trade_ticks",
+    "load_deepx_spot_trade_ticks",
 ]
 
 DEEPX: str
@@ -1588,3 +1590,19 @@ def get_deepx_wallet_perp_positions(
 def get_deepx_wallet_subaccounts(
     wallet: str, config: DeepXDataClientConfig | None = None
 ) -> DeepXWalletSubaccounts: ...
+def load_deepx_perp_trade_ticks(
+    market_id: int,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    max_pages: int = 100,
+    config: DeepXDataClientConfig | None = None,
+) -> tuple[model.CryptoPerpetual, list[model.TradeTick]]: ...
+def load_deepx_spot_trade_ticks(
+    market_name: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    max_pages: int = 100,
+    config: DeepXDataClientConfig | None = None,
+) -> tuple[model.CurrencyPair, list[model.TradeTick]]: ...

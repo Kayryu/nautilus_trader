@@ -17,6 +17,7 @@
 //!
 //! Run with:
 //! `cargo run -p nautilus-deepx --bin deepx-capture-runtime-fixtures`
+//! For an unapproved deployment, pass `--expected-genesis` and `--output-root` explicitly.
 
 use std::{
     collections::BTreeSet,
@@ -100,12 +101,13 @@ struct FixtureManifest {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let (expected_genesis, output_root) = capture_options(env::args().skip(1))?;
     let client = Client::new();
     let rpc_url = env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
     let genesis = rpc::<String>(&client, &rpc_url, "chain_getBlockHash", json!([0])).await?;
     ensure!(
-        genesis.result == EXPECTED_GENESIS_HASH,
-        "DeepX genesis hash mismatch: expected {EXPECTED_GENESIS_HASH}, received {}",
+        genesis.result == expected_genesis,
+        "DeepX genesis hash mismatch: expected {expected_genesis}, received {}",
         genesis.result,
     );
 
@@ -147,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
         spec_version: runtime.result.spec_version,
         transaction_version: runtime.result.transaction_version,
     };
-    let fixture_dir = fixture_dir(&identity, &finalized_head.result);
+    fs::create_dir_all(&output_root)?;
+    let fixture_dir = fixture_dir(&output_root, &identity, &finalized_head.result);
     ensure!(
         !fixture_dir.exists(),
         "DeepX fixture set already exists and is immutable: {}",
@@ -236,6 +239,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn capture_options(args: impl Iterator<Item = String>) -> anyhow::Result<(String, PathBuf)> {
+    let mut args = args;
+    let mut expected_genesis = None;
+    let mut output_root = None;
+    while let Some(option) = args.next() {
+        match option.as_str() {
+            "--expected-genesis" if expected_genesis.is_none() => {
+                let value = args.next().context("--expected-genesis requires a hash")?;
+                ensure!(
+                    value.len() == 66
+                        && value.starts_with("0x")
+                        && value.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit),
+                    "--expected-genesis requires a 32-byte hex hash",
+                );
+                expected_genesis = Some(value);
+            }
+            "--output-root" if output_root.is_none() => {
+                let value = args.next().context("--output-root requires a path")?;
+                let path = PathBuf::from(value);
+                ensure!(
+                    path.is_absolute(),
+                    "--output-root requires an absolute path"
+                );
+                output_root = Some(path);
+            }
+            _ => anyhow::bail!("unknown or repeated DeepX fixture capture option: {option}"),
+        }
+    }
+    ensure!(
+        expected_genesis.is_some() == output_root.is_some(),
+        "--expected-genesis and --output-root must be supplied together",
+    );
+    let root = output_root.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/runtime/testnet")
+    });
+    Ok((
+        expected_genesis.unwrap_or_else(|| EXPECTED_GENESIS_HASH.to_string()),
+        root,
+    ))
+}
+
 fn publish_fixture_set(staging_dir: &Path, fixture_dir: &Path) -> anyhow::Result<()> {
     let result = validate_written_fixture_set(staging_dir).and_then(|()| {
         fs::rename(staging_dir, fixture_dir).with_context(|| {
@@ -307,20 +351,18 @@ fn parse_block_number(value: &str) -> anyhow::Result<u64> {
         .with_context(|| format!("Invalid DeepX finalized block number: {value}"))
 }
 
-fn fixture_dir(identity: &FixtureIdentity, block_hash: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_data/runtime/testnet")
-        .join(format!(
-            "genesis-{}_metadata-{}_spec-{}_tx-{}_finalized-{}",
-            &identity.genesis_hash[2..10],
-            &identity.metadata_sha256[..8],
-            identity.spec_version,
-            identity.transaction_version,
-            block_hash
-                .trim_start_matches("0x")
-                .get(..8)
-                .unwrap_or(block_hash),
-        ))
+fn fixture_dir(root: &Path, identity: &FixtureIdentity, block_hash: &str) -> PathBuf {
+    root.join(format!(
+        "genesis-{}_metadata-{}_spec-{}_tx-{}_finalized-{}",
+        &identity.genesis_hash[2..10],
+        &identity.metadata_sha256[..8],
+        identity.spec_version,
+        identity.transaction_version,
+        block_hash
+            .trim_start_matches("0x")
+            .get(..8)
+            .unwrap_or(block_hash),
+    ))
 }
 
 fn write_fixture<T>(
@@ -730,6 +772,28 @@ mod tests {
     }
 
     #[rstest]
+    fn validates_captured_spec_375_fixture_set() {
+        let fixture_dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b",
+        ));
+
+        validate_written_fixture_set(fixture_dir).unwrap();
+    }
+
+    #[rstest]
+    fn validates_captured_spec_376_fixture_set() {
+        let fixture_dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448",
+        ));
+
+        validate_written_fixture_set(fixture_dir).unwrap();
+    }
+
+    #[rstest]
     fn rejects_tampered_signed_extension_order() {
         let fixture_dir = write_valid_fixture_set();
         let manifest_path = fixture_dir.0.join("manifest.json");
@@ -832,6 +896,7 @@ mod tests {
     #[rstest]
     fn fixture_directory_includes_runtime_and_finalized_block_identity() {
         let path = fixture_dir(
+            Path::new("/tmp/deepx-runtime-captures"),
             &fixture_identity(),
             "0xcfb45de9dc182734a6ce745ef75e8510cd796628861b17a286ea2f077de68315",
         );
@@ -844,10 +909,51 @@ mod tests {
     #[rstest]
     fn different_finalized_blocks_produce_different_directories() {
         let identity = fixture_identity();
-        let first = fixture_dir(&identity, "0x1111111122222222");
-        let second = fixture_dir(&identity, "0x3333333344444444");
+        let root = Path::new("/tmp/deepx-runtime-captures");
+        let first = fixture_dir(root, &identity, "0x1111111122222222");
+        let second = fixture_dir(root, &identity, "0x3333333344444444");
 
         assert_ne!(first, second);
+    }
+
+    #[rstest]
+    fn capture_options_require_explicit_pair_for_unapproved_deployment() {
+        let genesis = "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
+        let options = [
+            "--expected-genesis",
+            genesis,
+            "--output-root",
+            "/tmp/deepx-review",
+        ];
+        let (expected, root) = capture_options(options.into_iter().map(str::to_string)).unwrap();
+
+        assert_eq!(expected, genesis);
+        assert_eq!(root, PathBuf::from("/tmp/deepx-review"));
+        assert!(
+            capture_options(
+                ["--expected-genesis", genesis]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .is_err()
+        );
+        assert!(
+            capture_options(
+                ["--output-root", "/tmp/deepx-review"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case(vec!["--expected-genesis", "0x1234", "--output-root", "/tmp/deepx-review"])]
+    #[case(vec!["--expected-genesis", "0xgg", "--output-root", "/tmp/deepx-review"])]
+    #[case(vec!["--expected-genesis", EXPECTED_GENESIS_HASH, "--output-root", "relative"])]
+    #[case(vec!["--expected-genesis", EXPECTED_GENESIS_HASH, "--expected-genesis", EXPECTED_GENESIS_HASH])]
+    fn capture_options_reject_invalid_inputs(#[case] options: Vec<&str>) {
+        assert!(capture_options(options.into_iter().map(str::to_string)).is_err());
     }
 
     #[rstest]

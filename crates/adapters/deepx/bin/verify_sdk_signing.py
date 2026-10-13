@@ -19,8 +19,16 @@ from substrateinterface import Keypair, KeypairType, SubstrateInterface
 SDK_BLOB = "0108f89d79366f13e747ef59c75ce73a543dc404"
 COMPAT_BLOB = "06b2e9fc84cc36c647452027b9c5b2cbbfcafb8c"
 TEST_KEY = "0123456789abcdef" * 4
+SPEC_376_FINALIZED_PERP_CANCEL = (
+    "050284bb3d6fdc376a153ead60bc2ab97dd0be7cd55960065f5de9b395a3c3155f8837b88532"
+    "03f944ce34754e59ee71b1b514b96f9e420222a084aa4374aac260da37b6acb697514a27657a75"
+    "aa1aafe5d278e5ce591801000b0dc99734a101001603a13c7ab8decf4d32cf80c371647c93d0e2"
+    "f4183e60982d21a101000002000000"
+)
 FIXTURES = Path(__file__).resolve().parents[1] / "test_data/runtime/testnet"
-SNAPSHOT = FIXTURES / "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1"
+SNAPSHOT = (
+    FIXTURES / "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08"
+)
 
 
 class OfflineSubstrate(SubstrateInterface):
@@ -36,13 +44,19 @@ class OfflineSubstrate(SubstrateInterface):
             366: "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37",
             369: "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
             371: "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15",
+            375: "2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311",
+            376: "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447",
         }.get(self.fixture_version["result"]["specVersion"])
+        expected_genesis = (
+            "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
+            if self.fixture_version["result"]["specVersion"] in (375, 376)
+            else "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b"
+        )
         if (
             hashlib.sha256(metadata).hexdigest() != expected_hash
             or identity["metadata_sha256"] != expected_hash
             or identity["genesis_hash"] != self.fixture_genesis["result"]
-            or self.fixture_genesis["result"]
-            != "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b"
+            or self.fixture_genesis["result"] != expected_genesis
             or self.fixture_version["result"]["transactionVersion"] != 1
         ):
             raise ValueError("Runtime fixture identity is not the reviewed snapshot")
@@ -130,6 +144,56 @@ def load_sdk_builder(sdk_source: Path, compat_source: Path):
         namespace,
     )
     return namespace["build_signed_pallet_call_extrinsic"]
+
+
+def verify_spec376_finalized_signature() -> None:
+    """Check the immortal signing context against a finalized on-chain extrinsic."""
+    from eth_keys import keys
+    from eth_utils import keccak
+
+    # PerpMarket.cancel_order in finalized block 18476010,
+    # hash 0x841d9d8cef55aa90a20b79f18d79737c25b47ef8b6012205d1668e83efc2278d
+    encoded = bytes.fromhex(SPEC_376_FINALIZED_PERP_CANCEL)
+    if len(encoded) - 2 != int.from_bytes(encoded[:2], "little") >> 2:
+        raise AssertionError("Finalized extrinsic has an invalid SCALE length")
+    if encoded[2] != 0x84:
+        raise AssertionError("Finalized extrinsic is not signed version 4")
+    account = encoded[3:23]
+    signature = keys.Signature(signature_bytes=encoded[23:88])
+    extra, call = encoded[88:97], encoded[97:]
+    if len(extra) != 9 or extra[0] != 0 or extra[1] != 0x0B or extra[-1] != 0:
+        raise AssertionError(
+            "Finalized extrinsic has an unexpected immortal extension layout"
+        )
+    if call[:2] != bytes((22, 3)) or len(call) != 34:
+        raise AssertionError("Finalized extrinsic is not the captured perpetual cancel")
+
+    genesis = bytes.fromhex(
+        "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
+    )
+
+    def recovered(spec_version: int, era_implicit: bytes) -> bytes:
+        payload = (
+            call
+            + extra
+            + spec_version.to_bytes(4, "little")
+            + (1).to_bytes(4, "little")
+            + genesis
+            + era_implicit
+        )
+        return signature.recover_public_key_from_msg_hash(
+            keccak(payload)
+        ).to_canonical_address()
+
+    if (
+        recovered(376, genesis) != account
+        or recovered(375, genesis) == account
+        or recovered(376, bytes(32)) == account
+    ):
+        raise AssertionError(
+            "Finalized signature does not bind spec 376 and immortal genesis"
+        )
+    print("Finalized spec376 signature context: PerpMarket.cancel_order")
 
 
 def load_sdk_evm_builder(sdk_source: Path):
@@ -288,7 +352,7 @@ def main():
     parser.add_argument("sdk_source", type=Path)
     parser.add_argument("compat_source", type=Path)
     parser.add_argument(
-        "--spec-version", type=int, choices=(366, 369, 371), default=366
+        "--spec-version", type=int, choices=(366, 369, 371, 375, 376), default=366
     )
     args = parser.parse_args()
     global SNAPSHOT
@@ -301,6 +365,16 @@ def main():
         SNAPSHOT = (
             FIXTURES
             / "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda"
+        )
+    elif args.spec_version == 375:
+        SNAPSHOT = (
+            FIXTURES
+            / "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b"
+        )
+    elif args.spec_version == 376:
+        SNAPSHOT = (
+            FIXTURES
+            / "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448"
         )
     builder = load_sdk_builder(args.sdk_source, args.compat_source)
     source = (Path(__file__).resolve().parents[1] / "src/signing/mod.rs").read_text()
@@ -718,6 +792,23 @@ def main():
                 ),
             ]
         )
+    if args.spec_version in (375, 376):
+        selected = []
+        seen = set()
+        for vector in vectors:
+            identity = (vector[0], vector[1])
+            if (
+                identity
+                in {
+                    ("Subaccount", "no_op"),
+                    ("System", "remark"),
+                    ("PerpMarket", "place_order"),
+                }
+                and identity not in seen
+            ):
+                selected.append(vector)
+                seen.add(identity)
+        vectors = selected
     for pallet, call, params, nonce in vectors:
         encoded = builder(
             substrate_ws="ws://offline.invalid",
@@ -733,6 +824,8 @@ def main():
                 f"SDK/Rust signed extrinsic mismatch: {pallet}.{call}: {encoded}"
             )
         print(f"SDK/Rust complete extrinsic parity: {pallet}.{call}")
+    if args.spec_version == 376:
+        verify_spec376_finalized_signature()
     verify_evm_vectors(args.sdk_source)
     print(
         f"SDK blobs: {SDK_BLOB}, {COMPAT_BLOB}; spec{args.spec_version}/tx1; offline only"

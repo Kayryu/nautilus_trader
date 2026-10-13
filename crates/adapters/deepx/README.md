@@ -47,6 +47,15 @@ path against public testnet.
 
 Spot `subscribe_book_deltas`, `subscribe_book_depth10`, and `subscribe_quotes` use the node's
 read-only `orderbook_subscribe` JSON-RPC method over the configured Watch RPC WebSocket endpoint.
+If the endpoint explicitly rejects that method with JSON-RPC `-32601`, L2 and quote subscriptions
+poll validated Spot REST snapshots once per second. They publish only advancing venue update IDs
+with nondecreasing engine times. REST L2 batches replace the entire requested-depth book, and
+quotes use the best bid and ask. The REST fallback cannot serve depth10 because the response has
+no constituent order counts. Other RPC errors continue through bounded recovery.
+REST aggregate quantities can fall below the order step after partial fills; they are preserved
+exactly up to base-token precision. Unrepresentable levels and crossed books are rejected.
+The framework's debug formatter prints quantities above 16 decimal places as raw fixed-point
+integers, including in the live data tester; this does not change their stored value.
 Each node notification is a complete Spot book snapshot: L2 subscriptions publish replacement
 batches, depth10 publishes the best ten levels, and quotes use the best bid and ask. Price and
 amount values are converted from the node's fixed atomic scales and must match the loaded
@@ -1006,9 +1015,10 @@ framework clock at dispatch. Async reception timestamps use the live atomic cloc
 fences response emission and cancels owned tasks; reconnect drains them before opening a fresh
 generation. Nanosecond starts advance to the first eligible millisecond before REST pagination;
 a range with no eligible millisecond returns an empty correlated response. Spot `request_trades`
-uses the verified pair directory, bounded global cursor history, exact instrument precision,
-finalized tick/step grid checks, and chain-defined Buyer/Seller taker roles. Unknown takers,
-foreign pairs, precision loss, off-grid values, or malformed times reject the whole response.
+uses the verified pair directory, bounded global cursor history, exact execution amounts up to
+the base token's atomic precision, finalized price tick checks, and chain-defined Buyer/Seller
+taker roles. Partial fills may be smaller than the order step. Unknown takers, foreign pairs,
+precision loss, off-tick prices, or malformed times reject the whole response.
 `deepx-verify-spot-trade-history`
 compares live raw and framework ETH/USDC executions.
 A framework testnet run on 2026-09-14 verified three chronological ticks over
@@ -1017,6 +1027,42 @@ matching request correlation, and successful disconnect.
 A public run on 2026-09-14 verified two ETH-USDC trades across two size-one pages in the
 inclusive range `1789372702699..=1789372703699`. The live probe also identified and verified the
 fix for decimal JSON leverage values such as `25.0`.
+
+`load_deepx_perp_trade_ticks(market_id, start_ms, end_ms, limit=1000, max_pages=100)` exposes the
+same bounded perpetual history and validated current market instrument to Python backtests. It
+returns chronological ticks with initialization times set to their event times for replay. The
+market metadata is current, so a historical run does not reconstruct past tick sizes, fees, or
+margin rules. From the repository root, run the read-only live data tester with
+`.venv/bin/python examples/live/deepx/data_tester.py`, or run the simulated trade-tick backtest
+with `.venv/bin/python examples/backtest/deepx_ema_cross_ethusdc_trades.py`. The backtest accepts
+`--start-ms` and `--end-ms` together for a fixed UTC millisecond window and sends no transactions.
+`load_deepx_spot_trade_ticks(market_name, start_ms, end_ms, limit=1000, max_pages=100)` uses the
+bounded public Spot history and a finalized-chain-verified current Spot instrument. It likewise
+returns chronological replay ticks and does not reconstruct historical trading rules. Run the
+simulated Spot example with
+`.venv/bin/python examples/backtest/deepx_ema_cross_ethusdc_spot_trades.py`. The public testnet
+runtime observed on 2026-10-13 used genesis hash
+`0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`, specification
+375, and metadata SHA-256
+`2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311`.
+The read-only runtime snapshot and Spot storage decoder approve this captured identity. A public
+run loaded 1,000 exact Spot ticks and simulated eight fills. The Spot example disables optional
+portfolio analysis and omits the account report because the shared analysis path converts
+18-decimal ETH money to `f64` and panics; fill and position reports remain available.
+`examples/live/deepx/exec_tester.py` also wires the validated execution client to the framework
+test strategy. It first checks the public account snapshot and subaccount directory of wallet
+`0x781ed35b167068c93dfadab41dfb680edaca4e50`; select an address from that directory with
+`--subaccount` if there is more than one. Startup requires `DEEPX_TESTNET_PRIVATE_KEY` and a durable
+PostgreSQL store configured through `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, and
+`POSTGRES_DATABASE` (`POSTGRES_HOST` and `POSTGRES_PORT` are optional). By default the tester only
+connects and subscribes. `--submit-order` opts into one ETH-USDC perpetual IOC market buy of
+`0.0010` and a reduce-only shutdown close request scoped to the tester's positions. These are real
+testnet transactions and are not guaranteed to fill or close. Account ownership, finalized
+flat-account state, runtime identity, durable recovery, and signing remain enforced by the Rust
+client. The public snapshot preflight rejects inactive accounts, nonzero margin requirements, and
+outstanding borrowing; it does not establish the finalized flat-account proof. A 2026-10-13
+read-only snapshot returned three owned subaccounts, one with a nonzero margin requirement.
+Live execution startup and submission have not been verified against this wallet.
 
 `get_perp_order_book` exposes one exact, potentially price-aggregated REST snapshot for a required
 perpetual market ID. It validates the echoed book and per-level market identity, positive prices
@@ -1161,11 +1207,15 @@ partial model and cannot construct instruments. A 2026-09-17 ETH-USDC capture al
 exact value without assuming a shared scale. The instrument verifier cross-checks only stable,
 same-scale identity, precision, margin, fee, and minimum-order fields across both lookup routes.
 `observe_finalized_spot_market_spec_evidence` reads raw `min_order_size`, `tick_size`, and
-`step_size` for a bytes32 pair at an approved, canonical finalized checkpoint. The provider reads
-all directory pairs at one shared checkpoint after checking the block timestamp inherent, both
-timestamp storage routes, and EIP-1898 block selection. It converts base-token atomic units with
-`baseDecimal`, rechecks the timestamp after all pair reads, and publishes the complete
-Spot/Perpetual catalog only after every conversion succeeds.
+`step_size` from metadata-typed `SpotMarket.SpotMarkets` storage for a bytes32 pair at an approved,
+canonical finalized checkpoint. The provider reads all directory pairs at one shared checkpoint
+after checking the block timestamp inherent, both timestamp storage routes, and rejection of an
+impossible storage block hash. Each hash-pinned storage value must identify the requested pair and
+remain unchanged on a repeated read. The provider converts base-token atomic units with
+`baseDecimal`, rechecks the timestamp after all
+pair reads, and publishes the complete Spot/Perpetual catalog only after every conversion succeeds.
+The public RPC accepted an impossible canonical hash for EIP-1898 `eth_call`, so Spot precision
+discovery uses Substrate storage; Perp precompile reads retain their independent EIP-1898 gate.
 `observe_finalized_perp_order_spec_evidence` reads the Perp precompile's raw minimum size, tick,
 and step and the pallet's minimum notional at one approved, canonical finalized checkpoint. The
 storage value is decoded with that checkpoint's approved metadata, and the shared fields must
@@ -1495,13 +1545,42 @@ A read-only Perpetual verifier run for block `187071212` and wallet
 
 The `deepx-capture-runtime-fixtures` binary captures public runtime identity responses after
 verifying the expected testnet genesis hash. It does not access account data or submit
-transactions. The specification 371 finalized capture records block `195884340`, metadata SHA-256
+transactions. For a new, unapproved deployment, supply both `--expected-genesis <hash>` and
+`--output-root </absolute/review/path>` after `--` to inspect a fixture outside the repository;
+capture does not approve runtime signing. A 2026-10-13 capture under `/tmp/deepx-runtime-review`
+bound spec 375 and metadata SHA-256
+`2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311` to finalized
+block `18211500` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
+Its signed extensions use `CheckNonceEra` where the approved old-chain captures use
+`CheckMortality`. The Rust Subxt extension now matches complete immortal `Subaccount.no_op`,
+`System.remark`, and `PerpMarket.place_order` extrinsics generated offline by the pinned Python SDK
+against this captured metadata. Run `verify_sdk_signing.py --spec-version 375` with the pinned SDK
+source and compatibility helper to repeat that comparison. This proves encoding for those calls,
+not inclusion, account authorization, or durable recovery on the new deployment. The spec-375
+signing permit remains closed pending transaction and recovery validation.
+The same genesis advanced to spec 376 on 2026-10-13. One finalized spec-376 fixture binds metadata
+SHA-256 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447` to block
+`18494970`. Compared with spec 375, its 21 pallet indices, call and event identities, storage
+entries, and signed-extension descriptors are unchanged; `CancelReason.InsufficientBalance` and two
+Spot settlement errors were appended. The read-only permit accepts this exact identity, and a
+public verifier rediscovered three Spot and eight Perpetual instruments after the upgrade. The
+signing permit does not accept spec 376. The pinned SDK and Rust agree on complete offline spec-376
+`Subaccount.no_op`, `System.remark`, and `PerpMarket.place_order` bytes. Separately, an already
+finalized spec-376 `PerpMarket.cancel_order` in block `18476010` recovers its encoded signer only
+with spec 376, transaction version 1, and the new genesis hash as both implicit hashes. A read-only
+`system_dryRunAt` of the old offline remark vector returned transaction-validity code `0x01000b`
+(`IndeterminateImplicit`), so that probe does not establish live acceptance. No new transaction or
+durable recovery on spec 376 has been validated.
+On spec 376, a read-only Spot data tester observed 15 managed 20-level books, quotes, and trades
+without recovery warnings. The public Spot backtest replayed 1,000 ticks and submitted two simulated
+orders; the Perpetual backtest submitted eight simulated orders. Neither backtest sent a transaction.
+The specification 371 finalized capture records block `195884340`, metadata SHA-256
 `4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15`, and the canonical block-hash
 binding. Its metadata differs from the specification 369 capture only at the encoded runtime
 version byte. The checked-in runtime source retains the same signed-extension tuple and transaction
-version, and the live Python SDK independently reproduced exact `System.remark`, `Subaccount.no_op`,
-and `PerpMarket.place_order` extrinsics for specification 371. The signing gate therefore accepts
-only this exact captured identity; unknown metadata and future upgrades still fail closed.
+version, and the pinned Python SDK independently reproduced exact `System.remark`, `Subaccount.no_op`,
+and `PerpMarket.place_order` extrinsics for specification 371. The signing gate accepts the exact
+captured old-chain identities; unknown metadata and future upgrades still fail closed.
 
 Sanitized public REST fixtures under `test_data/http/testnet` include sidecar manifests when a
 capture is associated with the independently verified testnet runtime identity. REST responses are

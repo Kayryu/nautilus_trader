@@ -296,7 +296,7 @@ mod tests {
             366 => include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/test_data/runtime/testnet/",
-                "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1/metadata.json",
+                "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
             )),
             369 => include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),

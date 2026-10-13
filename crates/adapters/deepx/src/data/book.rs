@@ -149,6 +149,27 @@ pub(super) fn parse_spot_order_book(
     depth: NonZeroUsize,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBook> {
+    let deltas = parse_spot_order_book_deltas(
+        snapshot,
+        market,
+        instrument,
+        depth,
+        snapshot.last_update_id,
+        ts_init,
+    )?;
+    let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
+    book.apply_deltas(&deltas)?;
+    Ok(book)
+}
+
+pub(super) fn parse_spot_order_book_deltas(
+    snapshot: &DeepXSpotOrderBook,
+    market: &DeepXSpotMarket,
+    instrument: &InstrumentAny,
+    depth: NonZeroUsize,
+    sequence: u64,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderBookDeltas> {
     anyhow::ensure!(
         snapshot.pair_name == market.name,
         "DeepX Spot book name does not match instrument metadata"
@@ -167,6 +188,7 @@ pub(super) fn parse_spot_order_book(
         snapshot.last_update_id > 0,
         "DeepX Spot book sequence must be nonzero"
     );
+    anyhow::ensure!(sequence > 0, "DeepX Spot book sequence must be nonzero");
     let ts_event = UnixNanos::from(
         snapshot
             .engine_time
@@ -175,7 +197,7 @@ pub(super) fn parse_spot_order_book(
     );
     let mut deltas = vec![OrderBookDelta::clear(
         instrument.id(),
-        snapshot.last_update_id,
+        sequence,
         ts_event,
         ts_init,
     )];
@@ -185,22 +207,25 @@ pub(super) fn parse_spot_order_book(
     ] {
         for level in levels.iter().take(depth.get()) {
             let price = Price::from_decimal_dp(level.price, instrument.price_precision())?;
-            let size = Quantity::from_decimal_dp(level.qty, instrument.size_precision())?;
+            let exact_amount = level.qty.normalize();
+            anyhow::ensure!(
+                exact_amount.scale() <= u32::from(market.base_decimal),
+                "DeepX Spot book quantity exceeds base token precision"
+            );
+            let size = Quantity::from_decimal(exact_amount)?;
             anyhow::ensure!(
                 price.as_decimal() == level.price
                     && size.as_decimal() == level.qty
                     && price.as_decimal() % instrument.price_increment().as_decimal()
-                        == rust_decimal::Decimal::ZERO
-                    && size.as_decimal() % instrument.size_increment().as_decimal()
                         == rust_decimal::Decimal::ZERO,
-                "DeepX Spot book level is not exactly representable on the instrument grid"
+                "DeepX Spot book level is not exactly representable"
             );
             deltas.push(OrderBookDelta::new_checked(
                 instrument.id(),
                 BookAction::Add,
                 BookOrder::new(side, price, size, 0),
                 RecordFlag::F_SNAPSHOT as u8,
-                snapshot.last_update_id,
+                sequence,
                 ts_event,
                 ts_init,
             )?);
@@ -209,10 +234,7 @@ pub(super) fn parse_spot_order_book(
     if let Some(last) = deltas.last_mut() {
         last.flags |= RecordFlag::F_LAST as u8;
     }
-    let deltas = OrderBookDeltas::new_checked(instrument.id(), deltas)?;
-    let mut book = OrderBook::new(instrument.id(), BookType::L2_MBP);
-    book.apply_deltas(&deltas)?;
-    Ok(book)
+    OrderBookDeltas::new_checked(instrument.id(), deltas)
 }
 
 pub(super) fn parse_spot_order_book_quote_tick(
@@ -251,6 +273,12 @@ pub(super) fn quote_tick_from_book(
     ) else {
         return Ok(None);
     };
+    let size_precision = bid_size
+        .precision
+        .max(ask_size.precision)
+        .max(instrument.size_precision());
+    let bid_size = Quantity::from_decimal_dp(bid_size.as_decimal(), size_precision)?;
+    let ask_size = Quantity::from_decimal_dp(ask_size.as_decimal(), size_precision)?;
     Ok(Some(QuoteTick::new_checked(
         instrument.id(),
         bid_price,
@@ -908,12 +936,34 @@ mod tests {
     }
 
     #[rstest]
-    fn spot_rest_snapshot_rejects_off_grid_levels() {
-        let (market, snapshot, mut instrument) = spot_fixture();
-        let InstrumentAny::CurrencyPair(pair) = &mut instrument else {
-            unreachable!();
-        };
-        pair.size_increment = Quantity::from("0.0007");
+    fn spot_rest_snapshot_preserves_partial_level_below_order_step() {
+        let (market, mut snapshot, instrument) = spot_fixture();
+        snapshot.order_buy_list[0].qty = "0.00650570999547141".parse().unwrap();
+        let book = parse_spot_order_book(
+            &snapshot,
+            &market,
+            &instrument,
+            NonZeroUsize::new(1).unwrap(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            book.best_bid_size().unwrap().as_decimal(),
+            snapshot.order_buy_list[0].qty
+        );
+        let quote =
+            parse_spot_order_book_quote_tick(&snapshot, &market, &instrument, UnixNanos::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(quote.bid_size.as_decimal(), snapshot.order_buy_list[0].qty);
+        assert_eq!(quote.bid_size.precision, quote.ask_size.precision);
+    }
+
+    #[rstest]
+    fn spot_rest_snapshot_rejects_unrepresentable_level() {
+        let (market, mut snapshot, instrument) = spot_fixture();
+        snapshot.order_buy_list[0].qty = "0.0065057099954714123".parse().unwrap();
 
         assert!(
             parse_spot_order_book(

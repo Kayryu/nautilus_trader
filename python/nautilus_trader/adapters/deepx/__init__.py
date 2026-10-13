@@ -132,6 +132,8 @@ __all__ = [
     "get_deepx_wallet_funding_fees",
     "get_deepx_wallet_perp_positions",
     "get_deepx_wallet_subaccounts",
+    "load_deepx_perp_trade_ticks",
+    "load_deepx_spot_trade_ticks",
 ]
 
 fixup_module_names(globals(), __name__)

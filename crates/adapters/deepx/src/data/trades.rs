@@ -28,7 +28,7 @@ use rust_decimal::Decimal;
 
 use crate::http::{DeepXPerpTrade, DeepXSpotMarket, DeepXSpotTrade};
 
-pub(super) fn parse_trade_tick(
+pub(crate) fn parse_trade_tick(
     trade: &DeepXPerpTrade,
     instrument: &InstrumentAny,
     market_id: u64,
@@ -84,7 +84,7 @@ pub(super) fn parse_trade_tick(
     )
 }
 
-pub(super) fn parse_spot_trade_tick(
+pub(crate) fn parse_spot_trade_tick(
     trade: &DeepXSpotTrade,
     market: &DeepXSpotMarket,
     instrument: &InstrumentAny,
@@ -114,7 +114,12 @@ pub(super) fn parse_spot_trade_tick(
     );
     let price = Price::from_decimal_dp(trade.price, instrument.price_precision())
         .context("DeepX Spot trade price cannot be represented")?;
-    let size = Quantity::from_decimal_dp(trade.base_amount, instrument.size_precision())
+    let exact_amount = trade.base_amount.normalize();
+    ensure!(
+        exact_amount.scale() <= u32::from(market.base_decimal),
+        "DeepX Spot trade amount exceeds base token precision"
+    );
+    let size = Quantity::from_decimal(exact_amount)
         .context("DeepX Spot trade amount cannot be represented")?;
     ensure!(
         price.as_decimal() == trade.price,
@@ -127,10 +132,6 @@ pub(super) fn parse_spot_trade_tick(
     ensure!(
         price.as_decimal() % instrument.price_increment().as_decimal() == Decimal::ZERO,
         "DeepX Spot trade price is not a multiple of the instrument tick"
-    );
-    ensure!(
-        size.as_decimal() % instrument.size_increment().as_decimal() == Decimal::ZERO,
-        "DeepX Spot trade amount is not a multiple of the instrument step"
     );
     let aggressor = match trade.taker.as_str() {
         "Buyer" => AggressorSide::Buy,
@@ -237,17 +238,26 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn rejects_spot_trade_values_off_instrument_grid() {
-        let (market, trade) = fixture();
-        let mut instrument = spot_instrument();
-        let InstrumentAny::CurrencyPair(pair) = &mut instrument else {
-            unreachable!();
-        };
-        pair.size_increment = Quantity::from("0.0003");
+    fn preserves_spot_fill_below_order_step() {
+        let (market, mut trade) = fixture();
+        trade.base_amount = Decimal::from_str_exact("0.00001184918359125").unwrap();
+
+        let tick = parse_spot_trade_tick(&trade, &market, &spot_instrument(), UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(tick.size.as_decimal(), trade.base_amount);
+        assert_eq!(tick.size.precision, 17);
+    }
+
+    #[rstest::rstest]
+    fn rejects_spot_fill_beyond_base_token_precision() {
+        let (market, mut trade) = fixture();
+        trade.base_amount = Decimal::from_str_exact("0.0000000000000000001").unwrap();
 
         let error =
-            parse_spot_trade_tick(&trade, &market, &instrument, UnixNanos::default()).unwrap_err();
+            parse_spot_trade_tick(&trade, &market, &spot_instrument(), UnixNanos::default())
+                .unwrap_err();
 
-        assert!(format!("{error:#}").contains("not a multiple of the instrument step"));
+        assert!(format!("{error:#}").contains("exceeds base token precision"));
     }
 }

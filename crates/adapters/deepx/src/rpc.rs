@@ -17,11 +17,6 @@
 
 mod spot_margin;
 
-pub use spot_margin::{
-    DeepXFinalizedSpotMarginError, DeepXFinalizedSpotMarginEvidence,
-    observe_finalized_spot_margin_evidence,
-};
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Formatter},
@@ -29,7 +24,7 @@ use std::{
 };
 
 use alloy::{
-    primitives::{Address, Bytes, FixedBytes},
+    primitives::{Address, Bytes},
     sol,
     sol_types::{SolCall, SolValue},
 };
@@ -41,6 +36,10 @@ use nautilus_model::defi::rpc::RpcNodeHttpResponse;
 use parity_scale_codec::{Compact, Decode, DecodeAll, Encode};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
+pub use spot_margin::{
+    DeepXFinalizedSpotMarginError, DeepXFinalizedSpotMarginEvidence,
+    observe_finalized_spot_margin_evidence,
+};
 use subxt_core::ext::scale_value::{Composite, ValueDef, scale::decode_as_type};
 use thiserror::Error;
 
@@ -84,9 +83,16 @@ const DEEPX_LENDING_BORROW_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effe
 const DEEPX_SPEC_369_FINALIZED_HASH: &str =
     "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6";
 const DEEPX_SPEC_369_VERSION: u32 = 369;
+const DEEPX_SPEC_375_FINALIZED_HASH: &str =
+    "0x69e2314b93e1779538a422e2c09bad5a9bd08e2bc83c1fdd7e3037b48a525766";
+const DEEPX_SPEC_375_VERSION: u32 = 375;
+const DEEPX_SPEC_376_FINALIZED_HASH: &str =
+    "0x7340d448342fb2f7852e7f8999060c40652788cc5d6406846f66c6dc34086c34";
+const DEEPX_SPEC_376_VERSION: u32 = 376;
 const DEEPX_ETH_CALL_PROBE_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 const DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
 const DEEPX_MAX_PERP_MARKET_STORAGE_BYTES: usize = 16_384;
+const DEEPX_MAX_SPOT_MARKET_STORAGE_BYTES: usize = 16_384;
 const DEEPX_MAX_LENDING_POSITION_ASSETS: usize = 64;
 const DEEPX_LENDING_ASSET_QUERY_CONCURRENCY: usize = 8;
 const DEEPX_DEFAULT_MAX_PERP_POSITIONS: u32 = 8;
@@ -103,14 +109,6 @@ sol! {
         uint8 lendingMarket,
         bytes asset
     ) external view returns (uint128);
-
-    struct DeepXSpotMarketSpecAbi {
-        uint128 minOrderSize;
-        uint128 tickSize;
-        uint128 stepSize;
-    }
-
-    function getSpotMarketSpec(bytes32 pair) external view returns (DeepXSpotMarketSpecAbi);
 
     struct DeepXPerpOrderSpecAbi {
         uint128 min_order_size;
@@ -148,9 +146,6 @@ sol! {
     function perpMarkets(uint16 market_id) external view returns (DeepXPerpMarketAbi);
 }
 
-const DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS: Address = Address::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x4d,
-]);
 const DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS: Address = Address::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x4e,
 ]);
@@ -409,7 +404,7 @@ pub struct DeepXFinalizedSpotMarketSpecEvidence {
 }
 
 impl DeepXFinalizedSpotMarketSpecEvidence {
-    /// Returns the finalized checkpoint used for the precompile read.
+    /// Returns the finalized checkpoint used for the storage read.
     #[must_use]
     pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
         self.checkpoint
@@ -1686,7 +1681,7 @@ pub enum DeepXFinalizedLendingError {
 /// Errors raised while collecting finalized Spot market specification evidence.
 #[derive(Debug, Error)]
 pub enum DeepXFinalizedSpotMarketSpecError {
-    /// Watch capability evidence does not belong to the endpoint or lacks `eth_call`.
+    /// Watch capability evidence does not belong to the endpoint or lacks required reads.
     #[error("DeepX Watch RPC capabilities do not authorize finalized Spot market reads")]
     RpcCapabilitiesMismatch,
     /// The bounded batch size is zero or exceeds the supported maximum.
@@ -1701,7 +1696,7 @@ pub enum DeepXFinalizedSpotMarketSpecError {
     /// The selected block or its storage did not establish a consistent checkpoint.
     #[error("DeepX finalized Spot market checkpoint evidence is inconsistent: {0}")]
     Checkpoint(Box<DeepXFinalizedAccountError>),
-    /// The finalized EVM precompile request or JSON-RPC response failed.
+    /// The finalized storage request or JSON-RPC response failed.
     #[error("failed to query DeepX finalized Spot market spec for pair 0x{pair}: {source}")]
     Rpc {
         /// Deployment-provided bytes32 Spot pair identity.
@@ -1710,7 +1705,7 @@ pub enum DeepXFinalizedSpotMarketSpecError {
         #[source]
         source: anyhow::Error,
     },
-    /// The ABI response is malformed or contains an invalid zero constraint.
+    /// The storage response is malformed or contains an invalid zero constraint.
     #[error("DeepX finalized Spot market spec is invalid for pair 0x{0}")]
     InvalidEvidence(String),
 }
@@ -1859,6 +1854,12 @@ pub enum DeepXFinalizedAccountError {
     /// The invalid canonical-block probe failed without a valid JSON-RPC error envelope.
     #[error("DeepX eth_call canonical-block rejection was not verifiable: {0}")]
     EthCallRejectionRpc(#[source] anyhow::Error),
+    /// The invalid storage-block probe did not return a JSON-RPC error.
+    #[error("DeepX state_getStorage accepted an impossible block hash")]
+    StorageBlockHashIgnored,
+    /// The invalid storage-block probe failed without a valid JSON-RPC error envelope.
+    #[error("DeepX state_getStorage block rejection was not verifiable: {0}")]
+    StorageRejectionRpc(#[source] anyhow::Error),
     /// No subaccounts were supplied for a batch observation.
     #[error("DeepX finalized account batch requires at least one subaccount")]
     EmptySubaccounts,
@@ -2520,14 +2521,14 @@ pub async fn observe_finalized_margin_evidence(
 
 /// Observes raw Spot market constraints at one approved finalized Watch checkpoint.
 ///
-/// The call reads `SpotMarket.getSpotMarketSpec(bytes32)` using EIP-1898 `requireCanonical`
-/// block-hash semantics. The result preserves runtime units and does not infer token scaling.
+/// The call reads metadata-typed `SpotMarket.SpotMarkets` at one finalized block hash. The result
+/// preserves runtime units and does not infer token scaling.
 ///
 /// # Errors
 ///
 /// Returns an error unless Watch capability evidence authorizes the required reads, the finalized
-/// runtime and block checkpoint pass consistency checks, and the precompile returns exactly three
-/// positive `uint128` values.
+/// runtime and block checkpoint pass consistency checks, and storage contains three positive
+/// constraints for the requested pair.
 pub async fn observe_finalized_spot_market_spec_evidence(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
@@ -2537,7 +2538,6 @@ pub async fn observe_finalized_spot_market_spec_evidence(
     let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
     if watch_capabilities.role() != DeepXRpcRole::Watch
         || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
-        || !watch_capabilities.methods().contains("eth_call")
         || !watch_capabilities.methods().contains("state_getStorage")
         || !watch_capabilities
             .methods()
@@ -2546,7 +2546,7 @@ pub async fn observe_finalized_spot_market_spec_evidence(
     {
         return Err(DeepXFinalizedSpotMarketSpecError::RpcCapabilitiesMismatch);
     }
-    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
@@ -2557,10 +2557,11 @@ pub async fn observe_finalized_spot_market_spec_evidence(
         None,
         None,
     );
-    let timestamp_ms = validate_finalized_market_read_checkpoint(&client, observation.checkpoint())
-        .await
-        .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
-    let evidence = observe_spot_market_spec_at(endpoints, pair, &observation).await?;
+    let timestamp_ms =
+        validate_finalized_storage_read_checkpoint(&client, observation.checkpoint())
+            .await
+            .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
+    let evidence = observe_spot_market_spec_at(&client, pair, &observation, &metadata).await?;
     validate_finalized_market_timestamp_unchanged(&client, observation.checkpoint(), timestamp_ms)
         .await
         .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
@@ -2569,13 +2570,13 @@ pub async fn observe_finalized_spot_market_spec_evidence(
 
 /// Observes a bounded set of Spot market constraints at one approved finalized Watch checkpoint.
 ///
-/// Every EIP-1898 `eth_call` shares one checkpoint and the returned entries retain that checkpoint.
+/// Every storage read shares one checkpoint and the returned entries retain that checkpoint.
 /// The input must contain between one and 256 unique deployment pair identifiers.
 ///
 /// # Errors
 ///
 /// Returns an error unless Watch capability evidence authorizes the required reads, the finalized
-/// runtime and block checkpoint pass consistency checks, and every precompile response is valid.
+/// runtime and block checkpoint pass consistency checks, and every storage response is valid.
 pub async fn observe_finalized_spot_market_spec_batch(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
@@ -2590,7 +2591,6 @@ pub async fn observe_finalized_spot_market_spec_batch(
     let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
     if watch_capabilities.role() != DeepXRpcRole::Watch
         || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
-        || !watch_capabilities.methods().contains("eth_call")
         || !watch_capabilities.methods().contains("state_getStorage")
         || !watch_capabilities
             .methods()
@@ -2603,7 +2603,7 @@ pub async fn observe_finalized_spot_market_spec_batch(
     if pairs.iter().any(|pair| !unique.insert(*pair)) {
         return Err(DeepXFinalizedSpotMarketSpecError::DuplicatePair);
     }
-    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
+    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
@@ -2614,12 +2614,13 @@ pub async fn observe_finalized_spot_market_spec_batch(
         None,
         None,
     );
-    let timestamp_ms = validate_finalized_market_read_checkpoint(&client, observation.checkpoint())
-        .await
-        .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
+    let timestamp_ms =
+        validate_finalized_storage_read_checkpoint(&client, observation.checkpoint())
+            .await
+            .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
     let mut evidence = Vec::with_capacity(pairs.len());
     for pair in pairs {
-        evidence.push(observe_spot_market_spec_at(endpoints, *pair, &observation).await?);
+        evidence.push(observe_spot_market_spec_at(&client, *pair, &observation, &metadata).await?);
     }
     validate_finalized_market_timestamp_unchanged(&client, observation.checkpoint(), timestamp_ms)
         .await
@@ -2628,43 +2629,45 @@ pub async fn observe_finalized_spot_market_spec_batch(
 }
 
 async fn observe_spot_market_spec_at(
-    endpoints: &DeepXValidatedRpcEndpoints,
+    client: &BlockchainHttpRpcClient,
     pair: [u8; 32],
     observation: &DeepXObservedReadOnlyRuntimeSnapshot,
+    metadata: &[u8],
 ) -> Result<DeepXFinalizedSpotMarketSpecEvidence, DeepXFinalizedSpotMarketSpecError> {
     let pair_hex = hex::encode(pair);
-    let call_data = getSpotMarketSpecCall {
-        pair: FixedBytes::from(pair),
-    }
-    .abi_encode();
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
-    let encoded: String = client
+    let key = spot_market_storage_key(pair);
+    let checkpoint_hash = format!("0x{}", hex::encode(observation.checkpoint().block_hash()));
+    let stored: Option<String> = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS.to_string(),
-                    "data": format!("0x{}", hex::encode(call_data)),
-                },
-                {
-                    "blockHash": format!("0x{}", hex::encode(observation.checkpoint().block_hash())),
-                    "requireCanonical": true,
-                },
-            ],
+            "method": "state_getStorage",
+            "params": [key, checkpoint_hash],
         }))
         .await
         .map_err(|source| DeepXFinalizedSpotMarketSpecError::Rpc {
             pair: pair_hex.clone(),
             source,
         })?;
-    let (min_order_size, tick_size, step_size) = decode_finalized_spot_market_spec(&encoded)
-        .ok_or_else(|| DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex))?;
+    let (min_order_size, tick_size, step_size) = stored
+        .as_deref()
+        .and_then(|encoded| decode_finalized_spot_market_storage(encoded, metadata, pair))
+        .ok_or_else(|| DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex.clone()))?;
+    let repeated: Option<String> = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getStorage",
+            "params": [key, checkpoint_hash],
+        }))
+        .await
+        .map_err(|source| DeepXFinalizedSpotMarketSpecError::Rpc {
+            pair: pair_hex.clone(),
+            source,
+        })?;
+    if repeated != stored {
+        return Err(DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex));
+    }
 
     Ok(DeepXFinalizedSpotMarketSpecEvidence {
         checkpoint: observation.checkpoint(),
@@ -2676,26 +2679,54 @@ async fn observe_spot_market_spec_at(
     })
 }
 
-fn decode_finalized_spot_market_spec(encoded: &str) -> Option<(u128, u128, u128)> {
-    let bytes = encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())
-        .filter(|value| value.len() == 96)?;
-    let decode_word = |word: &[u8]| {
-        if word.len() != 32 || word[..16].iter().any(|byte| *byte != 0) {
-            return None;
-        }
-        let value = <[u8; 16]>::try_from(&word[16..]).ok()?;
-        Some(u128::from_be_bytes(value))
+fn decode_finalized_spot_market_storage(
+    encoded: &str,
+    metadata_bytes: &[u8],
+    pair: [u8; 32],
+) -> Option<(u128, u128, u128)> {
+    let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).ok()?;
+    let value_type = metadata
+        .pallet_by_name("SpotMarket")?
+        .storage()?
+        .entry_by_name("SpotMarkets")?
+        .entry_type()
+        .value_ty();
+    if encoded.len() > 2 + 2 * DEEPX_MAX_SPOT_MARKET_STORAGE_BYTES {
+        return None;
+    }
+    let bytes = decode_storage_hex(encoded)?;
+    let mut input = bytes.as_slice();
+    let market = decode_as_type(&mut input, value_type, metadata.types()).ok()?;
+    if !input.is_empty() {
+        return None;
+    }
+    let ValueDef::Composite(Composite::Named(fields)) = &market.value else {
+        return None;
     };
-    let min_order_size = decode_word(&bytes[0..32])?;
-    let tick_size = decode_word(&bytes[32..64])?;
-    let step_size = decode_word(&bytes[64..96])?;
-    (min_order_size > 0 && tick_size > 0 && step_size > 0).then_some((
-        min_order_size,
-        tick_size,
-        step_size,
-    ))
+    let ValueDef::Composite(Composite::Unnamed(pair_wrapper)) =
+        &fields.iter().find(|(name, _)| name == "pair")?.1.value
+    else {
+        return None;
+    };
+    let [wrapped_pair] = pair_wrapper.as_slice() else {
+        return None;
+    };
+    let ValueDef::Composite(Composite::Unnamed(stored_pair)) = &wrapped_pair.value else {
+        return None;
+    };
+    if stored_pair.len() != pair.len()
+        || !stored_pair
+            .iter()
+            .zip(pair)
+            .all(|(value, expected)| value.as_u128() == Some(u128::from(expected)))
+    {
+        return None;
+    }
+    let spec = fields.iter().find(|(name, _)| name == "order_spec")?;
+    let min_size = named_scale_u128(&spec.1.value, "min_qty")?;
+    let tick = named_scale_u128(&spec.1.value, "tick_size")?;
+    let step = named_scale_u128(&spec.1.value, "step_size")?;
+    (min_size > 0 && tick > 0 && step > 0).then_some((min_size, tick, step))
 }
 
 /// Observes raw Perp order constraints at an approved finalized checkpoint.
@@ -4048,6 +4079,29 @@ async fn validate_finalized_market_read_checkpoint(
     Ok(timestamp_ms)
 }
 
+async fn validate_finalized_storage_read_checkpoint(
+    client: &BlockchainHttpRpcClient,
+    checkpoint: DeepXFinalizedCheckpoint,
+) -> Result<u64, DeepXFinalizedAccountError> {
+    let timestamp_ms = observe_finalized_chain_time_with_client(client, checkpoint).await?;
+    validate_block_timestamp_inherent(client, checkpoint, timestamp_ms).await?;
+    let response: RpcNodeHttpResponse<String> = client
+        .execute_rpc_response(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "state_getStorage",
+            "params": [timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))],
+        }))
+        .await
+        .map_err(DeepXFinalizedAccountError::StorageRejectionRpc)?;
+    if response.jsonrpc.as_deref() != Some("2.0")
+        || response.id != Some(1)
+        || response.result.is_some()
+        || response.error.is_none()
+    {
+        return Err(DeepXFinalizedAccountError::StorageBlockHashIgnored);
+    }
+    Ok(timestamp_ms)
+}
+
 async fn validate_finalized_market_timestamp_unchanged(
     client: &BlockchainHttpRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
@@ -4104,11 +4158,39 @@ async fn validate_eth_call_block_selection(
 async fn validate_historical_runtime_semantics(
     client: &BlockchainHttpRpcClient,
 ) -> Result<(), DeepXHistoricalRuntimeError> {
+    validate_runtime_semantics_at(
+        client,
+        DEEPX_SPEC_369_FINALIZED_HASH,
+        DEEPX_SPEC_369_VERSION,
+    )
+    .await
+}
+
+async fn validate_read_only_runtime_semantics(
+    client: &BlockchainHttpRpcClient,
+    spec_version: u32,
+) -> Result<(), DeepXHistoricalRuntimeError> {
+    match spec_version {
+        DEEPX_SPEC_375_VERSION => {
+            validate_runtime_semantics_at(client, DEEPX_SPEC_375_FINALIZED_HASH, spec_version).await
+        }
+        DEEPX_SPEC_376_VERSION => {
+            validate_runtime_semantics_at(client, DEEPX_SPEC_376_FINALIZED_HASH, spec_version).await
+        }
+        _ => validate_historical_runtime_semantics(client).await,
+    }
+}
+
+async fn validate_runtime_semantics_at(
+    client: &BlockchainHttpRpcClient,
+    finalized_hash: &str,
+    expected_spec_version: u32,
+) -> Result<(), DeepXHistoricalRuntimeError> {
     let encoded: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "state_call",
-            "params": ["Core_version", "0x", DEEPX_SPEC_369_FINALIZED_HASH],
+            "params": ["Core_version", "0x", finalized_hash],
         }))
         .await
         .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
@@ -4116,10 +4198,10 @@ async fn validate_historical_runtime_semantics(
             source,
         })?;
     let received = decode_core_version_spec(&encoded)?;
-    if received != DEEPX_SPEC_369_VERSION {
+    if received != expected_spec_version {
         return Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
             method: "state_call(Core_version)",
-            expected: DEEPX_SPEC_369_VERSION,
+            expected: expected_spec_version,
             received,
         });
     }
@@ -4127,17 +4209,17 @@ async fn validate_historical_runtime_semantics(
         .execute_rpc_call(json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "state_getRuntimeVersion",
-            "params": [DEEPX_SPEC_369_FINALIZED_HASH],
+            "params": [finalized_hash],
         }))
         .await
         .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
             method: "state_getRuntimeVersion",
             source,
         })?;
-    if version.spec_version != DEEPX_SPEC_369_VERSION {
+    if version.spec_version != expected_spec_version {
         return Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
             method: "state_getRuntimeVersion",
-            expected: DEEPX_SPEC_369_VERSION,
+            expected: expected_spec_version,
             received: version.spec_version,
         });
     }
@@ -4420,6 +4502,12 @@ fn subaccount_max_perp_positions_storage_key() -> String {
 fn perp_market_storage_key(market_id: u16) -> String {
     let mut encoded = storage_value_key(b"PerpMarket", b"PerpMarkets");
     encoded.extend_from_slice(&market_id.encode());
+    format!("0x{}", hex::encode(encoded))
+}
+
+fn spot_market_storage_key(pair: [u8; 32]) -> String {
+    let mut encoded = storage_value_key(b"SpotMarket", b"SpotMarkets");
+    encoded.extend_from_slice(&pair);
     format!("0x{}", hex::encode(encoded))
 }
 
@@ -4917,7 +5005,7 @@ async fn observe_approved_finalized_read_only_runtime_with_metadata_at(
         DeepXReadOnlyRuntimeSnapshot::approved_testnet,
     )
     .await?;
-    validate_historical_runtime_semantics(&client).await?;
+    validate_read_only_runtime_semantics(&client, snapshot.identity().spec_version).await?;
     Ok((
         DeepXObservedReadOnlyRuntimeSnapshot {
             snapshot,
@@ -5113,8 +5201,22 @@ mod tests {
          genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/\
          metadata.json"
     );
+    const SPEC_375_METADATA_FIXTURE: &str = include_str!(
+        "../test_data/runtime/testnet/\
+         genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b/\
+         metadata.json"
+    );
     const FINALIZED_HASH: &str =
         "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+    const SPOT_MARKET_STORAGE_SPEC_375: &str = concat!(
+        "0x204554482f555344439eb03d8ac62ae18398ced13c033db78b905ad8c9061075736463",
+        "123ae070eb84068b5fed9f5b99f236507c44c880120c65746825f4990dd57548df46a4",
+        "5954eb93e4738e5722529068d4ac891a14784c17877eb74bd8489b3367c71d72766d",
+        "bfa4dfbfb662fa3700407a10f35a00000000000000000000102700000000000000000000",
+        "0000000000407a10f35a0000000000000000000040420f00000000000000000000000000",
+        "90010000640000000300010000d007000000000000000000000000000050c30000000000",
+        "000000000000000000f401000000000000",
+    );
 
     fn encoded_core_version(spec_version: u32) -> String {
         format!(
@@ -5154,6 +5256,88 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[rstest]
+    #[case::spec375_valid(375, None, None)]
+    #[case::spec375_core_mismatch(375, Some(374), None)]
+    #[case::spec375_version_mismatch(375, None, Some(374))]
+    #[case::spec376_valid(376, None, None)]
+    #[case::spec376_core_mismatch(376, Some(375), None)]
+    #[case::spec376_version_mismatch(376, None, Some(375))]
+    #[tokio::test]
+    async fn read_only_probe_uses_spec_specific_captured_checkpoint(
+        #[case] spec_version: u32,
+        #[case] core_version: Option<u32>,
+        #[case] runtime_version: Option<u32>,
+    ) {
+        let finalized_hash = match spec_version {
+            375 => DEEPX_SPEC_375_FINALIZED_HASH,
+            376 => DEEPX_SPEC_376_FINALIZED_HASH,
+            _ => unreachable!(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                observed_calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    match request["method"].as_str().unwrap() {
+                        "state_call" => {
+                            assert_eq!(
+                                request["params"],
+                                json!(["Core_version", "0x", finalized_hash])
+                            );
+                            Json(json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": encoded_core_version(core_version.unwrap_or(spec_version)),
+                            }))
+                        }
+                        "state_getRuntimeVersion" => {
+                            assert_eq!(request["params"], json!([finalized_hash]));
+                            Json(json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": {"specVersion": runtime_version.unwrap_or(spec_version),
+                                           "transactionVersion": 1},
+                            }))
+                        }
+                        method => panic!("unexpected runtime method {method}"),
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BlockchainHttpRpcClient::new(url, None, None);
+
+        let result = validate_read_only_runtime_semantics(&client, spec_version).await;
+        if core_version.is_some() {
+            assert!(matches!(
+                result,
+                Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
+                    method: "state_call(Core_version)",
+                    expected,
+                    received,
+                }) if expected == spec_version && received == spec_version - 1
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        } else if runtime_version.is_some() {
+            assert!(matches!(
+                result,
+                Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
+                    method: "state_getRuntimeVersion",
+                    expected,
+                    received,
+                }) if expected == spec_version && received == spec_version - 1
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        } else {
+            result.unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        }
+        server.abort();
     }
 
     #[rstest]
@@ -6617,13 +6801,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case::consistent(false, false)]
-    #[case::inconsistent_timestamp(true, false)]
-    #[case::timestamp_changes_during_batch(false, true)]
+    #[case::consistent(false, false, false, false)]
+    #[case::inconsistent_timestamp(true, false, false, false)]
+    #[case::timestamp_changes_during_batch(false, true, false, false)]
+    #[case::storage_changes_during_batch(false, false, true, false)]
+    #[case::storage_hash_ignored(false, false, false, true)]
     #[tokio::test]
     async fn finalized_spot_market_spec_is_pinned_to_approved_checkpoint(
         #[case] timestamp_mismatch: bool,
         #[case] late_timestamp_change: bool,
+        #[case] late_storage_change: bool,
+        #[case] storage_hash_ignored: bool,
     ) {
         let pair = [0x33; 32];
         let second_pair = [0x44; 32];
@@ -6706,56 +6894,33 @@ mod tests {
                             })
                         }
                         8 => {
-                            assert_eq!(request["method"], "eth_call");
-                            assert_eq!(request["params"][0]["to"], DEEPX_ETH_CALL_PROBE_ADDRESS);
+                            assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
-                                request["params"][1],
-                                json!({"blockHash": FINALIZED_HASH, "requireCanonical": true}),
+                                request["params"],
+                                json!([timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))]),
                             );
-                            json!({"jsonrpc": "2.0", "id": 1, "result": "0x"})
+                            if storage_hash_ignored {
+                                json!({"jsonrpc": "2.0", "id": 1, "result": "0x"})
+                            } else {
+                                json!({"jsonrpc": "2.0", "id": 1,
+                                    "error": {"code": -32000, "message": "unknown block"}})
+                            }
                         }
-                        9 => {
-                            assert_eq!(request["method"], "eth_call");
-                            assert_eq!(
-                                request["params"][1],
-                                json!({"blockHash": format!("0x{}", "00".repeat(32)),
-                                    "requireCanonical": true}),
-                            );
-                            json!({"jsonrpc": "2.0", "id": 1,
-                                "error": {"code": -32000, "message": "unknown block"}})
-                        }
-                        10 | 11 => {
-                            assert_eq!(request["method"], "eth_call");
-                            assert_eq!(
-                                request["params"][0]["to"],
-                                DEEPX_SPOT_MARKET_PRECOMPILE_ADDRESS.to_string(),
-                            );
-                            assert_eq!(
-                                request["params"][1],
-                                json!({
-                                    "blockHash": FINALIZED_HASH,
-                                    "requireCanonical": true,
-                                }),
-                            );
-                            let calldata = hex::decode(
-                                request["params"][0]["data"]
-                                    .as_str()
-                                    .unwrap()
-                                    .trim_start_matches("0x"),
-                            )
-                            .unwrap();
-                            let call = getSpotMarketSpecCall::abi_decode(&calldata).unwrap();
-                            assert!(
-                                call.pair == FixedBytes::from(pair)
-                                    || call.pair == FixedBytes::from(second_pair)
-                            );
+                        9..=12 => {
+                            assert_eq!(request["method"], "state_getStorage");
+                            assert_eq!(request["params"][1], FINALIZED_HASH);
+                            let observed_pair = if index < 11 { pair } else { second_pair };
+                            assert_eq!(request["params"][0], spot_market_storage_key(observed_pair));
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": 1,
-                                "result": format!("0x{:064x}{:064x}{:064x}", 11, 22, 33),
+                                "result": SPOT_MARKET_STORAGE_SPEC_375.replace(
+                                    "9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+                                    &hex::encode(observed_pair),
+                                ) + if index == 10 && late_storage_change { "00" } else { "" },
                             })
                         }
-                        12 => {
+                        13 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -6797,13 +6962,26 @@ mod tests {
                     if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch { .. })
             ));
             assert_eq!(calls.load(Ordering::Relaxed), 7);
+        } else if storage_hash_ignored {
+            assert!(matches!(
+                result,
+                Err(DeepXFinalizedSpotMarketSpecError::Checkpoint(source))
+                    if matches!(*source, DeepXFinalizedAccountError::StorageBlockHashIgnored)
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 9);
+        } else if late_storage_change {
+            assert!(matches!(
+                result,
+                Err(DeepXFinalizedSpotMarketSpecError::InvalidEvidence(_))
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 11);
         } else if late_timestamp_change {
             assert!(matches!(
                 result,
                 Err(DeepXFinalizedSpotMarketSpecError::Checkpoint(source))
                     if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch { .. })
             ));
-            assert_eq!(calls.load(Ordering::Relaxed), 13);
+            assert_eq!(calls.load(Ordering::Relaxed), 14);
         } else {
             let evidence = result.unwrap();
             assert_eq!(evidence.len(), 2);
@@ -6811,10 +6989,10 @@ mod tests {
             assert_eq!(evidence[0].checkpoint().block_number(), 42);
             assert_eq!(evidence[0].checkpoint(), evidence[1].checkpoint());
             assert_eq!(evidence[0].pair(), pair);
-            assert_eq!(evidence[0].min_order_size(), 11);
-            assert_eq!(evidence[0].tick_size(), 22);
-            assert_eq!(evidence[0].step_size(), 33);
-            assert_eq!(calls.load(Ordering::Relaxed), 13);
+            assert_eq!(evidence[0].min_order_size(), 100_000_000_000_000);
+            assert_eq!(evidence[0].tick_size(), 10_000);
+            assert_eq!(evidence[0].step_size(), 100_000_000_000_000);
+            assert_eq!(calls.load(Ordering::Relaxed), 14);
         }
     }
 
@@ -7219,21 +7397,40 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    fn decodes_only_complete_positive_spot_market_specs() {
-        assert_eq!(decode_finalized_spot_market_spec("0x"), None);
-        assert_eq!(decode_finalized_spot_market_spec("0x0000"), None);
-        for encoded in [
-            format!("0x{:064x}{:064x}{:064x}", 0, 22, 33),
-            format!("0x{:064x}{:064x}{:064x}", 11, 0, 33),
-            format!("0x{:064x}{:064x}{:064x}", 11, 22, 0),
-        ] {
-            assert_eq!(decode_finalized_spot_market_spec(&encoded), None);
-        }
-        let encoded = format!("0x{:064x}{:064x}{:064x}", 11, 22, 33);
+    #[rstest]
+    fn decodes_only_matching_complete_spot_market_storage() {
+        let metadata: Value = serde_json::from_str(SPEC_375_METADATA_FIXTURE).unwrap();
+        let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let pair = hex::decode("9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert_eq!(
-            decode_finalized_spot_market_spec(&encoded),
-            Some((11, 22, 33)),
+            decode_finalized_spot_market_storage(
+                SPOT_MARKET_STORAGE_SPEC_375,
+                &metadata_bytes,
+                pair,
+            ),
+            Some((100_000_000_000_000, 10_000, 100_000_000_000_000)),
+        );
+        for encoded in [
+            "0x".to_string(),
+            format!("{SPOT_MARKET_STORAGE_SPEC_375}00"),
+            SPOT_MARKET_STORAGE_SPEC_375
+                .replace("00407a10f35a00000000000000000000", &"00".repeat(16)),
+        ] {
+            assert_eq!(
+                decode_finalized_spot_market_storage(&encoded, &metadata_bytes, pair),
+                None
+            );
+        }
+        assert_eq!(
+            decode_finalized_spot_market_storage(
+                SPOT_MARKET_STORAGE_SPEC_375,
+                &metadata_bytes,
+                [0x33; 32],
+            ),
+            None,
         );
     }
 

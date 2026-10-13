@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::common::{
     DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, Result,
-    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_VENUE},
+    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_TESTNET_SPEC_375_GENESIS_HASH, DEEPX_VENUE},
     urls,
 };
 
@@ -593,21 +593,26 @@ impl DeepXNetworkConfig {
 ///
 /// # Errors
 ///
-/// Returns an error unless every role appears exactly once with its configured URL and the approved
-/// DeepX testnet genesis hash.
+/// Returns an error unless every role appears exactly once with its configured URL and all roles
+/// observe the same captured DeepX testnet genesis hash.
 pub fn validate_rpc_endpoint_identities(
     config: &DeepXNetworkConfig,
     observations: impl IntoIterator<Item = DeepXObservedRpcEndpoint>,
 ) -> std::result::Result<DeepXValidatedRpcEndpoints, DeepXRpcEndpointValidationError> {
-    let approved_genesis_hash = hex::decode_array::<32>(
-        DEEPX_TESTNET_GENESIS_HASH
-            .strip_prefix("0x")
-            .unwrap_or(DEEPX_TESTNET_GENESIS_HASH),
-    )
-    .map_err(|_| DeepXRpcEndpointValidationError::InvalidApprovedGenesisHash)?;
+    let approved_genesis_hashes = [
+        DEEPX_TESTNET_GENESIS_HASH,
+        DEEPX_TESTNET_SPEC_375_GENESIS_HASH,
+    ]
+    .map(|hash| {
+        hex::decode_array::<32>(hash.strip_prefix("0x").unwrap_or(hash))
+            .map_err(|_| DeepXRpcEndpointValidationError::InvalidApprovedGenesisHash)
+    })
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut submission_url = None;
     let mut watch_url = None;
     let mut recovery_url = None;
+    let mut observed_genesis_hash = None;
 
     for observation in observations {
         let expected_url = config.rpc_url_for(observation.role)?;
@@ -616,11 +621,14 @@ pub fn validate_rpc_endpoint_identities(
                 observation.role,
             ));
         }
-        if observation.genesis_hash != approved_genesis_hash {
+        if !approved_genesis_hashes.contains(&observation.genesis_hash)
+            || observed_genesis_hash.is_some_and(|hash| hash != observation.genesis_hash)
+        {
             return Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
                 observation.role,
             ));
         }
+        observed_genesis_hash = Some(observation.genesis_hash);
         let role_url = match observation.role {
             DeepXRpcRole::Submission => &mut submission_url,
             DeepXRpcRole::Watch => &mut watch_url,
@@ -643,7 +651,9 @@ pub fn validate_rpc_endpoint_identities(
         recovery_url: recovery_url.ok_or(DeepXRpcEndpointValidationError::MissingRole(
             DeepXRpcRole::Recovery,
         ))?,
-        genesis_hash: approved_genesis_hash,
+        genesis_hash: observed_genesis_hash.ok_or(DeepXRpcEndpointValidationError::MissingRole(
+            DeepXRpcRole::Submission,
+        ))?,
     })
 }
 
@@ -1142,6 +1152,32 @@ mod tests {
         );
         assert_eq!(validated.genesis_hash(), approved_genesis_hash());
         assert!(!format!("{validated:?}").contains("secret"));
+    }
+
+    #[rstest]
+    fn new_testnet_genesis_requires_all_rpc_roles_to_agree() {
+        let config = DeepXNetworkConfig::default();
+        let new_genesis = hex::decode_array::<32>(
+            DEEPX_TESTNET_SPEC_375_GENESIS_HASH
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut observed_endpoints = observations(&config);
+        for observation in &mut observed_endpoints {
+            observation.genesis_hash = new_genesis;
+        }
+        let validated =
+            validate_rpc_endpoint_identities(&config, observed_endpoints.clone()).unwrap();
+        assert_eq!(validated.genesis_hash(), new_genesis);
+
+        observed_endpoints[1].genesis_hash = approved_genesis_hash();
+        assert_eq!(
+            validate_rpc_endpoint_identities(&config, observed_endpoints),
+            Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
+                observations(&config)[1].role(),
+            )),
+        );
     }
 
     #[rstest]

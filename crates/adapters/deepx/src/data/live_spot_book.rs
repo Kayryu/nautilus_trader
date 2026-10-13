@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Spot book snapshots streamed by the node's orderbook JSON-RPC subscription.
+//! Spot book snapshots from the node RPC, with REST polling when that RPC is unavailable.
 
 use std::{
     num::NonZeroUsize,
@@ -37,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::DeepXNetworkConfig,
     data::{book, live_trades::TradeSubscription},
-    http::DeepXSpotMarket,
+    http::{DeepXHttpClient, DeepXSpotMarket, DeepXSpotOrderBookRequest},
     websocket::{DeepXWsError, orderbook_rpc, transport::DeepXWsReadConnection},
 };
 
@@ -45,6 +45,12 @@ const MAX_RECONNECT_ATTEMPTS: usize = 5;
 const MAX_RPC_DEPTH: usize = 1000;
 const SUBSCRIBE_REQUEST_ID: u64 = 1;
 const UNSUBSCRIBE_REQUEST_ID: u64 = 2;
+const REST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+enum SubscriptionEnd {
+    Closed,
+    MethodUnavailable,
+}
 
 struct SubscriptionGuard(TradeSubscription);
 
@@ -147,6 +153,7 @@ pub(super) struct SpotBookTask {
     pub network: DeepXNetworkConfig,
     pub proxy_url: Option<String>,
     pub timeout: Duration,
+    pub http: DeepXHttpClient,
     pub sender: UnboundedSender<DataEvent>,
     pub connection_epoch: Arc<Mutex<bool>>,
     pub subscription: TradeSubscription,
@@ -210,14 +217,18 @@ impl SpotBookTask {
 
         let result = self.read_subscription(&mut connection, cancellation).await;
         let close = connection.close().await;
-        result.and(close)
+        let end = result.and_then(|end| close.map(|()| end))?;
+        match end {
+            SubscriptionEnd::Closed => Ok(()),
+            SubscriptionEnd::MethodUnavailable => self.poll_rest(cancellation).await,
+        }
     }
 
     async fn read_subscription(
         &self,
         connection: &mut DeepXWsReadConnection,
         cancellation: &CancellationToken,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SubscriptionEnd> {
         let mut subscription_id = None;
         loop {
             let message = tokio::select! {
@@ -226,9 +237,9 @@ impl SpotBookTask {
                     if let Some(subscription_id) = subscription_id.as_deref() {
                         self.unsubscribe(connection, subscription_id).await;
                     }
-                    return Ok(());
+                    return Ok(SubscriptionEnd::Closed);
                 }
-                () = self.sender.closed() => return Ok(()),
+                () = self.sender.closed() => return Ok(SubscriptionEnd::Closed),
                 result = tokio::time::timeout(self.timeout, connection.receive()) => {
                     match result {
                         Err(_) => anyhow::bail!("DeepX Spot book RPC receive timed out"),
@@ -248,6 +259,12 @@ impl SpotBookTask {
                 serde_json::from_str(text).context("invalid DeepX Spot book RPC JSON")?;
             if subscription_id.is_none() {
                 if value.get("id").is_some() {
+                    if value["jsonrpc"] == "2.0"
+                        && value["id"] == SUBSCRIBE_REQUEST_ID
+                        && value["error"]["code"] == -32601
+                    {
+                        return Ok(SubscriptionEnd::MethodUnavailable);
+                    }
                     subscription_id = Some(orderbook_rpc::parse_subscribe_ack(
                         &value,
                         SUBSCRIBE_REQUEST_ID,
@@ -300,6 +317,70 @@ impl SpotBookTask {
         }
     }
 
+    async fn poll_rest(&self, cancellation: &CancellationToken) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !matches!(self.output, SpotBookOutputKind::Depth10),
+            "DeepX Spot depth requires order counts unavailable from REST"
+        );
+        log::warn!("DeepX Spot book RPC method unavailable; polling REST snapshots");
+        let request = DeepXSpotOrderBookRequest {
+            name: Some(self.market.name.clone()),
+            pair: None,
+            tick_size: None,
+        };
+        let mut last_update_id = 0;
+        let mut last_engine_time = 0;
+        let mut interval = tokio::time::interval(REST_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(()),
+                () = self.sender.closed() => return Ok(()),
+                _ = interval.tick() => {}
+            }
+            let snapshot = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(()),
+                () = self.sender.closed() => return Ok(()),
+                result = self.http.get_spot_order_book(&request) => result?,
+            };
+            if snapshot.last_update_id <= last_update_id || snapshot.engine_time < last_engine_time
+            {
+                continue;
+            }
+            let ts_init = get_atomic_clock_realtime().get_time_ns();
+            let events = match self.output {
+                SpotBookOutputKind::Deltas => {
+                    let sequence = self.subscription.next_book_sequence()?;
+                    vec![DataEvent::Data(Data::from(
+                        book::parse_spot_order_book_deltas(
+                            &snapshot,
+                            &self.market,
+                            &self.instrument,
+                            self.depth,
+                            sequence,
+                            ts_init,
+                        )?,
+                    ))]
+                }
+                SpotBookOutputKind::Quotes => book::parse_spot_order_book_quote_tick(
+                    &snapshot,
+                    &self.market,
+                    &self.instrument,
+                    ts_init,
+                )?
+                .map(|quote| vec![DataEvent::Data(Data::Quote(quote))])
+                .unwrap_or_default(),
+                SpotBookOutputKind::Depth10 => unreachable!("checked above"),
+            };
+            self.subscription
+                .publish(&self.connection_epoch, &self.sender, events)?;
+            last_update_id = snapshot.last_update_id;
+            last_engine_time = snapshot.engine_time;
+        }
+    }
+
     async fn unsubscribe(&self, connection: &mut DeepXWsReadConnection, subscription: &str) {
         let request = json!({
             "jsonrpc": "2.0",
@@ -313,6 +394,9 @@ impl SpotBookTask {
     }
 
     fn publish_clear(&self) -> anyhow::Result<()> {
+        if !matches!(self.output, SpotBookOutputKind::Deltas) {
+            return Ok(());
+        }
         let ts = get_atomic_clock_realtime().get_time_ns();
         let sequence = self.subscription.next_book_sequence()?;
         let mut clear = OrderBookDelta::clear(self.instrument.id(), sequence, ts, ts);
@@ -330,6 +414,13 @@ impl SpotBookTask {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{
+        Router,
+        extract::ws::{Message as ServerMessage, WebSocketUpgrade},
+        routing::get,
+    };
     use nautilus_model::{
         enums::CurrencyType,
         identifiers::{InstrumentId, Symbol},
@@ -341,6 +432,8 @@ mod tests {
     use super::*;
 
     const SPOT_MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
+    const SPOT_BOOK: &str =
+        include_str!("../../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
 
     struct Server(tokio::task::JoinHandle<()>);
 
@@ -368,6 +461,208 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[rstest::rstest]
+    #[case(SpotBookOutputKind::Deltas)]
+    #[case(SpotBookOutputKind::Quotes)]
+    #[tokio::test]
+    async fn method_unavailable_polls_only_new_rest_snapshots(#[case] output: SpotBookOutputKind) {
+        let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let market = response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let rest_reads = Arc::clone(&reads);
+        let app = Router::new()
+            .route(
+                "/rpc",
+                get(|upgrade: WebSocketUpgrade| async move {
+                    upgrade.on_upgrade(|mut socket| async move {
+                        let Some(Ok(ServerMessage::Text(_))) = socket.recv().await else {
+                            return;
+                        };
+                        socket
+                            .send(ServerMessage::Text(
+                                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        while socket.recv().await.is_some() {}
+                    })
+                }),
+            )
+            .route(
+                "/internal/v1/market/spot/order-books",
+                get(move || {
+                    let reads = Arc::clone(&rest_reads);
+                    async move {
+                        let index = reads.fetch_add(1, Ordering::SeqCst);
+                        let mut response: Value = serde_json::from_str(SPOT_BOOK).unwrap();
+                        if index == 2 {
+                            response["data"]["lastUpdateId"] = json!(6_226_593);
+                        } else if index >= 3 {
+                            response["data"]["lastUpdateId"] = json!(6_226_595);
+                            response["data"]["engineTime"] = json!(1_789_620_906_511_u64);
+                        }
+                        response.to_string()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let subscription = TradeSubscription::new();
+        let (sender, mut receiver) = unbounded_channel();
+        let task = tokio::spawn(
+            SpotBookTask {
+                instrument: spot_instrument(),
+                market: Box::new(market),
+                depth: NonZeroUsize::new(2).unwrap(),
+                output,
+                network: DeepXNetworkConfig {
+                    base_url_rpc_watch: Some(format!("http://{address}/rpc")),
+                    ..Default::default()
+                },
+                proxy_url: None,
+                timeout: Duration::from_secs(2),
+                http: DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap(),
+                sender,
+                connection_epoch: Arc::new(Mutex::new(true)),
+                subscription: subscription.clone(),
+            }
+            .run(),
+        );
+        let first = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match (output, first) {
+            (SpotBookOutputKind::Deltas, DataEvent::Data(Data::Deltas(deltas))) => {
+                assert_eq!(deltas.deltas.len(), 5);
+                assert_eq!(deltas.deltas[1].order.price, Price::from("2435.67"));
+            }
+            (SpotBookOutputKind::Quotes, DataEvent::Data(Data::Quote(quote))) => {
+                assert_eq!(quote.bid_price, Price::from("2435.67"));
+                assert_eq!(quote.ask_price, Price::from("2435.82"));
+            }
+            _ => panic!("unexpected REST Spot book event"),
+        }
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while reads.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(receiver.try_recv().is_err());
+        let second = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(second, DataEvent::Data(_)));
+        subscription.retire();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!subscription.is_active());
+    }
+
+    #[rstest::rstest]
+    #[case(-32_000, SpotBookOutputKind::Deltas, false)]
+    #[case(-32_601, SpotBookOutputKind::Depth10, false)]
+    #[case(-32_601, SpotBookOutputKind::Deltas, true)]
+    #[tokio::test]
+    async fn rest_fallback_rejects_other_rpc_errors_depth_and_malformed_books(
+        #[case] error_code: i64,
+        #[case] output: SpotBookOutputKind,
+        #[case] expect_rest: bool,
+    ) {
+        let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(SPOT_MARKETS).unwrap();
+        let market = response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let rest_reads = Arc::clone(&reads);
+        let app = Router::new()
+            .route(
+                "/rpc",
+                get(move |upgrade: WebSocketUpgrade| async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(ServerMessage::Text(_))) = socket.recv().await else {
+                            return;
+                        };
+                        socket
+                            .send(ServerMessage::Text(
+                                json!({"jsonrpc":"2.0","id":1,"error":{"code":error_code}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        while socket.recv().await.is_some() {}
+                    })
+                }),
+            )
+            .route(
+                "/internal/v1/market/spot/order-books",
+                get(move || {
+                    let reads = Arc::clone(&rest_reads);
+                    async move {
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        let mut response: Value = serde_json::from_str(SPOT_BOOK).unwrap();
+                        response["data"]["orderBuyList"][0]["qty"] = json!(-1);
+                        response.to_string()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let (sender, mut receiver) = unbounded_channel();
+        let task = SpotBookTask {
+            instrument: spot_instrument(),
+            market: Box::new(market),
+            depth: NonZeroUsize::new(2).unwrap(),
+            output,
+            network: DeepXNetworkConfig {
+                base_url_rpc_watch: Some(format!("http://{address}/rpc")),
+                ..Default::default()
+            },
+            proxy_url: None,
+            timeout: Duration::from_secs(2),
+            http: DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap(),
+            sender,
+            connection_epoch: Arc::new(Mutex::new(true)),
+            subscription: TradeSubscription::new(),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            task.run_connection(&CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        if expect_rest {
+            assert!(error.to_string().contains("invalid"));
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+        }
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -467,6 +762,7 @@ mod tests {
             network,
             proxy_url: None,
             timeout: Duration::from_secs(2),
+            http: DeepXHttpClient::new("http://127.0.0.1:1", Some(2), None).unwrap(),
             sender,
             connection_epoch: Arc::new(Mutex::new(true)),
             subscription: subscription.clone(),
@@ -541,6 +837,7 @@ mod tests {
                 },
                 proxy_url: None,
                 timeout: Duration::from_secs(30),
+                http: DeepXHttpClient::new("http://127.0.0.1:1", Some(2), None).unwrap(),
                 sender,
                 connection_epoch: Arc::new(Mutex::new(true)),
                 subscription: subscription.clone(),

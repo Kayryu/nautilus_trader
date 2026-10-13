@@ -43,6 +43,12 @@ const TESTNET_SPEC_369_METADATA_SHA256: &str =
     "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c";
 const TESTNET_SPEC_371_METADATA_SHA256: &str =
     "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15";
+const TESTNET_SPEC_375_GENESIS_HASH: &str =
+    "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
+const TESTNET_SPEC_375_METADATA_SHA256: &str =
+    "2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311";
+const TESTNET_SPEC_376_METADATA_SHA256: &str =
+    "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447";
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
 const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
@@ -50,6 +56,17 @@ const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckTxVersion",
     "CheckGenesis",
     "CheckMortality",
+    "CheckNonce",
+    "CheckWeight",
+    "ChargeTransactionPayment",
+    "CheckPriority",
+];
+const TESTNET_SPEC_375_SIGNED_EXTENSIONS: &[&str] = &[
+    "CheckNonZeroSender",
+    "CheckSpecVersion",
+    "CheckTxVersion",
+    "CheckGenesis",
+    "CheckNonceEra",
     "CheckNonce",
     "CheckWeight",
     "ChargeTransactionPayment",
@@ -831,6 +848,8 @@ impl DeepXReadOnlyRuntimeSnapshot {
             TESTNET_SPEC_VERSION => TESTNET_METADATA_SHA256,
             369 => TESTNET_SPEC_369_METADATA_SHA256,
             371 => TESTNET_SPEC_371_METADATA_SHA256,
+            375 => TESTNET_SPEC_375_METADATA_SHA256,
+            376 => TESTNET_SPEC_376_METADATA_SHA256,
             _ => return Err(SnapshotError::RuntimeIdentityMismatch),
         };
         let (identity, _, _) = validate_testnet_runtime_snapshot(
@@ -871,7 +890,15 @@ fn validate_testnet_runtime_snapshot(
             environment.to_string(),
         ));
     }
-    let genesis_hash = decode_32(TESTNET_GENESIS_HASH)?;
+    let (approved_genesis, approved_extensions) = if matches!(observed_spec_version, 375 | 376) {
+        (
+            TESTNET_SPEC_375_GENESIS_HASH,
+            TESTNET_SPEC_375_SIGNED_EXTENSIONS,
+        )
+    } else {
+        (TESTNET_GENESIS_HASH, TESTNET_SIGNED_EXTENSIONS)
+    };
+    let genesis_hash = decode_32(approved_genesis)?;
     if observed_genesis_hash != genesis_hash
         || observed_transaction_version != TESTNET_TRANSACTION_VERSION
     {
@@ -892,7 +919,7 @@ fn validate_testnet_runtime_snapshot(
         .transaction_extensions_to_use_for_encoding()
         .map(|extension| extension.identifier().to_string())
         .collect::<Vec<_>>();
-    if signed_extensions != TESTNET_SIGNED_EXTENSIONS {
+    if signed_extensions != approved_extensions {
         return Err(SnapshotError::SignedExtensionsMismatch);
     }
     validate_unknown_extensions(&metadata)?;
@@ -936,6 +963,7 @@ fn validate_unknown_extensions(metadata: &Metadata) -> Result<(), SnapshotError>
         "CheckNonce",
         "CheckGenesis",
         "CheckMortality",
+        "CheckNonceEra",
         "ChargeAssetTxPayment",
         "ChargeTransactionPayment",
         "CheckMetadataHash",
@@ -1295,6 +1323,153 @@ mod tests {
                 index: 2,
             },
         );
+    }
+
+    #[rstest]
+    fn spec_375_new_genesis_is_not_approved_for_signing() {
+        const METADATA_RESPONSE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b/metadata.json",
+        ));
+        let response: RpcResponse = serde_json::from_str(METADATA_RESPONSE).unwrap();
+        let metadata = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let new_genesis =
+            decode_32("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7").unwrap();
+
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            new_genesis,
+            375,
+            1,
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(read_only.identity().genesis_hash, new_genesis);
+        assert_eq!(read_only.identity().signed_extensions[4], "CheckNonceEra");
+        assert!(matches!(
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                decode_32(TESTNET_GENESIS_HASH).unwrap(),
+                375,
+                1,
+                &metadata,
+            ),
+            Err(SnapshotError::RuntimeIdentityMismatch),
+        ));
+
+        assert!(matches!(
+            RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                new_genesis,
+                375,
+                1,
+                &metadata,
+            ),
+            Err(SnapshotError::RuntimeIdentityMismatch),
+        ));
+
+        let decoded = metadata::decode_from(&metadata).unwrap();
+        let extension = decoded
+            .extrinsic()
+            .transaction_extensions_to_use_for_encoding()
+            .find(|extension| extension.identifier() == "CheckNonceEra")
+            .unwrap();
+        let extra = decoded.types().resolve(extension.extra_ty()).unwrap();
+        let TypeDef::Composite(extra) = &extra.type_def else {
+            panic!("CheckNonceEra extra must be a composite type");
+        };
+        assert_eq!(extra.fields.len(), 1);
+        let era = decoded.types().resolve(extra.fields[0].ty.id).unwrap();
+        let TypeDef::Variant(era) = &era.type_def else {
+            panic!("CheckNonceEra value must be a variant type");
+        };
+        assert_eq!(era.variants.len(), 2);
+        assert_eq!(
+            (era.variants[0].name.as_str(), era.variants[0].index),
+            ("Immortal", 0)
+        );
+        assert!(era.variants[0].fields.is_empty());
+        assert_eq!(
+            (era.variants[1].name.as_str(), era.variants[1].index),
+            ("Mortal", 1)
+        );
+        assert_eq!(era.variants[1].fields.len(), 1);
+        assert_eq!(
+            decoded
+                .types()
+                .resolve(era.variants[1].fields[0].ty.id)
+                .unwrap()
+                .type_def,
+            TypeDef::Primitive(TypeDefPrimitive::U64),
+        );
+        let implicit = decoded.types().resolve(extension.additional_ty()).unwrap();
+        let TypeDef::Composite(implicit) = &implicit.type_def else {
+            panic!("CheckNonceEra implicit must be a composite type");
+        };
+        assert_eq!(implicit.fields.len(), 1);
+        let hash = decoded.types().resolve(implicit.fields[0].ty.id).unwrap();
+        let TypeDef::Array(hash) = &hash.type_def else {
+            panic!("CheckNonceEra implicit must contain a fixed array");
+        };
+        assert_eq!(hash.len, 32);
+        assert_eq!(
+            decoded
+                .types()
+                .resolve(hash.type_param.id)
+                .unwrap()
+                .type_def,
+            TypeDef::Primitive(TypeDefPrimitive::U8),
+        );
+    }
+
+    #[rstest]
+    fn spec_376_is_approved_only_for_read_only_use() {
+        const METADATA_RESPONSE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448/metadata.json",
+        ));
+        let response: RpcResponse = serde_json::from_str(METADATA_RESPONSE).unwrap();
+        let metadata = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let genesis = decode_32(TESTNET_SPEC_375_GENESIS_HASH).unwrap();
+
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis,
+            376,
+            TESTNET_TRANSACTION_VERSION,
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(read_only.identity().spec_version, 376);
+        assert_eq!(
+            hex::encode(read_only.identity().metadata_sha256),
+            TESTNET_SPEC_376_METADATA_SHA256,
+        );
+        assert!(matches!(
+            RuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis,
+                376,
+                TESTNET_TRANSACTION_VERSION,
+                &metadata,
+            ),
+            Err(SnapshotError::RuntimeIdentityMismatch),
+        ));
+
+        let mut changed = metadata.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+                &DeepXEnvironment::Testnet,
+                genesis,
+                376,
+                TESTNET_TRANSACTION_VERSION,
+                &changed,
+            ),
+            Err(SnapshotError::MetadataHashMismatch),
+        ));
     }
 
     #[rstest]

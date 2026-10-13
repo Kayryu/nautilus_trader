@@ -26,6 +26,9 @@ mod public_prices;
 mod status;
 mod trades;
 
+#[cfg(feature = "python")]
+pub(crate) use trades::{parse_spot_trade_tick, parse_trade_tick};
+
 const CANDLE_HISTORY_MAX_PAGES: usize = 100;
 
 use std::{
@@ -64,7 +67,7 @@ use nautilus_common::{
     providers::InstrumentProvider,
 };
 use nautilus_core::{
-    MUTEX_POISONED,
+    MUTEX_POISONED, Params,
     datetime::{NANOSECONDS_IN_MILLISECOND, try_datetime_to_unix_nanos},
     time::get_atomic_clock_realtime,
 };
@@ -339,6 +342,14 @@ impl DeepXDataClient {
         Ok((instrument, market))
     }
 
+    fn has_unsupported_live_subscription_params(params: Option<&Params>) -> bool {
+        params.is_some_and(|params| {
+            params
+                .iter()
+                .any(|(key, value)| key != "start_ns" || !value.is_null())
+        })
+    }
+
     fn spawn_data_request<F>(&self, capability: &'static str, future: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = anyhow::Result<DataResponse>> + Send + 'static,
@@ -393,6 +404,7 @@ impl DeepXDataClient {
             network: self.config.network.clone(),
             proxy_url: self.config.proxy_url.clone(),
             timeout: Duration::from_secs(self.config.websocket_timeout_secs),
+            http: self.http.clone(),
             sender,
             connection_epoch: Arc::clone(&self.request_epoch),
             subscription,
@@ -562,10 +574,7 @@ impl DataClient for DeepXDataClient {
         let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
-            command
-                .params
-                .as_ref()
-                .is_some_and(|params| !params.is_empty()),
+            Self::has_unsupported_live_subscription_params(command.params.as_ref()),
         )?;
         anyhow::ensure!(
             command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
@@ -848,10 +857,7 @@ impl DataClient for DeepXDataClient {
         let (instrument, market) = self.history_market(
             command.instrument_id,
             command.client_id,
-            command
-                .params
-                .as_ref()
-                .is_some_and(|params| !params.is_empty()),
+            Self::has_unsupported_live_subscription_params(command.params.as_ref()),
         )?;
         anyhow::ensure!(
             command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
@@ -1715,10 +1721,7 @@ impl DataClient for DeepXDataClient {
         let (instrument, market) = self.history_market(
             bar_type.instrument_id(),
             command.client_id,
-            command
-                .params
-                .as_ref()
-                .is_some_and(|params| !params.is_empty()),
+            Self::has_unsupported_live_subscription_params(command.params.as_ref()),
         )?;
         anyhow::ensure!(
             command.venue.is_none_or(|venue| venue == *DEEPX_VENUE),
@@ -3361,7 +3364,11 @@ mod tests {
             Some(client.http.base_url().replacen("http://", "ws://", 1));
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
-        client.subscribe_quotes(quote_subscribe()).unwrap();
+        let mut command = quote_subscribe();
+        let mut params = Params::new();
+        params.insert("start_ns".to_string(), serde_json::Value::Null);
+        command.params = Some(params);
+        client.subscribe_quotes(command).unwrap();
         client.subscribe_quotes(quote_subscribe()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -4795,7 +4802,10 @@ mod tests {
             Some(client.http.base_url().replacen("http://", "ws://", 1));
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
-        let command = live_bar_subscribe();
+        let mut command = live_bar_subscribe();
+        let mut params = Params::new();
+        params.insert("start_ns".to_string(), serde_json::Value::Null);
+        command.params = Some(params);
         client.subscribe_bars(command.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -4845,6 +4855,7 @@ mod tests {
     #[case("client")]
     #[case("venue")]
     #[case("params")]
+    #[case("start_ns")]
     #[case("disconnected")]
     #[tokio::test]
     async fn invalid_live_bar_admission_never_creates_tasks(#[case] scenario: &str) {
@@ -4878,6 +4889,11 @@ mod tests {
             "params" => {
                 let mut params = nautilus_core::Params::new();
                 params.insert("unsupported".into(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            "start_ns" => {
+                let mut params = Params::new();
+                params.insert("start_ns".to_string(), serde_json::json!(1));
                 command.params = Some(params);
             }
             "disconnected" => {}
@@ -5280,6 +5296,7 @@ mod tests {
     #[case("venue")]
     #[case("instrument")]
     #[case("params")]
+    #[case("start_ns")]
     #[case("ws-url")]
     #[case("disconnected")]
     #[tokio::test]
@@ -5298,6 +5315,11 @@ mod tests {
             "params" => {
                 let mut params = nautilus_core::Params::default();
                 params.insert("unsupported".to_string(), serde_json::json!(true));
+                command.params = Some(params);
+            }
+            "start_ns" => {
+                let mut params = Params::new();
+                params.insert("start_ns".to_string(), serde_json::json!(1));
                 command.params = Some(params);
             }
             "ws-url" => {
@@ -5334,7 +5356,11 @@ mod tests {
             Some(client.http.base_url().replacen("http://", "ws://", 1));
         client.connect().await.unwrap();
         while receiver.try_recv().is_ok() {}
-        client.subscribe_trades(live_subscribe()).unwrap();
+        let mut command = live_subscribe();
+        let mut params = Params::new();
+        params.insert("start_ns".to_string(), serde_json::Value::Null);
+        command.params = Some(params);
+        client.subscribe_trades(command).unwrap();
         client.subscribe_trades(live_subscribe()).unwrap();
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
