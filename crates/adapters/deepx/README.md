@@ -1331,9 +1331,11 @@ freshness semantics therefore remain disabled.
 perpetual-position, and active-order readers after one read-only runtime approval and pins every
 request to that exact checkpoint. It requires `state_getStorage` in addition to the component RPC
 methods and accepts the timestamp only as one exact non-zero SCALE `u64` Unix millisecond value.
-The shared read-only runtime boundary checks both historical runtime methods against the captured
-spec-369 checkpoint before any standalone account, market, lending, position, or order evidence is
-read. An inconsistent endpoint fails closed without returning those component values.
+The shared read-only runtime boundary checks `state_call(Core_version)` and
+`state_getRuntimeVersion` against the freshly observed finalized checkpoint before any standalone
+account, market, lending, position, or order evidence is read. An inconsistent endpoint fails
+closed without returning those component values and does not require archive access to a fixed
+historical block.
 `deepx-verify-finalized-account <subaccount-account-id20>` exercises the combined credential-free
 boundary. Component evidence retains the same strict bounds and identity checks; an unavailable or
 invalid component rejects the complete observation without returning a partial snapshot. This is
@@ -1516,9 +1518,10 @@ verified canonical finality and REST request scope; it does not enable Spot fill
 specified wallet's current Spot wallet-history response contains empty `ETH/USDC` and `SOL/USDC`
 subaccount groups, so no wallet-owned live Spot trade could be matched to a finalized event.
 `observe_finalized_spot_trades_at` now reads a requested finalized block through the validated
-Watch RPC endpoint, rejects inconsistent spec-369 historical runtime responses before event reads,
-requires fixture-approved historical metadata, compares two complete event storage reads, and
-rechecks the canonical block hash before returning decoded matches. The
+Watch RPC endpoint, rejects inconsistent runtime responses at the current finalized checkpoint
+before event reads, requires fixture-approved metadata at the requested block, compares two
+complete event storage reads, and rechecks the canonical block hash before returning decoded
+matches. The
 verifier's `--finalized` mode applies this read to at most 20 distinct blocks after bounded
 WS-to-REST matching and prints results only after every candidate agrees with chain evidence.
 The 2026-10-09 `ETH/USDC` wallet run acknowledged four subscriptions but observed zero batches
@@ -1551,9 +1554,10 @@ capture does not approve runtime signing. A finalized spec-376 fixture binds met
 SHA-256 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447` to block
 `19592700` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
 Its signed extensions use `CheckNonceEra` where the approved old-chain captures use
-`CheckMortality`. The read-only permit accepts this exact identity, and a
-public verifier rediscovered three Spot and eight Perpetual instruments after the upgrade. The
-signing permit does not accept spec 376. The pinned SDK and Rust agree on complete offline spec-376
+`CheckMortality`. Read-only and signing permits accept spec 376 and later runtime versions when
+the genesis hash, transaction version, metadata hash, and signed extensions continue to match this
+exact baseline identity. A public verifier rediscovered three Spot and eight Perpetual instruments
+after the upgrade. The pinned SDK and Rust agree on complete offline spec-376
 `Subaccount.no_op`, `System.remark`, and `PerpMarket.place_order` bytes. Separately, an already
 finalized spec-376 `PerpMarket.cancel_order` in block `18476010` recovers its encoded signer only
 with spec 376, transaction version 1, and the new genesis hash as both implicit hashes. A read-only
@@ -1569,7 +1573,8 @@ binding. Its metadata differs from the specification 369 capture only at the enc
 version byte. The checked-in runtime source retains the same signed-extension tuple and transaction
 version, and the pinned Python SDK independently reproduced exact `System.remark`, `Subaccount.no_op`,
 and `PerpMarket.place_order` extrinsics for specification 371. The signing gate accepts the exact
-captured old-chain identities; unknown metadata and future upgrades still fail closed.
+spec-376 baseline identity for runtime versions 376 and later; older versions and identity drift
+still fail closed.
 
 Sanitized public REST fixtures under `test_data/http/testnet` include sidecar manifests when a
 capture is associated with the independently verified testnet runtime identity. REST responses are

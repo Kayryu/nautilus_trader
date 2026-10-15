@@ -665,7 +665,7 @@ impl PyNodeRun {
                     return Err(raised);
                 }
 
-                result.map(|()| None).map_err(to_pyruntime_err)
+                result.map(|()| None).map_err(anyhow_to_pyruntime_err)
             }
             Poll::Pending => {
                 let suspended = self
@@ -801,6 +801,10 @@ fn node_consumed_err() -> PyErr {
         "LiveNode is being run by `run_async`; use the handle returned by `handle()` to stop it, \
          and the `cache` and `portfolio` captured before the run to read state",
     )
+}
+
+fn anyhow_to_pyruntime_err(e: anyhow::Error) -> PyErr {
+    to_pyruntime_err(format!("{e:#}"))
 }
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -1688,7 +1692,7 @@ fn run_live_node_detached(py: Python<'_>, node: &mut LiveNode) -> PyResult<()> {
             get_runtime().block_on(async { (*ptr.0).run().await })
         })
     }
-    .map_err(to_pyruntime_err)
+    .map_err(anyhow_to_pyruntime_err)
 }
 
 #[allow(unsafe_code)]
@@ -3718,6 +3722,24 @@ class ClaimsStrategy(Strategy):
             acquired_before_stop.load(Ordering::SeqCst),
             "worker thread should acquire the GIL while LiveNode::run is blocked"
         );
+    }
+
+    #[rstest]
+    fn test_anyhow_to_pyruntime_err_preserves_error_chain() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let error = anyhow::anyhow!("position report failed")
+                .context("mass status failed")
+                .context("startup reconciliation failed");
+            let py_error = super::anyhow_to_pyruntime_err(error);
+
+            assert!(py_error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert_eq!(
+                py_error.value(py).to_string(),
+                "startup reconciliation failed: mass status failed: position report failed",
+            );
+        });
     }
 
     #[rstest]

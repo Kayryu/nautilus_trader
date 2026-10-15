@@ -27,6 +27,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use anyhow::Context;
 use nautilus_common::{
     cache::{
         Cache,
@@ -3094,7 +3095,6 @@ impl DeepXExecutionClient {
     fn validate_finalized_spot_order_record(
         record: &DeepXSpotOrderRecord,
         market: &DeepXSpotReportMarket,
-        instrument: &InstrumentAny,
         finalized: &crate::rpc::DeepXSpotOrderStorageEvidence,
     ) -> anyhow::Result<()> {
         let order_id = record.order_id.parse::<u64>()?;
@@ -3130,19 +3130,16 @@ impl DeepXExecutionClient {
             side_is_buy == finalized.is_buy() && record.reduce_only == finalized.reduce_only(),
             "DeepX Spot REST and finalized order flags differ",
         );
-        let base = instrument
-            .base_currency()
-            .ok_or_else(|| anyhow::anyhow!("DeepX Spot instrument has no base currency"))?;
-        let quote = instrument.quote_currency();
         let to_decimal = |raw: [u8; 32], precision: u8| -> anyhow::Result<rust_decimal::Decimal> {
             anyhow::ensure!(raw[16..].iter().all(|byte| *byte == 0));
             let value = i128::try_from(u128::from_le_bytes(raw[..16].try_into()?))?;
             Ok(scaled_i128_to_decimal(value, u32::from(precision))?)
         };
         anyhow::ensure!(
-            record.base_remaining_amount == to_decimal(finalized.base_amount(), base.precision)?
+            record.base_remaining_amount
+                == to_decimal(finalized.base_amount(), market.base_decimal)?
                 && record.quote_remaining_amount
-                    == to_decimal(finalized.quote_amount(), quote.precision)?,
+                    == to_decimal(finalized.quote_amount(), market.quote_decimal)?,
             "DeepX Spot REST and finalized remaining amounts differ",
         );
         let expected_status = match finalized.status() {
@@ -3168,7 +3165,7 @@ impl DeepXExecutionClient {
                     anyhow::anyhow!("DeepX finalized Spot limit order has no price")
                 })?;
                 anyhow::ensure!(
-                    record.price == to_decimal(raw_price, quote.precision)?,
+                    record.price == to_decimal(raw_price, market.quote_decimal)?,
                     "DeepX Spot REST and finalized limit prices differ",
                 );
             }
@@ -3184,7 +3181,6 @@ impl DeepXExecutionClient {
 
     async fn validate_owned_finalized_spot_order_records(
         &self,
-        instrument_id: InstrumentId,
         market: &DeepXSpotReportMarket,
         records: &[DeepXSpotOrderRecord],
         require_complete_active_index: bool,
@@ -3192,15 +3188,6 @@ impl DeepXExecutionClient {
         if self.config.execution_backend != DeepXExecutionBackend::DirectPallet {
             return Ok(());
         }
-        let instrument = {
-            let cache = self.core.try_cache().map_err(|_| {
-                anyhow::anyhow!("DeepX Spot order validation cache is already mutably borrowed")
-            })?;
-            cache
-                .instrument(&instrument_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("DeepX Spot instrument is not loaded"))?
-        };
         let mut ids = Vec::with_capacity(records.len());
         let mut unique = HashSet::new();
         for record in records {
@@ -3243,7 +3230,7 @@ impl DeepXExecutionClient {
                 .ok_or_else(|| {
                     anyhow::anyhow!("DeepX Spot order {id} is absent from finalized storage")
                 })?;
-            Self::validate_finalized_spot_order_record(record, market, &instrument, finalized)?;
+            Self::validate_finalized_spot_order_record(record, market, finalized)?;
         }
         Ok(())
     }
@@ -10760,7 +10747,6 @@ impl ExecutionClient for DeepXExecutionClient {
                 .flat_map(|page| page.items)
                 .collect::<Vec<_>>();
             self.validate_owned_finalized_spot_order_records(
-                instrument_id,
                 market,
                 &open_records,
                 true,
@@ -10811,7 +10797,6 @@ impl ExecutionClient for DeepXExecutionClient {
                     .flat_map(|page| page.items)
                     .collect::<Vec<_>>();
                 self.validate_owned_finalized_spot_order_records(
-                    instrument_id,
                     market,
                     &history_records,
                     false,
@@ -11309,9 +11294,21 @@ impl ExecutionClient for DeepXExecutionClient {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
         let (order_reports, fill_reports, position_reports) = tokio::try_join!(
-            self.generate_order_status_reports(&order_cmd),
-            self.generate_fill_reports(fill_cmd),
-            self.generate_position_status_reports(&position_cmd),
+            async {
+                self.generate_order_status_reports(&order_cmd)
+                    .await
+                    .context("DeepX mass status order reports failed")
+            },
+            async {
+                self.generate_fill_reports(fill_cmd)
+                    .await
+                    .context("DeepX mass status fill reports failed")
+            },
+            async {
+                self.generate_position_status_reports(&position_cmd)
+                    .await
+                    .context("DeepX mass status position reports failed")
+            },
         )?;
 
         let mut mass_status = ExecutionMassStatus::new(
@@ -13456,29 +13453,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_startup_coordinator_rejects_read_only_runtime_for_signing() {
+    async fn runtime_startup_coordinator_accepts_spec_376_runtime_for_signing() {
         let rpc_url = runtime_startup_rpc_url(true, false).await;
         let mut client = test_client();
         configure_runtime_rpc_roles(&mut client, &rpc_url);
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
 
-        let error = client
-            .observe_and_record_runtime_validated()
-            .await
-            .unwrap_err();
+        client.observe_and_record_runtime_validated().await.unwrap();
 
         assert!(
-            matches!(error, DeepXRuntimeStartupError::SnapshotBootstrap(_)),
-            "unexpected startup error: {error:?}",
+            client.runtime_snapshot.is_some(),
+            "approved runtime snapshot was not retained",
         );
-        assert!(client.runtime_snapshot.is_none());
-        assert!(client.runtime_rpc_endpoints.is_none());
-        assert!(client.runtime_rpc_capabilities.is_none());
+        assert!(client.runtime_rpc_endpoints.is_some());
+        assert!(client.runtime_rpc_capabilities.is_some());
         assert!(
             client
                 .startup
-                .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)
+                .validate_next(DeepXExecutionStartupEvidence::AccountOwnershipValidated)
                 .is_ok()
         );
         assert!(!client.is_connected());
@@ -18116,7 +18109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_spot_order_validation_rejects_busy_cache_without_panicking() {
+    async fn finalized_spot_order_validation_does_not_require_instrument_cache() {
         let (client, cache) = test_client_with_cache();
         let _borrow = cache.borrow_mut();
         let market = DeepXSpotReportMarket {
@@ -18131,21 +18124,11 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
-        let error = client
-            .validate_owned_finalized_spot_order_records(
-                InstrumentId::from("ETH-USDC.DEEPX"),
-                &market,
-                &[],
-                true,
-            )
+        client
+            .validate_owned_finalized_spot_order_records(&market, &[], true)
             .now_or_never()
-            .expect("busy cache must be rejected before suspension")
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "DeepX Spot order validation cache is already mutably borrowed",
-        );
+            .expect("empty validation must complete before suspension")
+            .unwrap();
     }
 
     #[rstest]
@@ -20148,6 +20131,10 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
+            "DeepX mass status position reports failed",
+        );
+        assert_eq!(
+            error.source().unwrap().to_string(),
             "unsupported DeepX position report status: Liquidated",
         );
     }

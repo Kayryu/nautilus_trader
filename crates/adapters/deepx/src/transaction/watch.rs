@@ -50,7 +50,7 @@ use crate::{
     rpc::{
         DEEPX_RECOVERY_RPC_METHODS, DEEPX_SUBMISSION_RPC_METHODS, DEEPX_WATCH_RPC_METHODS,
         DeepXHistoricalRuntimeError, DeepXValidatedRpcMethodCapabilities,
-        validate_historical_runtime_semantics_at,
+        validate_finalized_runtime_semantics_at,
     },
     signing::{
         ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXReadOnlyRuntimeSnapshot,
@@ -1464,7 +1464,7 @@ async fn observe_finalized_delegate_change_at_inner<T>(
             finalized: finalized.block_number(),
         });
     }
-    validate_historical_runtime_semantics_at(watch_url).await?;
+    validate_finalized_runtime_semantics_at(watch_url).await?;
     let observe_location = || async {
         observe_canonical_block_at(
             watch_url,
@@ -1575,7 +1575,7 @@ pub struct DeepXSignedDelegateModeQuery {
 ///
 /// # Errors
 ///
-/// Returns an error if signing, finalized membership, approved historical runtime selection, or
+/// Returns an error if signing, finalized membership, approved finalized runtime selection, or
 /// same-index event evidence fails.
 pub async fn observe_signed_delegate_mode_change_at(
     environment: &DeepXEnvironment,
@@ -1823,7 +1823,7 @@ pub async fn observe_finalized_perp_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    validate_historical_runtime_semantics_at(watch_url).await?;
+    validate_finalized_runtime_semantics_at(watch_url).await?;
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let read_hash = || async {
         let encoded: Option<String> = client
@@ -1977,7 +1977,7 @@ pub async fn observe_finalized_spot_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    validate_historical_runtime_semantics_at(watch_url).await?;
+    validate_finalized_runtime_semantics_at(watch_url).await?;
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let read_hash = || async {
         let encoded: Option<String> = client

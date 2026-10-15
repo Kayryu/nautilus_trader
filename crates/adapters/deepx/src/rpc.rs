@@ -80,12 +80,6 @@ const DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_b
 const DEEPX_LENDING_POOL_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_pool_accounting_v2";
 const DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_deposit_v2";
 const DEEPX_LENDING_BORROW_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_borrow_v2";
-const DEEPX_SPEC_369_FINALIZED_HASH: &str =
-    "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6";
-const DEEPX_SPEC_369_VERSION: u32 = 369;
-const DEEPX_SPEC_376_FINALIZED_HASH: &str =
-    "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c";
-const DEEPX_SPEC_376_VERSION: u32 = 376;
 const DEEPX_ETH_CALL_PROBE_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 const DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
 const DEEPX_MAX_PERP_MARKET_STORAGE_BYTES: usize = 16_384;
@@ -1839,17 +1833,17 @@ pub enum DeepXFinalizedAccountError {
     /// The endpoint did not preserve the approved historical runtime version.
     #[error(transparent)]
     HistoricalRuntime(#[from] DeepXHistoricalRuntimeError),
-    /// The harmless EIP-1898 control call failed at the requested finalized block.
+    /// The harmless control call failed at the requested finalized block.
     #[error("failed to verify DeepX eth_call at the finalized checkpoint: {0}")]
     EthCallProbeRpc(#[source] anyhow::Error),
     /// The harmless control call returned an unexpected value at the valid checkpoint.
     #[error("DeepX eth_call control result at the finalized checkpoint is invalid")]
     InvalidEthCallProbeResult,
-    /// The invalid canonical-block probe did not return a JSON-RPC error.
-    #[error("DeepX eth_call accepted an impossible canonical block hash")]
+    /// The invalid block-number probe did not return a JSON-RPC error.
+    #[error("DeepX eth_call accepted an impossible block selector")]
     EthCallBlockHashIgnored,
-    /// The invalid canonical-block probe failed without a valid JSON-RPC error envelope.
-    #[error("DeepX eth_call canonical-block rejection was not verifiable: {0}")]
+    /// The invalid block-number probe failed without a valid JSON-RPC error envelope.
+    #[error("DeepX eth_call block-selector rejection was not verifiable: {0}")]
     EthCallRejectionRpc(#[source] anyhow::Error),
     /// The invalid storage-block probe did not return a JSON-RPC error.
     #[error("DeepX state_getStorage accepted an impossible block hash")]
@@ -2225,8 +2219,8 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
 /// Observes fixture-approved runtime identity and `Timestamp.Now` at one finalized Watch block.
 ///
 /// Runtime version and metadata are validated and applied before timestamp storage is read from the
-/// exact same checkpoint. The Watch endpoint must also return the captured spec-369 runtime from
-/// its finalized historical hash through both `Core_version` and `state_getRuntimeVersion`.
+/// exact same checkpoint. The Watch endpoint must also return the approved runtime at that
+/// checkpoint through both `Core_version` and `state_getRuntimeVersion`.
 /// `Timestamp.Now` must also agree with the block inherent and independent storage query.
 /// Runtime change evidence therefore blocks new signing permits even when a later check fails.
 /// This function performs no nonce allocation, signing, or submission.
@@ -2234,8 +2228,8 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
 /// # Errors
 ///
 /// Returns an error unless capability evidence authorizes the required Watch reads, the finalized
-/// runtime is fixture-approved and can be applied, historical runtime selection is consistent with
-/// its captured fixture, and all finalized timestamp observations agree.
+/// runtime is fixture-approved and can be applied, both runtime methods agree at the observed
+/// finalized checkpoint, and all finalized timestamp observations agree.
 pub async fn observe_and_apply_finalized_chain_time(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
@@ -2265,7 +2259,13 @@ pub async fn observe_and_apply_finalized_chain_time(
         None,
         None,
     );
-    if let Err(e) = validate_historical_runtime_semantics(&client).await {
+    if let Err(e) = validate_runtime_semantics_at_checkpoint(
+        &client,
+        applied.checkpoint(),
+        applied.identity().spec_version,
+    )
+    .await
+    {
         if !matches!(&e, DeepXHistoricalRuntimeError::Rpc { .. }) {
             service
                 .halt_for_inconsistent_evidence()
@@ -2781,10 +2781,7 @@ pub async fn observe_finalized_perp_order_spec_evidence(
                     "to": DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS.to_string(),
                     "data": format!("0x{}", hex::encode(call_data)),
                 },
-                {
-                    "blockHash": format!("0x{}", hex::encode(observation.checkpoint().block_hash())),
-                    "requireCanonical": true,
-                },
+                format!("0x{:x}", observation.checkpoint().block_number()),
             ],
         }))
         .await
@@ -3982,7 +3979,8 @@ async fn collect_finalized_account_evidence(
     runtime_identity: &ApprovedRuntimeIdentity,
     subaccount: [u8; 20],
 ) -> Result<DeepXFinalizedAccountEvidence, DeepXFinalizedAccountError> {
-    validate_historical_runtime_semantics(client).await?;
+    validate_runtime_semantics_at_checkpoint(client, checkpoint, runtime_identity.spec_version)
+        .await?;
     validate_eth_call_block_selection(client, checkpoint).await?;
     let timestamp_ms = observe_finalized_chain_time_with_client(client, checkpoint).await?;
     validate_block_timestamp_inherent(client, checkpoint, timestamp_ms).await?;
@@ -4119,10 +4117,7 @@ async fn validate_eth_call_block_selection(
     checkpoint: DeepXFinalizedCheckpoint,
 ) -> Result<(), DeepXFinalizedAccountError> {
     let call = json!({"to": DEEPX_ETH_CALL_PROBE_ADDRESS, "data": "0x"});
-    let selected = json!({
-        "blockHash": format!("0x{}", hex::encode(checkpoint.block_hash())),
-        "requireCanonical": true,
-    });
+    let selected = format!("0x{:x}", checkpoint.block_number());
     let valid: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0", "id": 1, "method": "eth_call",
@@ -4133,8 +4128,7 @@ async fn validate_eth_call_block_selection(
     if valid != "0x" {
         return Err(DeepXFinalizedAccountError::InvalidEthCallProbeResult);
     }
-    let impossible =
-        json!({"blockHash": format!("0x{}", "00".repeat(32)), "requireCanonical": true});
+    let impossible = "0xffffffff";
     let response: RpcNodeHttpResponse<String> = client
         .execute_rpc_response(json!({
             "jsonrpc": "2.0", "id": 1, "method": "eth_call",
@@ -4152,27 +4146,21 @@ async fn validate_eth_call_block_selection(
     Ok(())
 }
 
-async fn validate_historical_runtime_semantics(
+async fn validate_runtime_semantics_at_checkpoint(
     client: &BlockchainHttpRpcClient,
+    checkpoint: DeepXFinalizedCheckpoint,
+    expected_spec_version: u32,
 ) -> Result<(), DeepXHistoricalRuntimeError> {
-    validate_runtime_semantics_at(
-        client,
-        DEEPX_SPEC_369_FINALIZED_HASH,
-        DEEPX_SPEC_369_VERSION,
-    )
-    .await
+    let finalized_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    validate_runtime_semantics_at(client, &finalized_hash, expected_spec_version).await
 }
 
 async fn validate_read_only_runtime_semantics(
     client: &BlockchainHttpRpcClient,
-    spec_version: u32,
+    checkpoint: DeepXFinalizedCheckpoint,
+    expected_spec_version: u32,
 ) -> Result<(), DeepXHistoricalRuntimeError> {
-    match spec_version {
-        DEEPX_SPEC_376_VERSION => {
-            validate_runtime_semantics_at(client, DEEPX_SPEC_376_FINALIZED_HASH, spec_version).await
-        }
-        _ => validate_historical_runtime_semantics(client).await,
-    }
+    validate_runtime_semantics_at_checkpoint(client, checkpoint, expected_spec_version).await
 }
 
 async fn validate_runtime_semantics_at(
@@ -4220,11 +4208,33 @@ async fn validate_runtime_semantics_at(
     Ok(())
 }
 
-pub(crate) async fn validate_historical_runtime_semantics_at(
+pub(crate) async fn validate_finalized_runtime_semantics_at(
     watch_url: &str,
 ) -> Result<(), DeepXHistoricalRuntimeError> {
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    validate_historical_runtime_semantics(&client).await
+    let finalized_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getFinalizedHead",
+            "params": [],
+        }))
+        .await
+        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
+            method: "chain_getFinalizedHead",
+            source,
+        })?;
+    let version: ObservedRuntimeVersion = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getRuntimeVersion",
+            "params": [finalized_hash.clone()],
+        }))
+        .await
+        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
+    validate_runtime_semantics_at(&client, &finalized_hash, version.spec_version).await
 }
 
 #[derive(Decode)]
@@ -4552,6 +4562,7 @@ async fn observe_finalized_lending_with_client(
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXLendingPositionEvidence>, DeepXFinalizedLendingError> {
     let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    let block_number = format!("0x{:x}", checkpoint.block_number());
     let market_ids = (u8::MIN..=u8::MAX).collect::<Vec<_>>();
     let input = (vec![subaccount], market_ids).encode();
     let encoded: String = client
@@ -4571,7 +4582,15 @@ async fn observe_finalized_lending_with_client(
     stream::iter(
         raw_positions
             .into_iter()
-            .map(|raw| observe_finalized_lending_asset(client, &block_hash, subaccount, raw)),
+            .map(|raw| {
+                observe_finalized_lending_asset(
+                    client,
+                    &block_hash,
+                    &block_number,
+                    subaccount,
+                    raw,
+                )
+            }),
     )
     .buffered(DEEPX_LENDING_ASSET_QUERY_CONCURRENCY)
     .try_collect()
@@ -4589,6 +4608,7 @@ struct DeepXRawLendingPosition {
 async fn observe_finalized_lending_asset(
     client: &BlockchainHttpRpcClient,
     block_hash: &str,
+    block_number: &str,
     subaccount: [u8; 20],
     raw: DeepXRawLendingPosition,
 ) -> Result<DeepXLendingPositionEvidence, DeepXFinalizedLendingError> {
@@ -4618,9 +4638,15 @@ async fn observe_finalized_lending_asset(
         if raw.scaled_deposit == 0 {
             Ok(None)
         } else {
-            observe_finalized_max_withdrawal(client, block_hash, subaccount, market_id, &raw.asset)
-                .await
-                .map(Some)
+            observe_finalized_max_withdrawal(
+                client,
+                block_number,
+                subaccount,
+                market_id,
+                &raw.asset,
+            )
+            .await
+            .map(Some)
         }
     };
     let (pool, effective_deposit, effective_borrow, max_withdraw_amount) = tokio::join!(
@@ -4652,7 +4678,7 @@ async fn observe_finalized_lending_asset(
 
 async fn observe_finalized_max_withdrawal(
     client: &BlockchainHttpRpcClient,
-    block_hash: &str,
+    block_number: &str,
     subaccount: [u8; 20],
     market_id: u8,
     asset: &[u8],
@@ -4673,10 +4699,7 @@ async fn observe_finalized_max_withdrawal(
                     "to": DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string(),
                     "data": format!("0x{}", hex::encode(call_data)),
                 },
-                {
-                    "blockHash": block_hash,
-                    "requireCanonical": true,
-                },
+                block_number,
             ],
         }))
         .await
@@ -4999,7 +5022,12 @@ async fn observe_approved_finalized_read_only_runtime_with_metadata_at(
         DeepXReadOnlyRuntimeSnapshot::approved_testnet,
     )
     .await?;
-    validate_read_only_runtime_semantics(&client, snapshot.identity().spec_version).await?;
+    validate_read_only_runtime_semantics(
+        &client,
+        checkpoint,
+        snapshot.identity().spec_version,
+    )
+    .await?;
     Ok((
         DeepXObservedReadOnlyRuntimeSnapshot {
             snapshot,
@@ -5155,6 +5183,10 @@ mod tests {
         map_finalized_flat_account_balances,
     };
 
+    const DEEPX_SPEC_376_FINALIZED_HASH: &str =
+        "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c";
+    const DEEPX_SPEC_376_VERSION: u32 = 376;
+
     const GENESIS_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
@@ -5208,7 +5240,6 @@ mod tests {
             "state_call" if request["params"][0] == "Core_version" => {
                 let finalized_hash = request["params"][2].as_str()?;
                 let spec_version = match finalized_hash {
-                    DEEPX_SPEC_369_FINALIZED_HASH => DEEPX_SPEC_369_VERSION,
                     DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
                     _ => return None,
                 };
@@ -5220,7 +5251,6 @@ mod tests {
             "state_getRuntimeVersion" if completed_calls >= 5 => {
                 let finalized_hash = request["params"][0].as_str()?;
                 let spec_version = match finalized_hash {
-                    DEEPX_SPEC_369_FINALIZED_HASH => DEEPX_SPEC_369_VERSION,
                     DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
                     _ => return None,
                 };
@@ -5284,7 +5314,12 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = BlockchainHttpRpcClient::new(url, None, None);
 
-        let result = validate_read_only_runtime_semantics(&client, spec_version).await;
+        let checkpoint = DeepXFinalizedCheckpoint {
+            block_hash: decode_prefixed_hash(finalized_hash, "finalized hash").unwrap(),
+            block_number: FINALIZED_BLOCK_NUMBER,
+        };
+        let result =
+            validate_read_only_runtime_semantics(&client, checkpoint, spec_version).await;
         if core_version.is_some() {
             assert!(matches!(
                 result,
@@ -5313,10 +5348,10 @@ mod tests {
     }
 
     #[rstest]
-    fn core_version_decoder_accepts_historical_spec_version() {
+    fn core_version_decoder_accepts_baseline_spec_version() {
         assert_eq!(
-            decode_core_version_spec(&encoded_core_version(DEEPX_SPEC_369_VERSION)).unwrap(),
-            DEEPX_SPEC_369_VERSION,
+            decode_core_version_spec(&encoded_core_version(DEEPX_SPEC_376_VERSION)).unwrap(),
+            DEEPX_SPEC_376_VERSION,
         );
         assert!(matches!(
             decode_core_version_spec("0x00"),
@@ -5895,13 +5930,7 @@ mod tests {
                         );
                         assert_eq!(
                             request["params"][1],
-                            json!({
-                                "blockHash": format!(
-                                    "0x{}",
-                                    hex::encode(checkpoint.block_hash())
-                                ),
-                                "requireCanonical": true,
-                            })
+                            format!("0x{:x}", checkpoint.block_number())
                         );
                         let encoded = request["params"][0]["data"].as_str().unwrap();
                         let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
@@ -6614,7 +6643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_376_runtime_snapshot_remains_unapproved_for_signing() {
+    async fn observes_spec_376_signing_runtime_snapshot() {
         let calls = Arc::new(AtomicUsize::new(0));
         let rpc_url =
             spawn_runtime_snapshot_server(DEEPX_SPEC_376_VERSION, Arc::clone(&calls)).await;
@@ -6624,15 +6653,16 @@ mod tests {
             ..Default::default()
         };
 
-        let error = observe_approved_finalized_runtime_snapshot(&config)
+        let observation = observe_approved_finalized_runtime_snapshot(&config)
             .await
-            .unwrap_err();
+            .unwrap();
 
         assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert!(matches!(
-            error,
-            DeepXRuntimeSnapshotObservationError::Snapshot(SnapshotError::RuntimeIdentityMismatch)
-        ));
+        assert_eq!(
+            observation.snapshot().identity().spec_version,
+            DEEPX_SPEC_376_VERSION,
+        );
+        assert_eq!(observation.checkpoint().block_number(), FINALIZED_BLOCK_NUMBER);
     }
 
     #[tokio::test]
@@ -7231,19 +7261,12 @@ mod tests {
                         8 => {
                             assert_eq!(request["method"], "eth_call");
                             assert_eq!(request["params"][0]["to"], DEEPX_ETH_CALL_PROBE_ADDRESS);
-                            assert_eq!(
-                                request["params"][1],
-                                json!({"blockHash": FINALIZED_HASH, "requireCanonical": true}),
-                            );
+                            assert_eq!(request["params"][1], FINALIZED_BLOCK_NUMBER_HEX);
                             json!({"jsonrpc": "2.0", "id": 1, "result": "0x"})
                         }
                         9 => {
                             assert_eq!(request["method"], "eth_call");
-                            assert_eq!(
-                                request["params"][1],
-                                json!({"blockHash": format!("0x{}", "00".repeat(32)),
-                                    "requireCanonical": true}),
-                            );
+                            assert_eq!(request["params"][1], "0xffffffff");
                             json!({"jsonrpc": "2.0", "id": 1,
                                 "error": {"code": -32000, "message": "unknown block"}})
                         }
@@ -7253,10 +7276,7 @@ mod tests {
                                 request["params"][0]["to"],
                                 DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS.to_string(),
                             );
-                            assert_eq!(
-                                request["params"][1],
-                                json!({"blockHash": FINALIZED_HASH, "requireCanonical": true}),
-                            );
+                            assert_eq!(request["params"][1], FINALIZED_BLOCK_NUMBER_HEX);
                             let calldata = hex::decode(
                                 request["params"][0]["data"]
                                     .as_str()
@@ -7848,18 +7868,8 @@ mod tests {
                         }),
                         "state_getRuntimeVersion" => {
                             let at = request["params"][0].as_str().unwrap();
-                            if at == DEEPX_SPEC_369_FINALIZED_HASH {
-                                json!({
-                                    "jsonrpc": "2.0", "id": 1,
-                                    "result": {
-                                        "specVersion": DEEPX_SPEC_369_VERSION,
-                                        "transactionVersion": 1,
-                                    },
-                                })
-                            } else {
-                                assert_eq!(at, FINALIZED_HASH);
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap()
-                            }
+                            assert_eq!(at, FINALIZED_HASH);
+                            serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap()
                         }
                         "state_getMetadata" => {
                             serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
@@ -7881,14 +7891,10 @@ mod tests {
                         "eth_call" => {
                             assert_eq!(request["params"][0]["to"], DEEPX_ETH_CALL_PROBE_ADDRESS);
                             assert_eq!(request["params"][0]["data"], "0x");
-                            assert_eq!(request["params"][1]["requireCanonical"], true);
-                            if request["params"][1]["blockHash"] == FINALIZED_HASH {
+                            if request["params"][1] == FINALIZED_BLOCK_NUMBER_HEX {
                                 json!({"jsonrpc": "2.0", "id": 1, "result": "0x"})
                             } else {
-                                assert_eq!(
-                                    request["params"][1]["blockHash"],
-                                    format!("0x{}", "00".repeat(32))
-                                );
+                                assert_eq!(request["params"][1], "0xffffffff");
                                 json!({
                                     "jsonrpc": "2.0", "id": 1,
                                     "error": {"code": -32000, "message": "unknown block"},
@@ -7900,18 +7906,10 @@ mod tests {
                             if method == "Core_version" {
                                 assert_eq!(request["params"][1], "0x");
                                 let at = request["params"][2].as_str().unwrap();
-                                assert!(
-                                    at == DEEPX_SPEC_376_FINALIZED_HASH
-                                        || at == DEEPX_SPEC_369_FINALIZED_HASH
-                                );
-                                let spec_version = if at == DEEPX_SPEC_376_FINALIZED_HASH {
-                                    DEEPX_SPEC_376_VERSION
-                                } else {
-                                    DEEPX_SPEC_369_VERSION
-                                };
+                                assert_eq!(at, DEEPX_SPEC_376_FINALIZED_HASH);
                                 return Json(json!({
                                     "jsonrpc": "2.0", "id": 1,
-                                    "result": encoded_core_version(spec_version),
+                                    "result": encoded_core_version(DEEPX_SPEC_376_VERSION),
                                 }));
                             }
                             assert_eq!(request["params"][2], FINALIZED_HASH);
@@ -8076,15 +8074,6 @@ mod tests {
                         }
                         "state_getRuntimeVersion" => {
                             let at = request["params"][0].as_str().unwrap();
-                            if at == DEEPX_SPEC_369_FINALIZED_HASH {
-                                return Json(json!({
-                                    "jsonrpc": "2.0", "id": 1,
-                                    "result": {
-                                        "specVersion": DEEPX_SPEC_369_VERSION,
-                                        "transactionVersion": 1,
-                                    },
-                                }));
-                            }
                             assert_eq!(at, FINALIZED_HASH);
                             let mode = timestamp_mode.load(Ordering::Relaxed);
                             let mut response: Value =
@@ -8123,16 +8112,11 @@ mod tests {
                             if method == "Core_version" {
                                 assert_eq!(request["params"][1], "0x");
                                 let at = request["params"][2].as_str().unwrap();
-                                assert!(
-                                    at == DEEPX_SPEC_376_FINALIZED_HASH
-                                        || at == DEEPX_SPEC_369_FINALIZED_HASH
-                                );
+                                assert_eq!(at, DEEPX_SPEC_376_FINALIZED_HASH);
                                 let spec_version = if timestamp_mode.load(Ordering::Relaxed) == 6 {
                                     371
-                                } else if at == DEEPX_SPEC_376_FINALIZED_HASH {
-                                    DEEPX_SPEC_376_VERSION
                                 } else {
-                                    DEEPX_SPEC_369_VERSION
+                                    DEEPX_SPEC_376_VERSION
                                 };
                                 return Json(json!({
                                     "jsonrpc": "2.0", "id": 1,
@@ -8166,14 +8150,10 @@ mod tests {
                         "eth_call" => {
                             assert_eq!(request["params"][0]["to"], DEEPX_ETH_CALL_PROBE_ADDRESS);
                             assert_eq!(request["params"][0]["data"], "0x");
-                            assert_eq!(request["params"][1]["requireCanonical"], true);
-                            if request["params"][1]["blockHash"] == FINALIZED_HASH {
+                            if request["params"][1] == FINALIZED_BLOCK_NUMBER_HEX {
                                 json!("0x")
                             } else {
-                                assert_eq!(
-                                    request["params"][1]["blockHash"],
-                                    format!("0x{}", "00".repeat(32))
-                                );
+                                assert_eq!(request["params"][1], "0xffffffff");
                                 if timestamp_mode.load(Ordering::Relaxed) == 7 {
                                     json!("0x")
                                 } else {
@@ -8513,20 +8493,16 @@ mod tests {
             validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
 
-        assert!(matches!(
-            observe_and_apply_approved_finalized_runtime_snapshot(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &service,
-            )
-            .await,
-            Err(DeepXRuntimeSnapshotRefreshError::Observation(
-                DeepXRuntimeSnapshotObservationError::Snapshot(
-                    SnapshotError::RuntimeIdentityMismatch
-                )
-            )),
-        ));
+        let applied = observe_and_apply_approved_finalized_runtime_snapshot(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &service,
+        )
+        .await
+        .unwrap();
 
+        assert_eq!(applied.update(), DeepXRuntimeSnapshotUpdate::Unchanged);
+        assert_eq!(applied.identity().spec_version, DEEPX_SPEC_376_VERSION);
         assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert!(service.acquire().is_ok());
     }

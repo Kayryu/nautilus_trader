@@ -34,31 +34,12 @@ use thiserror::Error;
 use super::DeepXRuntimeConfig;
 use crate::common::DeepXEnvironment;
 
-const TESTNET_GENESIS_HASH: &str =
-    "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
-const TESTNET_METADATA_SHA256: &str =
-    "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37";
-const TESTNET_SPEC_VERSION: u32 = 366;
-const TESTNET_SPEC_369_METADATA_SHA256: &str =
-    "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c";
-const TESTNET_SPEC_371_METADATA_SHA256: &str =
-    "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15";
+const TESTNET_MIN_SPEC_VERSION: u32 = 376;
 const TESTNET_SPEC_376_GENESIS_HASH: &str =
     "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
 const TESTNET_SPEC_376_METADATA_SHA256: &str =
     "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447";
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
-const TESTNET_SIGNED_EXTENSIONS: &[&str] = &[
-    "CheckNonZeroSender",
-    "CheckSpecVersion",
-    "CheckTxVersion",
-    "CheckGenesis",
-    "CheckMortality",
-    "CheckNonce",
-    "CheckWeight",
-    "ChargeTransactionPayment",
-    "CheckPriority",
-];
 const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
     "CheckSpecVersion",
@@ -70,12 +51,6 @@ const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "ChargeTransactionPayment",
     "CheckPriority",
 ];
-
-#[derive(Clone, Copy)]
-enum RuntimeSnapshotAccess {
-    Signing,
-    ReadOnly,
-}
 
 #[derive(Clone, Copy)]
 struct ApprovedTestnetRuntime {
@@ -810,8 +785,7 @@ impl RuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let approved_runtime =
-            approved_testnet_runtime(observed_spec_version, RuntimeSnapshotAccess::Signing)?;
+        let approved_runtime = approved_testnet_runtime(observed_spec_version)?;
         let (identity, interfaces, metadata) = validate_testnet_runtime_snapshot(
             environment,
             observed_genesis_hash,
@@ -871,8 +845,7 @@ impl DeepXReadOnlyRuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let approved_runtime =
-            approved_testnet_runtime(observed_spec_version, RuntimeSnapshotAccess::ReadOnly)?;
+        let approved_runtime = approved_testnet_runtime(observed_spec_version)?;
         let (identity, interfaces, metadata) = validate_testnet_runtime_snapshot(
             environment,
             observed_genesis_hash,
@@ -907,30 +880,15 @@ impl DeepXReadOnlyRuntimeSnapshot {
 
 fn approved_testnet_runtime(
     spec_version: u32,
-    access: RuntimeSnapshotAccess,
 ) -> Result<ApprovedTestnetRuntime, SnapshotError> {
-    let metadata_sha256 = match spec_version {
-        TESTNET_SPEC_VERSION => TESTNET_METADATA_SHA256,
-        369 => TESTNET_SPEC_369_METADATA_SHA256,
-        371 => TESTNET_SPEC_371_METADATA_SHA256,
-        376 if matches!(access, RuntimeSnapshotAccess::ReadOnly) => {
-            TESTNET_SPEC_376_METADATA_SHA256
-        }
-        _ => return Err(SnapshotError::RuntimeIdentityMismatch),
-    };
-    let (genesis_hash, signed_extensions) = if spec_version == 376 {
-        (
-            TESTNET_SPEC_376_GENESIS_HASH,
-            TESTNET_SPEC_376_SIGNED_EXTENSIONS,
-        )
-    } else {
-        (TESTNET_GENESIS_HASH, TESTNET_SIGNED_EXTENSIONS)
-    };
+    if spec_version < TESTNET_MIN_SPEC_VERSION {
+        return Err(SnapshotError::RuntimeIdentityMismatch);
+    }
 
     Ok(ApprovedTestnetRuntime {
-        genesis_hash,
-        metadata_sha256,
-        signed_extensions,
+        genesis_hash: TESTNET_SPEC_376_GENESIS_HASH,
+        metadata_sha256: TESTNET_SPEC_376_METADATA_SHA256,
+        signed_extensions: TESTNET_SPEC_376_SIGNED_EXTENSIONS,
     })
 }
 
@@ -1127,75 +1085,42 @@ mod tests {
     }
 
     #[rstest]
-    #[case(TESTNET_SPEC_VERSION, TESTNET_METADATA_SHA256)]
-    #[case(369, TESTNET_SPEC_369_METADATA_SHA256)]
-    #[case(371, TESTNET_SPEC_371_METADATA_SHA256)]
-    fn signing_policy_approves_only_pinned_runtime_identities(
-        #[case] spec_version: u32,
-        #[case] metadata_sha256: &str,
-    ) {
-        let approved =
-            approved_testnet_runtime(spec_version, RuntimeSnapshotAccess::Signing).unwrap();
-
-        assert_eq!(approved.genesis_hash, TESTNET_GENESIS_HASH);
-        assert_eq!(approved.metadata_sha256, metadata_sha256);
-        assert_eq!(approved.signed_extensions, TESTNET_SIGNED_EXTENSIONS);
-    }
-
-    #[rstest]
-    fn spec_376_is_approved_only_for_read_only_use() {
+    #[case(376)]
+    #[case(377)]
+    #[case(u32::MAX)]
+    fn signing_policy_approves_spec_376_and_later(#[case] spec_version: u32) {
         let metadata = spec_376_metadata_bytes();
         let genesis = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
 
-        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+        let signing = RuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             genesis,
-            376,
+            spec_version,
             TESTNET_TRANSACTION_VERSION,
             &metadata,
         )
         .unwrap();
-        assert_eq!(read_only.identity().spec_version, 376);
-        assert_eq!(read_only.identity().signed_extensions[4], "CheckNonceEra");
+        assert_eq!(signing.identity().spec_version, spec_version);
+        assert_eq!(signing.identity().signed_extensions[4], "CheckNonceEra");
         assert_eq!(
-            hex::encode(read_only.identity().metadata_sha256),
+            hex::encode(signing.identity().metadata_sha256),
             TESTNET_SPEC_376_METADATA_SHA256,
         );
-        assert!(matches!(
-            RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                genesis,
-                376,
-                TESTNET_TRANSACTION_VERSION,
-                &metadata,
-            ),
-            Err(SnapshotError::RuntimeIdentityMismatch),
-        ));
-
-        let mut changed = metadata.clone();
-        *changed.last_mut().unwrap() ^= 1;
-        assert!(matches!(
-            DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                genesis,
-                376,
-                TESTNET_TRANSACTION_VERSION,
-                &changed,
-            ),
-            Err(SnapshotError::MetadataHashMismatch),
-        ));
     }
 
     #[rstest]
     #[case(365)]
+    #[case(366)]
     #[case(367)]
     #[case(368)]
+    #[case(369)]
     #[case(370)]
+    #[case(371)]
     #[case(372)]
-    #[case(376)]
-    fn signing_policy_rejects_unapproved_runtime_identities(#[case] spec_version: u32) {
+    #[case(375)]
+    fn signing_policy_rejects_versions_before_376(#[case] spec_version: u32) {
         assert!(matches!(
-            approved_testnet_runtime(spec_version, RuntimeSnapshotAccess::Signing),
+            approved_testnet_runtime(spec_version),
             Err(SnapshotError::RuntimeIdentityMismatch),
         ));
     }
@@ -1848,7 +1773,7 @@ mod tests {
         assert!(matches!(
             RuntimeSnapshot::approved_testnet(
                 &DeepXEnvironment::Testnet,
-                decode_32(TESTNET_GENESIS_HASH).unwrap(),
+                decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
                 372,
                 TESTNET_TRANSACTION_VERSION,
                 &spec_376_metadata_bytes(),
@@ -1864,8 +1789,8 @@ mod tests {
         assert!(matches!(
             RuntimeSnapshot::approved_testnet(
                 &environment,
-                decode_32(TESTNET_GENESIS_HASH).unwrap(),
-                TESTNET_SPEC_VERSION,
+                decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
+                TESTNET_MIN_SPEC_VERSION,
                 TESTNET_TRANSACTION_VERSION,
                 &spec_376_metadata_bytes(),
             ),
