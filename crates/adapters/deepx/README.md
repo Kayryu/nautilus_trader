@@ -1041,10 +1041,10 @@ bounded public Spot history and a finalized-chain-verified current Spot instrume
 returns chronological replay ticks and does not reconstruct historical trading rules. Run the
 simulated Spot example with
 `.venv/bin/python examples/backtest/deepx_ema_cross_ethusdc_spot_trades.py`. The public testnet
-runtime observed on 2026-10-13 used genesis hash
+runtime observed on 2026-10-14 used genesis hash
 `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`, specification
-375, and metadata SHA-256
-`2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311`.
+376, and metadata SHA-256
+`57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447`.
 The read-only runtime snapshot and Spot storage decoder approve this captured identity. A public
 run loaded 1,000 exact Spot ticks and simulated eight fills. The Spot example disables optional
 portfolio analysis and omits the account report because the shared analysis path converts
@@ -1547,22 +1547,11 @@ The `deepx-capture-runtime-fixtures` binary captures public runtime identity res
 verifying the expected testnet genesis hash. It does not access account data or submit
 transactions. For a new, unapproved deployment, supply both `--expected-genesis <hash>` and
 `--output-root </absolute/review/path>` after `--` to inspect a fixture outside the repository;
-capture does not approve runtime signing. A 2026-10-13 capture under `/tmp/deepx-runtime-review`
-bound spec 375 and metadata SHA-256
-`2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311` to finalized
-block `18211500` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
-Its signed extensions use `CheckNonceEra` where the approved old-chain captures use
-`CheckMortality`. The Rust Subxt extension now matches complete immortal `Subaccount.no_op`,
-`System.remark`, and `PerpMarket.place_order` extrinsics generated offline by the pinned Python SDK
-against this captured metadata. Run `verify_sdk_signing.py --spec-version 375` with the pinned SDK
-source and compatibility helper to repeat that comparison. This proves encoding for those calls,
-not inclusion, account authorization, or durable recovery on the new deployment. The spec-375
-signing permit remains closed pending transaction and recovery validation.
-The same genesis advanced to spec 376 on 2026-10-13. One finalized spec-376 fixture binds metadata
+capture does not approve runtime signing. A finalized spec-376 fixture binds metadata
 SHA-256 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447` to block
-`18494970`. Compared with spec 375, its 21 pallet indices, call and event identities, storage
-entries, and signed-extension descriptors are unchanged; `CancelReason.InsufficientBalance` and two
-Spot settlement errors were appended. The read-only permit accepts this exact identity, and a
+`19592700` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
+Its signed extensions use `CheckNonceEra` where the approved old-chain captures use
+`CheckMortality`. The read-only permit accepts this exact identity, and a
 public verifier rediscovered three Spot and eight Perpetual instruments after the upgrade. The
 signing permit does not accept spec 376. The pinned SDK and Rust agree on complete offline spec-376
 `Subaccount.no_op`, `System.remark`, and `PerpMarket.place_order` bytes. Separately, an already

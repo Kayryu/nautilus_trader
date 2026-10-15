@@ -2405,6 +2405,8 @@ pub struct DeepXPerpMarketLookup {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use rstest::rstest;
 
     use super::*;
@@ -2451,9 +2453,6 @@ mod tests {
         include_str!("../../test_data/http/testnet/perp_market_eth_usdc_by_id.json");
     const PERP_MARKET_ETH_USDC_MANIFEST: &str =
         include_str!("../../test_data/http/testnet/perp_market_eth_usdc_by_id.manifest.json");
-    const RUNTIME_MANIFEST: &str = include_str!(
-        "../../test_data/runtime/testnet/genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json"
-    );
     const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
         include_str!("../../test_data/http/testnet/perp_history_orders_account_market_3.json");
     const PERP_HISTORY_ORDERS_ACCOUNT_MANIFEST: &str = include_str!(
@@ -2647,19 +2646,17 @@ mod tests {
     struct PerpVolumeRuntimeIdentity {
         #[serde(flatten)]
         identity: FixtureIdentity,
-        source_manifest: String,
+        captured_block: CapturedBlock,
     }
 
-    #[derive(Debug, Deserialize)]
-    struct RuntimeFixtureManifest {
-        deployment: String,
-        endpoint_role: String,
-        identity: FixtureIdentity,
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+    struct CapturedBlock {
+        hash: String,
+        number: Option<u64>,
     }
 
     fn validate_perp_volume_fixture_manifest(
         manifest: &PerpVolumeFixtureManifest,
-        runtime_manifest: &RuntimeFixtureManifest,
     ) -> Result<(), String> {
         if manifest.deployment != "testnet"
             || manifest.endpoint_role != "public_rest_market_data"
@@ -2670,14 +2667,25 @@ mod tests {
             || manifest.response.status != 200
             || manifest.response.content_type != "application/json"
             || manifest.response.payload_path != "perp_volume_1h.json"
-            || manifest.runtime_identity.source_manifest
-                != "../../runtime/testnet/genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/manifest.json"
-            || runtime_manifest.deployment != "testnet"
-            || runtime_manifest.endpoint_role != "runtime_identity"
         {
             return Err("unexpected DeepX perpetual volume fixture provenance".to_string());
         }
-        if manifest.runtime_identity.identity != runtime_manifest.identity {
+        if manifest.runtime_identity.identity
+            != (FixtureIdentity {
+                genesis_hash: "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b"
+                    .to_string(),
+                metadata_sha256: "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37"
+                    .to_string(),
+                spec_version: 366,
+                transaction_version: 1,
+            })
+            || manifest.runtime_identity.captured_block
+                != (CapturedBlock {
+                    hash: "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6"
+                        .to_string(),
+                    number: None,
+                })
+        {
             return Err("DeepX perpetual volume fixture runtime identity mismatch".to_string());
         }
 
@@ -3039,12 +3047,10 @@ mod tests {
     fn decodes_sanitized_perp_volume_fixture() {
         let manifest: PerpVolumeFixtureManifest =
             serde_json::from_str(PERP_VOLUME_1H_MANIFEST).unwrap();
-        let runtime_manifest: RuntimeFixtureManifest =
-            serde_json::from_str(RUNTIME_MANIFEST).unwrap();
         let response: DeepXApiResponse<DeepXPerpVolume> =
             serde_json::from_str(PERP_VOLUME_1H_RESPONSE).unwrap();
 
-        validate_perp_volume_fixture_manifest(&manifest, &runtime_manifest).unwrap();
+        validate_perp_volume_fixture_manifest(&manifest).unwrap();
         assert_eq!(response.code, DeepXResponseCode::Api(200));
         assert!(!response.fail);
         assert_eq!(response.data.total_volume, Decimal::new(2_117_975, 3));
@@ -3135,16 +3141,67 @@ mod tests {
 
     #[rstest]
     fn rejects_perp_volume_fixture_runtime_identity_drift() {
-        let manifest: PerpVolumeFixtureManifest =
+        let mut manifest: PerpVolumeFixtureManifest =
             serde_json::from_str(PERP_VOLUME_1H_MANIFEST).unwrap();
-        let mut runtime_manifest: RuntimeFixtureManifest =
-            serde_json::from_str(RUNTIME_MANIFEST).unwrap();
-        runtime_manifest.identity.spec_version += 1;
+        manifest.runtime_identity.identity.spec_version += 1;
 
         assert_eq!(
-            validate_perp_volume_fixture_manifest(&manifest, &runtime_manifest),
+            validate_perp_volume_fixture_manifest(&manifest),
             Err("DeepX perpetual volume fixture runtime identity mismatch".to_string()),
         );
+    }
+
+    #[rstest]
+    fn fixture_runtime_provenance_is_self_contained() {
+        let http_dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/http/testnet"
+        ));
+        let mut runtime_sidecars = 0;
+
+        for entry in fs::read_dir(http_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".manifest.json")
+            {
+                continue;
+            }
+
+            let manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let Some(identity) = manifest
+                .get("runtime_identity")
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            assert!(
+                identity.get("source_manifest").is_none(),
+                "{}",
+                path.display()
+            );
+            assert!(
+                identity["captured_block"]["hash"].is_string(),
+                "{}",
+                path.display()
+            );
+            runtime_sidecars += 1;
+        }
+
+        let websocket_path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/websocket/testnet/user_balances.manifest.json"
+        ));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(websocket_path).unwrap()).unwrap();
+        let identity = &manifest["runtime_identity"];
+        assert!(identity.get("source_manifest").is_none());
+        assert!(identity["captured_block"]["hash"].is_string());
+
+        assert_eq!(runtime_sidecars, 44);
     }
 
     #[rstest]

@@ -1,0 +1,51 @@
+{
+  "captured_at": "2026-10-14T10:24:56+00:00",
+  "deployment": "testnet",
+  "endpoint_role": "finalized_spot_market_storage",
+  "rpc_url": "https://rpc-testnet.deepx.fi",
+  "block_hash": "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c",
+  "block_number": 19592700,
+  "runtime_identity": {
+    "genesis_hash": "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
+    "metadata_sha256": "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447",
+    "spec_version": 376,
+    "transaction_version": 1
+  },
+  "storage": {
+    "pallet": "SpotMarket",
+    "item": "SpotMarkets",
+    "pair": "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+    "key": "0xbf8b4717648a584e695abe559e6c1de558e67555b0125b96b366d5ac600f0dcf9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
+  },
+  "rpc_payloads": [
+    {
+      "method": "state_getStorage",
+      "params": [
+        "0xbf8b4717648a584e695abe559e6c1de558e67555b0125b96b366d5ac600f0dcf9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+        "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c"
+      ],
+      "payload_path": "spot_market_eth_usdc.json",
+      "bytes": 497
+    },
+    {
+      "method": "state_getStorage",
+      "params": [
+        "0xbf8b4717648a584e695abe559e6c1de558e67555b0125b96b366d5ac600f0dcf9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+        "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c"
+      ],
+      "payload_path": "spot_market_eth_usdc_repeated.json",
+      "bytes": 497
+    },
+    {
+      "method": "state_queryStorageAt",
+      "params": [
+        [
+          "0xbf8b4717648a584e695abe559e6c1de558e67555b0125b96b366d5ac600f0dcf9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"
+        ],
+        "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c"
+      ],
+      "payload_path": "spot_market_eth_usdc_query_storage_at.json",
+      "bytes": 725
+    }
+  ]
+}

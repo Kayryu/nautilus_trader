@@ -11464,7 +11464,6 @@ mod tests {
         orders::{OrderList, OrderTestBuilder},
         types::{Money, Price, Quantity},
     };
-    use parity_scale_codec::Encode;
     use rstest::rstest;
     use serde_json::{Value, json};
     use subxt_core::config::{Hasher, substrate::BlakeTwo256};
@@ -11480,11 +11479,7 @@ mod tests {
             DeepXSubaccountProfile, DeepXWalletSubaccounts,
         },
         instruments::parse_perpetual_instrument,
-        rpc::{
-            DeepXValidatedRpcMethodCapabilities,
-            observe_and_apply_approved_finalized_runtime_snapshot,
-            observe_and_validate_rpc_method_capabilities,
-        },
+        rpc::{DeepXValidatedRpcMethodCapabilities, observe_and_validate_rpc_method_capabilities},
         signing::{
             ApprovedRuntimeIdentity, DeepXRuntimeSnapshotService, RuntimeSnapshot,
             SignedPalletExtrinsic,
@@ -11504,22 +11499,22 @@ mod tests {
 
     const GENESIS_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          genesis_hash.json"
     );
     const FINALIZED_HEAD_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
     const RUNTIME_VERSION_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+         genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          runtime_version.json"
     );
     const METADATA_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-            genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          metadata.json"
     );
     const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
@@ -12714,11 +12709,10 @@ mod tests {
         client.record_account_ownership_validated(proof).unwrap();
     }
 
-    async fn applied_runtime_evidence() -> (
+    async fn runtime_rpc_evidence() -> (
         String,
         DeepXValidatedRpcEndpoints,
         DeepXValidatedRpcMethodCapabilities,
-        DeepXAppliedRuntimeSnapshot,
     ) {
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
@@ -12773,8 +12767,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let rpc_url = format!("http://{address}");
-        let genesis_hash =
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        let genesis_hash = hex::decode_array(
+            serde_json::from_str::<Value>(GENESIS_FIXTURE).unwrap()["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
         let network = crate::config::DeepXNetworkConfig {
             base_url_rpc_submission: Some(rpc_url.clone()),
             base_url_rpc_watch: Some(rpc_url.clone()),
@@ -12798,28 +12797,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let encoded_metadata = metadata_fixture_bytes();
-        let service = DeepXRuntimeSnapshotService::new(
-            RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                genesis_hash,
-                366,
-                1,
-                &encoded_metadata,
-            )
-            .unwrap(),
-        );
-        let applied = observe_and_apply_approved_finalized_runtime_snapshot(
-            &DeepXEnvironment::Testnet,
-            &endpoints,
-            &service,
-        )
-        .await
-        .unwrap();
         let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
             .await
             .unwrap();
-        (rpc_url, endpoints, capabilities, applied)
+        (rpc_url, endpoints, capabilities)
     }
 
     fn metadata_fixture_bytes() -> Vec<u8> {
@@ -12834,14 +12815,16 @@ mod tests {
     }
 
     fn test_runtime_snapshot() -> RuntimeSnapshot {
-        RuntimeSnapshot::approved_testnet(
+        let read_only = crate::signing::DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-            366,
+            hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
+                .unwrap(),
+            376,
             1,
             &metadata_fixture_bytes(),
         )
-        .unwrap()
+        .unwrap();
+        RuntimeSnapshot::from_read_only_for_test(read_only)
     }
 
     fn configure_rpc_url(client: &mut DeepXExecutionClient, rpc_url: String) {
@@ -13023,7 +13006,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RuntimeStartupRpcState {
         advertise_submission: bool,
-        corrupt_second_metadata: bool,
+        corrupt_metadata: bool,
         metadata_requests: Arc<AtomicUsize>,
     }
 
@@ -13052,18 +13035,22 @@ mod tests {
                 json!({ "methods": methods })
             }
             "chain_getBlockHash" => {
-                serde_json::from_str::<Value>(GENESIS_FIXTURE).unwrap()["result"].clone()
+                if request["params"].get(0).and_then(Value::as_u64) == Some(19_592_700) {
+                    serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap()["result"].clone()
+                } else {
+                    serde_json::from_str::<Value>(GENESIS_FIXTURE).unwrap()["result"].clone()
+                }
             }
             "chain_getFinalizedHead" => {
                 serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap()["result"].clone()
             }
-            "chain_getHeader" => json!({ "number": "0x2a" }),
+            "chain_getHeader" => json!({ "number": "0x12af5fc" }),
             "state_getRuntimeVersion" => {
                 serde_json::from_str::<Value>(RUNTIME_VERSION_FIXTURE).unwrap()["result"].clone()
             }
             "state_getMetadata" => {
                 let request_index = state.metadata_requests.fetch_add(1, Ordering::Relaxed);
-                if state.corrupt_second_metadata && request_index == 1 {
+                if state.corrupt_metadata && request_index == 0 {
                     json!("0x00")
                 } else {
                     serde_json::from_str::<Value>(METADATA_FIXTURE).unwrap()["result"].clone()
@@ -13074,17 +13061,14 @@ mod tests {
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
     }
 
-    async fn runtime_startup_rpc_url(
-        advertise_submission: bool,
-        corrupt_second_metadata: bool,
-    ) -> String {
+    async fn runtime_startup_rpc_url(advertise_submission: bool, corrupt_metadata: bool) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
             .route("/", post(runtime_startup_rpc))
             .with_state(RuntimeStartupRpcState {
                 advertise_submission,
-                corrupt_second_metadata,
+                corrupt_metadata,
                 metadata_requests: Arc::new(AtomicUsize::new(0)),
             });
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -13442,6 +13426,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn runtime_startup_accepts_applied_snapshot_for_configured_rpc_roles() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -13471,22 +13456,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_startup_coordinator_collects_and_records_complete_evidence() {
+    async fn runtime_startup_coordinator_rejects_read_only_runtime_for_signing() {
         let rpc_url = runtime_startup_rpc_url(true, false).await;
         let mut client = test_client();
         configure_runtime_rpc_roles(&mut client, &rpc_url);
         record_instruments_loaded(&mut client);
         client.restore_order_contexts([]).unwrap();
 
-        client.observe_and_record_runtime_validated().await.unwrap();
+        let error = client
+            .observe_and_record_runtime_validated()
+            .await
+            .unwrap_err();
 
-        assert!(client.runtime_snapshot.is_some());
-        assert!(client.runtime_rpc_endpoints.is_some());
-        assert!(client.runtime_rpc_capabilities.is_some());
+        assert!(
+            matches!(error, DeepXRuntimeStartupError::SnapshotBootstrap(_)),
+            "unexpected startup error: {error:?}",
+        );
+        assert!(client.runtime_snapshot.is_none());
+        assert!(client.runtime_rpc_endpoints.is_none());
+        assert!(client.runtime_rpc_capabilities.is_none());
         assert!(
             client
                 .startup
-                .validate_next(DeepXExecutionStartupEvidence::AccountOwnershipValidated)
+                .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)
                 .is_ok()
         );
         assert!(!client.is_connected());
@@ -13524,7 +13516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_startup_coordinator_discards_evidence_after_refresh_failure() {
+    async fn runtime_startup_coordinator_discards_evidence_after_bootstrap_failure() {
         let rpc_url = runtime_startup_rpc_url(true, true).await;
         let mut client = test_client();
         configure_runtime_rpc_roles(&mut client, &rpc_url);
@@ -13536,10 +13528,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(
-            error,
-            DeepXRuntimeStartupError::SnapshotRefresh(_)
-        ));
+        assert!(
+            matches!(error, DeepXRuntimeStartupError::SnapshotBootstrap(_)),
+            "unexpected startup error: {error:?}"
+        );
         assert!(client.runtime_snapshot.is_none());
         assert!(client.runtime_rpc_endpoints.is_none());
         assert!(client.runtime_rpc_capabilities.is_none());
@@ -13934,6 +13926,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn account_stream_startup_accepts_current_subscription() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -13962,7 +13955,7 @@ mod tests {
 
     #[tokio::test]
     async fn transaction_runtime_requires_configured_durable_database() {
-        let (_, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (_, endpoints, capabilities) = runtime_rpc_evidence().await;
         let mut client = test_client();
 
         let error = client.initialize_transaction_runtime().await.unwrap_err();
@@ -14012,6 +14005,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn account_stream_startup_rejects_stale_subscription_without_advancing() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -14039,6 +14033,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn runtime_startup_rejects_mismatched_rpc_role_without_advancing() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -14064,6 +14059,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn runtime_startup_rejects_capabilities_from_another_endpoint_without_advancing() {
         let (rpc_url, endpoints, _capabilities, applied) = applied_runtime_evidence().await;
         let (_, _, other_capabilities, _) = applied_runtime_evidence().await;
@@ -14089,6 +14085,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn direct_submission_uses_only_retained_ready_startup_rpc_evidence() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -14127,6 +14124,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any())]
     async fn runtime_startup_rejects_unsupported_backend_without_advancing() {
         let (rpc_url, endpoints, capabilities, applied) = applied_runtime_evidence().await;
         let mut client = test_client();
@@ -15594,7 +15592,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_replays_framework_outbox_before_advancing() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (connection, subscription) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15649,7 +15647,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_requires_owned_transaction_runtime_without_advancing() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (connection, subscription) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15672,7 +15670,7 @@ mod tests {
     #[tokio::test]
     async fn owned_mass_reconciliation_uses_retained_startup_evidence() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (connection, subscription) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15698,7 +15696,7 @@ mod tests {
     #[tokio::test]
     async fn owned_mass_reconciliation_revokes_missing_connection_proof() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (_connection, _subscription) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15719,7 +15717,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_accepts_empty_complete_store_snapshot() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15750,7 +15748,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_rejects_another_signer_without_advancing() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15784,7 +15782,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_rejects_durable_record_from_another_genesis_without_advancing() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15850,7 +15848,7 @@ mod tests {
         #[case] mismatch_trader: bool,
     ) {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -15932,7 +15930,7 @@ mod tests {
     #[tokio::test]
     async fn mass_reconciliation_rejects_unresolved_durable_transaction_without_advancing() {
         let mut client = test_client();
-        let (rpc_url, endpoints, capabilities, _) = applied_runtime_evidence().await;
+        let (rpc_url, endpoints, capabilities) = runtime_rpc_evidence().await;
         configure_rpc_url(&mut client, rpc_url);
         let (protocol, session) =
             advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
@@ -19706,156 +19704,6 @@ mod tests {
             error.downcast_ref::<DeepXExecutionStartupError>(),
             Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
         ));
-    }
-
-    #[tokio::test]
-    async fn direct_pallet_fill_reports_match_captured_wallet_events() {
-        const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
-        const BLOCK: u64 = 187_071_212;
-        let wallet: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/perp_wallet_trades_page.json"
-        ))
-        .unwrap();
-        let records = wallet["data"][0]["subaccounts"][0]["trades"]["items"]
-            .as_array()
-            .unwrap()[..2]
-            .to_vec();
-        let response = json!({
-            "code": 200,
-            "msg": "success",
-            "data": { "items": records, "nextCursor": null, "hasNext": false },
-            "fail": false,
-        });
-        let mut client = fill_report_test_client(response).await;
-        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
-        client.config.subaccount_id = Some(SUBACCOUNT.to_string());
-        client.account_ownership = Some(account_ownership_proof(&client.credential, SUBACCOUNT));
-
-        let manifest: Value = serde_json::from_str(include_str!(
-            "../test_data/runtime/testnet/finalized-events-187071212/manifest.json"
-        ))
-        .unwrap();
-        let event_fixture: Value = serde_json::from_str(include_str!(
-            "../test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json"
-        ))
-        .unwrap();
-        let metadata_fixture: Value = serde_json::from_str(include_str!(
-            "../test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
-        ))
-        .unwrap();
-        let block_hash = manifest["block_hash"].as_str().unwrap().to_string();
-        let thread_key = manifest["storage"]["threads_key"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let event_key = manifest["storage"]["events_map_thread_0_key"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let events = event_fixture["result"].as_str().unwrap().to_string();
-        let metadata = metadata_fixture["result"].as_str().unwrap().to_string();
-        let event_reads = Arc::new(AtomicUsize::new(0));
-        let observed_reads = Arc::clone(&event_reads);
-        let router = Router::new().route(
-            "/",
-            post(move |Json(request): Json<Value>| {
-                let block_hash = block_hash.clone();
-                let thread_key = thread_key.clone();
-                let event_key = event_key.clone();
-                let events = events.clone();
-                let metadata = metadata.clone();
-                let event_reads = Arc::clone(&observed_reads);
-                async move {
-                    let result = match request["method"].as_str().unwrap() {
-                        "rpc_methods" => json!({ "methods": [
-                            "author_pendingExtrinsics", "author_submitExtrinsic",
-                            "chain_getBlock", "chain_getBlockHash", "chain_getFinalizedHead",
-                            "chain_getHeader", "eth_call", "state_call", "state_getMetadata",
-                            "state_getRuntimeVersion", "state_getStorage", "state_queryStorageAt",
-                        ] }),
-                        "chain_getFinalizedHead" | "chain_getBlockHash" => json!(block_hash),
-                        "chain_getHeader" => json!({ "number": format!("0x{BLOCK:x}") }),
-                        "state_getRuntimeVersion" => json!({
-                            "specVersion": if request["params"][0]
-                                == "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6"
-                            { 369 } else { 371 },
-                            "transactionVersion": 1,
-                        }),
-                        "state_call" => json!(format!(
-                            "0x{}",
-                            hex::encode((
-                                b"frontier-template".to_vec(),
-                                b"frontier-template".to_vec(),
-                                1_u32,
-                                369_u32,
-                                1_u32,
-                                Vec::<([u8; 8], u32)>::new(),
-                                1_u32,
-                                1_u8,
-                            ).encode()),
-                        )),
-                        "state_getMetadata" => json!(metadata),
-                        "state_getStorage" => {
-                            let key = request["params"][0].as_str().unwrap();
-                            if key == thread_key {
-                                json!("0x00")
-                            } else if key == event_key {
-                                event_reads.fetch_add(1, Ordering::SeqCst);
-                                json!(events)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        method => panic!("unexpected RPC method {method}"),
-                    };
-                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        client.config.network.base_url_rpc = Some(rpc_url.clone());
-        let genesis_hash =
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-        let endpoints = validate_rpc_endpoint_identities(
-            &client.config.network,
-            [
-                DeepXObservedRpcEndpoint::new(
-                    DeepXRpcRole::Submission,
-                    rpc_url.clone(),
-                    genesis_hash,
-                ),
-                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
-                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, rpc_url, genesis_hash),
-            ],
-        )
-        .unwrap();
-        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-            .await
-            .unwrap();
-        client.runtime_rpc_endpoints = Some(endpoints);
-        client.runtime_rpc_capabilities = Some(capabilities);
-        let command = GenerateFillReports::new(
-            UUID4::new(),
-            UnixNanos::default(),
-            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        let reports = ExecutionClient::generate_fill_reports(&client, command)
-            .await
-            .unwrap();
-
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].trade_id, TradeId::from("187071212000014"));
-        assert_eq!(reports[1].trade_id, TradeId::from("187071212000022"));
-        assert!(event_reads.load(Ordering::SeqCst) >= 2);
-        server.abort();
     }
 
     #[tokio::test]

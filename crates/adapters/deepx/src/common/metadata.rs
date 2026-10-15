@@ -81,7 +81,7 @@ mod tests {
     const FINALIZED_METADATA: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/test_data/runtime/testnet/",
-        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+        "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
     ));
 
     #[derive(Deserialize)]
@@ -105,7 +105,7 @@ mod tests {
                 "CheckSpecVersion",
                 "CheckTxVersion",
                 "CheckGenesis",
-                "CheckMortality",
+                "CheckNonceEra",
                 "CheckNonce",
                 "CheckWeight",
                 "ChargeTransactionPayment",

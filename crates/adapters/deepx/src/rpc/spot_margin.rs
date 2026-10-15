@@ -291,25 +291,12 @@ mod tests {
     const BLOCK_HASH: &str = "0xbb48406ad92b4a214f64b71b9ac95052df793113ef82b5e7df744dd44546f0e4";
     const BLOCK_NUMBER: u32 = 217_394_490;
 
-    fn metadata_for(spec_version: u32) -> Vec<u8> {
-        let fixture = match spec_version {
-            366 => include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/",
-                "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
-            )),
-            369 => include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/",
-                "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json",
-            )),
-            371 => include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/",
-                "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-            )),
-            _ => unreachable!(),
-        };
+    fn metadata() -> Vec<u8> {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+        ));
         let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
         hex::decode(
             fixture["result"]
@@ -321,10 +308,6 @@ mod tests {
         .unwrap()
     }
 
-    fn metadata() -> Vec<u8> {
-        metadata_for(371)
-    }
-
     #[rstest::rstest]
     fn finalized_spot_margin_key_uses_identity_account_id20() {
         assert_eq!(
@@ -334,11 +317,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(366)]
-    #[case(369)]
-    #[case(371)]
-    fn approved_runtime_uses_identity_subaccount_info_storage(#[case] spec_version: u32) {
-        let bytes = metadata_for(spec_version);
+    fn retained_runtime_uses_identity_subaccount_info_storage() {
+        let bytes = metadata();
         let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
             RuntimeMetadataPrefixed::decode(&mut bytes.as_slice()).unwrap()
         else {

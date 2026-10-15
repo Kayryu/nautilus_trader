@@ -26,43 +26,28 @@ SPEC_376_FINALIZED_PERP_CANCEL = (
     "f4183e60982d21a101000002000000"
 )
 FIXTURES = Path(__file__).resolve().parents[1] / "test_data/runtime/testnet"
-SNAPSHOT = (
-    FIXTURES / "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08"
-)
+SNAPSHOT = FIXTURES / "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2"
 
 
 class OfflineSubstrate(SubstrateInterface):
     def __init__(self):
         self.fixture_metadata = json.loads((SNAPSHOT / "metadata.json").read_text())
-        self.fixture_version = json.loads(
-            (SNAPSHOT / "runtime_version.json").read_text()
-        )
+        self.fixture_version = json.loads((SNAPSHOT / "runtime_version.json").read_text())
         self.fixture_genesis = json.loads((SNAPSHOT / "genesis_hash.json").read_text())
         identity = json.loads((SNAPSHOT / "manifest.json").read_text())["identity"]
         metadata = bytes.fromhex(self.fixture_metadata["result"].removeprefix("0x"))
-        expected_hash = {
-            366: "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37",
-            369: "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
-            371: "4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15",
-            375: "2102104ce23d677c3857c232befe4cfa0a6c2bab572fb5e06c105dda6dc31311",
-            376: "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447",
-        }.get(self.fixture_version["result"]["specVersion"])
-        expected_genesis = (
-            "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
-            if self.fixture_version["result"]["specVersion"] in (375, 376)
-            else "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b"
-        )
+        expected_hash = "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447"
+        expected_genesis = "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
         if (
             hashlib.sha256(metadata).hexdigest() != expected_hash
             or identity["metadata_sha256"] != expected_hash
             or identity["genesis_hash"] != self.fixture_genesis["result"]
             or self.fixture_genesis["result"] != expected_genesis
+            or self.fixture_version["result"]["specVersion"] != 376
             or self.fixture_version["result"]["transactionVersion"] != 1
         ):
             raise ValueError("Runtime fixture identity is not the reviewed snapshot")
-        super().__init__(
-            url="http://offline.invalid", auto_discover=False, ss58_format=42
-        )
+        super().__init__(url="http://offline.invalid", auto_discover=False, ss58_format=42)
 
     def rpc_request(self, method, params, *args, **kwargs):
         if method == "rpc_methods":
@@ -88,9 +73,7 @@ def load_pinned_source(path: Path, expected_blob: str) -> bytes:
             raise ValueError("SDK source response has an unexpected GitHub blob")
     else:
         source = path.read_bytes()
-    blob = hashlib.sha1(
-        b"blob " + str(len(source)).encode() + b"\0" + source
-    ).hexdigest()
+    blob = hashlib.sha1(b"blob " + str(len(source)).encode() + b"\0" + source).hexdigest()
     if blob != expected_blob:
         raise ValueError("SDK source is not the reviewed pinned GitHub blob")
     return source
@@ -104,9 +87,7 @@ def load_sdk_builder(sdk_source: Path, compat_source: Path):
         item
         for item in compat_tree.body
         if (isinstance(item, ast.ClassDef) and item.name == "_ImmortalMetadata")
-        or (
-            isinstance(item, ast.FunctionDef) and item.name == "create_signed_extrinsic"
-        )
+        or (isinstance(item, ast.FunctionDef) and item.name == "create_signed_extrinsic")
     ]
     if {item.name for item in compat_items} != {
         "_ImmortalMetadata",
@@ -115,9 +96,7 @@ def load_sdk_builder(sdk_source: Path, compat_source: Path):
         raise ValueError("Pinned SDK compatibility functions are missing")
     compat_namespace = {"Any": Any, "copy": copy}
     exec(  # noqa: S102 - exact reviewed blob and selected definitions only
-        compile(
-            ast.Module(body=compat_items, type_ignores=[]), str(compat_source), "exec"
-        ),
+        compile(ast.Module(body=compat_items, type_ignores=[]), str(compat_source), "exec"),
         compat_namespace,
     )
 
@@ -125,9 +104,7 @@ def load_sdk_builder(sdk_source: Path, compat_source: Path):
     selected = {"build_signed_pallet_call_extrinsic", "_create_ecdsa_keypair"}
     tree = ast.parse(source)
     functions = [
-        item
-        for item in tree.body
-        if isinstance(item, ast.FunctionDef) and item.name in selected
+        item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name in selected
     ]
     if {item.name for item in functions} != selected:
         raise ValueError("Pinned SDK functions are missing")
@@ -162,15 +139,11 @@ def verify_spec376_finalized_signature() -> None:
     signature = keys.Signature(signature_bytes=encoded[23:88])
     extra, call = encoded[88:97], encoded[97:]
     if len(extra) != 9 or extra[0] != 0 or extra[1] != 0x0B or extra[-1] != 0:
-        raise AssertionError(
-            "Finalized extrinsic has an unexpected immortal extension layout"
-        )
+        raise AssertionError("Finalized extrinsic has an unexpected immortal extension layout")
     if call[:2] != bytes((22, 3)) or len(call) != 34:
         raise AssertionError("Finalized extrinsic is not the captured perpetual cancel")
 
-    genesis = bytes.fromhex(
-        "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
-    )
+    genesis = bytes.fromhex("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
 
     def recovered(spec_version: int, era_implicit: bytes) -> bytes:
         payload = (
@@ -181,18 +154,14 @@ def verify_spec376_finalized_signature() -> None:
             + genesis
             + era_implicit
         )
-        return signature.recover_public_key_from_msg_hash(
-            keccak(payload)
-        ).to_canonical_address()
+        return signature.recover_public_key_from_msg_hash(keccak(payload)).to_canonical_address()
 
     if (
         recovered(376, genesis) != account
         or recovered(375, genesis) == account
         or recovered(376, bytes(32)) == account
     ):
-        raise AssertionError(
-            "Finalized signature does not bind spec 376 and immortal genesis"
-        )
+        raise AssertionError("Finalized signature does not bind spec 376 and immortal genesis")
     print("Finalized spec376 signature context: PerpMarket.cancel_order")
 
 
@@ -290,9 +259,7 @@ def verify_evm_vectors(sdk_source: Path):
     from eth_abi import encode as abi_encode
     from eth_utils import keccak
 
-    rust_source = (
-        Path(__file__).resolve().parents[1] / "src/signing/evm.rs"
-    ).read_text()
+    rust_source = (Path(__file__).resolve().parents[1] / "src/signing/evm.rs").read_text()
     signature = "setProfitAndLossPoint(address,uint16,uint128,uint128)"
     pnl_calldata = keccak(text=signature)[:4] + abi_encode(
         ["address", "uint16", "uint128", "uint128"],
@@ -351,31 +318,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sdk_source", type=Path)
     parser.add_argument("compat_source", type=Path)
-    parser.add_argument(
-        "--spec-version", type=int, choices=(366, 369, 371, 375, 376), default=366
-    )
     args = parser.parse_args()
-    global SNAPSHOT
-    if args.spec_version == 369:
-        SNAPSHOT = (
-            FIXTURES
-            / "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff"
-        )
-    elif args.spec_version == 371:
-        SNAPSHOT = (
-            FIXTURES
-            / "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda"
-        )
-    elif args.spec_version == 375:
-        SNAPSHOT = (
-            FIXTURES
-            / "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b"
-        )
-    elif args.spec_version == 376:
-        SNAPSHOT = (
-            FIXTURES
-            / "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448"
-        )
     builder = load_sdk_builder(args.sdk_source, args.compat_source)
     source = (Path(__file__).resolve().parents[1] / "src/signing/mod.rs").read_text()
     vectors = [
@@ -655,9 +598,7 @@ def main():
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
                             "is_buy": True,
-                            "quote_amount": int.from_bytes(
-                                bytes([0x33]) * 32, "little"
-                            ),
+                            "quote_amount": int.from_bytes(bytes([0x33]) * 32, "little"),
                             "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
                             "order_type": {"Limit": "IOC"},
                             "post_only": "None",
@@ -674,9 +615,7 @@ def main():
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
                             "is_buy": True,
-                            "quote_amount": int.from_bytes(
-                                bytes([0x33]) * 32, "little"
-                            ),
+                            "quote_amount": int.from_bytes(bytes([0x33]) * 32, "little"),
                             "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
                             "order_type": {"Market": None},
                             "post_only": "None",
@@ -713,9 +652,7 @@ def main():
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
                             "is_buy": True,
-                            "quote_amount": int.from_bytes(
-                                bytes([0x33]) * 32, "little"
-                            ),
+                            "quote_amount": int.from_bytes(bytes([0x33]) * 32, "little"),
                             "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
                             "order_type": {"Limit": "GTC"},
                             "post_only": "None",
@@ -732,9 +669,7 @@ def main():
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
                             "is_buy": False,
-                            "quote_amount": int.from_bytes(
-                                bytes([0x33]) * 32, "little"
-                            ),
+                            "quote_amount": int.from_bytes(bytes([0x33]) * 32, "little"),
                             "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
                             "order_type": {"Limit": "IOC"},
                             "post_only": "None",
@@ -751,9 +686,7 @@ def main():
                             "subaccount": "0x" + "11" * 20,
                             "pair": "0x" + "22" * 32,
                             "is_buy": False,
-                            "quote_amount": int.from_bytes(
-                                bytes([0x33]) * 32, "little"
-                            ),
+                            "quote_amount": int.from_bytes(bytes([0x33]) * 32, "little"),
                             "base_amount": int.from_bytes(bytes([0x44]) * 32, "little"),
                             "order_type": {"Market": 50},
                             "post_only": "None",
@@ -820,16 +753,12 @@ def main():
         )
         expected_literal = f'"{encoded.removeprefix("0x")}"'
         if expected_literal not in source:
-            raise AssertionError(
-                f"SDK/Rust signed extrinsic mismatch: {pallet}.{call}: {encoded}"
-            )
+            raise AssertionError(f"SDK/Rust signed extrinsic mismatch: {pallet}.{call}: {encoded}")
         print(f"SDK/Rust complete extrinsic parity: {pallet}.{call}")
     if args.spec_version == 376:
         verify_spec376_finalized_signature()
     verify_evm_vectors(args.sdk_source)
-    print(
-        f"SDK blobs: {SDK_BLOB}, {COMPAT_BLOB}; spec{args.spec_version}/tx1; offline only"
-    )
+    print(f"SDK blobs: {SDK_BLOB}, {COMPAT_BLOB}; spec{args.spec_version}/tx1; offline only")
 
 
 if __name__ == "__main__":

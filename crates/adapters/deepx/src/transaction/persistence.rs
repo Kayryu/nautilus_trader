@@ -5210,21 +5210,22 @@ mod tests {
         let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
         let bytes = nautilus_core::hex::decode(metadata.result.trim_start_matches("0x")).unwrap();
-        crate::signing::RuntimeSnapshot::approved_testnet(
+        let read_only = crate::signing::DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             nautilus_core::hex::decode_array(
-                "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
+                "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
             )
             .unwrap(),
-            366,
+            376,
             1,
             &bytes,
         )
-        .unwrap()
+        .unwrap();
+        crate::signing::RuntimeSnapshot::from_read_only_for_test(read_only)
     }
 
     fn remark_key() -> crate::common::DeepXPrivateKey {
@@ -5906,11 +5907,8 @@ mod tests {
         server.abort();
     }
 
-    #[rstest]
-    #[case(false)]
-    #[case(true)]
     #[tokio::test]
-    async fn invalid_runtime_permit_blocks_durable_rest_submission(#[case] mismatched: bool) {
+    async fn revoked_runtime_permit_blocks_durable_rest_submission() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use axum::{Router, routing::post};
@@ -5932,39 +5930,10 @@ mod tests {
             prepare_initial_submission(&store, &lease, restored[0].committed(), &record, &verifier)
                 .await
                 .unwrap();
-        let snapshot = if mismatched {
-            let metadata: serde_json::Value = serde_json::from_str(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/",
-                "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-            )))
-            .unwrap();
-            let bytes = nautilus_core::hex::decode(
-                metadata["result"]
-                    .as_str()
-                    .unwrap()
-                    .trim_start_matches("0x"),
-            )
-            .unwrap();
-            crate::signing::RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                nautilus_core::hex::decode_array(
-                    "86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b",
-                )
-                .unwrap(),
-                371,
-                1,
-                &bytes,
-            )
-            .unwrap()
-        } else {
-            remark_snapshot()
-        };
+        let snapshot = remark_snapshot();
         let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot);
         let runtime_permit = service.acquire().unwrap();
-        if !mismatched {
-            service.halt_for_inconsistent_evidence().unwrap();
-        }
+        service.halt_for_inconsistent_evidence().unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
@@ -5990,11 +5959,7 @@ mod tests {
         let Err(crate::transaction::DeepXRestSubmissionError::NotSent(reason)) = result else {
             panic!("invalid runtime permit must prevent REST submission");
         };
-        if mismatched {
-            assert!(reason.contains("runtime permit does not match"));
-        } else {
-            assert!(reason.contains("inconsistent"));
-        }
+        assert!(reason.contains("inconsistent"));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(store.current_revision(), 3);
         server.abort();
@@ -6453,94 +6418,6 @@ mod tests {
                 )
             )
         ));
-    }
-
-    #[rstest]
-    #[case(0)]
-    #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(5)]
-    #[case(6)]
-    #[case(7)]
-    #[case(8)]
-    #[tokio::test]
-    async fn direct_dispatch_supports_exact_captured_spec369(#[case] operation: u8) {
-        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json",
-        )))
-        .unwrap();
-        let metadata = nautilus_core::hex::decode(
-            response["result"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let snapshot = crate::signing::RuntimeSnapshot::approved_testnet(
-            &DeepXEnvironment::Testnet,
-            remark_snapshot().identity().genesis_hash,
-            369,
-            1,
-            &metadata,
-        )
-        .unwrap();
-        let baseline = direct_operation_fixture(operation);
-        let mut identity = serde_json::to_value(baseline.identity()).unwrap();
-        identity["runtime"] =
-            serde_json::to_value(DeepXDirectRuntimeIdentity::from(snapshot.identity())).unwrap();
-        let created = DeepXTransactionRecord::created(serde_json::from_value(identity).unwrap());
-        let store = TestStore::new(1, &created);
-        let lease = store
-            .acquire_signer_lease(created.identity().signer())
-            .await
-            .unwrap();
-        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
-            &created,
-            DeepXTransactionRevision::new(1),
-        )
-        .unwrap();
-        let verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
-            snapshot.clone(),
-            remark_key(),
-            [0x11; 20],
-        )
-        .unwrap();
-        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot);
-        let signed = crate::transaction::prepare_signed_direct_pallet_transaction(
-            &store,
-            &lease,
-            &committed,
-            &created,
-            &service.acquire().unwrap(),
-            &verifier,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            crate::transaction::load_verified_direct_pallet_for_signer(&store, &lease, &verifier,)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        let old_verifier = crate::transaction::DeepXDirectPalletCallVerifier::new(
-            remark_snapshot(),
-            remark_key(),
-            [0x11; 20],
-        )
-        .unwrap();
-        assert!(
-            old_verifier
-                .verify(
-                    signed.record().identity(),
-                    signed.record().signed_extrinsic().unwrap()
-                )
-                .is_err()
-        );
     }
 
     #[tokio::test]

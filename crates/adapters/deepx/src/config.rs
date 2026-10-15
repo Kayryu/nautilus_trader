@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::common::{
     DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, Result,
-    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_TESTNET_SPEC_375_GENESIS_HASH, DEEPX_VENUE},
+    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_VENUE},
     urls,
 };
 
@@ -599,16 +599,12 @@ pub fn validate_rpc_endpoint_identities(
     config: &DeepXNetworkConfig,
     observations: impl IntoIterator<Item = DeepXObservedRpcEndpoint>,
 ) -> std::result::Result<DeepXValidatedRpcEndpoints, DeepXRpcEndpointValidationError> {
-    let approved_genesis_hashes = [
-        DEEPX_TESTNET_GENESIS_HASH,
-        DEEPX_TESTNET_SPEC_375_GENESIS_HASH,
-    ]
-    .map(|hash| {
-        hex::decode_array::<32>(hash.strip_prefix("0x").unwrap_or(hash))
-            .map_err(|_| DeepXRpcEndpointValidationError::InvalidApprovedGenesisHash)
-    })
-    .into_iter()
-    .collect::<std::result::Result<Vec<_>, _>>()?;
+    let approved_genesis_hash = hex::decode_array::<32>(
+        DEEPX_TESTNET_GENESIS_HASH
+            .strip_prefix("0x")
+            .unwrap_or(DEEPX_TESTNET_GENESIS_HASH),
+    )
+    .map_err(|_| DeepXRpcEndpointValidationError::InvalidApprovedGenesisHash)?;
     let mut submission_url = None;
     let mut watch_url = None;
     let mut recovery_url = None;
@@ -621,7 +617,7 @@ pub fn validate_rpc_endpoint_identities(
                 observation.role,
             ));
         }
-        if !approved_genesis_hashes.contains(&observation.genesis_hash)
+        if observation.genesis_hash != approved_genesis_hash
             || observed_genesis_hash.is_some_and(|hash| hash != observation.genesis_hash)
         {
             return Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
@@ -1155,14 +1151,9 @@ mod tests {
     }
 
     #[rstest]
-    fn new_testnet_genesis_requires_all_rpc_roles_to_agree() {
+    fn testnet_genesis_requires_all_rpc_roles_to_agree() {
         let config = DeepXNetworkConfig::default();
-        let new_genesis = hex::decode_array::<32>(
-            DEEPX_TESTNET_SPEC_375_GENESIS_HASH
-                .strip_prefix("0x")
-                .unwrap(),
-        )
-        .unwrap();
+        let new_genesis = approved_genesis_hash();
         let mut observed_endpoints = observations(&config);
         for observation in &mut observed_endpoints {
             observation.genesis_hash = new_genesis;
@@ -1171,7 +1162,7 @@ mod tests {
             validate_rpc_endpoint_identities(&config, observed_endpoints.clone()).unwrap();
         assert_eq!(validated.genesis_hash(), new_genesis);
 
-        observed_endpoints[1].genesis_hash = approved_genesis_hash();
+        observed_endpoints[1].genesis_hash = [0; 32];
         assert_eq!(
             validate_rpc_endpoint_identities(&config, observed_endpoints),
             Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(

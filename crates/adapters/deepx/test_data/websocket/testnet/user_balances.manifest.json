@@ -43,7 +43,10 @@
     "metadata_sha256": "98136fdbab99332fa40828119c9d53a71a219f3e23155844cc0230cc663cba3c",
     "spec_version": 369,
     "transaction_version": 1,
-    "source_manifest": "../../../runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/manifest.json"
+    "captured_block": {
+      "hash": "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6",
+      "number": 184886760
+    }
   },
   "limitations": [
     "The WebSocket account channel is address-scoped and does not authenticate the subscriber.",

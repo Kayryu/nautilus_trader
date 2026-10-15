@@ -338,7 +338,7 @@ mod tests {
     use super::*;
     use crate::{
         common::{DeepXEnvironment, DeepXKeyScheme},
-        signing::{DeepXRuntimeSnapshotService, RuntimeSnapshot},
+        signing::{DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService, RuntimeSnapshot},
     };
 
     #[derive(Deserialize)]
@@ -350,18 +350,19 @@ mod tests {
         let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
-        RuntimeSnapshot::approved_testnet(
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
-            hex::decode_array("86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b")
+            hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
                 .unwrap(),
-            371,
+            376,
             1,
             &hex::decode(metadata.result.trim_start_matches("0x")).unwrap(),
         )
-        .unwrap()
+        .unwrap();
+        RuntimeSnapshot::from_read_only_for_test(read_only)
     }
 
     fn key() -> DeepXPrivateKey {

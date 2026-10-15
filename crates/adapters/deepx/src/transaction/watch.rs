@@ -53,11 +53,12 @@ use crate::{
         validate_historical_runtime_semantics_at,
     },
     signing::{
-        ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXRemoveDelegateAccountParams,
-        DeepXRuntimeConfig, DeepXRuntimeInterfaceError, DeepXRuntimeSnapshotPermit,
-        DeepXSetDelegateAccountParams, DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode,
-        RuntimeSnapshot, SigningError, SnapshotError, sign_remove_delegate_account,
-        sign_set_delegate_account, sign_update_delegate_mode,
+        ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXReadOnlyRuntimeSnapshot,
+        DeepXRemoveDelegateAccountParams, DeepXRuntimeConfig, DeepXRuntimeInterfaceCatalog,
+        DeepXRuntimeInterfaceError, DeepXRuntimeSnapshotPermit, DeepXSetDelegateAccountParams,
+        DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode, RuntimeSnapshot, SigningError,
+        SnapshotError, sign_remove_delegate_account, sign_set_delegate_account,
+        sign_update_delegate_mode,
     },
 };
 
@@ -65,6 +66,54 @@ const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
     "0x26aa394eea5630e07c48ae0c9558cef7",
     "80d41e5e16056765bc8461851072c9d7",
 );
+
+trait RuntimeMetadataView {
+    fn identity(&self) -> &ApprovedRuntimeIdentity;
+    fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog;
+    fn metadata(&self) -> &subxt_core::metadata::Metadata;
+}
+
+impl RuntimeMetadataView for RuntimeSnapshot {
+    fn identity(&self) -> &ApprovedRuntimeIdentity {
+        self.identity()
+    }
+
+    fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
+        self.interfaces()
+    }
+
+    fn metadata(&self) -> &subxt_core::metadata::Metadata {
+        self.metadata()
+    }
+}
+
+impl RuntimeMetadataView for DeepXReadOnlyRuntimeSnapshot {
+    fn identity(&self) -> &ApprovedRuntimeIdentity {
+        self.identity()
+    }
+
+    fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
+        self.interfaces()
+    }
+
+    fn metadata(&self) -> &subxt_core::metadata::Metadata {
+        self.metadata()
+    }
+}
+
+impl<T: RuntimeMetadataView + ?Sized> RuntimeMetadataView for &T {
+    fn identity(&self) -> &ApprovedRuntimeIdentity {
+        (*self).identity()
+    }
+
+    fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
+        (*self).interfaces()
+    }
+
+    fn metadata(&self) -> &subxt_core::metadata::Metadata {
+        (*self).metadata()
+    }
+}
 
 /// Wallet delegate account operation reported by the runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,8 +369,8 @@ pub enum DeepXPerpTradeMatchError {
 ///
 /// The caller supplies the validated account and market's base/quote decimals and quote symbol.
 /// Runtime prices use the chain's fixed six-decimal quote precision and leverage uses three
-/// decimals. Observed spec-369 and spec-371 records encode the REST ID as block number times one
-/// million plus the global event index. The caller must independently establish canonical finality
+/// decimals. The REST ID encodes the block number times one million plus the global event index.
+/// The caller must independently establish canonical finality
 /// for the event's block; a match does not prove the REST timestamp.
 ///
 /// # Errors
@@ -758,6 +807,20 @@ pub fn decode_finalized_delegate_account_changes(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedDelegateAccountChange>, DeepXDelegateAccountEventError> {
+    decode_finalized_delegate_account_changes_with_runtime(
+        snapshot,
+        block_hash,
+        block_number,
+        event_bytes,
+    )
+}
+
+fn decode_finalized_delegate_account_changes_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    block_hash: [u8; 32],
+    block_number: u64,
+    event_bytes: &[u8],
+) -> Result<Vec<DeepXFinalizedDelegateAccountChange>, DeepXDelegateAccountEventError> {
     snapshot
         .interfaces()
         .event("Subaccount", "DelegateAccountSet")?;
@@ -850,9 +913,27 @@ pub fn verify_finalized_delegate_account_change_events(
     expected_delegate: [u8; 20],
     expected_kind: DeepXDelegateAccountChangeKind,
 ) -> Result<DeepXFinalizedDelegateAccountChange, DeepXDelegateAccountVerificationError> {
+    verify_finalized_delegate_account_change_events_with_runtime(
+        snapshot,
+        location,
+        event_bytes,
+        expected_owner,
+        expected_delegate,
+        expected_kind,
+    )
+}
+
+fn verify_finalized_delegate_account_change_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    location: DeepXFinalizedTransactionLocation,
+    event_bytes: &[u8],
+    expected_owner: [u8; 20],
+    expected_delegate: [u8; 20],
+    expected_kind: DeepXDelegateAccountChangeKind,
+) -> Result<DeepXFinalizedDelegateAccountChange, DeepXDelegateAccountVerificationError> {
     snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
     snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let changes = decode_finalized_delegate_account_changes(
+    let changes = decode_finalized_delegate_account_changes_with_runtime(
         snapshot,
         location.block_hash(),
         location.block_number(),
@@ -911,6 +992,20 @@ pub fn verify_finalized_delegate_account_change_events(
 /// Returns an error for unsupported metadata, incomplete SCALE bytes, or invalid event fields.
 pub fn decode_finalized_delegate_mode_changes(
     snapshot: &RuntimeSnapshot,
+    block_hash: [u8; 32],
+    block_number: u64,
+    event_bytes: &[u8],
+) -> Result<Vec<DeepXFinalizedDelegateModeChange>, DeepXDelegateModeEventError> {
+    decode_finalized_delegate_mode_changes_with_runtime(
+        snapshot,
+        block_hash,
+        block_number,
+        event_bytes,
+    )
+}
+
+fn decode_finalized_delegate_mode_changes_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
     block_hash: [u8; 32],
     block_number: u64,
     event_bytes: &[u8],
@@ -1015,9 +1110,27 @@ pub fn verify_finalized_delegate_mode_change_events(
     expected_delegate: [u8; 20],
     expected_mode: DeepXDelegateMode,
 ) -> Result<DeepXFinalizedDelegateModeChange, DeepXDelegateModeVerificationError> {
+    verify_finalized_delegate_mode_change_events_with_runtime(
+        snapshot,
+        location,
+        event_bytes,
+        expected_owner,
+        expected_delegate,
+        expected_mode,
+    )
+}
+
+fn verify_finalized_delegate_mode_change_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    location: DeepXFinalizedTransactionLocation,
+    event_bytes: &[u8],
+    expected_owner: [u8; 20],
+    expected_delegate: [u8; 20],
+    expected_mode: DeepXDelegateMode,
+) -> Result<DeepXFinalizedDelegateModeChange, DeepXDelegateModeVerificationError> {
     snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
     snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let changes = decode_finalized_delegate_mode_changes(
+    let changes = decode_finalized_delegate_mode_changes_with_runtime(
         snapshot,
         location.block_hash(),
         location.block_number(),
@@ -1159,7 +1272,7 @@ async fn observe_finalized_delegate_mode_change_at_inner(
         location,
         expected_runtime,
         |snapshot, events| {
-            verify_finalized_delegate_mode_change_events(
+            verify_finalized_delegate_mode_change_events_with_runtime(
                 snapshot,
                 location,
                 events,
@@ -1199,7 +1312,7 @@ pub async fn observe_finalized_delegate_account_change_at(
         location,
         None,
         |snapshot, events| {
-            verify_finalized_delegate_account_change_events(
+            verify_finalized_delegate_account_change_events_with_runtime(
                 snapshot,
                 location,
                 events,
@@ -1306,7 +1419,7 @@ pub async fn observe_signed_delegate_account_change_at(
         location,
         Some(signed.runtime()),
         |snapshot, events| {
-            verify_finalized_delegate_account_change_events(
+            verify_finalized_delegate_account_change_events_with_runtime(
                 snapshot,
                 location,
                 events,
@@ -1327,7 +1440,10 @@ async fn observe_finalized_delegate_change_at_inner<T>(
     capabilities: &DeepXValidatedRpcMethodCapabilities,
     location: DeepXFinalizedTransactionLocation,
     expected_runtime: Option<&ApprovedRuntimeIdentity>,
-    verify: impl FnOnce(&RuntimeSnapshot, &[u8]) -> Result<T, DeepXFinalizedDelegateObservationError>,
+    verify: impl FnOnce(
+        &DeepXReadOnlyRuntimeSnapshot,
+        &[u8],
+    ) -> Result<T, DeepXFinalizedDelegateObservationError>,
 ) -> Result<T, DeepXFinalizedDelegateObservationError> {
     use DeepXFinalizedDelegateObservationError as Error;
 
@@ -1392,7 +1508,7 @@ async fn observe_finalized_delegate_change_at_inner<T>(
         .and_then(|encoded| hex::decode(encoded).ok())
         .filter(|bytes| !bytes.is_empty())
         .ok_or(Error::InvalidMetadata)?;
-    let snapshot = RuntimeSnapshot::approved_testnet(
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -1517,7 +1633,23 @@ pub fn decode_finalized_perp_trade_events(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedPerpTrade>, DeepXPerpTradeEventError> {
-    snapshot.interfaces().event("PerpMarket", "NewTrade")?;
+    decode_finalized_perp_trade_events_with_metadata(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        event_bytes,
+    )
+}
+
+fn decode_finalized_perp_trade_events_with_metadata(
+    interfaces: &DeepXRuntimeInterfaceCatalog,
+    metadata: &subxt_core::metadata::Metadata,
+    block_hash: [u8; 32],
+    block_number: u64,
+    event_bytes: &[u8],
+) -> Result<Vec<DeepXFinalizedPerpTrade>, DeepXPerpTradeEventError> {
+    interfaces.event("PerpMarket", "NewTrade")?;
     let mut remaining = event_bytes;
     let declared = Compact::<u32>::decode(&mut remaining)
         .map_err(|_| DeepXPerpTradeEventError::MalformedEventBytes)?
@@ -1525,10 +1657,7 @@ pub fn decode_finalized_perp_trade_events(
     let mut consumed = event_bytes.len() - remaining.len();
     let mut count = 0_u32;
     let mut trades = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
+    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
     for event in events.iter() {
         let event = event.map_err(|e| DeepXPerpTradeEventError::Decode(Box::new(e)))?;
         let event_index = count;
@@ -1569,7 +1698,23 @@ pub fn decode_finalized_spot_trade_events(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedSpotTrade>, DeepXSpotTradeEventError> {
-    snapshot.interfaces().event("SpotMarket", "OrderMatched")?;
+    decode_finalized_spot_trade_events_with_metadata(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        event_bytes,
+    )
+}
+
+fn decode_finalized_spot_trade_events_with_metadata(
+    interfaces: &DeepXRuntimeInterfaceCatalog,
+    metadata: &subxt_core::metadata::Metadata,
+    block_hash: [u8; 32],
+    block_number: u64,
+    event_bytes: &[u8],
+) -> Result<Vec<DeepXFinalizedSpotTrade>, DeepXSpotTradeEventError> {
+    interfaces.event("SpotMarket", "OrderMatched")?;
     let mut remaining = event_bytes;
     let declared = Compact::<u32>::decode(&mut remaining)
         .map_err(|_| DeepXSpotTradeEventError::MalformedEventBytes)?
@@ -1577,10 +1722,7 @@ pub fn decode_finalized_spot_trade_events(
     let mut consumed = event_bytes.len() - remaining.len();
     let mut count = 0_u32;
     let mut trades = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
+    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
     for event in events.iter() {
         let event = event.map_err(|e| DeepXSpotTradeEventError::Decode(Box::new(e)))?;
         let event_index = count;
@@ -1743,7 +1885,7 @@ pub async fn observe_finalized_perp_trades_at(
         .and_then(|encoded| hex::decode(encoded).ok())
         .filter(|bytes| !bytes.is_empty())
         .ok_or(Error::InvalidMetadata)?;
-    let snapshot = RuntimeSnapshot::approved_testnet(
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -1755,7 +1897,13 @@ pub async fn observe_finalized_perp_trades_at(
     if first != second {
         return Err(Error::EventStorageChanged);
     }
-    let trades = decode_finalized_perp_trade_events(&snapshot, block_hash, block_number, &first)?;
+    let trades = decode_finalized_perp_trade_events_with_metadata(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        &first,
+    )?;
     if read_hash().await? != block_hash {
         return Err(Error::CanonicalHashChanged);
     }
@@ -1889,7 +2037,7 @@ pub async fn observe_finalized_spot_trades_at(
         .and_then(|encoded| hex::decode(encoded).ok())
         .filter(|bytes| !bytes.is_empty())
         .ok_or(Error::InvalidMetadata)?;
-    let snapshot = RuntimeSnapshot::approved_testnet(
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -1901,7 +2049,13 @@ pub async fn observe_finalized_spot_trades_at(
     if first != second {
         return Err(Error::EventStorageChanged);
     }
-    let trades = decode_finalized_spot_trade_events(&snapshot, block_hash, block_number, &first)?;
+    let trades = decode_finalized_spot_trade_events_with_metadata(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        &first,
+    )?;
     if read_hash().await? != block_hash {
         return Err(Error::CanonicalHashChanged);
     }
@@ -2139,6 +2293,24 @@ pub fn verify_perp_place_inclusion_events(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
+    verify_perp_place_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_perp_place_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
     use DeepXPerpPlaceEventVerificationError as Error;
     let Some(DeepXTransactionOperation::PerpPlace { is_long, .. }) = identity.operation() else {
         return Err(Error::UnsupportedOperation);
@@ -2180,6 +2352,24 @@ pub fn verify_perp_place_inclusion_events(
 /// Returns an error for foreign scope, incomplete events, conflicting fields or missing evidence.
 pub fn verify_perp_profit_and_loss_point_inclusion_events(
     snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpProfitAndLossPointEventVerificationError> {
+    verify_perp_profit_and_loss_point_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_perp_profit_and_loss_point_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
     identity: &DeepXTransactionIdentity,
     block_hash: [u8; 32],
     block_number: u64,
@@ -2268,7 +2458,7 @@ pub enum DeepXPerpProfitAndLossPointEventVerificationError {
 }
 
 fn verify_indexed_perp_events(
-    snapshot: &RuntimeSnapshot,
+    snapshot: &impl RuntimeMetadataView,
     block_hash: [u8; 32],
     block_number: u64,
     extrinsic_index: u32,
@@ -2449,6 +2639,24 @@ pub fn verify_perp_close_inclusion_events(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpCloseEventVerificationError> {
+    verify_perp_close_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_perp_close_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpCloseEventVerificationError> {
     let Some(DeepXTransactionOperation::PerpClose {
         subaccount,
         market_id,
@@ -2540,6 +2748,24 @@ pub enum DeepXSpotPlaceEventVerificationError {
 /// duplicate evidence, or successful dispatch without the expected business event.
 pub fn verify_spot_place_inclusion_events(
     snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXSpotPlaceEventVerificationError> {
+    verify_spot_place_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_spot_place_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
     identity: &DeepXTransactionIdentity,
     block_hash: [u8; 32],
     block_number: u64,
@@ -2698,6 +2924,24 @@ pub enum DeepXSpotCancelEventVerificationError {
 /// duplicate evidence, or successful dispatch without the expected business event.
 pub fn verify_spot_cancel_inclusion_events(
     snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXSpotCancelEventVerificationError> {
+    verify_spot_cancel_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_spot_cancel_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
     identity: &DeepXTransactionIdentity,
     block_hash: [u8; 32],
     block_number: u64,
@@ -2873,6 +3117,26 @@ pub fn verify_perp_modify_inclusion_events(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpModifyEventVerificationError> {
+    verify_perp_modify_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        params,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_perp_modify_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    identity: &DeepXTransactionIdentity,
+    params: DeepXPerpModifyParams,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpModifyEventVerificationError> {
     use DeepXPerpModifyEventVerificationError as Error;
 
     if !matches!(
@@ -2939,7 +3203,7 @@ pub fn verify_perp_modify_inclusion_events(
         identity.runtime().clone(),
         params.cancel,
     );
-    let cancel_evidence = verify_perp_cancel_inclusion_events(
+    let cancel_evidence = verify_perp_cancel_inclusion_events_with_runtime(
         snapshot,
         &cancel_identity,
         block_hash,
@@ -2968,7 +3232,7 @@ pub fn verify_perp_modify_inclusion_events(
         identity.runtime().clone(),
         place_params,
     );
-    let place_evidence = verify_perp_place_inclusion_events(
+    let place_evidence = verify_perp_place_inclusion_events_with_runtime(
         snapshot,
         &place_identity,
         block_hash,
@@ -3110,7 +3374,7 @@ fn verify_perp_modify_sizing_event(
 }
 
 fn perp_modify_events_are_ordered(
-    snapshot: &RuntimeSnapshot,
+    snapshot: &impl RuntimeMetadataView,
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<bool, DeepXPerpModifyEventVerificationError> {
@@ -3160,6 +3424,15 @@ fn perp_modify_events_are_ordered(
 /// authoritative evidence, event decoding fails, or cancellation evidence conflicts or repeats.
 pub fn verify_perp_cancel_business_event(
     snapshot: &RuntimeSnapshot,
+    identity: &DeepXTransactionIdentity,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXIndexedOutcome<DeepXBusinessEventOutcome>, DeepXPerpCancelEventVerificationError> {
+    verify_perp_cancel_business_event_with_runtime(snapshot, identity, extrinsic_index, event_bytes)
+}
+
+fn verify_perp_cancel_business_event_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
     identity: &DeepXTransactionIdentity,
     extrinsic_index: u32,
     event_bytes: &[u8],
@@ -3236,6 +3509,24 @@ fn verify_perp_cancel_inclusion_events(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpCancelEventVerificationError> {
+    verify_perp_cancel_inclusion_events_with_runtime(
+        snapshot,
+        identity,
+        block_hash,
+        block_number,
+        extrinsic_index,
+        event_bytes,
+    )
+}
+
+fn verify_perp_cancel_inclusion_events_with_runtime(
+    snapshot: &impl RuntimeMetadataView,
+    identity: &DeepXTransactionIdentity,
+    block_hash: [u8; 32],
+    block_number: u64,
+    extrinsic_index: u32,
+    event_bytes: &[u8],
+) -> Result<DeepXInclusionEvidence, DeepXPerpCancelEventVerificationError> {
     let Some(DeepXTransactionOperation::PerpCancel { fast_cancel, .. }) = identity.operation()
     else {
         return Err(DeepXPerpCancelEventVerificationError::UnsupportedOperation);
@@ -3292,8 +3583,12 @@ fn verify_perp_cancel_inclusion_events(
             },
         });
     }
-    let business_event =
-        verify_perp_cancel_business_event(snapshot, identity, extrinsic_index, event_bytes)?;
+    let business_event = verify_perp_cancel_business_event_with_runtime(
+        snapshot,
+        identity,
+        extrinsic_index,
+        event_bytes,
+    )?;
     Ok(DeepXInclusionEvidence::from_indexed_observations(
         block_hash,
         block_number,
@@ -4868,42 +5163,6 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn events_map_storage_keys_use_substrate_hashers() {
-        let snapshot = runtime_snapshot();
-        let threads = system_threads_storage_key(42);
-        let events = system_events_map_storage_key(42, 3);
-        let threads_address =
-            subxt_core::storage::address::dynamic("System", "Threads", vec![ScaleValue::u128(42)]);
-        let events_address = subxt_core::storage::address::dynamic(
-            "System",
-            "EventsMap",
-            vec![ScaleValue::u128(42), ScaleValue::u128(3)],
-        );
-        assert_eq!(
-            threads,
-            format!(
-                "0x{}",
-                hex::encode(
-                    subxt_core::storage::get_address_bytes(&threads_address, snapshot.metadata(),)
-                        .unwrap(),
-                ),
-            ),
-        );
-        assert_eq!(
-            events,
-            format!(
-                "0x{}",
-                hex::encode(
-                    subxt_core::storage::get_address_bytes(&events_address, snapshot.metadata(),)
-                        .unwrap(),
-                ),
-            ),
-        );
-        assert_ne!(events, system_events_map_storage_key(42, 4));
-        assert_ne!(events, system_events_map_storage_key(43, 3));
-    }
-
-    #[rstest]
     fn events_map_batches_combine_compact_counts() {
         let mut first = Compact(1_u32).encode();
         first.push(10);
@@ -4921,6 +5180,123 @@ mod tests {
         let mut batch = Compact(0_u32).encode();
         batch.push(1);
         assert!(combine_events_map_batches(&[batch], 42).is_err());
+    }
+
+    #[rstest]
+    fn spec_376_finalized_event_fixture_is_complete_and_read_only_approved() {
+        const FIXTURE_ROOT: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-19592700-spec376/",
+        );
+        let metadata_response: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+        )))
+        .unwrap();
+        let metadata_bytes = hex::decode(
+            metadata_response["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let read_only = crate::signing::DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
+                .unwrap(),
+            376,
+            1,
+            &metadata_bytes,
+        )
+        .unwrap();
+        let manifest: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-19592700-spec376/manifest.json",
+        )))
+        .unwrap();
+        let initial: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events.json",
+        )))
+        .unwrap();
+        let repeated: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_repeated.json",
+        )))
+        .unwrap();
+        let queried: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_query_storage_at.json",
+        )))
+        .unwrap();
+        assert_eq!(
+            manifest["rpc_payloads"],
+            json!([
+                "system_events.json",
+                "system_events_repeated.json",
+                "system_events_query_storage_at.json",
+            ]),
+        );
+        assert_eq!(initial["result"], repeated["result"]);
+        assert_eq!(queried["result"][0]["block"], manifest["block_hash"]);
+        assert_eq!(
+            queried["result"][0]["changes"][0][0],
+            manifest["storage"]["standard_events_key"],
+        );
+        assert_eq!(queried["result"][0]["changes"][0][1], initial["result"]);
+        let event_bytes = hex::decode(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test_data/runtime/testnet/finalized-events-19592700-spec376/",
+                "reassembled_events.hex",
+            ))
+            .trim()
+            .trim_start_matches("0x"),
+        )
+        .unwrap();
+        assert!(std::path::Path::new(FIXTURE_ROOT).is_dir());
+        let mut remaining = event_bytes.as_slice();
+        let declared = Compact::<u32>::decode(&mut remaining).unwrap().0;
+        let mut consumed = event_bytes.len() - remaining.len();
+        let mut decoded = 0_u32;
+        let mut inventory = Vec::new();
+
+        for event in Events::<DeepXRuntimeConfig>::decode_from(
+            event_bytes.clone(),
+            read_only.metadata().clone(),
+        )
+        .iter()
+        {
+            let event = event.unwrap();
+            decoded += 1;
+            consumed += event.bytes().len();
+            inventory.push(format!("{}.{}", event.pallet_name(), event.variant_name()));
+        }
+
+        assert_eq!(declared, 15);
+        assert_eq!(decoded, declared);
+        assert_eq!(consumed, event_bytes.len());
+        assert_eq!(
+            inventory,
+            [
+                "System.ExtrinsicSuccess",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "System.ExtrinsicFailed",
+                "PerpMarket.OrderCancelled",
+                "System.ExtrinsicSuccess",
+                "PerpMarket.OrderCancelled",
+                "System.ExtrinsicSuccess",
+                "System.ExtrinsicFailed",
+                "PerpMarket.OrderCancelled",
+                "System.ExtrinsicSuccess",
+            ]
+        );
     }
     use nautilus_model::{
         enums::OrderSide,
@@ -5020,58 +5396,31 @@ mod tests {
         .unwrap()
     }
 
-    fn runtime_snapshot() -> RuntimeSnapshot {
-        #[derive(Deserialize)]
-        struct RpcResponse {
-            result: String,
-        }
-        let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
+    fn read_only_runtime_snapshot() -> DeepXReadOnlyRuntimeSnapshot {
+        let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
-        RuntimeSnapshot::approved_testnet(
+        DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-            366,
+            376,
             1,
-            &hex::decode(metadata.result.trim_start_matches("0x")).unwrap(),
+            &hex::decode(
+                metadata["result"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap(),
         )
         .unwrap()
     }
 
-    fn runtime_snapshot_for_spec(spec: u32) -> RuntimeSnapshot {
-        if spec == 366 {
-            runtime_snapshot()
-        } else {
-            let encoded = match spec {
-                369 => include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"
-                )),
-                371 => include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json"
-                )),
-                _ => panic!("unsupported test runtime specification {spec}"),
-            };
-            let metadata: Value = serde_json::from_str(encoded).unwrap();
-            RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-                spec,
-                1,
-                &hex::decode(
-                    metadata["result"]
-                        .as_str()
-                        .unwrap()
-                        .trim_start_matches("0x"),
-                )
-                .unwrap(),
-            )
-            .unwrap()
-        }
+    fn runtime_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot::from_read_only_for_test(read_only_runtime_snapshot())
     }
 
     #[rstest]
@@ -5079,12 +5428,8 @@ mod tests {
     #[case(u128::MAX, 0)]
     #[case(0, u128::MAX)]
     #[case(u128::MAX, 17)]
-    fn perp_profit_and_loss_events_bind_points(
-        #[case] take: u128,
-        #[case] stop: u128,
-        #[values(366, 369, 371)] spec: u32,
-    ) {
-        let snapshot = runtime_snapshot_for_spec(spec);
+    fn perp_profit_and_loss_events_bind_points(#[case] take: u128, #[case] stop: u128) {
+        let snapshot = runtime_snapshot();
         let baseline = cancel_identity([0x11; 20], 7, false);
         let identity = DeepXTransactionIdentity::new_perp_profit_and_loss_point(
             ClientOrderId::new(baseline.client_order_id()),
@@ -5159,7 +5504,7 @@ mod tests {
             record
         };
         let verify = |bytes: &[u8]| {
-            verify_perp_profit_and_loss_point_inclusion_events(
+            verify_perp_profit_and_loss_point_inclusion_events_with_runtime(
                 &snapshot, &identity, [8; 32], 42, 4, bytes,
             )
         };
@@ -5168,24 +5513,11 @@ mod tests {
         let valid = system_events(&[business.clone(), dispatch.clone()]);
         assert!(verify(&valid).is_ok());
         assert!(
-            verify_perp_profit_and_loss_point_inclusion_events(
+            verify_perp_profit_and_loss_point_inclusion_events_with_runtime(
                 &snapshot, &baseline, [8; 32], 42, 4, &valid
             )
             .is_err()
         );
-        if spec != 366 {
-            assert!(
-                verify_perp_profit_and_loss_point_inclusion_events(
-                    &runtime_snapshot(),
-                    &identity,
-                    [8; 32],
-                    42,
-                    4,
-                    &valid
-                )
-                .is_err()
-            );
-        }
         assert!(verify(&system_events(std::slice::from_ref(&business))).is_err());
         assert!(
             verify(&system_events(&[
@@ -5257,12 +5589,8 @@ mod tests {
     #[case(0, None)]
     #[case(0, Some(u64::MAX))]
     #[case(u128::MAX, Some(19))]
-    fn perp_close_events_bind_generated_order(
-        #[case] price: u128,
-        #[case] slippage: Option<u64>,
-        #[values(366, 369, 371)] spec: u32,
-    ) {
-        let snapshot = runtime_snapshot_for_spec(spec);
+    fn perp_close_events_bind_generated_order(#[case] price: u128, #[case] slippage: Option<u64>) {
+        let snapshot = runtime_snapshot();
         let baseline = perp_place_identity(true, price == 0);
         let close = DeepXTransactionIdentity::new_perp_close(
             ClientOrderId::new(baseline.client_order_id()),
@@ -5325,7 +5653,9 @@ mod tests {
             |order: &ScaleValue<()>| perp_place_event_record(&snapshot, 4, &generated, order);
         let dispatch = dispatch_event_record(&snapshot, 4, true);
         let verify = |events: &[u8]| {
-            verify_perp_close_inclusion_events(&snapshot, &close, [8; 32], 42, 4, events)
+            verify_perp_close_inclusion_events_with_runtime(
+                &snapshot, &close, [8; 32], 42, 4, events,
+            )
         };
         let valid = system_events(&[business(&order), dispatch.clone()]);
         assert!(verify(&valid).is_ok());
@@ -5337,19 +5667,6 @@ mod tests {
             ]))
             .is_err()
         );
-        if spec != 366 {
-            assert!(
-                verify_perp_close_inclusion_events(
-                    &runtime_snapshot(),
-                    &close,
-                    [8; 32],
-                    42,
-                    4,
-                    &valid
-                )
-                .is_err()
-            );
-        }
         if price != 0 {
             let mut changed = order.clone();
             let ValueDef::Composite(Composite::Named(fields)) = &mut changed.value else {
@@ -5529,7 +5846,7 @@ mod tests {
     }
 
     fn perp_place_event_record(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         index: u32,
         identity: &DeepXTransactionIdentity,
         order: &ScaleValue<()>,
@@ -5603,7 +5920,7 @@ mod tests {
     }
 
     fn perp_modify_event_records(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         index: u32,
         block_number: u64,
         params: DeepXPerpModifyParams,
@@ -5645,7 +5962,7 @@ mod tests {
         let response: MetadataResponse = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
         let bytes = hex::decode(response.result.trim_start_matches("0x")).unwrap();
@@ -5836,7 +6153,7 @@ mod tests {
         let events = system_events(&perp_modify_event_records(&snapshot, 4, 42, params));
 
         assert!(matches!(
-            verify_perp_modify_inclusion_events(
+            verify_perp_modify_inclusion_events_with_runtime(
                 &snapshot, &identity, params, [8; 32], 42, 4, &events,
             ),
             Err(DeepXPerpModifyEventVerificationError::UnsupportedOperation),
@@ -5852,7 +6169,7 @@ mod tests {
         let events = system_events(&records[1..]);
 
         assert!(matches!(
-            verify_perp_modify_inclusion_events(
+            verify_perp_modify_inclusion_events_with_runtime(
                 &snapshot, &identity, params, [8; 32], 42, 4, &events,
             ),
             Err(DeepXPerpModifyEventVerificationError::Cancel(_)),
@@ -5869,7 +6186,7 @@ mod tests {
         let events = system_events(&records);
 
         assert!(matches!(
-            verify_perp_modify_inclusion_events(
+            verify_perp_modify_inclusion_events_with_runtime(
                 &snapshot, &identity, params, [8; 32], 42, 4, &events,
             ),
             Err(DeepXPerpModifyEventVerificationError::UnsupportedOperation),
@@ -5893,9 +6210,10 @@ mod tests {
             ),
             dispatch_event_record(&snapshot, 4, true),
         ]);
-        let evidence =
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
-                .unwrap();
+        let evidence = verify_perp_place_inclusion_events_with_runtime(
+            &snapshot, &identity, [8; 32], 42, 4, &events,
+        )
+        .unwrap();
         assert_eq!(
             evidence.outcome,
             super::super::DeepXInclusionOutcome::Success
@@ -5936,7 +6254,9 @@ mod tests {
             dispatch_event_record(&snapshot, 4, true),
         ]);
         assert!(matches!(
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events),
+            verify_perp_place_inclusion_events_with_runtime(
+                &snapshot, &identity, [8; 32], 42, 4, &events,
+            ),
             Err(DeepXPerpPlaceEventVerificationError::ConflictingEvent)
         ));
     }
@@ -5970,8 +6290,10 @@ mod tests {
             events.push(0);
         }
         assert!(
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
-                .is_err()
+            verify_perp_place_inclusion_events_with_runtime(
+                &snapshot, &identity, [8; 32], 42, 4, &events,
+            )
+            .is_err()
         );
     }
 
@@ -5980,9 +6302,10 @@ mod tests {
         let snapshot = runtime_snapshot();
         let identity = perp_place_identity(true, false);
         let events = system_events(&[dispatch_event_record(&snapshot, 4, false)]);
-        let evidence =
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
-                .unwrap();
+        let evidence = verify_perp_place_inclusion_events_with_runtime(
+            &snapshot, &identity, [8; 32], 42, 4, &events,
+        )
+        .unwrap();
         assert_eq!(
             evidence.outcome,
             super::super::DeepXInclusionOutcome::Failed
@@ -6008,135 +6331,10 @@ mod tests {
             dispatch_event_record(&snapshot, dispatch_index, true),
         ]);
         assert!(
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
-                .is_err()
-        );
-    }
-
-    #[rstest]
-    fn perp_place_spec369_event_binding_requires_exact_runtime_scope() {
-        let metadata: Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/metadata.json"))).unwrap();
-        let snapshot = RuntimeSnapshot::approved_testnet(
-            &DeepXEnvironment::Testnet,
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-            369,
-            1,
-            &hex::decode(
-                metadata["result"]
-                    .as_str()
-                    .unwrap()
-                    .trim_start_matches("0x"),
+            verify_perp_place_inclusion_events_with_runtime(
+                &snapshot, &identity, [8; 32], 42, 4, &events,
             )
-            .unwrap(),
-        )
-        .unwrap();
-        let old_identity = perp_place_identity(true, false);
-        let mut encoded = serde_json::to_value(&old_identity).unwrap();
-        encoded["runtime"] =
-            serde_json::to_value(DeepXDirectRuntimeIdentity::from(snapshot.identity())).unwrap();
-        let identity: DeepXTransactionIdentity = serde_json::from_value(encoded).unwrap();
-        let events = system_events(&[
-            perp_place_event_record(
-                &snapshot,
-                4,
-                &identity,
-                &perp_place_order_value(&identity, 42),
-            ),
-            dispatch_event_record(&snapshot, 4, true),
-        ]);
-        assert!(
-            verify_perp_place_inclusion_events(&snapshot, &identity, [8; 32], 42, 4, &events)
-                .is_ok()
-        );
-        assert!(matches!(
-            verify_perp_place_inclusion_events(&snapshot, &old_identity, [8; 32], 42, 4, &events),
-            Err(DeepXPerpPlaceEventVerificationError::UnsupportedOperation)
-        ));
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn finalized_perp_order_scan_verifies_same_index_business_events(
-        #[values(false, true)] close: bool,
-    ) {
-        let snapshot = runtime_snapshot();
-        let identity = perp_place_identity(true, false);
-        let close_identity = DeepXTransactionIdentity::new_perp_close(
-            ClientOrderId::new(identity.client_order_id()),
-            identity.signer(),
-            identity.instrument_id(),
-            OrderSide::Sell,
-            identity.nonce(),
-            identity.runtime().clone(),
-            crate::signing::DeepXPerpCloseParams {
-                subaccount: [0x11; 20],
-                market_id: 100,
-                price: u128::MAX,
-                slippage: None,
-            },
-        );
-        let mut order = perp_place_order_value(&identity, 41);
-        if close {
-            let ValueDef::Composite(Composite::Named(fields)) = &mut order.value else {
-                panic!();
-            };
-            for (name, value) in [
-                ("order_type", ScaleValue::unnamed_variant("Stop", [])),
-                ("take_profit", ScaleValue::unnamed_variant("None", [])),
-                ("stop_loss", ScaleValue::unnamed_variant("None", [])),
-                ("reduce_only", ScaleValue::bool(true)),
-            ] {
-                fields.iter_mut().find(|(key, _)| key == name).unwrap().1 = value;
-            }
-        }
-        let target = extrinsic(&[1, 2, 3, 4]);
-        let hash = BlakeTwo256.hash(&target).0;
-        let blocks = BTreeMap::from([(41, vec![format!("0x{}", hex::encode(target))])]);
-        let events = system_events(&[
-            perp_place_event_record(&snapshot, 0, &identity, &order),
-            dispatch_event_record(&snapshot, 0, true),
-        ]);
-        let storage = BTreeMap::from([(41, format!("0x{}", hex::encode(events)))]);
-        let (endpoints, capabilities, _) =
-            recovery_endpoints_with_events(42, None, blocks, vec![], storage).await;
-        let collection = if close {
-            collect_finalized_perp_close_recovery_scan(
-                &endpoints,
-                &capabilities,
-                &snapshot,
-                &close_identity,
-                39,
-                decode_hash(&block_hash(39)).unwrap(),
-                2,
-                hash,
-            )
-            .await
-            .unwrap()
-        } else {
-            collect_finalized_perp_place_recovery_scan(
-                &endpoints,
-                &capabilities,
-                &snapshot,
-                &identity,
-                39,
-                decode_hash(&block_hash(39)).unwrap(),
-                2,
-                hash,
-            )
-            .await
-            .unwrap()
-        };
-        let DeepXFinalizedRecoveryCollection::Scan(scan) = collection else {
-            panic!("expected scan");
-        };
-        assert_eq!(
-            scan.classify(),
-            DeepXRecoveryDecision::FinalizedInclusion(inclusion(
-                decode_hash(&block_hash(41)).unwrap(),
-                41,
-                0
-            ))
+            .is_err()
         );
     }
 
@@ -6215,7 +6413,7 @@ mod tests {
     }
 
     fn spot_place_event_record(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         extrinsic_index: u32,
         identity: &DeepXTransactionIdentity,
     ) -> Vec<u8> {
@@ -6307,7 +6505,7 @@ mod tests {
     }
 
     fn cancel_event_record(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         extrinsic_index: u32,
         subaccount: [u8; 20],
         order_id: u64,
@@ -6323,7 +6521,7 @@ mod tests {
     }
 
     fn cancel_event_record_with_phase(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         phase: Phase,
         subaccount: [u8; 20],
         order_id: u64,
@@ -6345,7 +6543,7 @@ mod tests {
     }
 
     fn dispatch_event_record(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         extrinsic_index: u32,
         success: bool,
     ) -> Vec<u8> {
@@ -6426,7 +6624,7 @@ mod tests {
     }
 
     fn delegate_account_event_record(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         phase: Phase,
         kind: DeepXDelegateAccountChangeKind,
     ) -> Vec<u8> {
@@ -6434,7 +6632,7 @@ mod tests {
     }
 
     fn delegate_account_event_record_for_owner(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         phase: Phase,
         kind: DeepXDelegateAccountChangeKind,
         owner: [u8; 20],
@@ -6481,9 +6679,8 @@ mod tests {
     #[case::removed(DeepXDelegateAccountChangeKind::Removed)]
     fn finalized_delegate_account_change_binds_complete_event_and_dispatch(
         #[case] kind: DeepXDelegateAccountChangeKind,
-        #[values(366, 369, 371)] spec: u32,
     ) {
-        let snapshot = runtime_snapshot_for_spec(spec);
+        let snapshot = read_only_runtime_snapshot();
         let location = DeepXFinalizedTransactionLocation {
             extrinsic_hash: [9; 32],
             block_number: 42,
@@ -6496,8 +6693,9 @@ mod tests {
             dispatch_event_record(&snapshot, 7, true),
         ]);
         let decoded =
-            decode_finalized_delegate_account_changes(&snapshot, [3; 32], 42, &events).unwrap();
-        let change = verify_finalized_delegate_account_change_events(
+            decode_finalized_delegate_account_changes_with_runtime(&snapshot, [3; 32], 42, &events)
+                .unwrap();
+        let change = verify_finalized_delegate_account_change_events_with_runtime(
             &snapshot, location, &events, [0x11; 20], [0x22; 20], kind,
         )
         .unwrap();
@@ -6513,7 +6711,7 @@ mod tests {
 
     #[rstest::rstest]
     fn finalized_delegate_account_change_rejects_incomplete_or_conflicting_evidence() {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = read_only_runtime_snapshot();
         let location = DeepXFinalizedTransactionLocation {
             extrinsic_hash: [9; 32],
             block_number: 42,
@@ -6533,7 +6731,10 @@ mod tests {
         wrong_count[0] = Compact(3_u32).encode()[0];
         for bytes in [&trailing, &wrong_count, &valid[..valid.len() - 1]] {
             assert!(
-                decode_finalized_delegate_account_changes(&snapshot, [3; 32], 42, bytes).is_err()
+                decode_finalized_delegate_account_changes_with_runtime(
+                    &snapshot, [3; 32], 42, bytes,
+                )
+                .is_err()
             );
         }
         let wrong_phase = system_events(&[delegate_account_event_record(
@@ -6542,11 +6743,16 @@ mod tests {
             DeepXDelegateAccountChangeKind::Set,
         )]);
         assert!(matches!(
-            decode_finalized_delegate_account_changes(&snapshot, [3; 32], 42, &wrong_phase),
+            decode_finalized_delegate_account_changes_with_runtime(
+                &snapshot,
+                [3; 32],
+                42,
+                &wrong_phase,
+            ),
             Err(DeepXDelegateAccountEventError::InvalidChange(0))
         ));
         let verify = |records: &[Vec<u8>], owner, kind| {
-            verify_finalized_delegate_account_change_events(
+            verify_finalized_delegate_account_change_events_with_runtime(
                 &snapshot,
                 location,
                 &system_events(records),
@@ -6564,7 +6770,7 @@ mod tests {
             Err(DeepXDelegateAccountVerificationError::ConflictingChange)
         ));
         assert!(matches!(
-            verify_finalized_delegate_account_change_events(
+            verify_finalized_delegate_account_change_events_with_runtime(
                 &snapshot,
                 location,
                 &valid,
@@ -6616,12 +6822,16 @@ mod tests {
         ));
     }
 
-    fn delegate_mode_event_record(snapshot: &RuntimeSnapshot, phase: Phase, mode: &str) -> Vec<u8> {
+    fn delegate_mode_event_record(
+        snapshot: &impl RuntimeMetadataView,
+        phase: Phase,
+        mode: &str,
+    ) -> Vec<u8> {
         delegate_mode_event_record_for_owner(snapshot, phase, mode, [0x11; 20])
     }
 
     fn delegate_mode_event_record_for_owner(
-        snapshot: &RuntimeSnapshot,
+        snapshot: &impl RuntimeMetadataView,
         phase: Phase,
         mode: &str,
         owner: [u8; 20],
@@ -6669,12 +6879,13 @@ mod tests {
         #[case] variant: &str,
         #[case] expected_mode: DeepXDelegateMode,
     ) {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = read_only_runtime_snapshot();
         let dispatch = dispatch_event_record(&snapshot, 7, true);
         let change = delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), variant);
         let events = system_events(&[dispatch.clone(), change]);
         let decoded =
-            decode_finalized_delegate_mode_changes(&snapshot, [3; 32], 42, &events).unwrap();
+            decode_finalized_delegate_mode_changes_with_runtime(&snapshot, [3; 32], 42, &events)
+                .unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].block_hash, [3; 32]);
         assert_eq!(decoded[0].block_number, 42);
@@ -6684,7 +6895,7 @@ mod tests {
         assert_eq!(decoded[0].delegate, [0x22; 20]);
         assert_eq!(decoded[0].mode, expected_mode);
         assert!(
-            decode_finalized_delegate_mode_changes(
+            decode_finalized_delegate_mode_changes_with_runtime(
                 &snapshot,
                 [3; 32],
                 42,
@@ -6697,7 +6908,7 @@ mod tests {
 
     #[rstest::rstest]
     fn finalized_delegate_mode_changes_reject_incomplete_or_invalid_events() {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = runtime_snapshot();
         let change =
             delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), "PlaceOrCancelOrder");
         let complete = system_events(std::slice::from_ref(&change));
@@ -6707,7 +6918,10 @@ mod tests {
         wrong_count[0] = Compact(2_u32).encode()[0];
         let truncated = &complete[..complete.len() - 1];
         for bytes in [&trailing[..], &wrong_count, truncated] {
-            assert!(decode_finalized_delegate_mode_changes(&snapshot, [3; 32], 42, bytes).is_err());
+            assert!(
+                decode_finalized_delegate_mode_changes_with_runtime(&snapshot, [3; 32], 42, bytes,)
+                    .is_err()
+            );
         }
         let wrong_phase = system_events(&[delegate_mode_event_record(
             &snapshot,
@@ -6715,14 +6929,19 @@ mod tests {
             "Disable",
         )]);
         assert!(matches!(
-            decode_finalized_delegate_mode_changes(&snapshot, [3; 32], 42, &wrong_phase),
+            decode_finalized_delegate_mode_changes_with_runtime(
+                &snapshot,
+                [3; 32],
+                42,
+                &wrong_phase,
+            ),
             Err(DeepXDelegateModeEventError::InvalidChange(0))
         ));
         let mut invalid_mode = change;
         let phase_length = Phase::ApplyExtrinsic(7).encode().len();
         invalid_mode[phase_length + 2 + 40] = u8::MAX;
         assert!(
-            decode_finalized_delegate_mode_changes(
+            decode_finalized_delegate_mode_changes_with_runtime(
                 &snapshot,
                 [3; 32],
                 42,
@@ -6734,7 +6953,7 @@ mod tests {
 
     #[rstest::rstest]
     fn finalized_delegate_mode_change_binds_successful_dispatch_and_terms() {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = runtime_snapshot();
         let location = DeepXFinalizedTransactionLocation {
             extrinsic_hash: [9; 32],
             block_number: 42,
@@ -6747,7 +6966,7 @@ mod tests {
             delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), "PlaceOrCancelOrder"),
             dispatch_event_record(&snapshot, 7, true),
         ]);
-        let change = verify_finalized_delegate_mode_change_events(
+        let change = verify_finalized_delegate_mode_change_events_with_runtime(
             &snapshot,
             location,
             &events,
@@ -6767,7 +6986,7 @@ mod tests {
 
     #[rstest::rstest]
     fn finalized_delegate_mode_change_rejects_conflicting_or_incomplete_evidence() {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = runtime_snapshot();
         let location = DeepXFinalizedTransactionLocation {
             extrinsic_hash: [9; 32],
             block_number: 42,
@@ -6778,7 +6997,7 @@ mod tests {
             delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), "PlaceOrCancelOrder");
         let success = dispatch_event_record(&snapshot, 7, true);
         let verify = |records: &[Vec<u8>], owner, mode| {
-            verify_finalized_delegate_mode_change_events(
+            verify_finalized_delegate_mode_change_events_with_runtime(
                 &snapshot,
                 location,
                 &system_events(records),
@@ -6796,7 +7015,7 @@ mod tests {
             Err(DeepXDelegateModeVerificationError::ConflictingChange)
         ));
         assert!(matches!(
-            verify_finalized_delegate_mode_change_events(
+            verify_finalized_delegate_mode_change_events_with_runtime(
                 &snapshot,
                 location,
                 &system_events(&[change.clone(), success.clone()]),
@@ -6899,9 +7118,11 @@ mod tests {
         Vec::<[u8; 32]>::new().encode_to(&mut record);
         let events = system_events(&[dispatch_event_record(&snapshot, 3, true), record.clone()]);
         assert_eq!(
-            verify_spot_cancel_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &events)
-                .unwrap()
-                .outcome(),
+            verify_spot_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [1; 32], 42, 3, &events,
+            )
+            .unwrap()
+            .outcome(),
             DeepXInclusionOutcome::Success
         );
         for name in ["subaccount", "pair", "order_id", "is_buy", "fast_cancel"] {
@@ -6915,16 +7136,20 @@ mod tests {
             }
             let changed = serde_json::from_value(changed).unwrap();
             assert!(
-                verify_spot_cancel_inclusion_events(&snapshot, &changed, [1; 32], 42, 3, &events)
-                    .is_err(),
+                verify_spot_cancel_inclusion_events_with_runtime(
+                    &snapshot, &changed, [1; 32], 42, 3, &events,
+                )
+                .is_err(),
                 "{name}"
             );
         }
         let failed = system_events(&[dispatch_event_record(&snapshot, 3, false)]);
         assert_eq!(
-            verify_spot_cancel_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &failed)
-                .unwrap()
-                .outcome(),
+            verify_spot_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [1; 32], 42, 3, &failed,
+            )
+            .unwrap()
+            .outcome(),
             DeepXInclusionOutcome::Failed
         );
         for invalid in [
@@ -6946,14 +7171,16 @@ mod tests {
             [events.as_slice(), &[0]].concat(),
         ] {
             assert!(
-                verify_spot_cancel_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &invalid)
-                    .is_err()
+                verify_spot_cancel_inclusion_events_with_runtime(
+                    &snapshot, &identity, [1; 32], 42, 3, &invalid,
+                )
+                .is_err()
             );
         }
         let mut wrong_index = record.clone();
         wrong_index[1..5].copy_from_slice(&4_u32.to_le_bytes());
         assert!(
-            verify_spot_cancel_inclusion_events(
+            verify_spot_cancel_inclusion_events_with_runtime(
                 &snapshot,
                 &identity,
                 [1; 32],
@@ -6967,7 +7194,7 @@ mod tests {
         let reason_offset = wrong_reason.len() - 2;
         wrong_reason[reason_offset] = 255;
         assert!(
-            verify_spot_cancel_inclusion_events(
+            verify_spot_cancel_inclusion_events_with_runtime(
                 &snapshot,
                 &identity,
                 [1; 32],
@@ -6988,9 +7215,11 @@ mod tests {
         let record = spot_place_event_record(&snapshot, 3, &identity);
         let events = system_events(&[dispatch_event_record(&snapshot, 3, true), record.clone()]);
         assert_eq!(
-            verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &events)
-                .unwrap()
-                .outcome(),
+            verify_spot_place_inclusion_events_with_runtime(
+                &snapshot, &identity, [1; 32], 42, 3, &events,
+            )
+            .unwrap()
+            .outcome(),
             DeepXInclusionOutcome::Success
         );
 
@@ -6998,8 +7227,10 @@ mod tests {
         changed["operation"]["quote_amount"][0] = json!(255);
         let changed = serde_json::from_value(changed).unwrap();
         assert!(
-            verify_spot_place_inclusion_events(&snapshot, &changed, [1; 32], 42, 3, &events)
-                .is_err()
+            verify_spot_place_inclusion_events_with_runtime(
+                &snapshot, &changed, [1; 32], 42, 3, &events,
+            )
+            .is_err()
         );
 
         for name in ["runtime", "nonce", "side"] {
@@ -7019,17 +7250,21 @@ mod tests {
             }
             let changed = serde_json::from_value(changed).unwrap();
             assert!(
-                verify_spot_place_inclusion_events(&snapshot, &changed, [1; 32], 42, 3, &events)
-                    .is_err(),
+                verify_spot_place_inclusion_events_with_runtime(
+                    &snapshot, &changed, [1; 32], 42, 3, &events,
+                )
+                .is_err(),
                 "{name}"
             );
         }
 
         let failed = system_events(&[dispatch_event_record(&snapshot, 3, false)]);
         assert_eq!(
-            verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &failed)
-                .unwrap()
-                .outcome(),
+            verify_spot_place_inclusion_events_with_runtime(
+                &snapshot, &identity, [1; 32], 42, 3, &failed,
+            )
+            .unwrap()
+            .outcome(),
             DeepXInclusionOutcome::Failed
         );
         for invalid in [
@@ -7055,8 +7290,10 @@ mod tests {
             [events.as_slice(), &[0]].concat(),
         ] {
             assert!(
-                verify_spot_place_inclusion_events(&snapshot, &identity, [1; 32], 42, 3, &invalid)
-                    .is_err()
+                verify_spot_place_inclusion_events_with_runtime(
+                    &snapshot, &identity, [1; 32], 42, 3, &invalid,
+                )
+                .is_err()
             );
         }
     }
@@ -7090,7 +7327,7 @@ mod tests {
                         spot_place_event_record(&snapshot, 3, &identity),
                     ]);
                     assert_eq!(
-                        verify_spot_place_inclusion_events(
+                        verify_spot_place_inclusion_events_with_runtime(
                             &snapshot, &identity, [1; 32], 42, 3, &events
                         )
                         .unwrap()
@@ -7134,7 +7371,7 @@ mod tests {
                         }
                         let changed = serde_json::from_value(changed).unwrap();
                         assert!(
-                            verify_spot_place_inclusion_events(
+                            verify_spot_place_inclusion_events_with_runtime(
                                 &snapshot, &changed, [1; 32], 42, 3, &events
                             )
                             .is_err(),
@@ -7154,7 +7391,8 @@ mod tests {
         let events = system_events(&[cancel_event_record(&snapshot, 3, subaccount, 9001, 0)]);
 
         assert_eq!(
-            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events).unwrap(),
+            verify_perp_cancel_business_event_with_runtime(&snapshot, &identity, 3, &events)
+                .unwrap(),
             DeepXIndexedOutcome {
                 extrinsic_index: 3,
                 outcome: DeepXBusinessEventOutcome::Success,
@@ -7172,9 +7410,10 @@ mod tests {
             dispatch_event_record(&snapshot, 3, true),
         ]);
 
-        let inclusion =
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events)
-                .unwrap();
+        let inclusion = verify_perp_cancel_inclusion_events_with_runtime(
+            &snapshot, &identity, [41; 32], 41, 3, &events,
+        )
+        .unwrap();
 
         assert_eq!(inclusion.block_hash(), [41; 32]);
         assert_eq!(inclusion.block_number(), 41);
@@ -7192,7 +7431,9 @@ mod tests {
         let events = system_events(&[dispatch_event_record(&snapshot, 3, true)]);
 
         assert!(matches!(
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events,),
+            verify_perp_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [41; 32], 41, 3, &events,
+            ),
             Err(DeepXPerpCancelEventVerificationError::InclusionEvidence(_)),
         ));
     }
@@ -7211,9 +7452,10 @@ mod tests {
             dispatch_event_record(&snapshot, 3, success),
         ]);
 
-        let inclusion =
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events)
-                .unwrap();
+        let inclusion = verify_perp_cancel_inclusion_events_with_runtime(
+            &snapshot, &identity, [41; 32], 41, 3, &events,
+        )
+        .unwrap();
 
         assert_eq!(inclusion.extrinsic_index(), 3);
         assert_eq!(inclusion.outcome(), expected);
@@ -7229,7 +7471,9 @@ mod tests {
         ]);
 
         assert!(matches!(
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events),
+            verify_perp_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [41; 32], 41, 3, &events,
+            ),
             Err(DeepXPerpCancelEventVerificationError::DuplicateEvent),
         ));
     }
@@ -7241,7 +7485,9 @@ mod tests {
         let events = system_events(&[dispatch_event_record(&snapshot, 4, true)]);
 
         assert!(matches!(
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events),
+            verify_perp_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [41; 32], 41, 3, &events,
+            ),
             Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes),
         ));
     }
@@ -7254,7 +7500,9 @@ mod tests {
         events.push(0);
 
         assert!(matches!(
-            verify_perp_cancel_inclusion_events(&snapshot, &identity, [41; 32], 41, 3, &events),
+            verify_perp_cancel_inclusion_events_with_runtime(
+                &snapshot, &identity, [41; 32], 41, 3, &events,
+            ),
             Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes),
         ));
     }
@@ -7277,7 +7525,8 @@ mod tests {
             )]),
         ] {
             assert_eq!(
-                verify_perp_cancel_business_event(&snapshot, &identity, 3, &events).unwrap(),
+                verify_perp_cancel_business_event_with_runtime(&snapshot, &identity, 3, &events)
+                    .unwrap(),
                 DeepXIndexedOutcome {
                     extrinsic_index: 3,
                     outcome: DeepXBusinessEventOutcome::NotObserved,
@@ -7306,7 +7555,7 @@ mod tests {
         )]);
 
         assert!(matches!(
-            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+            verify_perp_cancel_business_event_with_runtime(&snapshot, &identity, 3, &events),
             Err(DeepXPerpCancelEventVerificationError::ConflictingEvent),
         ));
     }
@@ -7320,7 +7569,7 @@ mod tests {
         let events = system_events(&[record.clone(), record]);
 
         assert!(matches!(
-            verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+            verify_perp_cancel_business_event_with_runtime(&snapshot, &identity, 3, &events),
             Err(DeepXPerpCancelEventVerificationError::DuplicateEvent),
         ));
     }
@@ -7334,7 +7583,7 @@ mod tests {
 
         for events in [vec![4], trailing] {
             assert!(matches!(
-                verify_perp_cancel_business_event(&snapshot, &identity, 3, &events),
+                verify_perp_cancel_business_event_with_runtime(&snapshot, &identity, 3, &events),
                 Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes),
             ));
         }
@@ -7361,11 +7610,11 @@ mod tests {
         );
 
         assert!(matches!(
-            verify_perp_cancel_business_event(&snapshot, &fast_cancel, 3, &[0]),
+            verify_perp_cancel_business_event_with_runtime(&snapshot, &fast_cancel, 3, &[0]),
             Err(DeepXPerpCancelEventVerificationError::FastCancelUnsupported),
         ));
         assert!(matches!(
-            verify_perp_cancel_business_event(&snapshot, &legacy, 3, &[0]),
+            verify_perp_cancel_business_event_with_runtime(&snapshot, &legacy, 3, &[0]),
             Err(DeepXPerpCancelEventVerificationError::UnsupportedOperation),
         ));
     }
@@ -7586,249 +7835,20 @@ mod tests {
     }
 
     #[rstest]
-    fn finalized_event_storage_metadata_layout() {
+    fn finalized_event_storage_uses_current_metadata_layout() {
         let snapshot = runtime_snapshot();
         let system = snapshot.metadata().pallet_by_name("System").unwrap();
         let storage = system.storage().unwrap();
         assert_eq!(storage.prefix(), "System");
         let events = storage.entry_by_name("Events").unwrap();
-        let threads = storage.entry_by_name("Threads").unwrap();
-        let batches = storage.entry_by_name("EventsMap").unwrap();
         assert_eq!(events.entry_type().key_ty(), None);
-        assert_eq!(threads.entry_type().key_ty(), Some(4));
-        assert_eq!(threads.entry_type().value_ty(), 2);
-        assert_eq!(batches.entry_type().key_ty(), Some(135));
-        assert_eq!(
-            batches.entry_type().value_ty(),
-            events.entry_type().value_ty()
-        );
-        assert_eq!(threads.default_bytes(), &[0]);
-        assert_eq!(batches.default_bytes(), &[0]);
-    }
-
-    #[rstest]
-    fn finalized_event_fixture_proves_known_perpetual_placement() {
-        let fixture: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-185969410/system_events.json",
-        )))
-        .unwrap();
-        let block_hash = hex::decode_array(
-            fixture["block_hash"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let event_bytes =
-            hex::decode(fixture["result"].as_str().unwrap().trim_start_matches("0x")).unwrap();
-        let snapshot = runtime_snapshot_for_spec(369);
-        let identity = DeepXTransactionIdentity::new_perp_place(
-            ClientOrderId::new("O-DEEPX-CAPTURED-1789445053841"),
-            [0; 20],
-            InstrumentId::from("ETH-USDC-PERP.DEEPX"),
-            OrderSide::Buy,
-            DeepXNonceReservation::TimestampOrderId {
-                value: 1_789_445_053_841,
-            },
-            DeepXDirectRuntimeIdentity::from(snapshot.identity()),
-            crate::signing::DeepXPerpPlaceParams {
-                subaccount: hex::decode_array("4ded31cb63949b52f9dfc9bcfade4eab7017eadc").unwrap(),
-                market_id: 3,
-                is_long: true,
-                size: 300_000_000_000_000_000,
-                price: 2_499_050_000,
-                order_type: crate::signing::DeepXPerpOrderType::Limit(
-                    crate::signing::DeepXTimeInForce::Gtc,
-                ),
-                take_profit: None,
-                stop_loss: None,
-                reduce_only: false,
-                post_only: crate::signing::DeepXPostOnlyParam::None,
-            },
-        );
-
-        let evidence = verify_perp_place_inclusion_events(
-            &snapshot,
-            &identity,
-            block_hash,
-            fixture["block_number"].as_u64().unwrap(),
-            u32::try_from(fixture["extrinsic_index"].as_u64().unwrap()).unwrap(),
-            &event_bytes,
-        )
-        .unwrap();
-
-        assert_eq!(evidence.block_hash(), block_hash);
-        assert_eq!(evidence.block_number(), 185_969_410);
-        assert_eq!(evidence.extrinsic_index(), 8);
-        assert_eq!(evidence.outcome(), DeepXInclusionOutcome::Success);
-    }
-
-    #[rstest]
-    fn spec_369_finalized_trade_id_matches_account_trade() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-185969410/system_events.json",
-        )))
-        .unwrap();
-        let event_bytes =
-            hex::decode(fixture["result"].as_str().unwrap().trim_start_matches("0x")).unwrap();
-        let block_hash = hex::decode_array(
-            fixture["block_hash"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let block_number = fixture["block_number"].as_u64().unwrap();
-        let snapshot = runtime_snapshot_for_spec(369);
-        let trades =
-            decode_finalized_perp_trade_events(&snapshot, block_hash, block_number, &event_bytes)
-                .unwrap();
-        assert_eq!(trades.len(), 4);
-        let trade = trades.iter().find(|trade| trade.event_index == 51).unwrap();
-        let page: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_account_trades_account_market_3.json",
-        )))
-        .unwrap();
-        let record: crate::http::DeepXPerpAccountTradeRecord = serde_json::from_value(
-            page["data"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|item| item["orderId"] == "1789445053841")
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        let buyer = hex::decode_array("4ded31cb63949b52f9dfc9bcfade4eab7017eadc").unwrap();
-        let matched =
-            match_finalized_perp_account_trade(&trades, &record, buyer, 18, 6, "USDC").unwrap();
-        assert_eq!(matched.event_index, 51);
-        assert_eq!(trade.block_hash, block_hash);
-        assert_eq!(trade.block_number, block_number);
-        assert_eq!(trade.market_id, u16::try_from(record.market_id).unwrap());
-        assert_eq!(trade.buyer_order_id.to_string(), record.order_id);
-        assert_eq!(trade.buyer, buyer);
-        assert_eq!(trade.taker, record.taker);
-        assert_eq!(trade.filled_direction, record.filled_direction);
-        assert_eq!(trade.fee_asset, b"usdc");
-        assert_eq!(
-            crate::common::parse::decimal_to_scaled_i128(record.price, 6).unwrap(),
-            i128::try_from(trade.price).unwrap(),
-        );
-        assert_eq!(
-            crate::common::parse::decimal_to_scaled_i128(record.size, 18).unwrap(),
-            i128::try_from(trade.size).unwrap(),
-        );
-        assert_eq!(
-            crate::common::parse::decimal_to_scaled_i128(record.leverage, 3).unwrap(),
-            i128::from(trade.buyer_leverage),
-        );
-        assert_eq!(
-            crate::common::parse::decimal_to_scaled_i128(record.fee, 6).unwrap(),
-            -trade.taker_fee,
-        );
-        assert_eq!(record.id, 185969410000051);
-
-        let mut seller_record = record.clone();
-        seller_record.order_id = trade.seller_order_id.to_string();
-        seller_record.is_long = false;
-        seller_record.fee = rust_decimal::Decimal::new(74918, 6);
-        seller_record.fee_asset = "USDC".to_string();
-        assert_eq!(
-            match_finalized_perp_account_trade(
-                &trades,
-                &seller_record,
-                trade.seller,
-                18,
-                6,
-                "USDC",
-            )
-            .unwrap()
-            .event_index,
-            51,
-        );
-        let mut first_generated = trade.clone();
-        first_generated.buyer_order_id = 0;
-        let mut zero_order_record = record.clone();
-        zero_order_record.order_id = "0".to_string();
-        assert_eq!(
-            match_finalized_perp_account_trade(
-                &[first_generated],
-                &zero_order_record,
-                buyer,
-                18,
-                6,
-                "USDC",
-            )
-            .unwrap()
-            .buyer_order_id,
-            0,
-        );
-        let mut duplicate = trades.clone();
-        duplicate.push(trade.clone());
-        assert!(matches!(
-            match_finalized_perp_account_trade(&duplicate, &record, buyer, 18, 6, "USDC"),
-            Err(DeepXPerpTradeMatchError::Ambiguous),
-        ));
-        let mut wrong_fee = record.clone();
-        wrong_fee.fee += rust_decimal::Decimal::new(1, 6);
-        assert!(matches!(
-            match_finalized_perp_account_trade(&trades, &wrong_fee, buyer, 18, 6, "USDC"),
-            Err(DeepXPerpTradeMatchError::NotFound),
-        ));
-        let mut wrong_id = record.clone();
-        wrong_id.id += 1;
-        assert!(matches!(
-            match_finalized_perp_account_trade(&trades, &wrong_id, buyer, 18, 6, "USDC"),
-            Err(DeepXPerpTradeMatchError::NotFound),
-        ));
-        assert!(matches!(
-            match_finalized_perp_account_trade(&trades, &record, [0; 20], 18, 6, "USDC"),
-            Err(DeepXPerpTradeMatchError::NotFound),
-        ));
-        assert!(matches!(
-            match_finalized_perp_account_trade(&trades, &record, buyer, 18, 5, "USDC"),
-            Err(DeepXPerpTradeMatchError::InexactValue { field: "fee", .. }),
-        ));
-
-        assert!(matches!(
-            decode_finalized_perp_trade_events(
-                &snapshot,
-                block_hash,
-                block_number,
-                &event_bytes[..event_bytes.len() - 1],
-            ),
-            Err(DeepXPerpTradeEventError::Decode(_) | DeepXPerpTradeEventError::MalformedEventBytes),
-        ));
-        let mut wrong_count = event_bytes.clone();
-        wrong_count[0] -= 4;
-        assert!(matches!(
-            decode_finalized_perp_trade_events(&snapshot, block_hash, block_number, &wrong_count),
-            Err(DeepXPerpTradeEventError::MalformedEventBytes),
-        ));
-        let mut trailing = event_bytes.clone();
-        trailing.push(0);
-        assert!(matches!(
-            decode_finalized_perp_trade_events(&snapshot, block_hash, block_number, &trailing),
-            Err(DeepXPerpTradeEventError::MalformedEventBytes),
-        ));
-        assert!(matches!(
-            decode_finalized_perp_trade_events(
-                &snapshot,
-                block_hash,
-                block_number + 1,
-                &event_bytes,
-            ),
-            Err(DeepXPerpTradeEventError::InvalidTrade(_)),
-        ));
+        assert!(storage.entry_by_name("Threads").is_none());
+        assert!(storage.entry_by_name("EventsMap").is_none());
     }
 
     #[rstest]
     fn finalized_perp_trade_decoder_accepts_first_generated_order_id() {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = runtime_snapshot();
         let pallet = snapshot.metadata().pallet_by_name("PerpMarket").unwrap();
         let event = pallet
             .event_variants()
@@ -7878,1292 +7898,17 @@ mod tests {
         }
         Vec::<[u8; 32]>::new().encode_to(&mut record);
 
-        let trades =
-            decode_finalized_perp_trade_events(&snapshot, [3; 32], 42, &system_events(&[record]))
-                .unwrap();
+        let trades = decode_finalized_perp_trade_events_with_metadata(
+            snapshot.interfaces(),
+            snapshot.metadata(),
+            [3; 32],
+            42,
+            &system_events(&[record]),
+        )
+        .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].buyer_order_id, 0);
         assert_eq!(trades[0].seller_order_id, 7);
-    }
-
-    #[rstest]
-    fn spec_371_finalized_trade_ids_bind_two_wallet_partial_fills() {
-        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json",
-        )))
-        .unwrap();
-        let bytes = hex::decode(
-            response["result"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/manifest.json",
-        )))
-        .unwrap();
-        assert_eq!(
-            bytes.len(),
-            manifest["storage"]["batch_bytes"].as_u64().unwrap() as usize
-        );
-        let snapshot = runtime_snapshot_for_spec(371);
-        let block_hash = hex::decode_array(
-            manifest["block_hash"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let block_number = manifest["block_number"].as_u64().unwrap();
-        let trades =
-            decode_finalized_perp_trade_events(&snapshot, block_hash, block_number, &bytes)
-                .unwrap();
-        assert_eq!(trades.len(), 2);
-        let wallet: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_wallet_trades_page.json",
-        )))
-        .unwrap();
-        let subaccount = hex::decode_array("4ded31cb63949b52f9dfc9bcfade4eab7017eadc").unwrap();
-        let records = wallet["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|market| market["marketId"] == 3)
-            .unwrap()["subaccounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|group| group["subaccount"] == "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc")
-            .unwrap()["trades"]["items"]
-            .as_array()
-            .unwrap();
-        for (id, index, price, size, fee) in [
-            (
-                187071212000014_u64,
-                14,
-                2404060000,
-                62000000000000000,
-                29783,
-            ),
-            (
-                187071212000022_u64,
-                22,
-                2403970000,
-                238000000000000000,
-                114328,
-            ),
-        ] {
-            let record: DeepXPerpAccountTradeRecord = serde_json::from_value(
-                records
-                    .iter()
-                    .find(|item| item["id"] == id)
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-            let trade =
-                match_finalized_perp_account_trade(&trades, &record, subaccount, 18, 6, "USDC")
-                    .unwrap();
-            assert_eq!(trade.event_index, index);
-            assert_eq!(
-                (trade.price, trade.size, trade.taker_fee),
-                (price, size, fee)
-            );
-        }
-    }
-
-    #[rstest]
-    fn wallet_trade_batch_reconciles_rest_and_finalized_events_atomically() {
-        use crate::{
-            http::{DeepXAccountSortOrder, DeepXPerpAccountTradesRequest},
-            websocket::{
-                DeepXWsPerpFinalizedTradeScope, DeepXWsPerpTradeHistoryFrame,
-                DeepXWsPerpTradeHistoryMatchError, DeepXWsPerpTradeHistoryRequest,
-                match_perp_trade_history_batch_to_finalized,
-            },
-        };
-
-        let response: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json",
-        )))
-        .unwrap();
-        let bytes = hex::decode(
-            response["result"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let manifest: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/manifest.json",
-        )))
-        .unwrap();
-        let block_hash = hex::decode_array(
-            manifest["block_hash"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let trades = decode_finalized_perp_trade_events(
-            &runtime_snapshot_for_spec(371),
-            block_hash,
-            manifest["block_number"].as_u64().unwrap(),
-            &bytes,
-        )
-        .unwrap();
-        let wallet: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_wallet_trades_page.json",
-        )))
-        .unwrap();
-        let address = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
-        let items = wallet["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|market| market["marketId"] == 3)
-            .unwrap()["subaccounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|group| group["subaccount"] == address)
-            .unwrap()["trades"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item["id"].as_u64(),
-                    Some(187_071_212_000_014 | 187_071_212_000_022)
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(items.len(), 2);
-        let records = items
-            .iter()
-            .cloned()
-            .map(serde_json::from_value::<DeepXPerpAccountTradeRecord>)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let ws_request = DeepXWsPerpTradeHistoryRequest::new(3, address).unwrap();
-        let frame = serde_json::json!({
-            "type": "data",
-            "channel": "user_perp_trade_history",
-            "market": {"type": "perp", "id": 3},
-            "data": {"address": address, "trades": {
-                "items": items, "nextCursor": null, "hasNext": false,
-            }},
-            "timestamp": 1_789_522_187_243_u64,
-        });
-        let DeepXWsPerpTradeHistoryFrame::TradeBatch(batch) =
-            DeepXWsPerpTradeHistoryFrame::parse(&frame.to_string(), &ws_request).unwrap()
-        else {
-            panic!("expected synthesized trade-history batch");
-        };
-        let request = DeepXPerpAccountTradesRequest {
-            subaccount: address.to_string(),
-            order_id: None,
-            market_id: Some(3),
-            is_long: None,
-            cursor: None,
-            sort: DeepXAccountSortOrder::Descending,
-            start_ms: None,
-            end_ms: None,
-            page_size: Some(100),
-        };
-        let subaccount = hex::decode_array(address.trim_start_matches("0x")).unwrap();
-        let scope = DeepXWsPerpFinalizedTradeScope {
-            subaccount,
-            base_decimal: 18,
-            quote_decimal: 6,
-            quote_symbol: "USDC",
-        };
-        let matched =
-            match_perp_trade_history_batch_to_finalized(&batch, &request, &records, &trades, scope)
-                .unwrap();
-        assert_eq!(
-            matched
-                .iter()
-                .map(|(record, trade)| (record.id, trade.event_index))
-                .collect::<Vec<_>>(),
-            [(187_071_212_000_022, 22), (187_071_212_000_014, 14)],
-        );
-        assert!(matches!(
-            match_perp_trade_history_batch_to_finalized(
-                &batch,
-                &request,
-                &records,
-                &trades[..1],
-                scope,
-            ),
-            Err(DeepXWsPerpTradeHistoryMatchError::Finalized(
-                DeepXPerpTradeMatchError::NotFound
-            )),
-        ));
-    }
-
-    #[rstest]
-    fn finalized_wallet_trade_matches_are_complete_and_fail_atomically() {
-        let response: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json",
-        )))
-        .unwrap();
-        let bytes = hex::decode(
-            response["result"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        let block_hash =
-            hex::decode_array("598bc26ae08b4995ca792f2cddfd80e722733c61367db3cb483f77ea6dfba7f9")
-                .unwrap();
-        let trades = decode_finalized_perp_trade_events(
-            &runtime_snapshot_for_spec(371),
-            block_hash,
-            187_071_212,
-            &bytes,
-        )
-        .unwrap();
-        let wallet: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_wallet_trades_page.json",
-        )))
-        .unwrap();
-        let groups: Vec<DeepXPerpWalletTradeMarket> =
-            serde_json::from_value(wallet["data"].clone()).unwrap();
-        let market: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_market_eth_usdc_by_id.json",
-        )))
-        .unwrap();
-        let markets =
-            vec![serde_json::from_value::<DeepXPerpMarketLookup>(market["data"].clone()).unwrap()];
-        let subaccount = hex::decode_array("4ded31cb63949b52f9dfc9bcfade4eab7017eadc").unwrap();
-        let matches =
-            match_finalized_wallet_perp_trades(&trades, &groups, &[subaccount], &markets).unwrap();
-        assert_eq!(
-            matches
-                .iter()
-                .map(|entry| entry.record.id)
-                .collect::<Vec<_>>(),
-            vec![187_071_212_000_014, 187_071_212_000_022],
-        );
-
-        let mut missing = groups.clone();
-        missing[0].subaccounts[0]
-            .trades
-            .items
-            .retain(|record| record.id != 187_071_212_000_022);
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(&trades, &missing, &[subaccount], &markets),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::MissingRecord),
-        ));
-        let mut conflicting = groups.clone();
-        conflicting[0].subaccounts[0].trades.items[0].fee += rust_decimal::Decimal::new(1, 6);
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(&trades, &conflicting, &[subaccount], &markets),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::Trade(
-                DeepXPerpTradeMatchError::NotFound
-            )),
-        ));
-        let mut incomplete = groups.clone();
-        incomplete[0].subaccounts[0].trades.has_next = true;
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(&trades, &incomplete, &[subaccount], &markets),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::IncompletePage),
-        ));
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(
-                &trades,
-                &groups,
-                &[subaccount, subaccount],
-                &markets
-            ),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::InvalidSubaccounts),
-        ));
-        let mut duplicated = groups.clone();
-        let repeated = duplicated[0].subaccounts[0].trades.items[0].clone();
-        duplicated[0].subaccounts[0].trades.items.push(repeated);
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(&trades, &duplicated, &[subaccount], &markets),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::DuplicateRecord),
-        ));
-        let mut conflicting_block = trades.clone();
-        conflicting_block[1].block_number += 1;
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(
-                &conflicting_block,
-                &groups,
-                &[subaccount],
-                &markets
-            ),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::ConflictingEvents),
-        ));
-        let mut self_trade = trades.clone();
-        self_trade[0].buyer = subaccount;
-        assert!(matches!(
-            match_finalized_wallet_perp_trades(&self_trade, &groups, &[subaccount], &markets),
-            Err(DeepXFinalizedWalletPerpTradeMatchError::SelfTrade),
-        ));
-    }
-
-    #[derive(Clone, Copy)]
-    enum TradeObservationScenario {
-        Valid,
-        NotFinalized,
-        HistoricalRuntimeMismatch,
-        HistoricalRuntimeVersionMismatch,
-        ChangedStorage,
-        ChangedHash,
-        WrongRuntime,
-        MalformedStorage,
-    }
-
-    #[derive(Clone)]
-    struct TradeObservationRpcState {
-        scenario: TradeObservationScenario,
-        metadata: String,
-        events: String,
-        block_extrinsic: String,
-        storage_reads: Arc<AtomicUsize>,
-        hash_reads: Arc<AtomicUsize>,
-    }
-
-    async fn trade_observation_rpc(
-        State(state): State<TradeObservationRpcState>,
-        Json(request): Json<Value>,
-    ) -> Json<Value> {
-        const BLOCK: u64 = 187_071_212;
-        let hash = "0x598bc26ae08b4995ca792f2cddfd80e722733c61367db3cb483f77ea6dfba7f9";
-        let result = match request["method"].as_str().unwrap() {
-            "rpc_methods" => json!({
-                "methods": [
-                    "author_pendingExtrinsics", "author_submitExtrinsic", "chain_getBlock",
-                    "chain_getBlockHash", "chain_getFinalizedHead", "chain_getHeader",
-                    "eth_call", "state_getMetadata", "state_getRuntimeVersion",
-                    "state_getStorage", "state_queryStorageAt", "state_call",
-                ],
-            }),
-            "chain_getFinalizedHead" => json!(hash),
-            "chain_getHeader" => json!({
-                "number": if matches!(state.scenario, TradeObservationScenario::NotFinalized) {
-                    format!("0x{:x}", BLOCK - 1)
-                } else {
-                    format!("0x{BLOCK:x}")
-                },
-            }),
-            "chain_getBlockHash" => {
-                assert_eq!(request["params"][0], BLOCK);
-                let read = state.hash_reads.fetch_add(1, Ordering::SeqCst);
-                if matches!(state.scenario, TradeObservationScenario::ChangedHash) && read > 0 {
-                    json!(block_hash(BLOCK))
-                } else {
-                    json!(hash)
-                }
-            }
-            "chain_getBlock" => json!({
-                "block": {
-                    "header": { "number": format!("0x{BLOCK:x}") },
-                    "extrinsics": [state.block_extrinsic],
-                },
-            }),
-            "state_getRuntimeVersion" => json!({
-                "specVersion": if request["params"][0]
-                    == "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6"
-                {
-                    if matches!(state.scenario, TradeObservationScenario::HistoricalRuntimeVersionMismatch) {
-                        371
-                    } else {
-                        369
-                    }
-                } else if matches!(state.scenario, TradeObservationScenario::WrongRuntime) {
-                    999
-                } else {
-                    371
-                },
-                "transactionVersion": 1,
-            }),
-            "state_call" => {
-                assert_eq!(request["params"][0], "Core_version");
-                assert_eq!(request["params"][1], "0x");
-                assert_eq!(
-                    request["params"][2],
-                    "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6"
-                );
-                let spec_version = if matches!(
-                    state.scenario,
-                    TradeObservationScenario::HistoricalRuntimeMismatch
-                ) {
-                    371
-                } else {
-                    369
-                };
-                json!(format!(
-                    "0x{}",
-                    hex::encode(
-                        (
-                            b"frontier-template".to_vec(),
-                            b"frontier-template".to_vec(),
-                            1_u32,
-                            spec_version,
-                            1_u32,
-                            Vec::<([u8; 8], u32)>::new(),
-                            1_u32,
-                            1_u8,
-                        )
-                            .encode()
-                    )
-                ))
-            }
-            "state_getMetadata" => json!(state.metadata),
-            "state_getStorage" => {
-                assert_eq!(request["params"][1], hash);
-                let key = request["params"][0].as_str().unwrap();
-                if key == SYSTEM_EVENTS_STORAGE_KEY {
-                    Value::Null
-                } else if key == system_threads_storage_key(BLOCK) {
-                    json!("0x00")
-                } else {
-                    assert_eq!(key, system_events_map_storage_key(BLOCK, 0));
-                    let read = state.storage_reads.fetch_add(1, Ordering::SeqCst);
-                    if matches!(state.scenario, TradeObservationScenario::ChangedStorage)
-                        && read > 0
-                    {
-                        json!("0x00")
-                    } else if matches!(state.scenario, TradeObservationScenario::MalformedStorage) {
-                        json!("0xgg")
-                    } else {
-                        json!(state.events)
-                    }
-                }
-            }
-            method => panic!("unexpected method {method}"),
-        };
-        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
-    }
-
-    #[tokio::test]
-    async fn finalized_delegate_account_observation_uses_chain_sourced_events() {
-        const BLOCK: u64 = 187_071_212;
-        let snapshot = runtime_snapshot_for_spec(371);
-        let metadata: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-        )))
-        .unwrap();
-        let block_hash =
-            hex::decode_array("598bc26ae08b4995ca792f2cddfd80e722733c61367db3cb483f77ea6dfba7f9")
-                .unwrap();
-        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot.clone());
-        let permit = service.acquire().unwrap();
-        let key = DeepXPrivateKey::new(
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            &DeepXKeyScheme::Secp256k1,
-        )
-        .unwrap();
-        for kind in [
-            DeepXDelegateAccountChangeKind::Set,
-            DeepXDelegateAccountChangeKind::Removed,
-        ] {
-            let operation = match kind {
-                DeepXDelegateAccountChangeKind::Set => {
-                    DeepXSignedDelegateAccountOperation::Set(DeepXSetDelegateAccountParams {
-                        delegate: [0x22; 20],
-                        name: b"risk-desk".to_vec(),
-                        valid_until: 1_900_000_000_000,
-                    })
-                }
-                DeepXDelegateAccountChangeKind::Removed => {
-                    DeepXSignedDelegateAccountOperation::Remove(DeepXRemoveDelegateAccountParams {
-                        delegate: [0x22; 20],
-                    })
-                }
-            };
-            let query = DeepXSignedDelegateAccountQuery {
-                operation,
-                nonce: 63,
-                block_number: BLOCK,
-            };
-            let signed = match &query.operation {
-                DeepXSignedDelegateAccountOperation::Set(params) => {
-                    sign_set_delegate_account(&permit, &key, params.clone(), query.nonce).unwrap()
-                }
-                DeepXSignedDelegateAccountOperation::Remove(params) => {
-                    sign_remove_delegate_account(&permit, &key, *params, query.nonce).unwrap()
-                }
-            };
-            let location = DeepXFinalizedTransactionLocation {
-                extrinsic_hash: signed.extrinsic_hash(),
-                block_number: BLOCK,
-                block_hash,
-                extrinsic_index: 0,
-            };
-            let events = system_events(&[
-                delegate_account_event_record_for_owner(
-                    &snapshot,
-                    Phase::ApplyExtrinsic(0),
-                    kind,
-                    signed.signer(),
-                ),
-                dispatch_event_record(&snapshot, 0, true),
-            ]);
-            for scenario in [
-                TradeObservationScenario::Valid,
-                TradeObservationScenario::ChangedStorage,
-                TradeObservationScenario::NotFinalized,
-            ] {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let url = format!("http://{}", listener.local_addr().unwrap());
-                let state = TradeObservationRpcState {
-                    scenario,
-                    metadata: metadata["result"].as_str().unwrap().to_string(),
-                    events: format!("0x{}", hex::encode(&events)),
-                    block_extrinsic: format!("0x{}", hex::encode(signed.bytes())),
-                    storage_reads: Arc::new(AtomicUsize::new(0)),
-                    hash_reads: Arc::new(AtomicUsize::new(0)),
-                };
-                tokio::spawn(async move {
-                    axum::serve(
-                        listener,
-                        Router::new()
-                            .route("/", post(trade_observation_rpc))
-                            .with_state(state),
-                    )
-                    .await
-                    .unwrap();
-                });
-                let config = DeepXNetworkConfig {
-                    base_url_rpc: Some(url.clone()),
-                    ..Default::default()
-                };
-                let genesis_hash =
-                    hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-                let endpoints = validate_rpc_endpoint_identities(
-                    &config,
-                    [
-                        DeepXObservedRpcEndpoint::new(
-                            DeepXRpcRole::Submission,
-                            url.clone(),
-                            genesis_hash,
-                        ),
-                        DeepXObservedRpcEndpoint::new(
-                            DeepXRpcRole::Watch,
-                            url.clone(),
-                            genesis_hash,
-                        ),
-                        DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
-                    ],
-                )
-                .unwrap();
-                let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-                    .await
-                    .unwrap();
-                let result = observe_finalized_delegate_account_change_at(
-                    &DeepXEnvironment::Testnet,
-                    &endpoints,
-                    &capabilities,
-                    location,
-                    signed.signer(),
-                    [0x22; 20],
-                    kind,
-                )
-                .await;
-                match scenario {
-                    TradeObservationScenario::Valid => {
-                        let change = result.unwrap();
-                        assert_eq!(change.block_hash, block_hash);
-                        assert_eq!(change.block_number, BLOCK);
-                        assert_eq!(change.event_index, 0);
-                        assert_eq!(change.extrinsic_index, 0);
-                        assert_eq!(change.owner, signed.signer());
-                        assert_eq!(change.delegate, [0x22; 20]);
-                        assert_eq!(change.kind, kind);
-                        assert_eq!(
-                            observe_signed_delegate_account_change_at(
-                                &DeepXEnvironment::Testnet,
-                                &endpoints,
-                                &capabilities,
-                                &permit,
-                                &key,
-                                &query,
-                            )
-                            .await
-                            .unwrap(),
-                            DeepXSignedDelegateAccountObservation::Finalized(change.clone()),
-                        );
-                        let changed_nonce = DeepXSignedDelegateAccountQuery {
-                            nonce: query.nonce + 1,
-                            ..query.clone()
-                        };
-                        assert!(matches!(
-                            observe_signed_delegate_account_change_at(
-                                &DeepXEnvironment::Testnet,
-                                &endpoints,
-                                &capabilities,
-                                &permit,
-                                &key,
-                                &changed_nonce,
-                            )
-                            .await,
-                            Err(DeepXSignedDelegateAccountObservationError::Watch(
-                                DeepXTransactionWatchError::FinalizedExtrinsicUnavailable(BLOCK)
-                            ))
-                        ));
-                        if let DeepXSignedDelegateAccountOperation::Set(params) = &query.operation {
-                            for changed_params in [
-                                DeepXSetDelegateAccountParams {
-                                    name: b"other-desk".to_vec(),
-                                    ..params.clone()
-                                },
-                                DeepXSetDelegateAccountParams {
-                                    valid_until: params.valid_until + 1,
-                                    ..params.clone()
-                                },
-                            ] {
-                                let mut changed = query.clone();
-                                changed.operation =
-                                    DeepXSignedDelegateAccountOperation::Set(changed_params);
-                                assert!(matches!(
-                                    observe_signed_delegate_account_change_at(
-                                        &DeepXEnvironment::Testnet,
-                                        &endpoints,
-                                        &capabilities,
-                                        &permit,
-                                        &key,
-                                        &changed,
-                                    )
-                                    .await,
-                                    Err(DeepXSignedDelegateAccountObservationError::Watch(
-                                        DeepXTransactionWatchError::FinalizedExtrinsicUnavailable(
-                                            BLOCK
-                                        )
-                                    ))
-                                ));
-                            }
-                        }
-                        let other_kind = match kind {
-                            DeepXDelegateAccountChangeKind::Set => {
-                                DeepXDelegateAccountChangeKind::Removed
-                            }
-                            DeepXDelegateAccountChangeKind::Removed => {
-                                DeepXDelegateAccountChangeKind::Set
-                            }
-                        };
-                        assert!(matches!(
-                            observe_finalized_delegate_account_change_at(
-                                &DeepXEnvironment::Testnet,
-                                &endpoints,
-                                &capabilities,
-                                location,
-                                signed.signer(),
-                                [0x22; 20],
-                                other_kind,
-                            )
-                            .await,
-                            Err(DeepXFinalizedDelegateObservationError::AccountVerification(
-                                DeepXDelegateAccountVerificationError::ConflictingChange
-                            ))
-                        ));
-                    }
-                    TradeObservationScenario::ChangedStorage => assert!(matches!(
-                        result,
-                        Err(DeepXFinalizedDelegateObservationError::EventStorageChanged)
-                    )),
-                    TradeObservationScenario::NotFinalized => {
-                        assert!(matches!(
-                            result,
-                            Err(DeepXFinalizedDelegateObservationError::NotFinalized { .. })
-                        ));
-                        assert!(matches!(
-                            observe_signed_delegate_account_change_at(
-                                &DeepXEnvironment::Testnet,
-                                &endpoints,
-                                &capabilities,
-                                &permit,
-                                &key,
-                                &query,
-                            )
-                            .await,
-                            Ok(DeepXSignedDelegateAccountObservation::Pending(checkpoint))
-                                if checkpoint.block_number() == BLOCK - 1
-                        ));
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn finalized_delegate_mode_observation_checks_chain_and_event_evidence() {
-        const BLOCK: u64 = 187_071_212;
-        let snapshot = runtime_snapshot_for_spec(371);
-        let events = system_events(&[
-            delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(0), "Disable"),
-            dispatch_event_record(&snapshot, 0, true),
-        ]);
-        let metadata: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-        )))
-        .unwrap();
-        let block_hash =
-            hex::decode_array("598bc26ae08b4995ca792f2cddfd80e722733c61367db3cb483f77ea6dfba7f9")
-                .unwrap();
-        let location = DeepXFinalizedTransactionLocation {
-            extrinsic_hash: BlakeTwo256.hash(&extrinsic(&[1, 2, 3, 4])).0,
-            block_number: BLOCK,
-            block_hash,
-            extrinsic_index: 0,
-        };
-        for scenario in [
-            TradeObservationScenario::Valid,
-            TradeObservationScenario::NotFinalized,
-            TradeObservationScenario::HistoricalRuntimeMismatch,
-            TradeObservationScenario::HistoricalRuntimeVersionMismatch,
-            TradeObservationScenario::ChangedStorage,
-            TradeObservationScenario::ChangedHash,
-            TradeObservationScenario::WrongRuntime,
-            TradeObservationScenario::MalformedStorage,
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let state = TradeObservationRpcState {
-                scenario,
-                metadata: metadata["result"].as_str().unwrap().to_string(),
-                events: format!("0x{}", hex::encode(&events)),
-                block_extrinsic: format!("0x{}", hex::encode(extrinsic(&[1, 2, 3, 4]))),
-                storage_reads: Arc::new(AtomicUsize::new(0)),
-                hash_reads: Arc::new(AtomicUsize::new(0)),
-            };
-            tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    Router::new()
-                        .route("/", post(trade_observation_rpc))
-                        .with_state(state),
-                )
-                .await
-                .unwrap();
-            });
-            let config = DeepXNetworkConfig {
-                base_url_rpc: Some(url.clone()),
-                ..Default::default()
-            };
-            let genesis_hash =
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-            let endpoints = validate_rpc_endpoint_identities(
-                &config,
-                [
-                    DeepXObservedRpcEndpoint::new(
-                        DeepXRpcRole::Submission,
-                        url.clone(),
-                        genesis_hash,
-                    ),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
-                ],
-            )
-            .unwrap();
-            let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-                .await
-                .unwrap();
-            let result = observe_finalized_delegate_mode_change_at(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                location,
-                [0x11; 20],
-                [0x22; 20],
-                DeepXDelegateMode::Disable,
-            )
-            .await;
-            match scenario {
-                TradeObservationScenario::Valid => {
-                    let change = result.unwrap();
-                    assert_eq!(change.block_hash, block_hash);
-                    assert_eq!(change.block_number, BLOCK);
-                    assert_eq!(change.event_index, 0);
-                    assert_eq!(change.extrinsic_index, 0);
-                    assert_eq!(change.owner, [0x11; 20]);
-                    assert_eq!(change.delegate, [0x22; 20]);
-                    assert_eq!(change.mode, DeepXDelegateMode::Disable);
-                    let older_runtime = runtime_snapshot_for_spec(369);
-                    assert!(matches!(
-                        observe_finalized_delegate_mode_change_at_inner(
-                            &DeepXEnvironment::Testnet,
-                            &endpoints,
-                            &capabilities,
-                            location,
-                            ExpectedDelegateModeChange {
-                                owner: [0x11; 20],
-                                delegate: [0x22; 20],
-                                mode: DeepXDelegateMode::Disable,
-                            },
-                            Some(older_runtime.identity()),
-                        )
-                        .await,
-                        Err(DeepXFinalizedDelegateObservationError::RuntimeMismatch)
-                    ));
-                    for invalid_location in [
-                        DeepXFinalizedTransactionLocation {
-                            extrinsic_hash: [9; 32],
-                            ..location
-                        },
-                        DeepXFinalizedTransactionLocation {
-                            extrinsic_index: 1,
-                            ..location
-                        },
-                    ] {
-                        assert!(matches!(
-                            observe_finalized_delegate_mode_change_at(
-                                &DeepXEnvironment::Testnet,
-                                &endpoints,
-                                &capabilities,
-                                invalid_location,
-                                [0x11; 20],
-                                [0x22; 20],
-                                DeepXDelegateMode::Disable,
-                            )
-                            .await,
-                            Err(DeepXFinalizedDelegateObservationError::LocationChanged)
-                        ));
-                    }
-                }
-                TradeObservationScenario::NotFinalized => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedDelegateObservationError::NotFinalized { .. })
-                )),
-                TradeObservationScenario::HistoricalRuntimeMismatch
-                | TradeObservationScenario::HistoricalRuntimeVersionMismatch => {
-                    assert!(matches!(
-                        result,
-                        Err(DeepXFinalizedDelegateObservationError::HistoricalRuntime(_))
-                    ));
-                }
-                TradeObservationScenario::ChangedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedDelegateObservationError::EventStorageChanged)
-                )),
-                TradeObservationScenario::ChangedHash => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedDelegateObservationError::LocationChanged)
-                )),
-                TradeObservationScenario::WrongRuntime => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedDelegateObservationError::Runtime(_))
-                )),
-                TradeObservationScenario::MalformedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedDelegateObservationError::Watch(_))
-                )),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_signed_delegate_mode_change_binds_exact_finalized_call() {
-        const BLOCK: u64 = 187_071_212;
-        let snapshot = runtime_snapshot_for_spec(371);
-        let service = crate::signing::DeepXRuntimeSnapshotService::new(snapshot.clone());
-        let permit = service.acquire().unwrap();
-        let key = DeepXPrivateKey::new(
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            &DeepXKeyScheme::Secp256k1,
-        )
-        .unwrap();
-        let params = DeepXUpdateDelegateModeParams {
-            address: [0x22; 20],
-            new_mode: DeepXWritableDelegateMode::Disable,
-        };
-        let signed = sign_update_delegate_mode(&permit, &key, params, 63).unwrap();
-        let events = system_events(&[
-            delegate_mode_event_record_for_owner(
-                &snapshot,
-                Phase::ApplyExtrinsic(0),
-                "Disable",
-                signed.signer(),
-            ),
-            dispatch_event_record(&snapshot, 0, true),
-        ]);
-        let metadata: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-        )))
-        .unwrap();
-        for scenario in [
-            TradeObservationScenario::Valid,
-            TradeObservationScenario::NotFinalized,
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let state = TradeObservationRpcState {
-                scenario,
-                metadata: metadata["result"].as_str().unwrap().to_string(),
-                events: format!("0x{}", hex::encode(&events)),
-                block_extrinsic: format!("0x{}", hex::encode(signed.bytes())),
-                storage_reads: Arc::new(AtomicUsize::new(0)),
-                hash_reads: Arc::new(AtomicUsize::new(0)),
-            };
-            tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    Router::new()
-                        .route("/", post(trade_observation_rpc))
-                        .with_state(state),
-                )
-                .await
-                .unwrap();
-            });
-            let config = DeepXNetworkConfig {
-                base_url_rpc: Some(url.clone()),
-                ..Default::default()
-            };
-            let genesis_hash =
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-            let endpoints = validate_rpc_endpoint_identities(
-                &config,
-                [
-                    DeepXObservedRpcEndpoint::new(
-                        DeepXRpcRole::Submission,
-                        url.clone(),
-                        genesis_hash,
-                    ),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
-                ],
-            )
-            .unwrap();
-            let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-                .await
-                .unwrap();
-            let result = observe_signed_delegate_mode_change_at(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                &permit,
-                &key,
-                DeepXSignedDelegateModeQuery {
-                    params,
-                    nonce: 63,
-                    block_number: BLOCK,
-                },
-            )
-            .await
-            .unwrap();
-            match scenario {
-                TradeObservationScenario::Valid => {
-                    let DeepXSignedDelegateModeObservation::Finalized(change) = result else {
-                        panic!("expected finalized delegate mode change");
-                    };
-                    assert_eq!(change.block_number, BLOCK);
-                    assert_eq!(change.extrinsic_index, 0);
-                    assert_eq!(change.owner, signed.signer());
-                    assert_eq!(change.delegate, params.address);
-                    assert_eq!(change.mode, DeepXDelegateMode::Disable);
-                    assert!(matches!(
-                        observe_signed_delegate_mode_change_at(
-                            &DeepXEnvironment::Testnet,
-                            &endpoints,
-                            &capabilities,
-                            &permit,
-                            &key,
-                            DeepXSignedDelegateModeQuery {
-                                params,
-                                nonce: 64,
-                                block_number: BLOCK,
-                            },
-                        )
-                        .await,
-                        Err(DeepXSignedDelegateModeObservationError::Watch(
-                            DeepXTransactionWatchError::FinalizedExtrinsicUnavailable(BLOCK)
-                        ))
-                    ));
-                }
-                TradeObservationScenario::NotFinalized => {
-                    let DeepXSignedDelegateModeObservation::Pending(checkpoint) = result else {
-                        panic!("expected pending finalized checkpoint");
-                    };
-                    assert_eq!(checkpoint.block_number(), BLOCK - 1);
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn finalized_perp_trade_observation_checks_historical_consistency() {
-        const BLOCK: u64 = 187_071_212;
-        let metadata: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-        )))
-        .unwrap();
-        let events: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json",
-        )))
-        .unwrap();
-        for scenario in [
-            TradeObservationScenario::Valid,
-            TradeObservationScenario::NotFinalized,
-            TradeObservationScenario::HistoricalRuntimeMismatch,
-            TradeObservationScenario::HistoricalRuntimeVersionMismatch,
-            TradeObservationScenario::ChangedStorage,
-            TradeObservationScenario::ChangedHash,
-            TradeObservationScenario::WrongRuntime,
-            TradeObservationScenario::MalformedStorage,
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let state = TradeObservationRpcState {
-                scenario,
-                metadata: metadata["result"].as_str().unwrap().to_string(),
-                events: events["result"].as_str().unwrap().to_string(),
-                block_extrinsic: format!("0x{}", hex::encode(extrinsic(&[1, 2, 3, 4]))),
-                storage_reads: Arc::new(AtomicUsize::new(0)),
-                hash_reads: Arc::new(AtomicUsize::new(0)),
-            };
-            let storage_reads = Arc::clone(&state.storage_reads);
-            tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    Router::new()
-                        .route("/", post(trade_observation_rpc))
-                        .with_state(state),
-                )
-                .await
-                .unwrap();
-            });
-            let config = DeepXNetworkConfig {
-                base_url_rpc: Some(url.clone()),
-                ..Default::default()
-            };
-            let genesis_hash =
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-            let endpoints = validate_rpc_endpoint_identities(
-                &config,
-                [
-                    DeepXObservedRpcEndpoint::new(
-                        DeepXRpcRole::Submission,
-                        url.clone(),
-                        genesis_hash,
-                    ),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
-                ],
-            )
-            .unwrap();
-            let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-                .await
-                .unwrap();
-            let result = observe_finalized_perp_trades_at(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                BLOCK,
-            )
-            .await;
-            match scenario {
-                TradeObservationScenario::Valid => {
-                    assert_eq!(
-                        result
-                            .unwrap()
-                            .iter()
-                            .map(|trade| trade.event_index)
-                            .collect::<Vec<_>>(),
-                        vec![14, 22]
-                    );
-                }
-                TradeObservationScenario::NotFinalized => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::NotFinalized { .. })
-                )),
-                TradeObservationScenario::HistoricalRuntimeMismatch => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::HistoricalRuntime(
-                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                            method: "state_call(Core_version)",
-                            expected: 369,
-                            received: 371,
-                        }
-                    ))
-                )),
-                TradeObservationScenario::HistoricalRuntimeVersionMismatch => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::HistoricalRuntime(
-                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                            method: "state_getRuntimeVersion",
-                            expected: 369,
-                            received: 371,
-                        }
-                    ))
-                )),
-                TradeObservationScenario::ChangedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::EventStorageChanged)
-                )),
-                TradeObservationScenario::ChangedHash => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::CanonicalHashChanged)
-                )),
-                TradeObservationScenario::WrongRuntime => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::Runtime(_))
-                )),
-                TradeObservationScenario::MalformedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedPerpTradeObservationError::Watch(
-                        DeepXTransactionWatchError::InvalidEventStorage(BLOCK)
-                    ))
-                )),
-            }
-            if matches!(
-                scenario,
-                TradeObservationScenario::HistoricalRuntimeMismatch
-                    | TradeObservationScenario::HistoricalRuntimeVersionMismatch
-            ) {
-                assert_eq!(storage_reads.load(Ordering::SeqCst), 0);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn finalized_spot_trade_observation_checks_historical_consistency() {
-        const BLOCK: u64 = 187_071_212;
-        let metadata: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/metadata.json",
-        )))
-        .unwrap();
-        let events: Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-187071212/events_map_thread_0.json",
-        )))
-        .unwrap();
-        for scenario in [
-            TradeObservationScenario::Valid,
-            TradeObservationScenario::NotFinalized,
-            TradeObservationScenario::HistoricalRuntimeMismatch,
-            TradeObservationScenario::HistoricalRuntimeVersionMismatch,
-            TradeObservationScenario::ChangedStorage,
-            TradeObservationScenario::ChangedHash,
-            TradeObservationScenario::WrongRuntime,
-            TradeObservationScenario::MalformedStorage,
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let state = TradeObservationRpcState {
-                scenario,
-                metadata: metadata["result"].as_str().unwrap().to_string(),
-                events: events["result"].as_str().unwrap().to_string(),
-                block_extrinsic: format!("0x{}", hex::encode(extrinsic(&[1, 2, 3, 4]))),
-                storage_reads: Arc::new(AtomicUsize::new(0)),
-                hash_reads: Arc::new(AtomicUsize::new(0)),
-            };
-            let storage_reads = Arc::clone(&state.storage_reads);
-            tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    Router::new()
-                        .route("/", post(trade_observation_rpc))
-                        .with_state(state),
-                )
-                .await
-                .unwrap();
-            });
-            let config = DeepXNetworkConfig {
-                base_url_rpc: Some(url.clone()),
-                ..Default::default()
-            };
-            let genesis_hash =
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-            let endpoints = validate_rpc_endpoint_identities(
-                &config,
-                [
-                    DeepXObservedRpcEndpoint::new(
-                        DeepXRpcRole::Submission,
-                        url.clone(),
-                        genesis_hash,
-                    ),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
-                    DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
-                ],
-            )
-            .unwrap();
-            let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-                .await
-                .unwrap();
-            let result = observe_finalized_spot_trades_at(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                BLOCK,
-            )
-            .await;
-            match scenario {
-                TradeObservationScenario::Valid => assert!(result.unwrap().is_empty()),
-                TradeObservationScenario::NotFinalized => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::NotFinalized { .. })
-                )),
-                TradeObservationScenario::HistoricalRuntimeMismatch => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::HistoricalRuntime(
-                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                            method: "state_call(Core_version)",
-                            expected: 369,
-                            received: 371,
-                        }
-                    ))
-                )),
-                TradeObservationScenario::HistoricalRuntimeVersionMismatch => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::HistoricalRuntime(
-                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                            method: "state_getRuntimeVersion",
-                            expected: 369,
-                            received: 371,
-                        }
-                    ))
-                )),
-                TradeObservationScenario::ChangedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::EventStorageChanged)
-                )),
-                TradeObservationScenario::ChangedHash => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::CanonicalHashChanged)
-                )),
-                TradeObservationScenario::WrongRuntime => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::Runtime(_))
-                )),
-                TradeObservationScenario::MalformedStorage => assert!(matches!(
-                    result,
-                    Err(DeepXFinalizedSpotTradeObservationError::Watch(
-                        DeepXTransactionWatchError::InvalidEventStorage(BLOCK)
-                    ))
-                )),
-            }
-            if matches!(
-                scenario,
-                TradeObservationScenario::HistoricalRuntimeMismatch
-                    | TradeObservationScenario::HistoricalRuntimeVersionMismatch
-            ) {
-                assert_eq!(storage_reads.load(Ordering::SeqCst), 0);
-            }
-        }
     }
 
     #[tokio::test]
@@ -10032,7 +8777,7 @@ mod tests {
     #[case(0)]
     #[case(7)]
     fn finalized_spot_match_decodes_approved_event_and_exact_account_trade(#[case] buy_id: u64) {
-        let snapshot = runtime_snapshot_for_spec(371);
+        let snapshot = read_only_runtime_snapshot();
         let pallet = snapshot.metadata().pallet_by_name("SpotMarket").unwrap();
         let event = pallet
             .event_variants()
@@ -10075,7 +8820,14 @@ mod tests {
         }
         Vec::<[u8; 32]>::new().encode_to(&mut record);
         let events = system_events(&[record]);
-        let trades = decode_finalized_spot_trade_events(&snapshot, [3; 32], 42, &events).unwrap();
+        let trades = decode_finalized_spot_trade_events_with_metadata(
+            snapshot.interfaces(),
+            snapshot.metadata(),
+            [3; 32],
+            42,
+            &events,
+        )
+        .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].event_index, 0);
         assert_eq!(
@@ -10170,6 +8922,15 @@ mod tests {
         ));
         let mut truncated = events;
         truncated.pop();
-        assert!(decode_finalized_spot_trade_events(&snapshot, [3; 32], 42, &truncated).is_err());
+        assert!(
+            decode_finalized_spot_trade_events_with_metadata(
+                snapshot.interfaces(),
+                snapshot.metadata(),
+                [3; 32],
+                42,
+                &truncated,
+            )
+            .is_err()
+        );
     }
 }

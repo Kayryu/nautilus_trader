@@ -93,6 +93,11 @@ path = "bin/capture_runtime_fixtures.rs"
 doc = false
 
 [[bin]]
+name = "deepx-capture-finalized-events"
+path = "bin/capture_finalized_events.rs"
+doc = false
+
+[[bin]]
 name = "deepx-verify-rest-instruments"
 path = "bin/verify_rest_instruments.rs"
 doc = false

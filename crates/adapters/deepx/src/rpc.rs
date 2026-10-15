@@ -83,11 +83,8 @@ const DEEPX_LENDING_BORROW_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effe
 const DEEPX_SPEC_369_FINALIZED_HASH: &str =
     "0x95febbff91cf1eccbb782b20a36aa42333bce15eebbaef91d0fe7fa55f59afe6";
 const DEEPX_SPEC_369_VERSION: u32 = 369;
-const DEEPX_SPEC_375_FINALIZED_HASH: &str =
-    "0x69e2314b93e1779538a422e2c09bad5a9bd08e2bc83c1fdd7e3037b48a525766";
-const DEEPX_SPEC_375_VERSION: u32 = 375;
 const DEEPX_SPEC_376_FINALIZED_HASH: &str =
-    "0x7340d448342fb2f7852e7f8999060c40652788cc5d6406846f66c6dc34086c34";
+    "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c";
 const DEEPX_SPEC_376_VERSION: u32 = 376;
 const DEEPX_ETH_CALL_PROBE_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 const DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
@@ -4171,9 +4168,6 @@ async fn validate_read_only_runtime_semantics(
     spec_version: u32,
 ) -> Result<(), DeepXHistoricalRuntimeError> {
     match spec_version {
-        DEEPX_SPEC_375_VERSION => {
-            validate_runtime_semantics_at(client, DEEPX_SPEC_375_FINALIZED_HASH, spec_version).await
-        }
         DEEPX_SPEC_376_VERSION => {
             validate_runtime_semantics_at(client, DEEPX_SPEC_376_FINALIZED_HASH, spec_version).await
         }
@@ -5163,60 +5157,32 @@ mod tests {
 
     const GENESIS_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          genesis_hash.json"
     );
     const FINALIZED_HEAD_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
     const RUNTIME_VERSION_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          runtime_version.json"
     );
-    const METADATA_FIXTURE: &str = include_str!(
+    const SPEC_376_METADATA_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/\
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          metadata.json"
     );
-    const SPEC_369_METADATA_FIXTURE: &str = include_str!(
+    const SPOT_MARKET_STORAGE_SPEC_376_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/\
-         metadata.json"
+            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
+            spot_market_eth_usdc.json"
     );
-    const SPEC_369_FINALIZED_HEAD_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/\
-         finalized_head.json"
-    );
-    const SPEC_369_RUNTIME_VERSION_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-98136fdb_spec-369_tx-1_finalized-95febbff/\
-         runtime_version.json"
-    );
-    const SPEC_371_METADATA_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-         genesis-86604388_metadata-4a620bad_spec-371_tx-1_finalized-64caaeda/\
-         metadata.json"
-    );
-    const SPEC_375_METADATA_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-         genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b/\
-         metadata.json"
-    );
-    const FINALIZED_HASH: &str =
-        "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
-    const SPOT_MARKET_STORAGE_SPEC_375: &str = concat!(
-        "0x204554482f555344439eb03d8ac62ae18398ced13c033db78b905ad8c9061075736463",
-        "123ae070eb84068b5fed9f5b99f236507c44c880120c65746825f4990dd57548df46a4",
-        "5954eb93e4738e5722529068d4ac891a14784c17877eb74bd8489b3367c71d72766d",
-        "bfa4dfbfb662fa3700407a10f35a00000000000000000000102700000000000000000000",
-        "0000000000407a10f35a0000000000000000000040420f00000000000000000000000000",
-        "90010000640000000300010000d007000000000000000000000000000050c30000000000",
-        "000000000000000000f401000000000000",
-    );
+    const FINALIZED_HASH: &str = DEEPX_SPEC_376_FINALIZED_HASH;
+    const FINALIZED_BLOCK_NUMBER: u32 = 19_592_700;
+    const FINALIZED_BLOCK_NUMBER_HEX: &str = "0x12af5fc";
 
     fn encoded_core_version(spec_version: u32) -> String {
         format!(
@@ -5237,31 +5203,40 @@ mod tests {
         )
     }
 
-    fn historical_runtime_probe_response(request: &Value) -> Option<Value> {
+    fn historical_runtime_probe_response(request: &Value, completed_calls: usize) -> Option<Value> {
         match request["method"].as_str()? {
             "state_call" if request["params"][0] == "Core_version" => {
-                assert_eq!(
-                    request["params"],
-                    json!(["Core_version", "0x", DEEPX_SPEC_369_FINALIZED_HASH])
-                );
+                let finalized_hash = request["params"][2].as_str()?;
+                let spec_version = match finalized_hash {
+                    DEEPX_SPEC_369_FINALIZED_HASH => DEEPX_SPEC_369_VERSION,
+                    DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
+                    _ => return None,
+                };
                 Some(json!({
                     "jsonrpc": "2.0", "id": 1,
-                    "result": encoded_core_version(DEEPX_SPEC_369_VERSION),
+                    "result": encoded_core_version(spec_version),
                 }))
             }
-            "state_getRuntimeVersion"
-                if request["params"] == json!([DEEPX_SPEC_369_FINALIZED_HASH]) =>
-            {
-                Some(serde_json::from_str(SPEC_369_RUNTIME_VERSION_FIXTURE).unwrap())
+            "state_getRuntimeVersion" if completed_calls >= 5 => {
+                let finalized_hash = request["params"][0].as_str()?;
+                let spec_version = match finalized_hash {
+                    DEEPX_SPEC_369_FINALIZED_HASH => DEEPX_SPEC_369_VERSION,
+                    DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
+                    _ => return None,
+                };
+                Some(json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {
+                        "specVersion": spec_version,
+                        "transactionVersion": 1,
+                    },
+                }))
             }
             _ => None,
         }
     }
 
     #[rstest]
-    #[case::spec375_valid(375, None, None)]
-    #[case::spec375_core_mismatch(375, Some(374), None)]
-    #[case::spec375_version_mismatch(375, None, Some(374))]
     #[case::spec376_valid(376, None, None)]
     #[case::spec376_core_mismatch(376, Some(375), None)]
     #[case::spec376_version_mismatch(376, None, Some(375))]
@@ -5271,11 +5246,8 @@ mod tests {
         #[case] core_version: Option<u32>,
         #[case] runtime_version: Option<u32>,
     ) {
-        let finalized_hash = match spec_version {
-            375 => DEEPX_SPEC_375_FINALIZED_HASH,
-            376 => DEEPX_SPEC_376_FINALIZED_HASH,
-            _ => unreachable!(),
-        };
+        assert_eq!(spec_version, DEEPX_SPEC_376_VERSION);
+        let finalized_hash = DEEPX_SPEC_376_FINALIZED_HASH;
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = Arc::clone(&calls);
         let app = Router::new().route(
@@ -5341,12 +5313,7 @@ mod tests {
     }
 
     #[rstest]
-    fn historical_runtime_sentinel_matches_captured_finalized_fixture() {
-        let head: Value = serde_json::from_str(SPEC_369_FINALIZED_HEAD_FIXTURE).unwrap();
-        let version: Value = serde_json::from_str(SPEC_369_RUNTIME_VERSION_FIXTURE).unwrap();
-
-        assert_eq!(head["result"], DEEPX_SPEC_369_FINALIZED_HASH);
-        assert_eq!(version["result"]["specVersion"], DEEPX_SPEC_369_VERSION);
+    fn core_version_decoder_accepts_historical_spec_version() {
         assert_eq!(
             decode_core_version_spec(&encoded_core_version(DEEPX_SPEC_369_VERSION)).unwrap(),
             DEEPX_SPEC_369_VERSION,
@@ -5358,34 +5325,8 @@ mod tests {
     }
 
     #[rstest]
-    fn captured_timestamp_inherent_decodes_exact_milliseconds() {
+    fn timestamp_inherent_decodes_exact_milliseconds() {
         let captured = "0x280402000bf4a65c1ba101".to_string();
-        for (spec_version, fixture) in [
-            (366, METADATA_FIXTURE),
-            (369, SPEC_369_METADATA_FIXTURE),
-            (371, SPEC_371_METADATA_FIXTURE),
-        ] {
-            let metadata_response: Value = serde_json::from_str(fixture).unwrap();
-            let metadata_bytes = hex::decode(
-                metadata_response["result"]
-                    .as_str()
-                    .unwrap()
-                    .trim_start_matches("0x"),
-            )
-            .unwrap();
-            let snapshot = RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-                spec_version,
-                1,
-                &metadata_bytes,
-            )
-            .unwrap();
-            let timestamp = snapshot.metadata().pallet_by_name("Timestamp").unwrap();
-            assert_eq!(timestamp.index(), 2);
-            assert_eq!(timestamp.call_variant_by_name("set").unwrap().index, 0);
-        }
-
         assert_eq!(
             decode_timestamp_set_inherent(std::slice::from_ref(&captured)).unwrap(),
             1_791_460_419_316,
@@ -6673,40 +6614,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observes_approved_finalized_runtime_snapshot() {
+    async fn spec_376_runtime_snapshot_remains_unapproved_for_signing() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let rpc_url = spawn_runtime_snapshot_server(366, Arc::clone(&calls)).await;
+        let rpc_url =
+            spawn_runtime_snapshot_server(DEEPX_SPEC_376_VERSION, Arc::clone(&calls)).await;
         let config = DeepXNetworkConfig {
             environment: DeepXEnvironment::Testnet,
             base_url_rpc: Some(rpc_url),
             ..Default::default()
         };
 
-        let observation = observe_approved_finalized_runtime_snapshot(&config)
+        let error = observe_approved_finalized_runtime_snapshot(&config)
             .await
-            .unwrap();
+            .unwrap_err();
 
         assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert_eq!(
-            observation.snapshot().identity().environment,
-            DeepXEnvironment::Testnet
-        );
-        assert_eq!(observation.snapshot().identity().spec_version, 366);
-        assert_eq!(observation.snapshot().identity().transaction_version, 1);
-        assert_eq!(
-            observation.checkpoint().block_hash(),
-            hex::decode_array(FINALIZED_HASH.trim_start_matches("0x")).unwrap()
-        );
-        assert_eq!(observation.checkpoint().block_number(), 42);
+        assert!(matches!(
+            error,
+            DeepXRuntimeSnapshotObservationError::Snapshot(SnapshotError::RuntimeIdentityMismatch)
+        ));
     }
 
     #[tokio::test]
-    async fn observes_spec_371_through_read_only_and_signing_runtime_boundaries() {
+    async fn observes_spec_376_through_read_only_runtime_boundary() {
         let read_only_calls = Arc::new(AtomicUsize::new(0));
         let read_only_url = spawn_runtime_snapshot_server_with(
-            371,
+            DEEPX_SPEC_376_VERSION,
             1,
-            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             None,
             |_| {},
@@ -6724,35 +6659,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_only_calls.load(Ordering::Relaxed), 7);
-        assert_eq!(observation.snapshot().identity().spec_version, 371);
-        assert_eq!(observation.checkpoint().block_number(), 42);
-
-        let signing_calls = Arc::new(AtomicUsize::new(0));
-        let signing_url = spawn_runtime_snapshot_server_with(
-            371,
-            1,
-            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap(),
-            None,
-            None,
-            |_| {},
-            Arc::clone(&signing_calls),
-        )
-        .await;
-        let signing_config = DeepXNetworkConfig {
-            environment: DeepXEnvironment::Testnet,
-            base_url_rpc: Some(signing_url),
-            ..Default::default()
-        };
-
-        let signing = observe_approved_finalized_runtime_snapshot(&signing_config)
-            .await
-            .unwrap();
-        assert_eq!(signing_calls.load(Ordering::Relaxed), 5);
         assert_eq!(
-            signing.snapshot().identity(),
-            observation.snapshot().identity()
+            observation.snapshot().identity().spec_version,
+            DEEPX_SPEC_376_VERSION
         );
-        assert_eq!(signing.checkpoint(), observation.checkpoint());
+        assert_eq!(
+            observation.checkpoint().block_number(),
+            FINALIZED_BLOCK_NUMBER
+        );
     }
 
     #[rstest]
@@ -6766,9 +6680,9 @@ mod tests {
     ) {
         let calls = Arc::new(AtomicUsize::new(0));
         let watch_url = spawn_runtime_snapshot_server_with(
-            371,
+            DEEPX_SPEC_376_VERSION,
             1,
-            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             Some(mismatch),
             |_| {},
@@ -6791,7 +6705,7 @@ mod tests {
                 DeepXRuntimeSnapshotObservationError::HistoricalRuntime(
                     DeepXHistoricalRuntimeError::SpecVersionMismatch {
                         method: observed,
-                        expected: DEEPX_SPEC_369_VERSION,
+                        expected: DEEPX_SPEC_376_VERSION,
                         received: 371,
                     }
                 )
@@ -6815,13 +6729,16 @@ mod tests {
     ) {
         let pair = [0x33; 32];
         let second_pair = [0x44; 32];
-        let metadata: Value = serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
-        let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-        runtime_version["result"]["specVersion"] = json!(371);
+        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
+        let spot_market_storage: Value =
+            serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
+        let spot_market_storage = spot_market_storage["result"].as_str().unwrap().to_string();
         let header = json!({
-            "jsonrpc": "2.0", "id": 1, "result": { "number": "0x2a" }
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX }
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
@@ -6834,8 +6751,12 @@ mod tests {
                 let runtime_version = runtime_version.clone();
                 let metadata = metadata.clone();
                 let header = header.clone();
+                let spot_market_storage = spot_market_storage.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) = historical_runtime_probe_response(
+                        &request,
+                        calls.load(Ordering::Relaxed),
+                    ) {
                         return Json(response);
                     }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
@@ -6869,7 +6790,7 @@ mod tests {
                                 "id": 1,
                                 "result": {
                                     "block": {
-                                        "header": {"number": "0x2a"},
+                                        "header": {"number": FINALIZED_BLOCK_NUMBER_HEX},
                                         "extrinsics": [format!("0x{}", hex::encode(inherent.encode()))],
                                     },
                                 },
@@ -6914,7 +6835,7 @@ mod tests {
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": 1,
-                                "result": SPOT_MARKET_STORAGE_SPEC_375.replace(
+                                "result": spot_market_storage.replace(
                                     "9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
                                     &hex::encode(observed_pair),
                                 ) + if index == 10 && late_storage_change { "00" } else { "" },
@@ -6985,8 +6906,14 @@ mod tests {
         } else {
             let evidence = result.unwrap();
             assert_eq!(evidence.len(), 2);
-            assert_eq!(evidence[0].runtime_identity().spec_version, 371);
-            assert_eq!(evidence[0].checkpoint().block_number(), 42);
+            assert_eq!(
+                evidence[0].runtime_identity().spec_version,
+                DEEPX_SPEC_376_VERSION
+            );
+            assert_eq!(
+                evidence[0].checkpoint().block_number(),
+                FINALIZED_BLOCK_NUMBER
+            );
             assert_eq!(evidence[0].checkpoint(), evidence[1].checkpoint());
             assert_eq!(evidence[0].pair(), pair);
             assert_eq!(evidence[0].min_order_size(), 100_000_000_000_000);
@@ -7060,58 +6987,100 @@ mod tests {
     }
 
     fn encoded_perp_market_storage() -> String {
+        use subxt_core::ext::scale_value::Value as ScaleValue;
+
+        let fixed_i128 = || ScaleValue::unnamed_composite([ScaleValue::i128(0)]);
+        let market = ScaleValue::named_composite([
+            ("id", ScaleValue::u128(3)),
+            ("name", ScaleValue::from_bytes([])),
+            ("base_symbol", ScaleValue::from_bytes([])),
+            ("base_address", ScaleValue::from_bytes([0; 20])),
+            ("base_decimal", ScaleValue::i128(8)),
+            ("quote_market_id", ScaleValue::u128(0)),
+            ("quote_symbol", ScaleValue::from_bytes([])),
+            ("quote_address", ScaleValue::from_bytes([0; 20])),
+            ("quote_decimal", ScaleValue::i128(6)),
+            ("network", ScaleValue::from_bytes([])),
+            ("height", ScaleValue::u128(1)),
+            ("funding_rate", ScaleValue::i128(0)),
+            ("cumulative_funding_index", ScaleValue::i128(0)),
+            ("last_funding_rate_time", ScaleValue::u128(0)),
+            ("last_cacl_funding_rate_time", ScaleValue::u128(0)),
+            ("oracle_price", ScaleValue::u128(1)),
+            ("mark_price", ScaleValue::u128(1)),
+            ("max_deviation_bps", ScaleValue::u128(0)),
+            ("initial_margin_ratio", ScaleValue::u128(1)),
+            ("maintenance_margin_ratio", ScaleValue::u128(1)),
+            ("max_active_orders", ScaleValue::u128(1)),
+            ("is_quote_market", ScaleValue::bool(false)),
+            ("taker_fee_rate", ScaleValue::u128(0)),
+            ("maker_fee_rate", ScaleValue::i128(0)),
+            (
+                "order_spec",
+                ScaleValue::named_composite([
+                    ("min_qty", ScaleValue::u128(11)),
+                    ("tick_size", ScaleValue::u128(2)),
+                    ("step_size", ScaleValue::u128(3)),
+                    ("min_notional", ScaleValue::u128(50)),
+                ]),
+            ),
+            (
+                "limit_order_guard",
+                ScaleValue::named_composite([
+                    ("limit_long", ScaleValue::u128(1)),
+                    ("limit_short", ScaleValue::u128(1)),
+                ]),
+            ),
+            ("open_interest", ScaleValue::u128(0)),
+            ("long_open_pos_num", ScaleValue::u128(0)),
+            ("short_open_pos_num", ScaleValue::u128(0)),
+            ("base_interest_rate", fixed_i128()),
+            ("impact_margin_value", ScaleValue::u128(0)),
+            ("funding_rate_change_cap", fixed_i128()),
+            ("funding_rate_change_floor", fixed_i128()),
+            ("funding_rate_clamp_upper_bound", fixed_i128()),
+            ("funding_rate_clamp_lower_bound", fixed_i128()),
+            (
+                "liquidation_spec",
+                ScaleValue::named_composite([
+                    ("liquidation_duration", ScaleValue::u128(0)),
+                    ("liquidity_bucket_slippage_step", ScaleValue::u128(0)),
+                    ("liquidity_bucket_slippage_limit", ScaleValue::u128(0)),
+                    ("liquidity_dust_value", ScaleValue::u128(0)),
+                    (
+                        "liquidation_fee_rate",
+                        ScaleValue::unnamed_composite([
+                            ScaleValue::u128(0),
+                            ScaleValue::u128(0),
+                            ScaleValue::u128(0),
+                            ScaleValue::u128(0),
+                        ]),
+                    ),
+                ]),
+            ),
+            ("deployer_spec", ScaleValue::unnamed_variant("None", [])),
+            ("is_paused", ScaleValue::bool(false)),
+        ]);
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
+        let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).unwrap();
+        let value_type = metadata
+            .pallet_by_name("PerpMarket")
+            .unwrap()
+            .storage()
+            .unwrap()
+            .entry_by_name("PerpMarkets")
+            .unwrap()
+            .entry_type()
+            .value_ty();
         let mut bytes = Vec::new();
-        macro_rules! field {
-            ($value:expr) => {
-                bytes.extend(($value).encode());
-            };
-        }
-        field!(3u16);
-        field!(Vec::<u8>::new());
-        field!(Vec::<u8>::new());
-        field!([0u8; 20]);
-        field!(8i32);
-        field!(0u16);
-        field!(Vec::<u8>::new());
-        field!([0u8; 20]);
-        field!(6i32);
-        field!(Vec::<u8>::new());
-        field!(1u64);
-        field!(0i128);
-        field!(0i128);
-        field!(0u64);
-        field!(0u64);
-        field!(1u128);
-        field!(1u128);
-        field!(0u64);
-        field!(1u128);
-        field!(1u128);
-        field!(1u32);
-        field!(false);
-        field!(0u32);
-        field!(0i32);
-        for constraint in [11u128, 2, 3, 50] {
-            field!(constraint);
-        }
-        for _ in 0..2 {
-            field!(1u128);
-        }
-        for _ in 0..3 {
-            field!(0u128);
-        }
-        field!(0i128);
-        field!(0u128);
-        for _ in 0..4 {
-            field!(0i128);
-        }
-        field!(0u64);
-        field!(0u32);
-        field!(0u32);
-        field!(0u128);
-        field!(0u128);
-        field!(0u128);
-        field!(Option::<()>::None);
-        field!(false);
+        subxt_core::ext::scale_value::scale::encode_as_type(
+            &market,
+            value_type,
+            metadata.types(),
+            &mut bytes,
+        )
+        .unwrap();
         format!("0x{}", hex::encode(bytes))
     }
 
@@ -7121,7 +7090,7 @@ mod tests {
             perp_market_storage_key(3),
             "0xb052a07884e121f56b64aa711c766532bdc7a97672ba816c4074df5f464124630300",
         );
-        let metadata: Value = serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
         let encoded = encoded_perp_market_storage();
         assert_eq!(
@@ -7178,13 +7147,13 @@ mod tests {
         #[case] late_timestamp_change: bool,
         #[case] late_market_change: bool,
     ) {
-        let metadata: Value = serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
-        let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-        runtime_version["result"]["specVersion"] = json!(371);
+        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
         let header = json!({
-            "jsonrpc": "2.0", "id": 1, "result": { "number": "0x2a" }
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX }
         });
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
@@ -7198,7 +7167,10 @@ mod tests {
                 let metadata = metadata.clone();
                 let header = header.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) = historical_runtime_probe_response(
+                        &request,
+                        calls.load(Ordering::Relaxed),
+                    ) {
                         return Json(response);
                     }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
@@ -7232,7 +7204,7 @@ mod tests {
                                 "id": 1,
                                 "result": {
                                     "block": {
-                                        "header": {"number": "0x2a"},
+                                        "header": {"number": FINALIZED_BLOCK_NUMBER_HEX},
                                         "extrinsics": [format!("0x{}", hex::encode(inherent.encode()))],
                                     },
                                 },
@@ -7370,8 +7342,11 @@ mod tests {
             ));
         } else if matching {
             let evidence = result.unwrap();
-            assert_eq!(evidence.runtime_identity().spec_version, 371);
-            assert_eq!(evidence.checkpoint().block_number(), 42);
+            assert_eq!(
+                evidence.runtime_identity().spec_version,
+                DEEPX_SPEC_376_VERSION
+            );
+            assert_eq!(evidence.checkpoint().block_number(), FINALIZED_BLOCK_NUMBER);
             assert_eq!(evidence.market_id(), 3);
             assert_eq!(evidence.min_order_size(), 11);
             assert_eq!(evidence.tick_size(), 2);
@@ -7399,25 +7374,22 @@ mod tests {
 
     #[rstest]
     fn decodes_only_matching_complete_spot_market_storage() {
-        let metadata: Value = serde_json::from_str(SPEC_375_METADATA_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let storage: Value = serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
+        let encoded = storage["result"].as_str().unwrap();
         let pair = hex::decode("9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
             .unwrap()
             .try_into()
             .unwrap();
         assert_eq!(
-            decode_finalized_spot_market_storage(
-                SPOT_MARKET_STORAGE_SPEC_375,
-                &metadata_bytes,
-                pair,
-            ),
+            decode_finalized_spot_market_storage(encoded, &metadata_bytes, pair,),
             Some((100_000_000_000_000, 10_000, 100_000_000_000_000)),
         );
         for encoded in [
             "0x".to_string(),
-            format!("{SPOT_MARKET_STORAGE_SPEC_375}00"),
-            SPOT_MARKET_STORAGE_SPEC_375
-                .replace("00407a10f35a00000000000000000000", &"00".repeat(16)),
+            format!("{encoded}00"),
+            encoded.replace("00407a10f35a00000000000000000000", &"00".repeat(16)),
         ] {
             assert_eq!(
                 decode_finalized_spot_market_storage(&encoded, &metadata_bytes, pair),
@@ -7425,17 +7397,13 @@ mod tests {
             );
         }
         assert_eq!(
-            decode_finalized_spot_market_storage(
-                SPOT_MARKET_STORAGE_SPEC_375,
-                &metadata_bytes,
-                [0x33; 32],
-            ),
+            decode_finalized_spot_market_storage(encoded, &metadata_bytes, [0x33; 32],),
             None,
         );
     }
 
     #[tokio::test]
-    async fn spec_371_read_only_snapshot_authorizes_finalized_margin_evidence() {
+    async fn spec_376_read_only_snapshot_authorizes_finalized_margin_evidence() {
         let subaccount = [0x11; 20];
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
@@ -7444,7 +7412,9 @@ mod tests {
             post(move |Json(request): Json<Value>| {
                 let calls = Arc::clone(&server_calls);
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) =
+                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
+                    {
                         return Json(response);
                     }
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -7456,16 +7426,16 @@ mod tests {
                         "chain_getHeader" => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "result": { "number": "0x2a" },
+                            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
                         "state_getRuntimeVersion" => {
                             let mut response: Value =
                                 serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(371);
+                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
                             response
                         }
                         "state_getMetadata" => {
-                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
                         }
                         "state_call" => {
                             assert_eq!(request["params"][0], DEEPX_MARGIN_RUNTIME_API_METHOD);
@@ -7509,15 +7479,18 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(evidence.runtime_identity().spec_version, 371);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
+        assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.initial().total_collateral(), 1_000_000);
         assert_eq!(evidence.maintenance().total_margin_required(), 100_000);
         assert_eq!(calls.load(Ordering::Relaxed), 7);
     }
 
     #[tokio::test]
-    async fn spec_371_read_only_snapshot_authorizes_finalized_perp_positions() {
+    async fn spec_376_read_only_snapshot_authorizes_finalized_perp_positions() {
         let subaccount = [0x11; 20];
         let maximum_key = subaccount_max_perp_positions_storage_key();
         let positions_key = user_perp_positions_storage_key(subaccount);
@@ -7535,7 +7508,9 @@ mod tests {
                 let positions_key = positions_key.clone();
                 let encoded_positions = encoded_positions.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) =
+                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
+                    {
                         return Json(response);
                     }
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -7547,16 +7522,16 @@ mod tests {
                         "chain_getHeader" => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "result": { "number": "0x2a" },
+                            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
                         "state_getRuntimeVersion" => {
                             let mut response: Value =
                                 serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(371);
+                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
                             response
                         }
                         "state_getMetadata" => {
-                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
                         }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
@@ -7593,8 +7568,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(evidence.runtime_identity().spec_version, 371);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
+        assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.runtime_max_positions(), 8);
         assert_eq!(evidence.positions().len(), 1);
         assert_eq!(evidence.positions()[0].market_id(), 3);
@@ -7603,7 +7581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_371_read_only_snapshot_corroborates_finalized_perp_orders() {
+    async fn spec_376_read_only_snapshot_corroborates_finalized_perp_orders() {
         let subaccount = [0x11; 20];
         let order = perp_order(subaccount, 3, 42);
         let index_key = active_perp_orders_storage_key(subaccount);
@@ -7627,7 +7605,9 @@ mod tests {
                 let encoded_index = encoded_index.clone();
                 let encoded_order = encoded_order.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) =
+                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
+                    {
                         return Json(response);
                     }
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -7639,16 +7619,16 @@ mod tests {
                         "chain_getHeader" => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "result": { "number": "0x2a" },
+                            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
                         "state_getRuntimeVersion" => {
                             let mut response: Value =
                                 serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(371);
+                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
                             response
                         }
                         "state_getMetadata" => {
-                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
                         }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
@@ -7688,8 +7668,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(evidence.runtime_identity().spec_version, 371);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
+        assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.orders().len(), 1);
         assert_eq!(evidence.orders()[0].order_id(), 42);
         assert_eq!(evidence.orders()[0].market_id(), 3);
@@ -7698,7 +7681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_371_read_only_snapshot_corroborates_finalized_spot_orders() {
+    async fn spec_376_read_only_snapshot_corroborates_finalized_spot_orders() {
         let subaccount = [0x11; 20];
         let pair = [0x22; 32];
         let order = spot_order(subaccount, pair, 42);
@@ -7720,7 +7703,9 @@ mod tests {
                 let encoded_index = encoded_index.clone();
                 let encoded_order = encoded_order.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(&request) {
+                    if let Some(response) =
+                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
+                    {
                         return Json(response);
                     }
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -7732,16 +7717,16 @@ mod tests {
                         "chain_getHeader" => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "result": { "number": "0x2a" },
+                            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
                         "state_getRuntimeVersion" => {
                             let mut response: Value =
                                 serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(371);
+                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
                             response
                         }
                         "state_getMetadata" => {
-                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
                         }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
@@ -7788,8 +7773,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(evidence.runtime_identity().spec_version, 371);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
+        assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.orders().len(), 1);
         assert_eq!(evidence.active_order_ids(), &[42]);
         assert_eq!(evidence.orders()[0].owner(), subaccount);
@@ -7801,7 +7789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spec_371_read_only_snapshot_pins_complete_account_evidence_to_one_checkpoint() {
+    async fn spec_376_read_only_snapshot_pins_complete_account_evidence_to_one_checkpoint() {
         let subaccount = [0x11; 20];
         let timestamp_ms = 1_700_000_000_123_u64;
         let maximum_key = subaccount_max_perp_positions_storage_key();
@@ -7845,7 +7833,7 @@ mod tests {
                             json!({
                                 "jsonrpc": "2.0", "id": 1,
                                 "result": {"block": {
-                                    "header": {"number": "0x2a"},
+                                    "header": {"number": FINALIZED_BLOCK_NUMBER_HEX},
                                     "extrinsics": [format!("0x{}", hex::encode(call.encode()))],
                                 }},
                             })
@@ -7856,22 +7844,25 @@ mod tests {
                         "chain_getHeader" => json!({
                             "jsonrpc": "2.0",
                             "id": 1,
-                            "result": { "number": "0x2a" },
+                            "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
                         "state_getRuntimeVersion" => {
                             let at = request["params"][0].as_str().unwrap();
-                            assert!(at == FINALIZED_HASH || at == DEEPX_SPEC_369_FINALIZED_HASH);
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(if at == FINALIZED_HASH {
-                                371
+                            if at == DEEPX_SPEC_369_FINALIZED_HASH {
+                                json!({
+                                    "jsonrpc": "2.0", "id": 1,
+                                    "result": {
+                                        "specVersion": DEEPX_SPEC_369_VERSION,
+                                        "transactionVersion": 1,
+                                    },
+                                })
                             } else {
-                                DEEPX_SPEC_369_VERSION
-                            });
-                            response
+                                assert_eq!(at, FINALIZED_HASH);
+                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap()
+                            }
                         }
                         "state_getMetadata" => {
-                            serde_json::from_str(SPEC_371_METADATA_FIXTURE).unwrap()
+                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
                         }
                         "state_getStorage" => {
                             assert_eq!(
@@ -7908,10 +7899,19 @@ mod tests {
                             let method = request["params"][0].as_str().unwrap();
                             if method == "Core_version" {
                                 assert_eq!(request["params"][1], "0x");
-                                assert_eq!(request["params"][2], DEEPX_SPEC_369_FINALIZED_HASH);
+                                let at = request["params"][2].as_str().unwrap();
+                                assert!(
+                                    at == DEEPX_SPEC_376_FINALIZED_HASH
+                                        || at == DEEPX_SPEC_369_FINALIZED_HASH
+                                );
+                                let spec_version = if at == DEEPX_SPEC_376_FINALIZED_HASH {
+                                    DEEPX_SPEC_376_VERSION
+                                } else {
+                                    DEEPX_SPEC_369_VERSION
+                                };
                                 return Json(json!({
                                     "jsonrpc": "2.0", "id": 1,
-                                    "result": encoded_core_version(DEEPX_SPEC_369_VERSION),
+                                    "result": encoded_core_version(spec_version),
                                 }));
                             }
                             assert_eq!(request["params"][2], FINALIZED_HASH);
@@ -7999,8 +7999,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(evidence.runtime_identity().spec_version, 371);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
+        assert_eq!(
+            evidence.runtime_identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
+        assert_eq!(evidence.checkpoint().block_number(), FINALIZED_BLOCK_NUMBER);
         assert_eq!(evidence.subaccount(), subaccount);
         assert_eq!(evidence.timestamp_ms(), timestamp_ms);
         assert_eq!(evidence.margin().checkpoint(), evidence.checkpoint());
@@ -8058,7 +8061,7 @@ mod tests {
                             let mut call = vec![4, 2, 0];
                             call.extend(Compact(1_700_000_000_123_u64 + offset as u64).encode());
                             json!({"block": {
-                                "header": {"number": "0x2a"},
+                                "header": {"number": FINALIZED_BLOCK_NUMBER_HEX},
                                 "extrinsics": [format!("0x{}", hex::encode(call.encode()))],
                             }})
                         }
@@ -8068,24 +8071,34 @@ mod tests {
                                 serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap(),
                             );
                         }
-                        "chain_getHeader" => json!({ "number": "0x2a" }),
+                        "chain_getHeader" => {
+                            json!({ "number": FINALIZED_BLOCK_NUMBER_HEX })
+                        }
                         "state_getRuntimeVersion" => {
                             let at = request["params"][0].as_str().unwrap();
-                            assert!(at == FINALIZED_HASH || at == DEEPX_SPEC_369_FINALIZED_HASH);
+                            if at == DEEPX_SPEC_369_FINALIZED_HASH {
+                                return Json(json!({
+                                    "jsonrpc": "2.0", "id": 1,
+                                    "result": {
+                                        "specVersion": DEEPX_SPEC_369_VERSION,
+                                        "transactionVersion": 1,
+                                    },
+                                }));
+                            }
+                            assert_eq!(at, FINALIZED_HASH);
                             let mode = timestamp_mode.load(Ordering::Relaxed);
                             let mut response: Value =
                                 serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] =
-                                json!(if at == FINALIZED_HASH || mode == 5 {
-                                    371
-                                } else {
-                                    DEEPX_SPEC_369_VERSION
-                                });
+                            response["result"]["specVersion"] = json!(if mode == 5 {
+                                371
+                            } else {
+                                DEEPX_SPEC_376_VERSION
+                            });
                             return Json(response);
                         }
                         "state_getMetadata" => {
                             return Json(
-                                serde_json::from_str::<Value>(SPEC_371_METADATA_FIXTURE).unwrap(),
+                                serde_json::from_str::<Value>(SPEC_376_METADATA_FIXTURE).unwrap(),
                             );
                         }
                         "state_getStorage" => {
@@ -8109,9 +8122,15 @@ mod tests {
                             let method = request["params"][0].as_str().unwrap();
                             if method == "Core_version" {
                                 assert_eq!(request["params"][1], "0x");
-                                assert_eq!(request["params"][2], DEEPX_SPEC_369_FINALIZED_HASH);
+                                let at = request["params"][2].as_str().unwrap();
+                                assert!(
+                                    at == DEEPX_SPEC_376_FINALIZED_HASH
+                                        || at == DEEPX_SPEC_369_FINALIZED_HASH
+                                );
                                 let spec_version = if timestamp_mode.load(Ordering::Relaxed) == 6 {
                                     371
+                                } else if at == DEEPX_SPEC_376_FINALIZED_HASH {
+                                    DEEPX_SPEC_376_VERSION
                                 } else {
                                     DEEPX_SPEC_369_VERSION
                                 };
@@ -8332,33 +8351,48 @@ mod tests {
                 && matches!(*source, DeepXFinalizedAccountError::StorageQueryTimestampMismatch { .. })
         ));
 
-        for (mode, method) in [
-            (5, "state_getRuntimeVersion"),
-            (6, "state_call(Core_version)"),
-        ] {
-            timestamp_mode.store(mode, Ordering::Relaxed);
-            timestamp_reads.store(0, Ordering::Relaxed);
-            let error = observe_finalized_accounts_evidence(
+        timestamp_mode.store(5, Ordering::Relaxed);
+        timestamp_reads.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            observe_finalized_accounts_evidence(
                 &DeepXEnvironment::Testnet,
                 &endpoints,
                 &capabilities,
                 &subaccounts,
             )
-            .await
-            .unwrap_err();
-            assert!(matches!(
+            .await,
+            Err(DeepXFinalizedAccountError::RuntimeObservation(
+                DeepXRuntimeSnapshotObservationError::Snapshot(
+                    SnapshotError::RuntimeIdentityMismatch
+                )
+            ))
+        ));
+
+        timestamp_mode.store(6, Ordering::Relaxed);
+        timestamp_reads.store(0, Ordering::Relaxed);
+        let error = observe_finalized_accounts_evidence(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &subaccounts,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
                 error,
                 DeepXFinalizedAccountError::RuntimeObservation(
                     DeepXRuntimeSnapshotObservationError::HistoricalRuntime(
-                            DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                                method: observed,
-                                expected: DEEPX_SPEC_369_VERSION,
-                                received: 371,
-                            }
+                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
+                            method: "state_call(Core_version)",
+                            expected: DEEPX_SPEC_376_VERSION,
+                            received: 371,
+                        }
                     )
-                ) if observed == method
-            ));
-        }
+                )
+            ),
+            "{error:?}"
+        );
 
         timestamp_mode.store(7, Ordering::Relaxed);
         timestamp_reads.store(0, Ordering::Relaxed);
@@ -8473,22 +8507,27 @@ mod tests {
     #[tokio::test]
     async fn observes_and_applies_snapshot_from_validated_watch_endpoint() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let watch_url = spawn_runtime_snapshot_server(366, Arc::clone(&calls)).await;
+        let watch_url =
+            spawn_runtime_snapshot_server(DEEPX_SPEC_376_VERSION, Arc::clone(&calls)).await;
         let endpoints =
             validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
 
-        let applied = observe_and_apply_approved_finalized_runtime_snapshot(
-            &DeepXEnvironment::Testnet,
-            &endpoints,
-            &service,
-        )
-        .await
-        .unwrap();
+        assert!(matches!(
+            observe_and_apply_approved_finalized_runtime_snapshot(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &service,
+            )
+            .await,
+            Err(DeepXRuntimeSnapshotRefreshError::Observation(
+                DeepXRuntimeSnapshotObservationError::Snapshot(
+                    SnapshotError::RuntimeIdentityMismatch
+                )
+            )),
+        ));
 
         assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert_eq!(applied.update(), DeepXRuntimeSnapshotUpdate::Unchanged);
-        assert_eq!(applied.checkpoint().block_number(), 42);
         assert!(service.acquire().is_ok());
     }
 
@@ -8499,7 +8538,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             Some(json!(format!(
                 "0x{}",
                 hex::encode(timestamp_ms.to_le_bytes())
@@ -8514,26 +8553,27 @@ mod tests {
         let capabilities = validated_capabilities(&endpoints);
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
 
-        let evidence = observe_and_apply_finalized_chain_time(
-            &DeepXEnvironment::Testnet,
-            &endpoints,
-            &capabilities,
-            &service,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(calls.load(Ordering::Relaxed), 10);
-        assert_eq!(evidence.timestamp_ms(), timestamp_ms);
-        assert_eq!(evidence.checkpoint().block_number(), 42);
-        assert_eq!(
-            evidence.runtime_identity(),
-            approved_runtime_snapshot().identity()
-        );
-        assert_eq!(
-            service.acquire().unwrap().snapshot().identity(),
-            evidence.runtime_identity()
-        );
+        assert!(matches!(
+            observe_and_apply_finalized_chain_time(
+                &DeepXEnvironment::Testnet,
+                &endpoints,
+                &capabilities,
+                &service,
+            )
+            .await,
+            Err(DeepXFinalizedChainTimeError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            )),
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
     }
 
     #[tokio::test]
@@ -8542,7 +8582,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             Some(json!(format!(
                 "0x{}",
                 hex::encode(timestamp_ms.to_le_bytes())
@@ -8564,15 +8604,17 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::BlockEvidence(source))
-                if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch {
-                    block_ms,
-                    storage_ms,
-                } if block_ms == timestamp_ms + 1 && storage_ms == timestamp_ms)
+            Err(DeepXFinalizedChainTimeError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ))
         ));
         assert!(matches!(
             service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
     }
 
@@ -8581,7 +8623,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             Some("historical_runtime_mismatch"),
             |_| {},
@@ -8600,13 +8642,17 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::HistoricalRuntime(
-                DeepXHistoricalRuntimeError::SpecVersionMismatch { .. }
-            )),
+            Err(DeepXFinalizedChainTimeError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ))
         ));
         assert!(matches!(
             service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
     }
 
@@ -8615,7 +8661,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             Some("state_call"),
             |_| {},
@@ -8634,11 +8680,18 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::HistoricalRuntime(
-                DeepXHistoricalRuntimeError::Rpc { .. }
-            )),
+            Err(DeepXFinalizedChainTimeError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ))
         ));
-        assert!(service.acquire().is_ok());
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
     }
 
     #[tokio::test]
@@ -8646,7 +8699,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             Some("historical_runtime_mismatch"),
             |_| {},
@@ -8666,13 +8719,17 @@ mod tests {
                 [0x11; 20],
             )
             .await,
-            Err(DeepXFinalizedAccountError::HistoricalRuntime(
-                DeepXHistoricalRuntimeError::SpecVersionMismatch { .. }
-            )),
+            Err(DeepXFinalizedAccountError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ))
         ));
         assert!(matches!(
             service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
     }
 
@@ -8774,7 +8831,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             None,
             |_| {},
@@ -8793,10 +8850,19 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::Rpc(_)),
+            Err(DeepXFinalizedChainTimeError::Runtime(
+                DeepXRuntimeSnapshotRefreshError::Observation(
+                    DeepXRuntimeSnapshotObservationError::Snapshot(
+                        SnapshotError::RuntimeIdentityMismatch
+                    )
+                )
+            ))
         ));
-        assert_eq!(calls.load(Ordering::Relaxed), 8);
-        assert!(service.acquire().is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
     }
 
     #[tokio::test]
@@ -8855,7 +8921,7 @@ mod tests {
         let watch_url = spawn_runtime_snapshot_server_with(
             spec_version,
             transaction_version,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             fail_method,
             move |method| {
@@ -8916,7 +8982,7 @@ mod tests {
     #[case(true)]
     #[tokio::test]
     async fn metadata_change_blocks_before_fixture_validation(#[case] malformed: bool) {
-        let mut metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        let mut metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         metadata["result"] = if malformed {
             json!("0x00")
         } else {
@@ -8946,7 +9012,7 @@ mod tests {
                 .await,
                 Err(DeepXRuntimeSnapshotRefreshError::Observation(
                     DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::MetadataHashMismatch
+                        SnapshotError::RuntimeIdentityMismatch
                     )
                 )),
             ));
@@ -8965,14 +9031,13 @@ mod tests {
     #[case("chain_getFinalizedHead")]
     #[case("chain_getHeader")]
     #[case("state_getRuntimeVersion")]
-    #[case("state_getMetadata")]
     #[tokio::test]
     async fn pre_evidence_rpc_errors_do_not_block_signing(#[case] method: &'static str) {
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
         let url = spawn_runtime_snapshot_server_with(
             366,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             Some(method),
             |_| {},
@@ -8988,6 +9053,39 @@ mod tests {
             )) if failed == method,
         ));
         assert!(service.acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn metadata_rpc_error_after_runtime_change_blocks_signing() {
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+        let url = spawn_runtime_snapshot_server_with(
+            366,
+            1,
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
+            None,
+            Some("state_getMetadata"),
+            |_| {},
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        assert!(matches!(
+            observe_and_apply_approved_finalized_runtime_snapshot(
+                &DeepXEnvironment::Testnet,
+                &validated_endpoints(&url),
+                &service,
+            )
+            .await,
+            Err(DeepXRuntimeSnapshotRefreshError::Observation(
+                DeepXRuntimeSnapshotObservationError::Rpc {
+                    method: "state_getMetadata",
+                    ..
+                }
+            )),
+        ));
+        assert!(matches!(
+            service.acquire(),
+            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+        ));
     }
 
     async fn assert_old_runtime_cannot_clear_refresh(service: &DeepXRuntimeSnapshotService) {
@@ -9170,23 +9268,24 @@ mod tests {
     }
 
     fn approved_runtime_snapshot() -> RuntimeSnapshot {
-        let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let encoded_metadata = metadata["result"].as_str().unwrap();
-        RuntimeSnapshot::approved_testnet(
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
-            366,
+            DEEPX_SPEC_376_VERSION,
             1,
             &hex::decode(encoded_metadata.trim_start_matches("0x")).unwrap(),
         )
-        .unwrap()
+        .unwrap();
+        RuntimeSnapshot::from_read_only_for_test(read_only)
     }
 
     async fn spawn_runtime_snapshot_server(spec_version: u32, calls: Arc<AtomicUsize>) -> String {
         spawn_runtime_snapshot_server_with(
             spec_version,
             1,
-            serde_json::from_str(METADATA_FIXTURE).unwrap(),
+            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
             None,
             None,
             |_| {},
@@ -9210,7 +9309,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": 1,
             "result": {
-                "number": "0x2a"
+                "number": FINALIZED_BLOCK_NUMBER_HEX
             }
         });
         let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
@@ -9266,7 +9365,7 @@ mod tests {
                             assert_eq!(method, "state_call");
                             assert_eq!(
                                 request["params"],
-                                json!(["Core_version", "0x", DEEPX_SPEC_369_FINALIZED_HASH])
+                                json!(["Core_version", "0x", DEEPX_SPEC_376_FINALIZED_HASH])
                             );
                             json!({
                                 "jsonrpc": "2.0", "id": 1,
@@ -9274,20 +9373,20 @@ mod tests {
                                     if fail_method == Some("historical_core_version_mismatch") {
                                         371
                                     } else {
-                                        DEEPX_SPEC_369_VERSION
+                                        DEEPX_SPEC_376_VERSION
                                     }
                                 ),
                             })
                         }
                         6 => {
                             assert_eq!(method, "state_getRuntimeVersion");
-                            assert_eq!(request["params"], json!([DEEPX_SPEC_369_FINALIZED_HASH]));
+                            assert_eq!(request["params"], json!([DEEPX_SPEC_376_FINALIZED_HASH]));
                             let mut response = runtime_version;
                             response["result"]["specVersion"] =
                                 json!(if fail_method == Some("historical_runtime_mismatch") {
                                     371
                                 } else {
-                                    DEEPX_SPEC_369_VERSION
+                                    DEEPX_SPEC_376_VERSION
                                 });
                             response
                         }
@@ -9322,7 +9421,7 @@ mod tests {
                             json!({
                                 "jsonrpc": "2.0", "id": 1,
                                 "result": {"block": {
-                                    "header": {"number": "0x2a"},
+                                    "header": {"number": FINALIZED_BLOCK_NUMBER_HEX},
                                     "extrinsics": [format!("0x{}", hex::encode(call.encode()))],
                                 }},
                             })

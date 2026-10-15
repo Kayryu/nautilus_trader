@@ -555,7 +555,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::signing::{DeepXRuntimeSnapshotService, SigningError, sign_dynamic_pallet_call};
+    use crate::signing::{
+        DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService, RuntimeSnapshot, SigningError,
+        sign_dynamic_pallet_call,
+    };
 
     #[rstest]
     #[case(None)]
@@ -663,7 +666,7 @@ mod tests {
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
         let bytes = hex::decode(
@@ -673,16 +676,16 @@ mod tests {
                 .trim_start_matches("0x"),
         )
         .unwrap();
-        let snapshot = crate::signing::RuntimeSnapshot::approved_testnet(
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &crate::common::DeepXEnvironment::Testnet,
-            hex::decode_array("86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b")
+            hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
                 .unwrap(),
-            366,
+            376,
             1,
             &bytes,
         )
         .unwrap();
-        DeepXRuntimeSnapshotService::new(snapshot)
+        DeepXRuntimeSnapshotService::new(RuntimeSnapshot::from_read_only_for_test(read_only))
     }
 
     fn signed_remark() -> Result<SignedPalletExtrinsic, SigningError> {

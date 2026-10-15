@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 const DEFAULT_RPC_URL: &str = "https://rpc-testnet.deepx.fi";
 const RPC_URL_ENV: &str = "DEEPX_TESTNET_RPC_URL";
 const EXPECTED_GENESIS_HASH: &str =
-    "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b";
+    "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct JsonRpcResponse<T> {
@@ -624,10 +624,10 @@ mod tests {
     const FINALIZED_METADATA: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/test_data/runtime/testnet/",
-        "genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-03e29c08/metadata.json",
+        "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
     ));
     const FINALIZED_HASH: &str =
-        "0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6";
+        "0xe38016d2d2a267317f4f67173cd12f1a40a8f0513d4c71019dc6ec797932fc35";
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -659,11 +659,11 @@ mod tests {
 
     fn fixture_identity() -> FixtureIdentity {
         FixtureIdentity {
-            genesis_hash: "0x86604388e0d446bb3e2238f9836a7da6e46f8c4f26da82de49d51b05d363c50b"
+            genesis_hash: "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7"
                 .to_string(),
-            metadata_sha256: "e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37"
+            metadata_sha256: "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447"
                 .to_string(),
-            spec_version: 366,
+            spec_version: 376,
             transaction_version: 1,
         }
     }
@@ -719,7 +719,7 @@ mod tests {
                         "specName": "deepx",
                         "implName": "deepx",
                         "authoringVersion": 1,
-                        "specVersion": 366,
+                        "specVersion": 376,
                         "implVersion": 1,
                         "apis": [],
                         "transactionVersion": 1,
@@ -753,7 +753,7 @@ mod tests {
                 metadata_sha256: nautilus_core::hex::encode(
                     digest::digest(&digest::SHA256, &metadata_bytes).as_ref(),
                 ),
-                spec_version: 366,
+                spec_version: 376,
                 transaction_version: 1,
             },
             metadata_bytes: metadata_bytes.len(),
@@ -772,22 +772,11 @@ mod tests {
     }
 
     #[rstest]
-    fn validates_captured_spec_375_fixture_set() {
-        let fixture_dir = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
-            "genesis-87b3c185_metadata-2102104c_spec-375_tx-1_finalized-69e2314b",
-        ));
-
-        validate_written_fixture_set(fixture_dir).unwrap();
-    }
-
-    #[rstest]
     fn validates_captured_spec_376_fixture_set() {
         let fixture_dir = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
-            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-7340d448",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2",
         ));
 
         validate_written_fixture_set(fixture_dir).unwrap();
@@ -902,7 +891,7 @@ mod tests {
         );
 
         assert!(
-            path.ends_with("genesis-86604388_metadata-e6b8b68e_spec-366_tx-1_finalized-cfb45de9",)
+            path.ends_with("genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-cfb45de9",)
         );
     }
 

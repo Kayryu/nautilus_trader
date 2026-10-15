@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-10-14T08:56:53.101889055+00:00",
+  "deployment": "testnet",
+  "endpoint_role": "finalized_event_storage",
+  "rpc_url": "https://rpc-testnet.deepx.fi",
+  "block_hash": "0xe38016d218d6748473ffae7165aabee28aba3418306e64f6c781ea41b5d5a38c",
+  "block_number": 19592700,
+  "finalized_head_hash_at_capture": "0x967d67bcd6213858723227fb2319d89c9451ff28b59934a8a9f5c633e3b09b11",
+  "finalized_head_number_at_capture": 19682430,
+  "runtime_identity": {
+    "genesis_hash": "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
+    "metadata_sha256": "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447",
+    "spec_version": 376,
+    "transaction_version": 1
+  },
+  "storage": {
+    "layout": "System.Events",
+    "standard_events_key": "0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7",
+    "threads_key": null,
+    "events_map_keys": [],
+    "event_count": 15,
+    "reassembled_bytes": 593,
+    "reassembled_sha256": "b84acf65189c319a4123e73315ab5d025ddd092654899a12447024b4a2321abe"
+  },
+  "rpc_payloads": [
+    "system_events.json",
+    "system_events_repeated.json",
+    "system_events_query_storage_at.json"
+  ],
+  "reassembled_payload_path": "reassembled_events.hex"
+}
