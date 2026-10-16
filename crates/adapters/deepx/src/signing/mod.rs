@@ -1276,9 +1276,11 @@ pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     nonce: u64,
 ) -> Result<SignedPalletExtrinsic, SigningError> {
     sign_dynamic_pallet_call_with_runtime(
-        snapshot.identity(),
-        snapshot.interfaces(),
-        snapshot.client_state(),
+        RuntimeSigningContext {
+            identity: snapshot.identity(),
+            interfaces: snapshot.interfaces(),
+            client_state: snapshot.client_state(),
+        },
         key,
         pallet,
         call,
@@ -1287,23 +1289,28 @@ pub(crate) fn sign_dynamic_pallet_call_with_snapshot(
     )
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeSigningContext<'a> {
+    identity: &'a ApprovedRuntimeIdentity,
+    interfaces: &'a DeepXRuntimeInterfaceCatalog,
+    client_state: &'a ClientState<DeepXRuntimeConfig>,
+}
+
 fn sign_dynamic_pallet_call_with_runtime(
-    identity: &ApprovedRuntimeIdentity,
-    interfaces: &DeepXRuntimeInterfaceCatalog,
-    client_state: &ClientState<DeepXRuntimeConfig>,
+    runtime: RuntimeSigningContext<'_>,
     key: &DeepXPrivateKey,
     pallet: &str,
     call: &str,
     arguments: Vec<Value>,
     nonce: u64,
 ) -> Result<SignedPalletExtrinsic, SigningError> {
-    interfaces.call(pallet, call)?;
+    runtime.interfaces.call(pallet, call)?;
 
     let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
     let account_id = derive_signer_account_id(key)?;
     let payload = subxt_core::dynamic::tx(pallet, call, arguments);
-    let transaction =
-        tx::create_v4_signed(&payload, client_state, immortal_params(nonce))?.sign(&signer);
+    let transaction = tx::create_v4_signed(&payload, runtime.client_state, immortal_params(nonce))?
+        .sign(&signer);
     let hash = transaction.hash_with(BlakeTwo256);
 
     Ok(SignedPalletExtrinsic {
@@ -1311,7 +1318,7 @@ fn sign_dynamic_pallet_call_with_runtime(
         extrinsic_hash: hash.0,
         signer: account_id,
         nonce,
-        runtime: identity.clone(),
+        runtime: runtime.identity.clone(),
     })
 }
 
@@ -1378,9 +1385,11 @@ mod tests {
         nonce: u64,
     ) -> SignedPalletExtrinsic {
         sign_dynamic_pallet_call_with_runtime(
-            snapshot.identity(),
-            snapshot.interfaces(),
-            client_state,
+            RuntimeSigningContext {
+                identity: snapshot.identity(),
+                interfaces: snapshot.interfaces(),
+                client_state,
+            },
             &key(),
             pallet,
             call,
@@ -1617,9 +1626,11 @@ mod tests {
     fn spec376_metadata_rejects_malformed_arguments() {
         let (snapshot, client_state) = runtime();
         let result = sign_dynamic_pallet_call_with_runtime(
-            snapshot.identity(),
-            snapshot.interfaces(),
-            &client_state,
+            RuntimeSigningContext {
+                identity: snapshot.identity(),
+                interfaces: snapshot.interfaces(),
+                client_state: &client_state,
+            },
             &key(),
             "SpotMarket",
             "cancel_order",
@@ -1647,9 +1658,11 @@ mod tests {
     fn spec376_interface_rejects_unknown_call() {
         let (snapshot, client_state) = runtime();
         let result = sign_dynamic_pallet_call_with_runtime(
-            snapshot.identity(),
-            snapshot.interfaces(),
-            &client_state,
+            RuntimeSigningContext {
+                identity: snapshot.identity(),
+                interfaces: snapshot.interfaces(),
+                client_state: &client_state,
+            },
             &key(),
             "UnknownPallet",
             "unknown_call",

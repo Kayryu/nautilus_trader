@@ -40,6 +40,11 @@ const TESTNET_SPEC_376_GENESIS_HASH: &str =
 const TESTNET_SPEC_376_METADATA_SHA256: &str =
     "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447";
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
+const TESTNET_SPEC_376_METADATA_RESPONSE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/test_data/runtime/testnet/",
+    "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+));
 const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
     "CheckSpecVersion",
@@ -88,6 +93,9 @@ pub enum SnapshotError {
     /// The SCALE metadata cannot be decoded by the pinned DeepX Subxt fork.
     #[error("invalid DeepX runtime metadata: {0}")]
     InvalidMetadata(#[from] parity_scale_codec::Error),
+    /// The built-in approved metadata fixture cannot be decoded.
+    #[error("invalid built-in DeepX runtime metadata")]
+    InvalidBuiltInMetadata,
     /// The metadata does not match the approved testnet SHA-256.
     #[error("DeepX runtime metadata hash is not approved")]
     MetadataHashMismatch,
@@ -424,32 +432,12 @@ struct RuntimeSnapshotServiceState {
 #[derive(Debug)]
 enum PendingRuntimeIdentity {
     Approved(ApprovedRuntimeIdentity),
-    Observed {
-        environment: DeepXEnvironment,
-        genesis_hash: [u8; 32],
-        spec_version: u32,
-        transaction_version: u32,
-        metadata_sha256: Option<[u8; 32]>,
-    },
 }
 
 impl PendingRuntimeIdentity {
     fn matches(&self, identity: &ApprovedRuntimeIdentity) -> bool {
         match self {
             Self::Approved(approved) => approved == identity,
-            Self::Observed {
-                environment,
-                genesis_hash,
-                spec_version,
-                transaction_version,
-                metadata_sha256,
-            } => {
-                environment == &identity.environment
-                    && genesis_hash == &identity.genesis_hash
-                    && spec_version == &identity.spec_version
-                    && transaction_version == &identity.transaction_version
-                    && metadata_sha256.is_none_or(|hash| hash == identity.metadata_sha256)
-            }
         }
     }
 }
@@ -556,70 +544,6 @@ impl DeepXRuntimeSnapshotService {
 
         state.pending_identity = Some(PendingRuntimeIdentity::Approved(observed));
         Ok(DeepXRuntimeChangeDecision::RefreshRequired)
-    }
-
-    /// Latches runtime change evidence before metadata decoding or fixture approval.
-    pub(crate) fn observe_runtime_fingerprint(
-        &self,
-        environment: &DeepXEnvironment,
-        genesis_hash: [u8; 32],
-        spec_version: u32,
-        transaction_version: u32,
-        metadata_bytes: Option<&[u8]>,
-    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
-        let metadata_sha256 = metadata_bytes.map(|bytes| {
-            let mut hash = [0; 32];
-            hash.copy_from_slice(digest(&SHA256, bytes).as_ref());
-            hash
-        });
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
-        let matches = |identity: &ApprovedRuntimeIdentity| {
-            environment == &identity.environment
-                && genesis_hash == identity.genesis_hash
-                && spec_version == identity.spec_version
-                && transaction_version == identity.transaction_version
-                && metadata_sha256.is_none_or(|hash| hash == identity.metadata_sha256)
-        };
-
-        if let Some(pending) = &mut state.pending_identity {
-            match pending {
-                PendingRuntimeIdentity::Approved(identity) if matches(identity) => return Ok(()),
-                PendingRuntimeIdentity::Observed {
-                    environment: pending_environment,
-                    genesis_hash: pending_genesis,
-                    spec_version: pending_spec,
-                    transaction_version: pending_transaction,
-                    metadata_sha256: pending_hash,
-                } if environment == pending_environment
-                    && genesis_hash == *pending_genesis
-                    && spec_version == *pending_spec
-                    && transaction_version == *pending_transaction
-                    && (metadata_sha256.is_none()
-                        || pending_hash.is_none()
-                        || metadata_sha256 == *pending_hash) =>
-                {
-                    if metadata_sha256.is_some() {
-                        *pending_hash = metadata_sha256;
-                    }
-                    return Ok(());
-                }
-                _ => return Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange),
-            }
-        }
-
-        if !matches(state.active.identity()) {
-            state.pending_identity = Some(PendingRuntimeIdentity::Observed {
-                environment: environment.clone(),
-                genesis_hash,
-                spec_version,
-                transaction_version,
-                metadata_sha256,
-            });
-        }
-        Ok(())
     }
 
     /// Installs a fixture-validated replacement after all old signing permits are released.
@@ -810,6 +734,22 @@ impl RuntimeSnapshot {
         })
     }
 
+    /// Builds the approved DeepX testnet signing runtime from built-in metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the built-in fixture fails identity, integrity, or interface
+    /// validation.
+    pub(crate) fn built_in_testnet() -> Result<Self, SnapshotError> {
+        Self::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_SPEC_376_GENESIS_HASH)?,
+            TESTNET_MIN_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &built_in_testnet_metadata()?,
+        )
+    }
+
     /// Returns the approved identity associated with this snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
@@ -861,6 +801,22 @@ impl DeepXReadOnlyRuntimeSnapshot {
         })
     }
 
+    /// Builds the approved DeepX testnet read-only runtime from built-in metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the built-in fixture fails identity, integrity, or interface
+    /// validation.
+    pub(crate) fn built_in_testnet() -> Result<Self, SnapshotError> {
+        Self::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_SPEC_376_GENESIS_HASH)?,
+            TESTNET_MIN_SPEC_VERSION,
+            TESTNET_TRANSACTION_VERSION,
+            &built_in_testnet_metadata()?,
+        )
+    }
+
     /// Returns the fixture-approved identity associated with this read-only snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
@@ -878,9 +834,7 @@ impl DeepXReadOnlyRuntimeSnapshot {
     }
 }
 
-fn approved_testnet_runtime(
-    spec_version: u32,
-) -> Result<ApprovedTestnetRuntime, SnapshotError> {
+fn approved_testnet_runtime(spec_version: u32) -> Result<ApprovedTestnetRuntime, SnapshotError> {
     if spec_version < TESTNET_MIN_SPEC_VERSION {
         return Err(SnapshotError::RuntimeIdentityMismatch);
     }
@@ -1025,6 +979,15 @@ fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
     hex::decode_array(value).map_err(|_| SnapshotError::InvalidApprovedIdentity)
 }
 
+fn built_in_testnet_metadata() -> Result<Vec<u8>, SnapshotError> {
+    let response: serde_json::Value = serde_json::from_str(TESTNET_SPEC_376_METADATA_RESPONSE)
+        .map_err(|_| SnapshotError::InvalidBuiltInMetadata)?;
+    let encoded = response["result"]
+        .as_str()
+        .ok_or(SnapshotError::InvalidBuiltInMetadata)?;
+    hex::decode(encoded.trim_start_matches("0x")).map_err(|_| SnapshotError::InvalidBuiltInMetadata)
+}
+
 #[cfg(test)]
 mod tests {
     use frame_metadata::{
@@ -1038,20 +1001,29 @@ mod tests {
 
     use super::*;
 
-    const SPEC_376_METADATA_RESPONSE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/test_data/runtime/testnet/",
-        "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
-    ));
-
     #[derive(Deserialize)]
     struct RpcResponse {
         result: String,
     }
 
     fn spec_376_metadata_bytes() -> Vec<u8> {
-        let response: RpcResponse = serde_json::from_str(SPEC_376_METADATA_RESPONSE).unwrap();
+        let response: RpcResponse =
+            serde_json::from_str(TESTNET_SPEC_376_METADATA_RESPONSE).unwrap();
         hex::decode(response.result.trim_start_matches("0x")).unwrap()
+    }
+
+    #[rstest]
+    fn built_in_runtime_matches_captured_spec_376_fixture() {
+        let signing = RuntimeSnapshot::built_in_testnet().unwrap();
+        let read_only = DeepXReadOnlyRuntimeSnapshot::built_in_testnet().unwrap();
+
+        assert_eq!(signing.identity(), read_only.identity());
+        assert_eq!(signing.identity().spec_version, TESTNET_MIN_SPEC_VERSION);
+        assert_eq!(
+            hex::encode(signing.identity().metadata_sha256),
+            TESTNET_SPEC_376_METADATA_SHA256,
+        );
+        assert_eq!(signing.interfaces(), read_only.interfaces());
     }
 
     fn test_snapshot() -> RuntimeSnapshot {
@@ -1921,84 +1893,6 @@ mod tests {
         assert_eq!(
             service.install(snapshot),
             Err(DeepXRuntimeSnapshotServiceError::ClientRetired),
-        );
-    }
-
-    #[rstest]
-    #[case(false, false)]
-    #[case(false, true)]
-    #[case(true, false)]
-    #[case(true, true)]
-    fn observed_fingerprint_requires_matching_quiescent_install(
-        #[case] include_metadata: bool,
-        #[case] apply: bool,
-    ) {
-        let bytes = spec_376_metadata_bytes();
-        let replacement = test_snapshot();
-        let mut old = replacement.clone();
-        old.identity.spec_version -= 1;
-        let service = DeepXRuntimeSnapshotService::new(old.clone());
-        let permit = service.acquire().unwrap();
-        let identity = replacement.identity();
-        service
-            .observe_runtime_fingerprint(
-                &identity.environment,
-                identity.genesis_hash,
-                identity.spec_version,
-                identity.transaction_version,
-                None,
-            )
-            .unwrap();
-        if include_metadata {
-            service
-                .observe_runtime_fingerprint(
-                    &identity.environment,
-                    identity.genesis_hash,
-                    identity.spec_version,
-                    identity.transaction_version,
-                    Some(&bytes),
-                )
-                .unwrap();
-            assert_eq!(
-                service.observe_runtime_fingerprint(
-                    &identity.environment,
-                    identity.genesis_hash,
-                    identity.spec_version,
-                    identity.transaction_version,
-                    Some(&[0]),
-                ),
-                Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
-            );
-        }
-        assert_eq!(
-            service.install(old.clone()),
-            Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch)
-        );
-        assert_eq!(
-            service.observe_runtime_identity(old.identity().clone()),
-            Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
-        );
-        let install = || {
-            if apply {
-                service.apply_validated(&replacement).map(|_| ())
-            } else {
-                service.install(replacement.clone())
-            }
-        };
-        assert_eq!(
-            install(),
-            Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1))
-        );
-        assert_eq!(permit.snapshot().identity(), old.identity());
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
-        ));
-        drop(permit);
-        install().unwrap();
-        assert_eq!(
-            service.acquire().unwrap().snapshot().identity(),
-            replacement.identity()
         );
     }
 

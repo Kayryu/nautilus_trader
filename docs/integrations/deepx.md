@@ -807,14 +807,13 @@ submits no transaction; operational Spot margin changes remain disabled.
 finalized runtime checkpoint. It requires a caller-supplied expected wallet authority, decodes the
 complete SCALE value against that checkpoint's approved metadata, checks both account identities,
 compares `state_queryStorageAt` with `state_getStorage` at the same block hash, and rechecks the
-canonical hash for the checkpoint height. The approved spec366, 369, and 371 metadata fixtures
-declare the identity-keyed map. A read-only spec371 capture at finalized block `217394490` for
+canonical hash for the checkpoint height. The built-in spec-376 metadata declares the
+identity-keyed map. A read-only spec371 capture at finalized block `217394490` for
 subaccount `0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc` decoded the flag as `false`;
 both storage methods returned identical bytes, and a later height lookup returned the same hash.
 These matching RPC responses are consistency evidence, not a cryptographic storage proof. The
-public observer retains the existing historical `Core_version` guard; the current endpoint reports
-spec371 at the captured spec369 checkpoint, so it fails closed before live state collection. No
-Spot-margin mutation or transaction-result confirmation is enabled.
+public observer assumes node runtime compatibility and retains finalized-height, repeated-storage,
+and canonical-hash checks. No Spot-margin mutation or transaction-result confirmation is enabled.
 
 ## Offline wallet delegate setup signing
 
@@ -1641,22 +1640,13 @@ implemented and covered by unit tests:
   and canonical recovery method names. Evidence retains its endpoint URL and cannot satisfy
   execution startup for another validated endpoint set. Advertised names do not prove method
   semantics or authorize transaction operations.
-- A read-only finalized runtime snapshot collector which uses the ordinary configured RPC endpoint,
-  reads that hash's header, pins runtime-version and metadata reads to the same hash, and returns
-  only an approved snapshot paired with its strictly decoded finalized hash and block number. It
-  does not install the snapshot, select a mortality period, or authorize signing.
-- An explicit one-shot runtime snapshot coordinator which observes through the chain-identity-
-  validated Watch endpoint and blocks new signing permits on a runtime-version change before
-  awaiting metadata, or a raw metadata hash change before SCALE decoding and fixture validation.
-  Failed validation or later RPC errors leave the observed fingerprint pending; old permits stay
-  immutable, and observing the old identity does not clear the block. Pre-evidence RPC errors do
-  not block signing. Installation still requires a matching fixture-approved snapshot and release
-  of all old permits. An unchanged identity is idempotent. This is not a watcher or automatic
-  refresh loop and does not enable execution or submit transactions.
+- A read-only finalized checkpoint collector which validates testnet genesis and canonical
+  finality, then decodes block-pinned values with the built-in spec-376 metadata. Node runtime
+  compatibility is assumed; the adapter does not request or compare online runtime version,
+  metadata, or `Core_version` values.
 - A transport-neutral runtime snapshot service which grants immutable snapshots through counted
-  signing permits, blocks new permits as soon as a changed runtime identity is observed, and
-  installs a matching fixture-validated replacement only after all old permits are released. The
-  public offline signer requires one of these permits rather than accepting a bare snapshot.
+  signing permits backed by the built-in runtime identity. The public offline signer requires one
+  of these permits rather than accepting a bare snapshot.
   Snapshot construction explicitly rejects non-testnet deployment labels, and the immutable
   runtime identity retains its testnet deployment tag.
 - A fixture-derived immutable runtime interface catalog which records pallet, call, event, and
@@ -1947,19 +1937,11 @@ integration.
   is observed and prevents replacement until every permit for the old immutable snapshot is
   released. It accepts only an already validated snapshot matching the observed identity, and the
   public offline signing entry point cannot bypass this permit boundary.
-  A read-only collector can construct the approved immutable snapshot from genesis, finalized-head,
-  finalized-header, pinned runtime-version, and pinned metadata reads against the ordinary
-  configured RPC endpoint. It returns the snapshot with the strictly decoded checkpoint hash and
-  block number, but the committed fixture still predates header capture, so mortal signing remains
-  disabled. An explicit one-shot coordinator observes finalized runtime versions and metadata only
-  through the identity-validated Watch endpoint. It detects version or raw metadata hash changes,
-  including unknown upgrades, and blocks new signing permits before fixture validation. Later
-  failures leave the change latched. It atomically applies only a matching fixture-approved
-  snapshot after all old permits are released. It does not poll, retry automatically, approve
-  unknown fixtures, automatically resume signing after a failed refresh, or weaken permit
-  quiescence. The execution client's retained snapshot service can perform a one-shot finalized
-  chain-time observation: it validates and applies the runtime at the exact Watch checkpoint before
-  strictly decoding that block's `Timestamp.Now` storage as a non-zero SCALE `u64`. It performs no
+  Read-only collectors use the built-in spec-376 snapshot after validating testnet genesis and a
+  finalized canonical checkpoint. They do not fetch or compare node runtime metadata, version, or
+  `Core_version`. The execution client's retained snapshot service can perform a one-shot finalized
+  chain-time observation, strictly decoding that block's `Timestamp.Now` storage as a non-zero
+  SCALE `u64` and requiring repeated timestamp evidence to agree. It performs no
   nonce allocation, signing, persistence mutation, or submission. A separate client-owned
   perpetual placement reservation boundary combines that evidence with the retained signer lease,
   allocator, snapshot permit, and PostgreSQL store. It rejects account/subaccount,
@@ -2231,11 +2213,11 @@ integration.
   Historical runtime selection is also unreliable on this endpoint. The captured finalized
   spec-366 hash `0x03e29c08d90b26697535dacbcfa940c8d2ae08653e4b4760ac1dd4a281ced7c6`
   returned spec `371` through both `Core_version` and `state_getRuntimeVersion`. A captured
-  spec-369 finalized hash likewise returned spec `371` through `state_getRuntimeVersion`. Complete
-  account evidence and signing-bound chain time now require both runtime methods to return spec
-  `369` at that spec-369 hash. A read-only wallet rerun resolved four subaccounts, then rejected the
-  first because `Core_version` returned `371`. This detects the observed historical runtime defect;
-  it does not establish historical correctness of every `state_call` response. An `eth_call` with an
+  spec-369 finalized hash likewise returned spec `371` through `state_getRuntimeVersion`. Earlier
+  account evidence and signing-bound chain-time implementations rejected those responses. The
+  adapter no longer queries either runtime method and instead assumes compatibility with its
+  built-in spec-376 metadata. These observations remain historical endpoint evidence; they do not
+  establish historical correctness of every `state_call` response. An `eth_call` with an
   impossible canonical block hash also returned a successful `0x`, so EIP-1898 block selection is
   not yet trustworthy. Complete account evidence now requires a harmless call at the selected
   checkpoint to succeed and the same call with an impossible canonical hash to return a structured
@@ -2255,10 +2237,9 @@ integration.
   On October 11, 2026, the read-only wallet verifier again resolved four directory subaccounts
   and stopped before account storage reads because historical `Core_version` returned spec `371`
   for the captured spec-369 checkpoint. No finalized wallet account result was accepted.
-  Signing-bound account observation now closes its owned snapshot service to new signing permits
-  when these probes or timestamp consistency checks demonstrate contradictory RPC behavior.
-  Standalone read-only finalized evidence readers now run the same historical runtime probe at
-  their shared runtime-snapshot boundary before reading account, market, position, or order values.
+  Current signing-bound account observation does not perform these runtime probes. Timestamp,
+  repeated-read, finalized-height, and canonical-hash contradictions still fail closed before
+  releasing evidence.
   The local node source also shows that custom `lending_batchPositionsFor` and
   `lending_totalCollateralAndMarginRequiredFor` RPC handlers ignore their `at` argument and
   select `best_hash`. The adapter's finalized account collector instead calls the runtime APIs
@@ -3593,15 +3574,13 @@ creates the immutable identity, and returns the record only after `create_commit
 that record's exact encoding. It performs no signing or submission. The execution client now
 retains the configured store, signer lease, allocator, and verified durable snapshot for its
 configured signing key using the configured non-zero clock-drift limit, which defaults to five
-seconds. It also retains the fixture-approved runtime snapshot service and can use it to observe
-chain time without accepting a caller-supplied snapshot or time value. That operation first
-validates and applies runtime version and metadata from one finalized Watch checkpoint, then reads
-`Timestamp.Now` from the exact same block hash and requires it to agree with the block's
-`Timestamp.set` inherent and an independent `state_queryStorageAt` read. Historical runtime
-selection must also return the captured spec-369 version. A version mismatch or contradictory
-block timestamp evidence closes the owned snapshot service to new signing permits until restart;
-ordinary RPC transport failures do not latch that stop. Runtime change evidence is latched
-before any later timestamp-read failure. The operation does not allocate a new nonce, enable
+seconds. It also retains the built-in spec-376 runtime snapshot service and can use it to observe
+chain time without accepting a caller-supplied snapshot or time value. That operation validates
+genesis and one finalized canonical Watch checkpoint, then reads `Timestamp.Now` from the exact
+same block hash and requires it to agree with the block's `Timestamp.set` inherent and an
+independent `state_queryStorageAt` read. It does not query online runtime version, metadata, or
+`Core_version`; node runtime compatibility is assumed. Contradictory block timestamp or canonical
+evidence fails closed. The operation does not allocate a new nonce, enable
 sequential account nonces, sign, persist a transaction, or submit it. The signer rechecks an
 existing permit immediately before encoding, and order submission tasks recheck their retained
 permit before starting the transport. A revoked permit at that point is classified as locally not

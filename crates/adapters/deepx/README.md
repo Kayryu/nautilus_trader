@@ -732,17 +732,19 @@ default to ranges of 100 finalized blocks and require a non-zero configured rang
 nonce restoration uses a configurable non-zero clock-drift limit which defaults to five seconds.
 Execution configuration accepts an optional `postgres_cache_database_config` for the durable
 transaction store. Its non-zero `websocket_timeout_secs`, defaulting to 30 seconds, bounds WebSocket
-operations and startup account-event registration. After finalized runtime and account ownership
+operations and startup account-event registration. After testnet identity and account ownership
 validation, the execution client
 can acquire and retain the PostgreSQL signer lease, restore the complete durable signer record set,
 and seed its timestamp nonce allocator. Reset, stop, and disconnect drop that runtime and release
 the lease. Startup mass reconciliation uses only this client-owned store and lease; callers cannot
-inject a temporary persistence boundary. The runtime also retains the fixture-approved snapshot
-service. Its read-only chain-time operation first validates and applies runtime version and metadata
-from one finalized Watch checkpoint, then strictly decodes `Timestamp.Now` as one non-zero SCALE
-`u64` from that exact block hash. A runtime change is latched before any later timestamp-read
-failure. This read-only operation does not allocate a nonce, sign, persist a transaction, submit, or
-replay. A separate client-owned perpetual placement reservation
+inject a temporary persistence boundary. The runtime retains a snapshot service backed by the
+built-in spec-376 metadata and identity. Node runtime compatibility is assumed: startup and
+read-only operations do not call `state_getRuntimeVersion`, `state_getMetadata`, or
+`state_call(Core_version)`. They still validate the configured genesis with
+`chain_getBlockHash(0)`, bind reads to a finalized canonical checkpoint, and preserve repeated-read
+and timestamp consistency checks. The chain-time operation strictly decodes `Timestamp.Now` as one
+non-zero SCALE `u64` from that exact block hash. It does not allocate a nonce, sign, persist a
+transaction, submit, or replay. A separate client-owned perpetual placement reservation
 boundary combines that observation with the retained signer lease, allocator, snapshot permit, and
 store. It rejects account/subaccount and instrument/market mismatches, holds the runtime permit
 through the durable create, and releases only the exact acknowledged `created` record. The record
@@ -1328,14 +1330,12 @@ active position lifecycle ID `1659167` still returned service code 503 from the 
 freshness semantics therefore remain disabled.
 
 `observe_finalized_account_evidence` combines finalized `Timestamp.Now`, margin, lending,
-perpetual-position, and active-order readers after one read-only runtime approval and pins every
-request to that exact checkpoint. It requires `state_getStorage` in addition to the component RPC
-methods and accepts the timestamp only as one exact non-zero SCALE `u64` Unix millisecond value.
-The shared read-only runtime boundary checks `state_call(Core_version)` and
-`state_getRuntimeVersion` against the freshly observed finalized checkpoint before any standalone
-account, market, lending, position, or order evidence is read. An inconsistent endpoint fails
-closed without returning those component values and does not require archive access to a fixed
-historical block.
+perpetual-position, and active-order readers using the built-in spec-376 metadata and pins every
+request to one finalized canonical checkpoint. It requires `state_getStorage` in addition to the
+component RPC methods and accepts the timestamp only as one exact non-zero SCALE `u64` Unix
+millisecond value. The adapter assumes the node runtime is compatible and performs no online
+runtime-version, metadata, or `Core_version` comparison. An inconsistent checkpoint or repeated
+read still fails closed without returning component values.
 `deepx-verify-finalized-account <subaccount-account-id20>` exercises the combined credential-free
 boundary. Component evidence retains the same strict bounds and identity checks; an unavailable or
 invalid component rejects the complete observation without returning a partial snapshot. This is
@@ -1546,11 +1546,8 @@ A read-only Perpetual verifier run for block `187071212` and wallet
 `0x781ed35b167068c93dfadab41dfb680edaca4e50` on 2026-10-09 stopped when historical
 `state_call(Core_version)` returned spec 371 instead of the captured spec 369.
 
-The `deepx-capture-runtime-fixtures` binary captures public runtime identity responses after
-verifying the expected testnet genesis hash. It does not access account data or submit
-transactions. For a new, unapproved deployment, supply both `--expected-genesis <hash>` and
-`--output-root </absolute/review/path>` after `--` to inspect a fixture outside the repository;
-capture does not approve runtime signing. A finalized spec-376 fixture binds metadata
+The checked-in spec-376 fixture supplies the adapter's built-in metadata and signing identity. The
+adapter does not capture or approve runtime identity from a configured node. The fixture binds metadata
 SHA-256 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447` to block
 `19592700` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
 Its signed extensions use `CheckNonceEra` where the approved old-chain captures use

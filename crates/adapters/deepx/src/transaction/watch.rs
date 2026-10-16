@@ -15,6 +15,7 @@
 //! Fail-closed DeepX canonical block and submission-pool observations.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
@@ -50,7 +51,6 @@ use crate::{
     rpc::{
         DEEPX_RECOVERY_RPC_METHODS, DEEPX_SUBMISSION_RPC_METHODS, DEEPX_WATCH_RPC_METHODS,
         DeepXHistoricalRuntimeError, DeepXValidatedRpcMethodCapabilities,
-        validate_finalized_runtime_semantics_at,
     },
     signing::{
         ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXReadOnlyRuntimeSnapshot,
@@ -66,6 +66,19 @@ const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
     "0x26aa394eea5630e07c48ae0c9558cef7",
     "80d41e5e16056765bc8461851072c9d7",
 );
+
+async fn execute_rpc_read_with_retry<T: for<'de> Deserialize<'de>>(
+    client: &BlockchainHttpRpcClient,
+    request: serde_json::Value,
+) -> anyhow::Result<T> {
+    for delay_ms in [250, 500] {
+        match client.execute_rpc_call(request.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(_) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
+        }
+    }
+    client.execute_rpc_call(request).await
+}
 
 trait RuntimeMetadataView {
     fn identity(&self) -> &ApprovedRuntimeIdentity;
@@ -1464,7 +1477,6 @@ async fn observe_finalized_delegate_change_at_inner<T>(
             finalized: finalized.block_number(),
         });
     }
-    validate_finalized_runtime_semantics_at(watch_url).await?;
     let observe_location = || async {
         observe_canonical_block_at(
             watch_url,
@@ -1481,40 +1493,12 @@ async fn observe_finalized_delegate_change_at_inner<T>(
         return Err(Error::LocationChanged);
     }
 
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    let encoded_hash = format!("0x{}", hex::encode(location.block_hash()));
-    let version: RpcRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getRuntimeVersion",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    let metadata: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getMetadata",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getMetadata",
-            source,
-        })?;
-    let metadata = metadata
-        .strip_prefix("0x")
-        .and_then(|encoded| hex::decode(encoded).ok())
-        .filter(|bytes| !bytes.is_empty())
-        .ok_or(Error::InvalidMetadata)?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-        environment,
-        endpoints.genesis_hash(),
-        version.spec_version,
-        version.transaction_version,
-        &metadata,
-    )?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != *environment
+        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
     if expected_runtime.is_some_and(|runtime| runtime != snapshot.identity()) {
         return Err(Error::RuntimeMismatch);
     }
@@ -1781,13 +1765,6 @@ pub enum DeepXFinalizedPerpTradeObservationError {
     Events(#[from] DeepXPerpTradeEventError),
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RpcRuntimeVersion {
-    spec_version: u32,
-    transaction_version: u32,
-}
-
 /// Observes all perpetual trades in one finalized historical block through the Watch endpoint.
 ///
 /// The runtime metadata must match an approved fixture for the selected hash. Complete event
@@ -1823,7 +1800,6 @@ pub async fn observe_finalized_perp_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    validate_finalized_runtime_semantics_at(watch_url).await?;
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let read_hash = || async {
         let encoded: Option<String> = client
@@ -1860,38 +1836,12 @@ pub async fn observe_finalized_perp_trades_at(
         }
         .into());
     }
-    let version: RpcRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getRuntimeVersion",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    let metadata: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getMetadata",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getMetadata",
-            source,
-        })?;
-    let metadata = metadata
-        .strip_prefix("0x")
-        .and_then(|encoded| hex::decode(encoded).ok())
-        .filter(|bytes| !bytes.is_empty())
-        .ok_or(Error::InvalidMetadata)?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-        environment,
-        endpoints.genesis_hash(),
-        version.spec_version,
-        version.transaction_version,
-        &metadata,
-    )?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != *environment
+        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
     let first = fetch_system_events(watch_url, block_hash, block_number).await?;
     let second = fetch_system_events(watch_url, block_hash, block_number).await?;
     if first != second {
@@ -1977,7 +1927,6 @@ pub async fn observe_finalized_spot_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    validate_finalized_runtime_semantics_at(watch_url).await?;
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let read_hash = || async {
         let encoded: Option<String> = client
@@ -2012,38 +1961,12 @@ pub async fn observe_finalized_spot_trades_at(
         }
         .into());
     }
-    let version: RpcRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getRuntimeVersion",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    let metadata: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getMetadata",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getMetadata",
-            source,
-        })?;
-    let metadata = metadata
-        .strip_prefix("0x")
-        .and_then(|encoded| hex::decode(encoded).ok())
-        .filter(|bytes| !bytes.is_empty())
-        .ok_or(Error::InvalidMetadata)?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-        environment,
-        endpoints.genesis_hash(),
-        version.spec_version,
-        version.transaction_version,
-        &metadata,
-    )?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != *environment
+        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
     let first = fetch_system_events(watch_url, block_hash, block_number).await?;
     let second = fetch_system_events(watch_url, block_hash, block_number).await?;
     if first != second {
@@ -4241,33 +4164,37 @@ async fn observe_canonical_block_at(
     target_extrinsic_hash: [u8; 32],
 ) -> Result<DeepXCanonicalBlockObservation, DeepXTransactionWatchError> {
     let client = BlockchainHttpRpcClient::new(endpoint_url.to_string(), None, None);
-    let encoded_hash: Option<String> = client
-        .execute_rpc_call(json!({
+    let encoded_hash: Option<String> = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getBlockHash",
             "params": [block_number],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getBlockHash",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "chain_getBlockHash",
+        source,
+    })?;
     let encoded_hash =
         encoded_hash.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let block_hash = decode_hash(&encoded_hash)?;
-    let response: Option<RpcBlockResponse> = client
-        .execute_rpc_call(json!({
+    let response: Option<RpcBlockResponse> = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getBlock",
             "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getBlock",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "chain_getBlock",
+        source,
+    })?;
     let response = response.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let observed_number = decode_block_number(&response.block.header.number)?;
     if observed_number != block_number {
@@ -4700,18 +4627,20 @@ async fn collect_finalized_recovery_scan_inner(
     }
 
     let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
-    let encoded_checkpoint_hash: Option<String> = client
-        .execute_rpc_call(json!({
+    let encoded_checkpoint_hash: Option<String> = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getBlockHash",
             "params": [last_scanned_block],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getBlockHash",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "chain_getBlockHash",
+        source,
+    })?;
     let encoded_checkpoint_hash = encoded_checkpoint_hash.ok_or(
         DeepXTransactionWatchError::BlockUnavailable(last_scanned_block),
     )?;
@@ -4723,31 +4652,35 @@ async fn collect_finalized_recovery_scan_inner(
             received: observed_checkpoint_hash,
         });
     }
-    let encoded_finalized_hash: String = client
-        .execute_rpc_call(json!({
+    let encoded_finalized_hash: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getFinalizedHead",
             "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getFinalizedHead",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "chain_getFinalizedHead",
+        source,
+    })?;
     let finalized_hash = decode_hash(&encoded_finalized_hash)?;
-    let finalized_header: Option<RpcBlockHeader> = client
-        .execute_rpc_call(json!({
+    let finalized_header: Option<RpcBlockHeader> = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getHeader",
             "params": [encoded_finalized_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "chain_getHeader",
+        source,
+    })?;
     let finalized_header =
         finalized_header.ok_or(DeepXTransactionWatchError::FinalizedHeaderUnavailable)?;
     let finalized_block_number = decode_block_number(&finalized_header.number)?;
@@ -5053,18 +4986,20 @@ pub async fn observe_submission_pool(
         None,
         None,
     );
-    let extrinsics: Vec<String> = client
-        .execute_rpc_call(json!({
+    let extrinsics: Vec<String> = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "author_pendingExtrinsics",
             "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "author_pendingExtrinsics",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXTransactionWatchError::Rpc {
+        method: "author_pendingExtrinsics",
+        source,
+    })?;
 
     Ok(
         if find_extrinsic(&extrinsics, target_extrinsic_hash, "submission pool")?.is_some() {
@@ -5152,7 +5087,7 @@ mod tests {
         },
     };
 
-    use axum::{Json, Router, extract::State, routing::post};
+    use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use frame_metadata::{META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed};
     use parity_scale_codec::Encode;
     use rstest::rstest;
@@ -5161,6 +5096,42 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_read_retries_transient_transport_failures() {
+        async fn rpc(State(attempts): State<Arc<AtomicUsize>>) -> Result<Json<Value>, StatusCode> {
+            if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Ok(Json(json!({ "jsonrpc": "2.0", "id": 1, "result": 42 })))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn({
+            let attempts = Arc::clone(&attempts);
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route("/", post(rpc)).with_state(attempts),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = BlockchainHttpRpcClient::new(format!("http://{address}"), None, None);
+
+        let value: u64 = execute_rpc_read_with_retry(
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "test", "params": [] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
 
     #[rstest]
     fn events_map_batches_combine_compact_counts() {
@@ -7683,8 +7654,6 @@ mod tests {
                     "chain_getFinalizedHead",
                     "chain_getHeader",
                     "eth_call",
-                    "state_getMetadata",
-                    "state_getRuntimeVersion",
                     "state_getStorage",
                     "state_queryStorageAt",
                     "state_call",

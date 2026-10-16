@@ -197,7 +197,13 @@ impl BlockchainHttpRpcClient {
             anyhow::bail!("RPC error {}: {}", error.code, error.message);
         }
 
-        anyhow::ensure!(has_result, "Response missing both result and error fields");
+        if !has_result {
+            let raw_response = String::from_utf8_lossy(bytes.as_ref());
+            let preview = rpc_response_preview(&raw_response);
+            anyhow::bail!(
+                "Response missing both result and error fields\nRaw response: {preview}"
+            );
+        }
 
         Ok(parsed.result)
     }
@@ -236,9 +242,13 @@ impl BlockchainHttpRpcClient {
             anyhow::bail!("RPC error {}: {}", error.code, error.message);
         }
 
-        parsed
-            .result
-            .ok_or_else(|| anyhow::anyhow!("Response missing both result and error fields"))
+        parsed.result.ok_or_else(|| {
+            let raw_response = String::from_utf8_lossy(bytes.as_ref());
+            let preview = rpc_response_preview(&raw_response);
+            anyhow::anyhow!(
+                "Response missing both result and error fields\nRaw response: {preview}"
+            )
+        })
     }
 
     /// Creates a properly formatted `eth_call` JSON-RPC request object targeting a specific contract address with encoded function data.
@@ -1746,7 +1756,9 @@ pub(crate) mod tests {
             }))
             .await;
 
-        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Response missing both result and error fields"));
+        assert!(error.contains(r#"Raw response: {"id":1,"jsonrpc":"2.0"}"#));
     }
 
     #[tokio::test]

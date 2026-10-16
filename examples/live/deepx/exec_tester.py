@@ -29,7 +29,7 @@ from nautilus_trader.adapters.deepx import (
     get_deepx_wallet_account_snapshot,
 )
 from nautilus_trader.common import Environment
-from nautilus_trader.infrastructure import PostgresConnectOptions
+from nautilus_trader.infrastructure import PostgresCacheConfig, PostgresConnectOptions
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import (
     AccountId,
@@ -88,18 +88,32 @@ def check_account_candidate(
         raise ValueError("selected subaccount has outstanding borrowing")
 
 
-def postgres_options() -> PostgresConnectOptions:
+def postgres_options() -> tuple[PostgresConnectOptions, PostgresCacheConfig]:
     """Read the required durable transaction store settings from the environment."""
     required = ("POSTGRES_USERNAME", "POSTGRES_PASSWORD", "POSTGRES_DATABASE")
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
         raise ValueError(f"missing PostgreSQL settings: {', '.join(missing)}")
-    return PostgresConnectOptions(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        user=os.environ["POSTGRES_USERNAME"],
-        password=os.environ["POSTGRES_PASSWORD"],
-        database=os.environ["POSTGRES_DATABASE"],
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = int(os.getenv("POSTGRES_PORT", "5432"))
+    username = os.environ["POSTGRES_USERNAME"]
+    password = os.environ["POSTGRES_PASSWORD"]
+    database = os.environ["POSTGRES_DATABASE"]
+    return (
+        PostgresConnectOptions(
+            host=host,
+            port=port,
+            user=username,
+            password=password,
+            database=database,
+        ),
+        PostgresCacheConfig(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            database=database,
+        ),
     )
 
 
@@ -148,7 +162,7 @@ def main() -> None:
     check_account_candidate(subaccount, snapshot.subaccounts)
     if not os.environ.get("DEEPX_TESTNET_PRIVATE_KEY"):
         parser.error("DEEPX_TESTNET_PRIVATE_KEY is required for execution startup")
-    database = postgres_options()
+    database, cache_database = postgres_options()
 
     node = (
         LiveNode.builder(
@@ -156,6 +170,8 @@ def main() -> None:
             TraderId.from_str("TESTER-001"),
             Environment.LIVE,
         )
+        .with_cache_database_factory(cache_database)
+        .with_timeout_connection(180)
         .with_reconciliation(reconciliation=True)
         .add_data_client(
             None,

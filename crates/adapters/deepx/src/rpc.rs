@@ -33,7 +33,7 @@ use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_common::live::dst;
 use nautilus_core::hex;
 use nautilus_model::defi::rpc::RpcNodeHttpResponse;
-use parity_scale_codec::{Compact, Decode, DecodeAll, Encode};
+use parity_scale_codec::{Compact, Decode, Encode};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 pub use spot_margin::{
@@ -67,8 +67,6 @@ pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
     "chain_getFinalizedHead",
     "chain_getHeader",
     "eth_call",
-    "state_getMetadata",
-    "state_getRuntimeVersion",
     "state_getStorage",
     "state_queryStorageAt",
     "state_call",
@@ -149,13 +147,6 @@ pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
     "chain_getHeader",
     "state_getStorage",
 ];
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedRuntimeVersion {
-    spec_version: u32,
-    transaction_version: u32,
-}
 
 #[derive(Debug, Deserialize)]
 struct ObservedBlockHeader {
@@ -330,6 +321,17 @@ impl PartialEq for DeepXAppliedRuntimeSnapshot {
 impl Eq for DeepXAppliedRuntimeSnapshot {}
 
 impl DeepXAppliedRuntimeSnapshot {
+    pub(crate) const fn unchanged(
+        checkpoint: DeepXFinalizedCheckpoint,
+        snapshot: RuntimeSnapshot,
+    ) -> Self {
+        Self {
+            checkpoint,
+            update: DeepXRuntimeSnapshotUpdate::Unchanged,
+            snapshot,
+        }
+    }
+
     /// Returns the finalized checkpoint used for the approved observation.
     #[must_use]
     pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
@@ -1546,7 +1548,7 @@ pub enum DeepXFinalizedChainTimeError {
     BlockEvidence(#[source] Box<DeepXFinalizedAccountError>),
 }
 
-/// Errors raised when a captured historical runtime no longer resolves to its approved version.
+/// Errors raised while reading data at a captured historical runtime checkpoint.
 #[derive(Debug, Error)]
 pub enum DeepXHistoricalRuntimeError {
     /// A historical runtime RPC request failed.
@@ -1557,21 +1559,6 @@ pub enum DeepXHistoricalRuntimeError {
         /// Underlying RPC failure.
         #[source]
         source: anyhow::Error,
-    },
-    /// The `Core_version` SCALE result was malformed.
-    #[error("DeepX historical Core_version response is invalid")]
-    InvalidCoreVersion,
-    /// A historical runtime method returned the wrong specification version.
-    #[error(
-        "DeepX historical runtime method {method} returned spec {received}, expected {expected}"
-    )]
-    SpecVersionMismatch {
-        /// RPC method whose result disagreed with the captured fixture.
-        method: &'static str,
-        /// Captured specification version.
-        expected: u32,
-        /// Observed specification version.
-        received: u32,
     },
 }
 
@@ -2133,7 +2120,31 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     config: &DeepXNetworkConfig,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
     let url = config.rpc_url()?;
-    observe_approved_finalized_runtime_snapshot_at(&config.environment, url, |_, _, _| Ok(())).await
+    let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
+    let encoded_genesis: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "chain_getBlockHash",
+            "params": [0],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
+    let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
+    let snapshot = RuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != config.environment
+        || snapshot.identity().genesis_hash != genesis_hash
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
+    let checkpoint = observe_finalized_checkpoint_at(url).await?;
+    Ok(DeepXObservedRuntimeSnapshot {
+        snapshot,
+        checkpoint,
+    })
 }
 
 /// Collects a read-only approved runtime snapshot pinned to one finalized DeepX block.
@@ -2167,12 +2178,18 @@ pub(crate) async fn observe_approved_finalized_runtime_snapshot_for_endpoints(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
-    observe_approved_finalized_runtime_snapshot_at(
-        environment,
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        |_, _, _| Ok(()),
-    )
-    .await
+    let snapshot = RuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != *environment
+        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
+    let checkpoint =
+        observe_finalized_checkpoint_at(endpoints.url_for(DeepXRpcRole::Watch).to_string()).await?;
+    Ok(DeepXObservedRuntimeSnapshot {
+        snapshot,
+        checkpoint,
+    })
 }
 
 /// Observes and atomically applies an approved finalized runtime snapshot.
@@ -2192,21 +2209,8 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     endpoints: &DeepXValidatedRpcEndpoints,
     service: &DeepXRuntimeSnapshotService,
 ) -> Result<DeepXAppliedRuntimeSnapshot, DeepXRuntimeSnapshotRefreshError> {
-    let observation = observe_approved_finalized_runtime_snapshot_at(
-        environment,
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        |genesis_hash, version, metadata| {
-            service.observe_runtime_fingerprint(
-                environment,
-                genesis_hash,
-                version.spec_version,
-                version.transaction_version,
-                metadata,
-            )?;
-            Ok::<_, DeepXRuntimeSnapshotRefreshError>(())
-        },
-    )
-    .await?;
+    let observation =
+        observe_approved_finalized_runtime_snapshot_for_endpoints(environment, endpoints).await?;
     let update = service.apply_validated(observation.snapshot())?;
 
     Ok(DeepXAppliedRuntimeSnapshot {
@@ -2218,18 +2222,15 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
 
 /// Observes fixture-approved runtime identity and `Timestamp.Now` at one finalized Watch block.
 ///
-/// Runtime version and metadata are validated and applied before timestamp storage is read from the
-/// exact same checkpoint. The Watch endpoint must also return the approved runtime at that
-/// checkpoint through both `Core_version` and `state_getRuntimeVersion`.
-/// `Timestamp.Now` must also agree with the block inherent and independent storage query.
-/// Runtime change evidence therefore blocks new signing permits even when a later check fails.
+/// The built-in runtime snapshot is applied before timestamp storage is read from the exact same
+/// checkpoint. `Timestamp.Now` must also agree with the block inherent and independent storage
+/// query. Inconsistent checkpoint evidence blocks new signing permits even when a later check fails.
 /// This function performs no nonce allocation, signing, or submission.
 ///
 /// # Errors
 ///
-/// Returns an error unless capability evidence authorizes the required Watch reads, the finalized
-/// runtime is fixture-approved and can be applied, both runtime methods agree at the observed
-/// finalized checkpoint, and all finalized timestamp observations agree.
+/// Returns an error unless capability evidence authorizes the required Watch reads, the built-in
+/// runtime snapshot can be applied at a finalized checkpoint, and all timestamp observations agree.
 pub async fn observe_and_apply_finalized_chain_time(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
@@ -2239,15 +2240,9 @@ pub async fn observe_and_apply_finalized_chain_time(
     let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
     if watch_capabilities.role() != DeepXRpcRole::Watch
         || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
-        || ![
-            "state_getStorage",
-            "state_queryStorageAt",
-            "state_getRuntimeVersion",
-            "state_call",
-            "chain_getBlock",
-        ]
-        .into_iter()
-        .all(|method| watch_capabilities.methods().contains(method))
+        || !["state_getStorage", "state_queryStorageAt", "chain_getBlock"]
+            .into_iter()
+            .all(|method| watch_capabilities.methods().contains(method))
     {
         return Err(DeepXFinalizedChainTimeError::RpcCapabilitiesMismatch);
     }
@@ -2259,20 +2254,6 @@ pub async fn observe_and_apply_finalized_chain_time(
         None,
         None,
     );
-    if let Err(e) = validate_runtime_semantics_at_checkpoint(
-        &client,
-        applied.checkpoint(),
-        applied.identity().spec_version,
-    )
-    .await
-    {
-        if !matches!(&e, DeepXHistoricalRuntimeError::Rpc { .. }) {
-            service
-                .halt_for_inconsistent_evidence()
-                .map_err(DeepXRuntimeSnapshotRefreshError::from)?;
-        }
-        return Err(e.into());
-    }
     let checkpoint = applied.checkpoint();
     let timestamp_ms = observe_finalized_chain_time_with_client(&client, checkpoint).await?;
     if let Err(e) = validate_block_timestamp_inherent(&client, checkpoint, timestamp_ms).await {
@@ -2543,7 +2524,7 @@ pub async fn observe_finalized_spot_market_spec_evidence(
     {
         return Err(DeepXFinalizedSpotMarketSpecError::RpcCapabilitiesMismatch);
     }
-    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
@@ -2558,7 +2539,13 @@ pub async fn observe_finalized_spot_market_spec_evidence(
         validate_finalized_storage_read_checkpoint(&client, observation.checkpoint())
             .await
             .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
-    let evidence = observe_spot_market_spec_at(&client, pair, &observation, &metadata).await?;
+    let evidence = observe_spot_market_spec_at(
+        &client,
+        pair,
+        &observation,
+        observation.snapshot().metadata(),
+    )
+    .await?;
     validate_finalized_market_timestamp_unchanged(&client, observation.checkpoint(), timestamp_ms)
         .await
         .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
@@ -2600,7 +2587,7 @@ pub async fn observe_finalized_spot_market_spec_batch(
     if pairs.iter().any(|pair| !unique.insert(*pair)) {
         return Err(DeepXFinalizedSpotMarketSpecError::DuplicatePair);
     }
-    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
@@ -2617,7 +2604,15 @@ pub async fn observe_finalized_spot_market_spec_batch(
             .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
     let mut evidence = Vec::with_capacity(pairs.len());
     for pair in pairs {
-        evidence.push(observe_spot_market_spec_at(&client, *pair, &observation, &metadata).await?);
+        evidence.push(
+            observe_spot_market_spec_at(
+                &client,
+                *pair,
+                &observation,
+                observation.snapshot().metadata(),
+            )
+            .await?,
+        );
     }
     validate_finalized_market_timestamp_unchanged(&client, observation.checkpoint(), timestamp_ms)
         .await
@@ -2629,7 +2624,7 @@ async fn observe_spot_market_spec_at(
     client: &BlockchainHttpRpcClient,
     pair: [u8; 32],
     observation: &DeepXObservedReadOnlyRuntimeSnapshot,
-    metadata: &[u8],
+    metadata: &subxt_core::Metadata,
 ) -> Result<DeepXFinalizedSpotMarketSpecEvidence, DeepXFinalizedSpotMarketSpecError> {
     let pair_hex = hex::encode(pair);
     let key = spot_market_storage_key(pair);
@@ -2678,10 +2673,9 @@ async fn observe_spot_market_spec_at(
 
 fn decode_finalized_spot_market_storage(
     encoded: &str,
-    metadata_bytes: &[u8],
+    metadata: &subxt_core::Metadata,
     pair: [u8; 32],
 ) -> Option<(u128, u128, u128)> {
-    let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).ok()?;
     let value_type = metadata
         .pallet_by_name("SpotMarket")?
         .storage()?
@@ -2756,7 +2750,7 @@ pub async fn observe_finalized_perp_order_spec_evidence(
     {
         return Err(DeepXFinalizedPerpOrderSpecError::RpcCapabilitiesMismatch);
     }
-    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
         environment,
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
@@ -2803,7 +2797,13 @@ pub async fn observe_finalized_perp_order_spec_evidence(
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::StorageRpc { market_id, source })?;
     let (stored_min_size, stored_tick, stored_step, min_notional) = stored
         .as_deref()
-        .and_then(|encoded| decode_finalized_perp_market_storage(encoded, &metadata, market_id))
+        .and_then(|encoded| {
+            decode_finalized_perp_market_storage(
+                encoded,
+                observation.snapshot().metadata(),
+                market_id,
+            )
+        })
         .ok_or(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id))?;
     if (min_order_size, tick_size, step_size) != (stored_min_size, stored_tick, stored_step) {
         return Err(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id));
@@ -2853,10 +2853,9 @@ fn decode_finalized_perp_order_spec(encoded: &str, market_id: u16) -> Option<(u1
 
 fn decode_finalized_perp_market_storage(
     encoded: &str,
-    metadata_bytes: &[u8],
+    metadata: &subxt_core::Metadata,
     market_id: u16,
 ) -> Option<(u128, u128, u128, u128)> {
-    let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).ok()?;
     let value_type = metadata
         .pallet_by_name("PerpMarket")?
         .storage()?
@@ -3832,10 +3831,7 @@ pub async fn observe_and_apply_finalized_account_evidence(
     if let Err(e) = &evidence
         && matches!(
             e,
-            DeepXFinalizedAccountError::HistoricalRuntime(
-                DeepXHistoricalRuntimeError::SpecVersionMismatch { .. }
-                    | DeepXHistoricalRuntimeError::InvalidCoreVersion
-            ) | DeepXFinalizedAccountError::EthCallBlockHashIgnored
+            DeepXFinalizedAccountError::EthCallBlockHashIgnored
                 | DeepXFinalizedAccountError::BlockTimestampMismatch { .. }
                 | DeepXFinalizedAccountError::StorageQueryTimestampMismatch { .. }
                 | DeepXFinalizedAccountError::InvalidBlockTimestamp
@@ -3979,8 +3975,6 @@ async fn collect_finalized_account_evidence(
     runtime_identity: &ApprovedRuntimeIdentity,
     subaccount: [u8; 20],
 ) -> Result<DeepXFinalizedAccountEvidence, DeepXFinalizedAccountError> {
-    validate_runtime_semantics_at_checkpoint(client, checkpoint, runtime_identity.spec_version)
-        .await?;
     validate_eth_call_block_selection(client, checkpoint).await?;
     let timestamp_ms = observe_finalized_chain_time_with_client(client, checkpoint).await?;
     validate_block_timestamp_inherent(client, checkpoint, timestamp_ms).await?;
@@ -4144,123 +4138,6 @@ async fn validate_eth_call_block_selection(
         return Err(DeepXFinalizedAccountError::EthCallBlockHashIgnored);
     }
     Ok(())
-}
-
-async fn validate_runtime_semantics_at_checkpoint(
-    client: &BlockchainHttpRpcClient,
-    checkpoint: DeepXFinalizedCheckpoint,
-    expected_spec_version: u32,
-) -> Result<(), DeepXHistoricalRuntimeError> {
-    let finalized_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
-    validate_runtime_semantics_at(client, &finalized_hash, expected_spec_version).await
-}
-
-async fn validate_read_only_runtime_semantics(
-    client: &BlockchainHttpRpcClient,
-    checkpoint: DeepXFinalizedCheckpoint,
-    expected_spec_version: u32,
-) -> Result<(), DeepXHistoricalRuntimeError> {
-    validate_runtime_semantics_at_checkpoint(client, checkpoint, expected_spec_version).await
-}
-
-async fn validate_runtime_semantics_at(
-    client: &BlockchainHttpRpcClient,
-    finalized_hash: &str,
-    expected_spec_version: u32,
-) -> Result<(), DeepXHistoricalRuntimeError> {
-    let encoded: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_call",
-            "params": ["Core_version", "0x", finalized_hash],
-        }))
-        .await
-        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
-            method: "state_call(Core_version)",
-            source,
-        })?;
-    let received = decode_core_version_spec(&encoded)?;
-    if received != expected_spec_version {
-        return Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
-            method: "state_call(Core_version)",
-            expected: expected_spec_version,
-            received,
-        });
-    }
-    let version: ObservedRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getRuntimeVersion",
-            "params": [finalized_hash],
-        }))
-        .await
-        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    if version.spec_version != expected_spec_version {
-        return Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
-            method: "state_getRuntimeVersion",
-            expected: expected_spec_version,
-            received: version.spec_version,
-        });
-    }
-    Ok(())
-}
-
-pub(crate) async fn validate_finalized_runtime_semantics_at(
-    watch_url: &str,
-) -> Result<(), DeepXHistoricalRuntimeError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    let finalized_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getFinalizedHead",
-            "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
-            method: "chain_getFinalizedHead",
-            source,
-        })?;
-    let version: ObservedRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getRuntimeVersion",
-            "params": [finalized_hash.clone()],
-        }))
-        .await
-        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    validate_runtime_semantics_at(&client, &finalized_hash, version.spec_version).await
-}
-
-#[derive(Decode)]
-struct CoreVersionResponse {
-    _spec_name: Vec<u8>,
-    _impl_name: Vec<u8>,
-    _authoring_version: u32,
-    spec_version: u32,
-    _impl_version: u32,
-    _apis: Vec<([u8; 8], u32)>,
-    _transaction_version: u32,
-    _state_version: u8,
-}
-
-fn decode_core_version_spec(encoded: &str) -> Result<u32, DeepXHistoricalRuntimeError> {
-    let bytes = encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())
-        .ok_or(DeepXHistoricalRuntimeError::InvalidCoreVersion)?;
-    let mut input = bytes.as_slice();
-    let version: CoreVersionResponse =
-        Decode::decode(&mut input).map_err(|_| DeepXHistoricalRuntimeError::InvalidCoreVersion)?;
-    if !input.is_empty() || version.spec_version == 0 {
-        return Err(DeepXHistoricalRuntimeError::InvalidCoreVersion);
-    }
-    Ok(version.spec_version)
 }
 
 async fn validate_block_timestamp_inherent(
@@ -4579,19 +4456,9 @@ async fn observe_finalized_lending_with_client(
         .await
         .map_err(DeepXFinalizedLendingError::PositionsRpc)?;
     let raw_positions = decode_lending_positions(&encoded, subaccount)?;
-    stream::iter(
-        raw_positions
-            .into_iter()
-            .map(|raw| {
-                observe_finalized_lending_asset(
-                    client,
-                    &block_hash,
-                    &block_number,
-                    subaccount,
-                    raw,
-                )
-            }),
-    )
+    stream::iter(raw_positions.into_iter().map(|raw| {
+        observe_finalized_lending_asset(client, &block_hash, &block_number, subaccount, raw)
+    }))
     .buffered(DEEPX_LENDING_ASSET_QUERY_CONCURRENCY)
     .try_collect()
     .await
@@ -4980,73 +4847,11 @@ fn decode_timestamp_now(encoded: &str) -> Result<u64, DeepXFinalizedChainTimeErr
     Ok(timestamp_ms)
 }
 
-async fn observe_approved_finalized_runtime_snapshot_at<E>(
-    environment: &DeepXEnvironment,
-    url: String,
-    observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
-) -> Result<DeepXObservedRuntimeSnapshot, E>
-where
-    E: From<DeepXRuntimeSnapshotObservationError>,
-{
-    let (snapshot, checkpoint, _) = observe_finalized_runtime_snapshot_at(
-        environment,
-        url,
-        observe,
-        RuntimeSnapshot::approved_testnet,
-    )
-    .await?;
-    Ok(DeepXObservedRuntimeSnapshot {
-        snapshot,
-        checkpoint,
-    })
-}
-
 async fn observe_approved_finalized_read_only_runtime_snapshot_at(
     environment: &DeepXEnvironment,
     url: String,
 ) -> Result<DeepXObservedReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
-    let (observation, _) =
-        observe_approved_finalized_read_only_runtime_with_metadata_at(environment, url).await?;
-    Ok(observation)
-}
-
-async fn observe_approved_finalized_read_only_runtime_with_metadata_at(
-    environment: &DeepXEnvironment,
-    url: String,
-) -> Result<(DeepXObservedReadOnlyRuntimeSnapshot, Vec<u8>), DeepXRuntimeSnapshotObservationError> {
     let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
-    let (snapshot, checkpoint, metadata) = observe_finalized_runtime_snapshot_at(
-        environment,
-        url,
-        |_, _, _| Ok::<_, DeepXRuntimeSnapshotObservationError>(()),
-        DeepXReadOnlyRuntimeSnapshot::approved_testnet,
-    )
-    .await?;
-    validate_read_only_runtime_semantics(
-        &client,
-        checkpoint,
-        snapshot.identity().spec_version,
-    )
-    .await?;
-    Ok((
-        DeepXObservedReadOnlyRuntimeSnapshot {
-            snapshot,
-            checkpoint,
-        },
-        metadata,
-    ))
-}
-
-async fn observe_finalized_runtime_snapshot_at<E, S>(
-    environment: &DeepXEnvironment,
-    url: String,
-    mut observe: impl FnMut([u8; 32], &ObservedRuntimeVersion, Option<&[u8]>) -> Result<(), E>,
-    approve: impl FnOnce(&DeepXEnvironment, [u8; 32], u32, u32, &[u8]) -> Result<S, SnapshotError>,
-) -> Result<(S, DeepXFinalizedCheckpoint, Vec<u8>), E>
-where
-    E: From<DeepXRuntimeSnapshotObservationError>,
-{
-    let client = BlockchainHttpRpcClient::new(url, None, None);
     let encoded_genesis: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
@@ -5060,6 +4865,23 @@ where
             source,
         })?;
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
+    if snapshot.identity().environment != *environment
+        || snapshot.identity().genesis_hash != genesis_hash
+    {
+        return Err(SnapshotError::RuntimeIdentityMismatch.into());
+    }
+    let checkpoint = observe_finalized_checkpoint_at(url).await?;
+    Ok(DeepXObservedReadOnlyRuntimeSnapshot {
+        snapshot,
+        checkpoint,
+    })
+}
+
+async fn observe_finalized_checkpoint_at(
+    url: String,
+) -> Result<DeepXFinalizedCheckpoint, DeepXRuntimeSnapshotObservationError> {
+    let client = BlockchainHttpRpcClient::new(url, None, None);
     let encoded_finalized_hash: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
@@ -5073,70 +4895,22 @@ where
             source,
         })?;
     let finalized_hash = decode_prefixed_hash(&encoded_finalized_hash, "finalized hash")?;
-    let block_params = json!([encoded_finalized_hash]);
     let finalized_header: ObservedBlockHeader = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getHeader",
-            "params": block_params.clone(),
+            "params": [encoded_finalized_hash],
         }))
         .await
         .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
             method: "chain_getHeader",
             source,
         })?;
-    let finalized_block_number = decode_block_number(&finalized_header.number)?;
-    let runtime_version: ObservedRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getRuntimeVersion",
-            "params": block_params.clone(),
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    observe(genesis_hash, &runtime_version, None)?;
-    let encoded_metadata: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getMetadata",
-            "params": block_params,
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "state_getMetadata",
-            source,
-        })?;
-    let metadata = encoded_metadata
-        .strip_prefix("0x")
-        .ok_or(DeepXRuntimeSnapshotObservationError::InvalidMetadata)
-        .and_then(|value| {
-            hex::decode(value).map_err(|_| DeepXRuntimeSnapshotObservationError::InvalidMetadata)
-        })?;
-
-    observe(genesis_hash, &runtime_version, Some(&metadata))?;
-    let snapshot = approve(
-        environment,
-        genesis_hash,
-        runtime_version.spec_version,
-        runtime_version.transaction_version,
-        &metadata,
-    )
-    .map_err(DeepXRuntimeSnapshotObservationError::Snapshot)?;
-
-    Ok((
-        snapshot,
-        DeepXFinalizedCheckpoint {
-            block_hash: finalized_hash,
-            block_number: finalized_block_number,
-        },
-        metadata,
-    ))
+    Ok(DeepXFinalizedCheckpoint {
+        block_hash: finalized_hash,
+        block_number: decode_block_number(&finalized_header.number)?,
+    })
 }
 
 fn decode_prefixed_hash(
@@ -5173,6 +4947,7 @@ mod tests {
     use axum::{Json, Router, routing::post};
     use nautilus_core::UnixNanos;
     use nautilus_model::{enums::AccountType, identifiers::AccountId, types::Money};
+    use parity_scale_codec::DecodeAll;
     use rstest::rstest;
     use serde_json::Value;
     use tokio::net::TcpListener;
@@ -5197,11 +4972,6 @@ mod tests {
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
-    const RUNTIME_VERSION_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-            genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
-         runtime_version.json"
-    );
     const SPEC_376_METADATA_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
@@ -5215,149 +4985,6 @@ mod tests {
     const FINALIZED_HASH: &str = DEEPX_SPEC_376_FINALIZED_HASH;
     const FINALIZED_BLOCK_NUMBER: u32 = 19_592_700;
     const FINALIZED_BLOCK_NUMBER_HEX: &str = "0x12af5fc";
-
-    fn encoded_core_version(spec_version: u32) -> String {
-        format!(
-            "0x{}",
-            hex::encode(
-                (
-                    b"frontier-template".to_vec(),
-                    b"frontier-template".to_vec(),
-                    1_u32,
-                    spec_version,
-                    1_u32,
-                    Vec::<([u8; 8], u32)>::new(),
-                    1_u32,
-                    1_u8,
-                )
-                    .encode()
-            )
-        )
-    }
-
-    fn historical_runtime_probe_response(request: &Value, completed_calls: usize) -> Option<Value> {
-        match request["method"].as_str()? {
-            "state_call" if request["params"][0] == "Core_version" => {
-                let finalized_hash = request["params"][2].as_str()?;
-                let spec_version = match finalized_hash {
-                    DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
-                    _ => return None,
-                };
-                Some(json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "result": encoded_core_version(spec_version),
-                }))
-            }
-            "state_getRuntimeVersion" if completed_calls >= 5 => {
-                let finalized_hash = request["params"][0].as_str()?;
-                let spec_version = match finalized_hash {
-                    DEEPX_SPEC_376_FINALIZED_HASH => DEEPX_SPEC_376_VERSION,
-                    _ => return None,
-                };
-                Some(json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "result": {
-                        "specVersion": spec_version,
-                        "transactionVersion": 1,
-                    },
-                }))
-            }
-            _ => None,
-        }
-    }
-
-    #[rstest]
-    #[case::spec376_valid(376, None, None)]
-    #[case::spec376_core_mismatch(376, Some(375), None)]
-    #[case::spec376_version_mismatch(376, None, Some(375))]
-    #[tokio::test]
-    async fn read_only_probe_uses_spec_specific_captured_checkpoint(
-        #[case] spec_version: u32,
-        #[case] core_version: Option<u32>,
-        #[case] runtime_version: Option<u32>,
-    ) {
-        assert_eq!(spec_version, DEEPX_SPEC_376_VERSION);
-        let finalized_hash = DEEPX_SPEC_376_FINALIZED_HASH;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let observed_calls = Arc::clone(&calls);
-        let app = Router::new().route(
-            "/",
-            post(move |Json(request): Json<Value>| {
-                observed_calls.fetch_add(1, Ordering::Relaxed);
-                async move {
-                    match request["method"].as_str().unwrap() {
-                        "state_call" => {
-                            assert_eq!(
-                                request["params"],
-                                json!(["Core_version", "0x", finalized_hash])
-                            );
-                            Json(json!({
-                                "jsonrpc": "2.0", "id": 1,
-                                "result": encoded_core_version(core_version.unwrap_or(spec_version)),
-                            }))
-                        }
-                        "state_getRuntimeVersion" => {
-                            assert_eq!(request["params"], json!([finalized_hash]));
-                            Json(json!({
-                                "jsonrpc": "2.0", "id": 1,
-                                "result": {"specVersion": runtime_version.unwrap_or(spec_version),
-                                           "transactionVersion": 1},
-                            }))
-                        }
-                        method => panic!("unexpected runtime method {method}"),
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = BlockchainHttpRpcClient::new(url, None, None);
-
-        let checkpoint = DeepXFinalizedCheckpoint {
-            block_hash: decode_prefixed_hash(finalized_hash, "finalized hash").unwrap(),
-            block_number: FINALIZED_BLOCK_NUMBER,
-        };
-        let result =
-            validate_read_only_runtime_semantics(&client, checkpoint, spec_version).await;
-        if core_version.is_some() {
-            assert!(matches!(
-                result,
-                Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                    method: "state_call(Core_version)",
-                    expected,
-                    received,
-                }) if expected == spec_version && received == spec_version - 1
-            ));
-            assert_eq!(calls.load(Ordering::Relaxed), 1);
-        } else if runtime_version.is_some() {
-            assert!(matches!(
-                result,
-                Err(DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                    method: "state_getRuntimeVersion",
-                    expected,
-                    received,
-                }) if expected == spec_version && received == spec_version - 1
-            ));
-            assert_eq!(calls.load(Ordering::Relaxed), 2);
-        } else {
-            result.unwrap();
-            assert_eq!(calls.load(Ordering::Relaxed), 2);
-        }
-        server.abort();
-    }
-
-    #[rstest]
-    fn core_version_decoder_accepts_baseline_spec_version() {
-        assert_eq!(
-            decode_core_version_spec(&encoded_core_version(DEEPX_SPEC_376_VERSION)).unwrap(),
-            DEEPX_SPEC_376_VERSION,
-        );
-        assert!(matches!(
-            decode_core_version_spec("0x00"),
-            Err(DeepXHistoricalRuntimeError::InvalidCoreVersion),
-        ));
-    }
 
     #[rstest]
     fn timestamp_inherent_decodes_exact_milliseconds() {
@@ -6657,12 +6284,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
         assert_eq!(
             observation.snapshot().identity().spec_version,
             DEEPX_SPEC_376_VERSION,
         );
-        assert_eq!(observation.checkpoint().block_number(), FINALIZED_BLOCK_NUMBER);
+        assert_eq!(
+            observation.checkpoint().block_number(),
+            FINALIZED_BLOCK_NUMBER
+        );
     }
 
     #[tokio::test]
@@ -6688,7 +6318,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(read_only_calls.load(Ordering::Relaxed), 7);
+        assert_eq!(read_only_calls.load(Ordering::Relaxed), 3);
         assert_eq!(
             observation.snapshot().identity().spec_version,
             DEEPX_SPEC_376_VERSION
@@ -6697,51 +6327,6 @@ mod tests {
             observation.checkpoint().block_number(),
             FINALIZED_BLOCK_NUMBER
         );
-    }
-
-    #[rstest]
-    #[case::core_version("historical_core_version_mismatch", "state_call(Core_version)", 6)]
-    #[case::runtime_version("historical_runtime_mismatch", "state_getRuntimeVersion", 7)]
-    #[tokio::test]
-    async fn read_only_position_observation_rejects_historical_runtime_before_storage(
-        #[case] mismatch: &'static str,
-        #[case] method: &'static str,
-        #[case] expected_calls: usize,
-    ) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let watch_url = spawn_runtime_snapshot_server_with(
-            DEEPX_SPEC_376_VERSION,
-            1,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            Some(mismatch),
-            |_| {},
-            Arc::clone(&calls),
-        )
-        .await;
-        let endpoints =
-            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-        let capabilities = validated_capabilities(&endpoints);
-
-        assert!(matches!(
-            observe_finalized_perp_positions_evidence(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                [0x11; 20],
-            )
-            .await,
-            Err(DeepXFinalizedPerpPositionsError::RuntimeObservation(
-                DeepXRuntimeSnapshotObservationError::HistoricalRuntime(
-                    DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                        method: observed,
-                        expected: DEEPX_SPEC_376_VERSION,
-                        received: 371,
-                    }
-                )
-            )) if observed == method
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
     }
 
     #[rstest]
@@ -6759,10 +6344,8 @@ mod tests {
     ) {
         let pair = [0x33; 32];
         let second_pair = [0x44; 32];
-        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
-        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
         let spot_market_storage: Value =
             serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
         let spot_market_storage = spot_market_storage["result"].as_str().unwrap().to_string();
@@ -6778,25 +6361,15 @@ mod tests {
                 let calls = Arc::clone(&server_calls);
                 let genesis = genesis.clone();
                 let finalized_head = finalized_head.clone();
-                let runtime_version = runtime_version.clone();
-                let metadata = metadata.clone();
                 let header = header.clone();
                 let spot_market_storage = spot_market_storage.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(
-                        &request,
-                        calls.load(Ordering::Relaxed),
-                    ) {
-                        return Json(response);
-                    }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
                     let response = match index {
                         0 => genesis,
                         1 => finalized_head,
                         2 => header,
-                        3 => runtime_version,
-                        4 => metadata,
-                        5 => {
+                        3 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -6808,7 +6381,7 @@ mod tests {
                                 "result": format!("0x{}", hex::encode(1_700_000_000_123u64.encode())),
                             })
                         }
-                        6 => {
+                        4 => {
                             assert_eq!(request["method"], "chain_getBlock");
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             let mut inherent = vec![4, 2, 0];
@@ -6826,7 +6399,7 @@ mod tests {
                                 },
                             })
                         }
-                        7 => {
+                        5 => {
                             assert_eq!(request["method"], "state_queryStorageAt");
                             assert_eq!(
                                 request["params"],
@@ -6844,7 +6417,7 @@ mod tests {
                                 }],
                             })
                         }
-                        8 => {
+                        6 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -6857,10 +6430,10 @@ mod tests {
                                     "error": {"code": -32000, "message": "unknown block"}})
                             }
                         }
-                        9..=12 => {
+                        7..=10 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(request["params"][1], FINALIZED_HASH);
-                            let observed_pair = if index < 11 { pair } else { second_pair };
+                            let observed_pair = if index < 9 { pair } else { second_pair };
                             assert_eq!(request["params"][0], spot_market_storage_key(observed_pair));
                             json!({
                                 "jsonrpc": "2.0",
@@ -6868,10 +6441,10 @@ mod tests {
                                 "result": spot_market_storage.replace(
                                     "9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
                                     &hex::encode(observed_pair),
-                                ) + if index == 10 && late_storage_change { "00" } else { "" },
+                                ) + if index == 8 && late_storage_change { "00" } else { "" },
                             })
                         }
-                        13 => {
+                        11 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -6912,27 +6485,27 @@ mod tests {
                 Err(DeepXFinalizedSpotMarketSpecError::Checkpoint(source))
                     if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch { .. })
             ));
-            assert_eq!(calls.load(Ordering::Relaxed), 7);
+            assert_eq!(calls.load(Ordering::Relaxed), 5);
         } else if storage_hash_ignored {
             assert!(matches!(
                 result,
                 Err(DeepXFinalizedSpotMarketSpecError::Checkpoint(source))
                     if matches!(*source, DeepXFinalizedAccountError::StorageBlockHashIgnored)
             ));
-            assert_eq!(calls.load(Ordering::Relaxed), 9);
+            assert_eq!(calls.load(Ordering::Relaxed), 7);
         } else if late_storage_change {
             assert!(matches!(
                 result,
                 Err(DeepXFinalizedSpotMarketSpecError::InvalidEvidence(_))
             ));
-            assert_eq!(calls.load(Ordering::Relaxed), 11);
+            assert_eq!(calls.load(Ordering::Relaxed), 9);
         } else if late_timestamp_change {
             assert!(matches!(
                 result,
                 Err(DeepXFinalizedSpotMarketSpecError::Checkpoint(source))
                     if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch { .. })
             ));
-            assert_eq!(calls.load(Ordering::Relaxed), 14);
+            assert_eq!(calls.load(Ordering::Relaxed), 12);
         } else {
             let evidence = result.unwrap();
             assert_eq!(evidence.len(), 2);
@@ -6949,7 +6522,7 @@ mod tests {
             assert_eq!(evidence[0].min_order_size(), 100_000_000_000_000);
             assert_eq!(evidence[0].tick_size(), 10_000);
             assert_eq!(evidence[0].step_size(), 100_000_000_000_000);
-            assert_eq!(calls.load(Ordering::Relaxed), 14);
+            assert_eq!(calls.load(Ordering::Relaxed), 12);
         }
     }
 
@@ -7120,23 +6693,23 @@ mod tests {
             perp_market_storage_key(3),
             "0xb052a07884e121f56b64aa711c766532bdc7a97672ba816c4074df5f464124630300",
         );
-        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
-        let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet().unwrap();
+        let metadata = snapshot.metadata();
         let encoded = encoded_perp_market_storage();
         assert_eq!(
-            decode_finalized_perp_market_storage(&encoded, &metadata_bytes, 3),
+            decode_finalized_perp_market_storage(&encoded, metadata, 3),
             Some((11, 2, 3, 50)),
         );
         assert_eq!(
-            decode_finalized_perp_market_storage(&encoded, &metadata_bytes, 4),
+            decode_finalized_perp_market_storage(&encoded, metadata, 4),
             None,
         );
         assert_eq!(
-            decode_finalized_perp_market_storage(&format!("{encoded}00"), &metadata_bytes, 3),
+            decode_finalized_perp_market_storage(&format!("{encoded}00"), metadata, 3),
             None,
         );
         assert_eq!(
-            decode_finalized_perp_market_storage("0x", &metadata_bytes, 3),
+            decode_finalized_perp_market_storage("0x", metadata, 3),
             None,
         );
     }
@@ -7177,10 +6750,8 @@ mod tests {
         #[case] late_timestamp_change: bool,
         #[case] late_market_change: bool,
     ) {
-        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let genesis: Value = serde_json::from_str(GENESIS_FIXTURE).unwrap();
         let finalized_head: Value = serde_json::from_str(FINALIZED_HEAD_FIXTURE).unwrap();
-        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
         let header = json!({
             "jsonrpc": "2.0", "id": 1,
             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX }
@@ -7193,24 +6764,14 @@ mod tests {
                 let calls = Arc::clone(&server_calls);
                 let genesis = genesis.clone();
                 let finalized_head = finalized_head.clone();
-                let runtime_version = runtime_version.clone();
-                let metadata = metadata.clone();
                 let header = header.clone();
                 async move {
-                    if let Some(response) = historical_runtime_probe_response(
-                        &request,
-                        calls.load(Ordering::Relaxed),
-                    ) {
-                        return Json(response);
-                    }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
                     let response = match index {
                         0 => genesis,
                         1 => finalized_head,
                         2 => header,
-                        3 => runtime_version,
-                        4 => metadata,
-                        5 => {
+                        3 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -7222,7 +6783,7 @@ mod tests {
                                 "result": format!("0x{}", hex::encode(1_700_000_000_123u64.encode())),
                             })
                         }
-                        6 => {
+                        4 => {
                             assert_eq!(request["method"], "chain_getBlock");
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             let mut inherent = vec![4, 2, 0];
@@ -7240,7 +6801,7 @@ mod tests {
                                 },
                             })
                         }
-                        7 => {
+                        5 => {
                             assert_eq!(request["method"], "state_queryStorageAt");
                             assert_eq!(
                                 request["params"],
@@ -7258,19 +6819,19 @@ mod tests {
                                 }],
                             })
                         }
-                        8 => {
+                        6 => {
                             assert_eq!(request["method"], "eth_call");
                             assert_eq!(request["params"][0]["to"], DEEPX_ETH_CALL_PROBE_ADDRESS);
                             assert_eq!(request["params"][1], FINALIZED_BLOCK_NUMBER_HEX);
                             json!({"jsonrpc": "2.0", "id": 1, "result": "0x"})
                         }
-                        9 => {
+                        7 => {
                             assert_eq!(request["method"], "eth_call");
                             assert_eq!(request["params"][1], "0xffffffff");
                             json!({"jsonrpc": "2.0", "id": 1,
                                 "error": {"code": -32000, "message": "unknown block"}})
                         }
-                        10 => {
+                        8 => {
                             assert_eq!(request["method"], "eth_call");
                             assert_eq!(
                                 request["params"][0]["to"],
@@ -7294,7 +6855,7 @@ mod tests {
                                 "result": encoded_perp_market(3, evm_spec),
                             })
                         }
-                        11 => {
+                        9 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(request["params"][0], perp_market_storage_key(3));
                             assert_eq!(request["params"][1], FINALIZED_HASH);
@@ -7304,7 +6865,7 @@ mod tests {
                                 "result": encoded_perp_market_storage(),
                             })
                         }
-                        12 => {
+                        10 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(request["params"][0], perp_market_storage_key(3));
                             assert_eq!(request["params"][1], FINALIZED_HASH);
@@ -7314,7 +6875,7 @@ mod tests {
                             }
                             json!({"jsonrpc": "2.0", "id": 1, "result": stored})
                         }
-                        13 => {
+                        11 => {
                             assert_eq!(request["method"], "state_getStorage");
                             assert_eq!(
                                 request["params"],
@@ -7381,21 +6942,21 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::Relaxed),
             if timestamp_mismatch {
-                7
+                5
             } else if !matching && !late_timestamp_change && !late_market_change {
-                12
+                10
             } else if late_market_change {
-                13
+                11
             } else {
-                14
+                12
             },
         );
     }
 
     #[rstest]
     fn decodes_only_matching_complete_spot_market_storage() {
-        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
-        let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet().unwrap();
+        let metadata = snapshot.metadata();
         let storage: Value = serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
         let encoded = storage["result"].as_str().unwrap();
         let pair = hex::decode("9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
@@ -7403,7 +6964,7 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(
-            decode_finalized_spot_market_storage(encoded, &metadata_bytes, pair,),
+            decode_finalized_spot_market_storage(encoded, metadata, pair,),
             Some((100_000_000_000_000, 10_000, 100_000_000_000_000)),
         );
         for encoded in [
@@ -7412,12 +6973,12 @@ mod tests {
             encoded.replace("00407a10f35a00000000000000000000", &"00".repeat(16)),
         ] {
             assert_eq!(
-                decode_finalized_spot_market_storage(&encoded, &metadata_bytes, pair),
+                decode_finalized_spot_market_storage(&encoded, metadata, pair),
                 None
             );
         }
         assert_eq!(
-            decode_finalized_spot_market_storage(encoded, &metadata_bytes, [0x33; 32],),
+            decode_finalized_spot_market_storage(encoded, metadata, [0x33; 32],),
             None,
         );
     }
@@ -7432,11 +6993,6 @@ mod tests {
             post(move |Json(request): Json<Value>| {
                 let calls = Arc::clone(&server_calls);
                 async move {
-                    if let Some(response) =
-                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
-                    {
-                        return Json(response);
-                    }
                     calls.fetch_add(1, Ordering::Relaxed);
                     let response = match request["method"].as_str().unwrap() {
                         "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
@@ -7448,15 +7004,6 @@ mod tests {
                             "id": 1,
                             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
-                        "state_getRuntimeVersion" => {
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
-                            response
-                        }
-                        "state_getMetadata" => {
-                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
-                        }
                         "state_call" => {
                             assert_eq!(request["params"][0], DEEPX_MARGIN_RUNTIME_API_METHOD);
                             assert_eq!(request["params"][2], FINALIZED_HASH);
@@ -7506,7 +7053,7 @@ mod tests {
         assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.initial().total_collateral(), 1_000_000);
         assert_eq!(evidence.maintenance().total_margin_required(), 100_000);
-        assert_eq!(calls.load(Ordering::Relaxed), 7);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]
@@ -7528,11 +7075,6 @@ mod tests {
                 let positions_key = positions_key.clone();
                 let encoded_positions = encoded_positions.clone();
                 async move {
-                    if let Some(response) =
-                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
-                    {
-                        return Json(response);
-                    }
                     calls.fetch_add(1, Ordering::Relaxed);
                     let response = match request["method"].as_str().unwrap() {
                         "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
@@ -7544,15 +7086,6 @@ mod tests {
                             "id": 1,
                             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
-                        "state_getRuntimeVersion" => {
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
-                            response
-                        }
-                        "state_getMetadata" => {
-                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
-                        }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
                             assert_eq!(request["params"][0], json!([maximum_key, positions_key]),);
@@ -7597,7 +7130,7 @@ mod tests {
         assert_eq!(evidence.positions().len(), 1);
         assert_eq!(evidence.positions()[0].market_id(), 3);
         assert_eq!(evidence.positions()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]
@@ -7625,11 +7158,6 @@ mod tests {
                 let encoded_index = encoded_index.clone();
                 let encoded_order = encoded_order.clone();
                 async move {
-                    if let Some(response) =
-                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
-                    {
-                        return Json(response);
-                    }
                     calls.fetch_add(1, Ordering::Relaxed);
                     let response = match request["method"].as_str().unwrap() {
                         "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
@@ -7641,15 +7169,6 @@ mod tests {
                             "id": 1,
                             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
-                        "state_getRuntimeVersion" => {
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
-                            response
-                        }
-                        "state_getMetadata" => {
-                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
-                        }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
                             let keys = request["params"][0].as_array().unwrap();
@@ -7697,7 +7216,7 @@ mod tests {
         assert_eq!(evidence.orders()[0].order_id(), 42);
         assert_eq!(evidence.orders()[0].market_id(), 3);
         assert_eq!(evidence.orders()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 7);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]
@@ -7723,11 +7242,6 @@ mod tests {
                 let encoded_index = encoded_index.clone();
                 let encoded_order = encoded_order.clone();
                 async move {
-                    if let Some(response) =
-                        historical_runtime_probe_response(&request, calls.load(Ordering::Relaxed))
-                    {
-                        return Json(response);
-                    }
                     calls.fetch_add(1, Ordering::Relaxed);
                     let response = match request["method"].as_str().unwrap() {
                         "chain_getBlockHash" => serde_json::from_str(GENESIS_FIXTURE).unwrap(),
@@ -7739,15 +7253,6 @@ mod tests {
                             "id": 1,
                             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
-                        "state_getRuntimeVersion" => {
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(DEEPX_SPEC_376_VERSION);
-                            response
-                        }
-                        "state_getMetadata" => {
-                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
-                        }
                         "state_queryStorageAt" => {
                             assert_eq!(request["params"][1], FINALIZED_HASH);
                             let keys = request["params"][0].as_array().unwrap();
@@ -7805,7 +7310,7 @@ mod tests {
         assert_eq!(evidence.orders()[0].is_buy(), order.is_buy());
         assert_eq!(evidence.orders()[0].quote_amount(), order.quote_amount());
         assert_eq!(evidence.orders()[0].base_amount(), order.base_amount());
-        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]
@@ -7866,14 +7371,6 @@ mod tests {
                             "id": 1,
                             "result": { "number": FINALIZED_BLOCK_NUMBER_HEX },
                         }),
-                        "state_getRuntimeVersion" => {
-                            let at = request["params"][0].as_str().unwrap();
-                            assert_eq!(at, FINALIZED_HASH);
-                            serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap()
-                        }
-                        "state_getMetadata" => {
-                            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap()
-                        }
                         "state_getStorage" => {
                             assert_eq!(
                                 request["params"],
@@ -7903,15 +7400,6 @@ mod tests {
                         }
                         "state_call" => {
                             let method = request["params"][0].as_str().unwrap();
-                            if method == "Core_version" {
-                                assert_eq!(request["params"][1], "0x");
-                                let at = request["params"][2].as_str().unwrap();
-                                assert_eq!(at, DEEPX_SPEC_376_FINALIZED_HASH);
-                                return Json(json!({
-                                    "jsonrpc": "2.0", "id": 1,
-                                    "result": encoded_core_version(DEEPX_SPEC_376_VERSION),
-                                }));
-                            }
                             assert_eq!(request["params"][2], FINALIZED_HASH);
                             let result = if method == DEEPX_MARGIN_RUNTIME_API_METHOD {
                                 let encoded = request["params"][1].as_str().unwrap();
@@ -8025,7 +7513,7 @@ mod tests {
         assert_eq!(evidence.spot_orders().orders().len(), 1);
         assert_eq!(evidence.spot_orders().orders()[0].pair(), [0x22; 32]);
         assert_eq!(evidence.spot_orders().orders()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 22);
+        assert_eq!(calls.load(Ordering::Relaxed), 16);
     }
 
     #[tokio::test]
@@ -8072,24 +7560,6 @@ mod tests {
                         "chain_getHeader" => {
                             json!({ "number": FINALIZED_BLOCK_NUMBER_HEX })
                         }
-                        "state_getRuntimeVersion" => {
-                            let at = request["params"][0].as_str().unwrap();
-                            assert_eq!(at, FINALIZED_HASH);
-                            let mode = timestamp_mode.load(Ordering::Relaxed);
-                            let mut response: Value =
-                                serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-                            response["result"]["specVersion"] = json!(if mode == 5 {
-                                371
-                            } else {
-                                DEEPX_SPEC_376_VERSION
-                            });
-                            return Json(response);
-                        }
-                        "state_getMetadata" => {
-                            return Json(
-                                serde_json::from_str::<Value>(SPEC_376_METADATA_FIXTURE).unwrap(),
-                            );
-                        }
                         "state_getStorage" => {
                             assert_eq!(
                                 request["params"],
@@ -8109,20 +7579,6 @@ mod tests {
                         }
                         "state_call" => {
                             let method = request["params"][0].as_str().unwrap();
-                            if method == "Core_version" {
-                                assert_eq!(request["params"][1], "0x");
-                                let at = request["params"][2].as_str().unwrap();
-                                assert_eq!(at, DEEPX_SPEC_376_FINALIZED_HASH);
-                                let spec_version = if timestamp_mode.load(Ordering::Relaxed) == 6 {
-                                    371
-                                } else {
-                                    DEEPX_SPEC_376_VERSION
-                                };
-                                return Json(json!({
-                                    "jsonrpc": "2.0", "id": 1,
-                                    "result": encoded_core_version(spec_version),
-                                }));
-                            }
                             assert_eq!(request["params"][2], FINALIZED_HASH);
                             let bytes = hex::decode(
                                 request["params"][1]
@@ -8331,49 +7787,6 @@ mod tests {
                 && matches!(*source, DeepXFinalizedAccountError::StorageQueryTimestampMismatch { .. })
         ));
 
-        timestamp_mode.store(5, Ordering::Relaxed);
-        timestamp_reads.store(0, Ordering::Relaxed);
-        assert!(matches!(
-            observe_finalized_accounts_evidence(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                &subaccounts,
-            )
-            .await,
-            Err(DeepXFinalizedAccountError::RuntimeObservation(
-                DeepXRuntimeSnapshotObservationError::Snapshot(
-                    SnapshotError::RuntimeIdentityMismatch
-                )
-            ))
-        ));
-
-        timestamp_mode.store(6, Ordering::Relaxed);
-        timestamp_reads.store(0, Ordering::Relaxed);
-        let error = observe_finalized_accounts_evidence(
-            &DeepXEnvironment::Testnet,
-            &endpoints,
-            &capabilities,
-            &subaccounts,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                DeepXFinalizedAccountError::RuntimeObservation(
-                    DeepXRuntimeSnapshotObservationError::HistoricalRuntime(
-                        DeepXHistoricalRuntimeError::SpecVersionMismatch {
-                            method: "state_call(Core_version)",
-                            expected: DEEPX_SPEC_376_VERSION,
-                            received: 371,
-                        }
-                    )
-                )
-            ),
-            "{error:?}"
-        );
-
         timestamp_mode.store(7, Ordering::Relaxed);
         timestamp_reads.store(0, Ordering::Relaxed);
         let error = observe_finalized_accounts_evidence(
@@ -8503,12 +7916,12 @@ mod tests {
 
         assert_eq!(applied.update(), DeepXRuntimeSnapshotUpdate::Unchanged);
         assert_eq!(applied.identity().spec_version, DEEPX_SPEC_376_VERSION);
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(service.acquire().is_ok());
     }
 
     #[tokio::test]
-    async fn observes_runtime_bound_finalized_chain_time() {
+    async fn observes_finalized_chain_time_with_built_in_runtime() {
         let calls = Arc::new(AtomicUsize::new(0));
         let timestamp_ms = 1_700_000_000_123u64;
         let watch_url = spawn_runtime_snapshot_server_with(
@@ -8529,27 +7942,17 @@ mod tests {
         let capabilities = validated_capabilities(&endpoints);
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
 
-        assert!(matches!(
-            observe_and_apply_finalized_chain_time(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &capabilities,
-                &service,
-            )
-            .await,
-            Err(DeepXFinalizedChainTimeError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            )),
-        ));
+        let evidence = observe_and_apply_finalized_chain_time(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &service,
+        )
+        .await
+        .unwrap();
+        assert_eq!(evidence.timestamp_ms(), timestamp_ms);
         assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
+        assert!(service.acquire().is_ok());
     }
 
     #[tokio::test]
@@ -8580,132 +7983,12 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ))
+            Err(DeepXFinalizedChainTimeError::BlockEvidence(source))
+                if matches!(*source, DeepXFinalizedAccountError::BlockTimestampMismatch { .. })
         ));
         assert!(matches!(
             service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
-    }
-
-    #[tokio::test]
-    async fn historical_runtime_mismatch_closes_new_signing_permits() {
-        let watch_url = spawn_runtime_snapshot_server_with(
-            366,
-            1,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            Some("historical_runtime_mismatch"),
-            |_| {},
-            Arc::new(AtomicUsize::new(0)),
-        )
-        .await;
-        let endpoints =
-            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
-
-        assert!(matches!(
-            observe_and_apply_finalized_chain_time(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &validated_capabilities(&endpoints),
-                &service,
-            )
-            .await,
-            Err(DeepXFinalizedChainTimeError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ))
-        ));
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
-    }
-
-    #[tokio::test]
-    async fn historical_runtime_rpc_failure_does_not_latch_inconsistent_evidence() {
-        let watch_url = spawn_runtime_snapshot_server_with(
-            366,
-            1,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            Some("state_call"),
-            |_| {},
-            Arc::new(AtomicUsize::new(0)),
-        )
-        .await;
-        let endpoints =
-            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
-
-        assert!(matches!(
-            observe_and_apply_finalized_chain_time(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &validated_capabilities(&endpoints),
-                &service,
-            )
-            .await,
-            Err(DeepXFinalizedChainTimeError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ))
-        ));
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
-    }
-
-    #[tokio::test]
-    async fn signing_bound_account_observation_closes_permits_on_historical_mismatch() {
-        let watch_url = spawn_runtime_snapshot_server_with(
-            366,
-            1,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            Some("historical_runtime_mismatch"),
-            |_| {},
-            Arc::new(AtomicUsize::new(0)),
-        )
-        .await;
-        let endpoints =
-            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
-
-        assert!(matches!(
-            observe_and_apply_finalized_account_evidence(
-                &DeepXEnvironment::Testnet,
-                &endpoints,
-                &validated_capabilities(&endpoints),
-                &service,
-                [0x11; 20],
-            )
-            .await,
-            Err(DeepXFinalizedAccountError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ))
-        ));
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
+            Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent),
         ));
     }
 
@@ -8826,19 +8109,10 @@ mod tests {
                 &service,
             )
             .await,
-            Err(DeepXFinalizedChainTimeError::Runtime(
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ))
+            Err(DeepXFinalizedChainTimeError::Rpc(_))
         ));
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert!(service.acquire().is_ok());
     }
 
     #[tokio::test]
@@ -8880,133 +8154,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(367, 1, None)]
-    #[case(366, 2, None)]
-    #[case(367, 1, Some("state_getMetadata"))]
-    #[tokio::test]
-    async fn version_change_blocks_before_metadata_request(
-        #[case] spec_version: u32,
-        #[case] transaction_version: u32,
-        #[case] fail_method: Option<&'static str>,
-    ) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let snapshot = approved_runtime_snapshot();
-        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
-        let permit = service.acquire().unwrap();
-        let observed_service = service.clone();
-        let watch_url = spawn_runtime_snapshot_server_with(
-            spec_version,
-            transaction_version,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            fail_method,
-            move |method| {
-                if method == "state_getMetadata" {
-                    assert!(matches!(
-                        observed_service.acquire(),
-                        Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-                    ));
-                }
-            },
-            Arc::clone(&calls),
-        )
-        .await;
-        let endpoints =
-            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
-
-        let error = observe_and_apply_approved_finalized_runtime_snapshot(
-            &DeepXEnvironment::Testnet,
-            &endpoints,
-            &service,
-        )
-        .await
-        .unwrap_err();
-
-        if fail_method.is_some() {
-            assert!(matches!(
-                error,
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Rpc {
-                        method: "state_getMetadata",
-                        ..
-                    }
-                )
-            ));
-        } else {
-            assert!(matches!(
-                error,
-                DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )
-            ));
-        }
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert_eq!(permit.snapshot().identity(), snapshot.identity());
-        assert_eq!(permit.snapshot().interfaces(), snapshot.interfaces());
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
-        ));
-        drop(permit);
-        assert_old_runtime_cannot_clear_refresh(&service).await;
-    }
-
-    #[rstest::rstest]
-    #[case(false)]
-    #[case(true)]
-    #[tokio::test]
-    async fn metadata_change_blocks_before_fixture_validation(#[case] malformed: bool) {
-        let mut metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
-        metadata["result"] = if malformed {
-            json!("0x00")
-        } else {
-            json!(format!("{}00", metadata["result"].as_str().unwrap()))
-        };
-        let snapshot = approved_runtime_snapshot();
-        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
-        let permit = service.acquire().unwrap();
-
-        for _ in 0..2 {
-            let url = spawn_runtime_snapshot_server_with(
-                366,
-                1,
-                metadata.clone(),
-                None,
-                None,
-                |_| {},
-                Arc::new(AtomicUsize::new(0)),
-            )
-            .await;
-            assert!(matches!(
-                observe_and_apply_approved_finalized_runtime_snapshot(
-                    &DeepXEnvironment::Testnet,
-                    &validated_endpoints(&url),
-                    &service,
-                )
-                .await,
-                Err(DeepXRuntimeSnapshotRefreshError::Observation(
-                    DeepXRuntimeSnapshotObservationError::Snapshot(
-                        SnapshotError::RuntimeIdentityMismatch
-                    )
-                )),
-            ));
-            assert_eq!(permit.snapshot().identity(), snapshot.identity());
-            assert!(matches!(
-                service.acquire(),
-                Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
-            ));
-        }
-        drop(permit);
-        assert_old_runtime_cannot_clear_refresh(&service).await;
-    }
-
-    #[rstest::rstest]
-    #[case("chain_getBlockHash")]
     #[case("chain_getFinalizedHead")]
     #[case("chain_getHeader")]
-    #[case("state_getRuntimeVersion")]
     #[tokio::test]
     async fn pre_evidence_rpc_errors_do_not_block_signing(#[case] method: &'static str) {
         let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
@@ -9032,68 +8181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_rpc_error_after_runtime_change_blocks_signing() {
-        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
-        let url = spawn_runtime_snapshot_server_with(
-            366,
-            1,
-            serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap(),
-            None,
-            Some("state_getMetadata"),
-            |_| {},
-            Arc::new(AtomicUsize::new(0)),
-        )
-        .await;
-        assert!(matches!(
-            observe_and_apply_approved_finalized_runtime_snapshot(
-                &DeepXEnvironment::Testnet,
-                &validated_endpoints(&url),
-                &service,
-            )
-            .await,
-            Err(DeepXRuntimeSnapshotRefreshError::Observation(
-                DeepXRuntimeSnapshotObservationError::Rpc {
-                    method: "state_getMetadata",
-                    ..
-                }
-            )),
-        ));
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
-        ));
-    }
-
-    async fn assert_old_runtime_cannot_clear_refresh(service: &DeepXRuntimeSnapshotService) {
-        let snapshot = approved_runtime_snapshot();
-        assert_eq!(
-            service.apply_validated(&snapshot),
-            Err(DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange)
-        );
-        assert_eq!(
-            service.install(snapshot),
-            Err(DeepXRuntimeSnapshotServiceError::SnapshotIdentityMismatch)
-        );
-        let url = spawn_runtime_snapshot_server(366, Arc::new(AtomicUsize::new(0))).await;
-        assert!(matches!(
-            observe_and_apply_approved_finalized_runtime_snapshot(
-                &DeepXEnvironment::Testnet,
-                &validated_endpoints(&url),
-                service,
-            )
-            .await,
-            Err(DeepXRuntimeSnapshotRefreshError::Application(
-                DeepXRuntimeSnapshotServiceError::ConflictingRuntimeChange
-            )),
-        ));
-        assert!(matches!(
-            service.acquire(),
-            Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress)
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_unapproved_finalized_runtime_snapshot() {
+    async fn uses_built_in_runtime_snapshot_without_online_version_check() {
         let calls = Arc::new(AtomicUsize::new(0));
         let rpc_url = spawn_runtime_snapshot_server(367, Arc::clone(&calls)).await;
         let config = DeepXNetworkConfig {
@@ -9102,15 +8190,15 @@ mod tests {
             ..Default::default()
         };
 
-        let error = observe_approved_finalized_runtime_snapshot(&config)
+        let observation = observe_approved_finalized_runtime_snapshot(&config)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
-        assert!(matches!(
-            error,
-            DeepXRuntimeSnapshotObservationError::Snapshot(SnapshotError::RuntimeIdentityMismatch)
-        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            observation.snapshot().identity().spec_version,
+            DEEPX_SPEC_376_VERSION
+        );
     }
 
     #[tokio::test]
@@ -9288,9 +8376,7 @@ mod tests {
                 "number": FINALIZED_BLOCK_NUMBER_HEX
             }
         });
-        let mut runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-        runtime_version["result"]["specVersion"] = json!(spec_version);
-        runtime_version["result"]["transactionVersion"] = json!(transaction_version);
+        let _ = (spec_version, transaction_version, metadata);
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
@@ -9298,11 +8384,9 @@ mod tests {
                 let genesis = genesis.clone();
                 let finalized_head = finalized_head.clone();
                 let finalized_header = finalized_header.clone();
-                let runtime_version = runtime_version.clone();
-                let metadata = metadata.clone();
                 let on_request = on_request.clone();
                 async move {
-                    let index = calls.fetch_add(1, Ordering::Relaxed);
+                    calls.fetch_add(1, Ordering::Relaxed);
                     let method = request["method"].as_str().unwrap();
                     on_request(method);
                     if fail_method == Some(method) {
@@ -9311,63 +8395,20 @@ mod tests {
                             "error": { "code": -32000, "message": "injected observation failure" }
                         }));
                     }
-                    let response = match index {
-                        0 => {
-                            assert_eq!(method, "chain_getBlockHash");
+                    let response = match method {
+                        "chain_getBlockHash" => {
                             assert_eq!(request["params"], json!([0]));
                             genesis
                         }
-                        1 => {
-                            assert_eq!(method, "chain_getFinalizedHead");
+                        "chain_getFinalizedHead" => {
                             assert_eq!(request["params"], json!([]));
                             finalized_head
                         }
-                        2 => {
-                            assert_eq!(method, "chain_getHeader");
+                        "chain_getHeader" => {
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             finalized_header
                         }
-                        3 => {
-                            assert_eq!(method, "state_getRuntimeVersion");
-                            assert_eq!(request["params"], json!([FINALIZED_HASH]));
-                            runtime_version
-                        }
-                        4 => {
-                            assert_eq!(method, "state_getMetadata");
-                            assert_eq!(request["params"], json!([FINALIZED_HASH]));
-                            metadata
-                        }
-                        5 => {
-                            assert_eq!(method, "state_call");
-                            assert_eq!(
-                                request["params"],
-                                json!(["Core_version", "0x", DEEPX_SPEC_376_FINALIZED_HASH])
-                            );
-                            json!({
-                                "jsonrpc": "2.0", "id": 1,
-                                "result": encoded_core_version(
-                                    if fail_method == Some("historical_core_version_mismatch") {
-                                        371
-                                    } else {
-                                        DEEPX_SPEC_376_VERSION
-                                    }
-                                ),
-                            })
-                        }
-                        6 => {
-                            assert_eq!(method, "state_getRuntimeVersion");
-                            assert_eq!(request["params"], json!([DEEPX_SPEC_376_FINALIZED_HASH]));
-                            let mut response = runtime_version;
-                            response["result"]["specVersion"] =
-                                json!(if fail_method == Some("historical_runtime_mismatch") {
-                                    371
-                                } else {
-                                    DEEPX_SPEC_376_VERSION
-                                });
-                            response
-                        }
-                        7 => {
-                            assert_eq!(method, "state_getStorage");
+                        "state_getStorage" => {
                             assert_eq!(
                                 request["params"],
                                 json!([timestamp_now_storage_key(), FINALIZED_HASH])
@@ -9378,8 +8419,7 @@ mod tests {
                                 "result": timestamp_now
                             })
                         }
-                        8 => {
-                            assert_eq!(method, "chain_getBlock");
+                        "chain_getBlock" => {
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             let mut timestamp_ms = timestamp_now
                                 .as_ref()
@@ -9402,8 +8442,7 @@ mod tests {
                                 }},
                             })
                         }
-                        9 => {
-                            assert_eq!(method, "state_queryStorageAt");
+                        "state_queryStorageAt" => {
                             assert_eq!(
                                 request["params"],
                                 json!([[timestamp_now_storage_key()], FINALIZED_HASH])
@@ -9416,7 +8455,7 @@ mod tests {
                                 }],
                             })
                         }
-                        _ => panic!("unexpected DeepX runtime snapshot request"),
+                        _ => panic!("unexpected DeepX runtime snapshot request: {method}"),
                     };
                     Json(response)
                 }

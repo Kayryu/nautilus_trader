@@ -26,8 +26,8 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use anyhow::Context;
+use async_trait::async_trait;
 use nautilus_common::{
     cache::{
         Cache,
@@ -100,7 +100,6 @@ use crate::{
         DeepXRuntimeSnapshotObservationError, DeepXRuntimeSnapshotRefreshError,
         DeepXStoredOrderStatus, DeepXStoredPerpOrderType, DeepXStoredPostOnlyParam,
         DeepXStoredSpotOrderType, DeepXValidatedRpcMethodCapabilities,
-        observe_and_apply_approved_finalized_runtime_snapshot,
         observe_and_apply_finalized_account_evidence, observe_and_apply_finalized_chain_time,
         observe_and_apply_finalized_lending_evidence, observe_and_apply_finalized_margin_evidence,
         observe_and_apply_finalized_perp_order_evidence,
@@ -5489,10 +5488,9 @@ impl DeepXExecutionClient {
     /// Collects and records complete read-only runtime startup evidence.
     ///
     /// The configured Submission, Watch, and Recovery endpoints must first identify the approved
-    /// chain and advertise every role-specific method. An approved snapshot from the validated
-    /// Watch endpoint then bootstraps an isolated snapshot service, and a second finalized
-    /// observation is atomically applied before any evidence is retained by this client. This
-    /// operation does not initialize the durable transaction runtime, sign, or submit transactions.
+    /// chain and advertise every role-specific method. The built-in approved runtime is paired with
+    /// one finalized Watch checkpoint before any evidence is retained by this client. This operation
+    /// does not initialize the durable transaction runtime, sign, or submit transactions.
     ///
     /// # Errors
     ///
@@ -5505,18 +5503,15 @@ impl DeepXExecutionClient {
             .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)?;
         let endpoints = observe_and_validate_rpc_endpoint_identities(&self.config.network).await?;
         let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints).await?;
-        let bootstrap = observe_approved_finalized_runtime_snapshot_for_endpoints(
+        let observation = observe_approved_finalized_runtime_snapshot_for_endpoints(
             &self.config.network.environment,
             &endpoints,
         )
         .await?;
-        let service = DeepXRuntimeSnapshotService::new(bootstrap.into_snapshot());
-        let applied = observe_and_apply_approved_finalized_runtime_snapshot(
-            &self.config.network.environment,
-            &endpoints,
-            &service,
-        )
-        .await?;
+        let applied = DeepXAppliedRuntimeSnapshot::unchanged(
+            observation.checkpoint(),
+            observation.into_snapshot(),
+        );
         self.record_runtime_validated(&applied, &endpoints, &capabilities)?;
         Ok(())
     }
@@ -10746,12 +10741,8 @@ impl ExecutionClient for DeepXExecutionClient {
                 .into_iter()
                 .flat_map(|page| page.items)
                 .collect::<Vec<_>>();
-            self.validate_owned_finalized_spot_order_records(
-                market,
-                &open_records,
-                true,
-            )
-            .await?;
+            self.validate_owned_finalized_spot_order_records(market, &open_records, true)
+                .await?;
             for record in open_records {
                 let report = self
                     .build_tracked_spot_order_status_report_for_record(
@@ -10796,12 +10787,8 @@ impl ExecutionClient for DeepXExecutionClient {
                     .into_iter()
                     .flat_map(|page| page.items)
                     .collect::<Vec<_>>();
-                self.validate_owned_finalized_spot_order_records(
-                    market,
-                    &history_records,
-                    false,
-                )
-                .await?;
+                self.validate_owned_finalized_spot_order_records(market, &history_records, false)
+                    .await?;
                 for record in history_records {
                     reports.push(
                         self.build_tracked_spot_order_status_report_for_record(
@@ -11503,11 +11490,6 @@ mod tests {
         "../test_data/runtime/testnet/\
          genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
-    );
-    const RUNTIME_VERSION_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
-         genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
-         runtime_version.json"
     );
     const METADATA_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
@@ -12718,8 +12700,6 @@ mod tests {
             "id": 1,
             "result": { "number": "0x2a" },
         });
-        let runtime_version: Value = serde_json::from_str(RUNTIME_VERSION_FIXTURE).unwrap();
-        let metadata: Value = serde_json::from_str(METADATA_FIXTURE).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let router = Router::new().route(
             "/",
@@ -12729,8 +12709,6 @@ mod tests {
                     genesis.clone(),
                     finalized_head.clone(),
                     finalized_header.clone(),
-                    runtime_version.clone(),
-                    metadata.clone(),
                 ];
                 async move {
                     if request["method"] == "rpc_methods" {
@@ -12746,8 +12724,6 @@ mod tests {
                                     "chain_getFinalizedHead",
                                     "chain_getHeader",
                                     "eth_call",
-                                    "state_getMetadata",
-                                    "state_getRuntimeVersion",
                                     "state_getStorage",
                                     "state_queryStorageAt",
                                     "state_call",
@@ -13003,8 +12979,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RuntimeStartupRpcState {
         advertise_submission: bool,
-        corrupt_metadata: bool,
-        metadata_requests: Arc<AtomicUsize>,
+        fail_finalized_head: bool,
     }
 
     async fn runtime_startup_rpc(
@@ -13020,8 +12995,6 @@ mod tests {
                     "chain_getFinalizedHead",
                     "chain_getHeader",
                     "eth_call",
-                    "state_getMetadata",
-                    "state_getRuntimeVersion",
                     "state_getStorage",
                     "state_queryStorageAt",
                     "state_call",
@@ -13039,34 +13012,32 @@ mod tests {
                 }
             }
             "chain_getFinalizedHead" => {
+                if state.fail_finalized_head {
+                    return Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": { "code": -32000, "message": "injected finalized head failure" },
+                    }));
+                }
                 serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap()["result"].clone()
             }
             "chain_getHeader" => json!({ "number": "0x12af5fc" }),
-            "state_getRuntimeVersion" => {
-                serde_json::from_str::<Value>(RUNTIME_VERSION_FIXTURE).unwrap()["result"].clone()
-            }
-            "state_getMetadata" => {
-                let request_index = state.metadata_requests.fetch_add(1, Ordering::Relaxed);
-                if state.corrupt_metadata && request_index == 0 {
-                    json!("0x00")
-                } else {
-                    serde_json::from_str::<Value>(METADATA_FIXTURE).unwrap()["result"].clone()
-                }
-            }
             method => panic!("unexpected method {method}"),
         };
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
     }
 
-    async fn runtime_startup_rpc_url(advertise_submission: bool, corrupt_metadata: bool) -> String {
+    async fn runtime_startup_rpc_url(
+        advertise_submission: bool,
+        fail_finalized_head: bool,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = Router::new()
             .route("/", post(runtime_startup_rpc))
             .with_state(RuntimeStartupRpcState {
                 advertise_submission,
-                corrupt_metadata,
-                metadata_requests: Arc::new(AtomicUsize::new(0)),
+                fail_finalized_head,
             });
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         format!("http://{address}")
@@ -13218,8 +13189,6 @@ mod tests {
                     "chain_getFinalizedHead",
                     "chain_getHeader",
                     "eth_call",
-                    "state_getMetadata",
-                    "state_getRuntimeVersion",
                     "state_getStorage",
                     "state_queryStorageAt",
                     "state_call",
@@ -13324,8 +13293,6 @@ mod tests {
                     "chain_getFinalizedHead",
                     "chain_getHeader",
                     "eth_call",
-                    "state_getMetadata",
-                    "state_getRuntimeVersion",
                     "state_getStorage",
                     "state_queryStorageAt",
                     "state_call",
@@ -18109,7 +18076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalized_spot_order_validation_does_not_require_instrument_cache() {
+    async fn finalized_spot_order_validation_fails_before_requiring_instrument_cache() {
         let (client, cache) = test_client_with_cache();
         let _borrow = cache.borrow_mut();
         let market = DeepXSpotReportMarket {
@@ -18124,11 +18091,15 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
-        client
+        let error = client
             .validate_owned_finalized_spot_order_records(&market, &[], true)
             .now_or_never()
             .expect("empty validation must complete before suspension")
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "DeepX transaction runtime has not been initialized"
+        );
     }
 
     #[rstest]
@@ -18197,8 +18168,6 @@ mod tests {
                                     "chain_getFinalizedHead",
                                     "chain_getHeader",
                                     "eth_call",
-                                    "state_getMetadata",
-                                    "state_getRuntimeVersion",
                                     "state_getStorage",
                                     "state_queryStorageAt",
                                     "state_call",

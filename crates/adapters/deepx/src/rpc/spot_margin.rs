@@ -17,7 +17,6 @@
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
-use parity_scale_codec::DecodeAll;
 use serde_json::json;
 use subxt_core::ext::scale_value::{Composite, Value, ValueDef, scale::decode_as_type};
 use thiserror::Error;
@@ -25,7 +24,7 @@ use thiserror::Error;
 use super::{
     DeepXFinalizedCheckpoint, DeepXRpcRole, DeepXRuntimeSnapshotObservationError,
     DeepXValidatedRpcMethodCapabilities, ObservedStorageChangeSet,
-    observe_approved_finalized_read_only_runtime_with_metadata_at, storage_value_key,
+    observe_approved_finalized_read_only_runtime_snapshot_at, storage_value_key,
 };
 use crate::{
     common::DeepXEnvironment, config::DeepXValidatedRpcEndpoints, signing::ApprovedRuntimeIdentity,
@@ -120,9 +119,6 @@ pub async fn observe_finalized_spot_margin_evidence(
             "chain_getBlockHash",
             "chain_getFinalizedHead",
             "chain_getHeader",
-            "state_call",
-            "state_getMetadata",
-            "state_getRuntimeVersion",
             "state_getStorage",
             "state_queryStorageAt",
         ]
@@ -131,7 +127,7 @@ pub async fn observe_finalized_spot_margin_evidence(
     {
         return Err(DeepXFinalizedSpotMarginError::RpcCapabilitiesMismatch);
     }
-    let (observation, metadata) = observe_approved_finalized_read_only_runtime_with_metadata_at(
+    let observation = observe_approved_finalized_read_only_runtime_snapshot_at(
         environment,
         watch_url.to_string(),
     )
@@ -140,7 +136,7 @@ pub async fn observe_finalized_spot_margin_evidence(
     let enabled = observe_spot_margin_with_client(
         &client,
         observation.checkpoint(),
-        &metadata,
+        observation.snapshot().metadata(),
         subaccount,
         expected_authority,
     )
@@ -157,7 +153,7 @@ pub async fn observe_finalized_spot_margin_evidence(
 async fn observe_spot_margin_with_client(
     client: &BlockchainHttpRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
-    metadata: &[u8],
+    metadata: &subxt_core::Metadata,
     subaccount: [u8; 20],
     expected_authority: [u8; 20],
 ) -> Result<bool, DeepXFinalizedSpotMarginError> {
@@ -215,12 +211,11 @@ fn subaccount_info_storage_key(subaccount: [u8; 20]) -> String {
 }
 
 fn decode_spot_margin(
-    metadata_bytes: &[u8],
+    metadata: &subxt_core::Metadata,
     encoded: &str,
     subaccount: [u8; 20],
     expected_authority: [u8; 20],
 ) -> Option<bool> {
-    let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).ok()?;
     let value_type = metadata
         .pallet_by_name("Subaccount")?
         .storage()?
@@ -278,6 +273,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::DeepXReadOnlyRuntimeSnapshot;
 
     const WALLET: [u8; 20] = [
         0x78, 0x1e, 0xd3, 0x5b, 0x16, 0x70, 0x68, 0xc9, 0x3d, 0xfa, 0xda, 0xb4, 0x1d, 0xfb, 0x68,
@@ -291,7 +287,7 @@ mod tests {
     const BLOCK_HASH: &str = "0xbb48406ad92b4a214f64b71b9ac95052df793113ef82b5e7df744dd44546f0e4";
     const BLOCK_NUMBER: u32 = 217_394_490;
 
-    fn metadata() -> Vec<u8> {
+    fn metadata_bytes() -> Vec<u8> {
         let fixture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
@@ -308,6 +304,13 @@ mod tests {
         .unwrap()
     }
 
+    fn metadata() -> subxt_core::Metadata {
+        DeepXReadOnlyRuntimeSnapshot::built_in_testnet()
+            .unwrap()
+            .metadata()
+            .clone()
+    }
+
     #[rstest::rstest]
     fn finalized_spot_margin_key_uses_identity_account_id20() {
         assert_eq!(
@@ -318,7 +321,7 @@ mod tests {
 
     #[rstest::rstest]
     fn retained_runtime_uses_identity_subaccount_info_storage() {
-        let bytes = metadata();
+        let bytes = metadata_bytes();
         let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
             RuntimeMetadataPrefixed::decode(&mut bytes.as_slice()).unwrap()
         else {

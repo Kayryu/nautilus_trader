@@ -50,13 +50,6 @@ struct JsonRpcResponse<T> {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeVersion {
-    spec_version: u32,
-    transaction_version: u32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BlockHeader {
     number: String,
 }
@@ -139,31 +132,6 @@ async fn main() -> anyhow::Result<()> {
         parse_block_number(&header.result.number)? == block_number,
         "DeepX canonical header number mismatch",
     );
-    let runtime = rpc::<RuntimeVersion>(
-        &client,
-        &rpc_url,
-        "state_getRuntimeVersion",
-        json!([block_hash.result]),
-    )
-    .await?;
-    ensure!(
-        runtime.result.spec_version == EXPECTED_SPEC_VERSION
-            && runtime.result.transaction_version == EXPECTED_TRANSACTION_VERSION,
-        "DeepX block does not use the approved read-only runtime identity",
-    );
-    let metadata = rpc::<String>(
-        &client,
-        &rpc_url,
-        "state_getMetadata",
-        json!([block_hash.result]),
-    )
-    .await?;
-    let metadata_bytes = decode_hex(&metadata.result)?;
-    ensure!(
-        sha256(&metadata_bytes) == EXPECTED_METADATA_SHA256,
-        "DeepX metadata hash mismatch",
-    );
-
     let fixture_dir = output_root.join(format!("finalized-events-{block_number}-spec376"));
     ensure!(
         !fixture_dir.exists(),

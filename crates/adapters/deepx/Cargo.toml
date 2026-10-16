@@ -88,11 +88,6 @@ rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
-name = "deepx-capture-runtime-fixtures"
-path = "bin/capture_runtime_fixtures.rs"
-doc = false
-
-[[bin]]
 name = "deepx-capture-finalized-events"
 path = "bin/capture_finalized_events.rs"
 doc = false
