@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# -------------------------------------------------------------------------------------------------
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+#  https://nautechsystems.io
+#
+#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# -------------------------------------------------------------------------------------------------
+"""Run a simple dual moving-average strategy on the DeepX testnet."""
+
+import argparse
+import os
+from decimal import Decimal
+from typing import Any, Self
+
+from nautilus_trader.adapters.deepx import (
+    DeepXDataClientConfig,
+    DeepXDataClientFactory,
+    DeepXExecutionClientConfig,
+    DeepXExecutionClientFactory,
+    get_deepx_wallet_account_snapshot,
+)
+from nautilus_trader.common import Environment, LogColor
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.indicators import SimpleMovingAverage
+from nautilus_trader.infrastructure import PostgresCacheConfig, PostgresConnectOptions
+from nautilus_trader.live import LiveNode
+from nautilus_trader.model import (
+    AccountId,
+    Bar,
+    BarType,
+    InstrumentId,
+    OrderSide,
+    PositionClosed,
+    Quantity,
+    StrategyId,
+    TimeInForce,
+    TraderId,
+)
+from nautilus_trader.trading import Strategy
+
+WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
+INSTRUMENT_ID = InstrumentId.from_str("ETH-USDC-PERP.DEEPX")
+BAR_TYPE = BarType.from_str(f"{INSTRUMENT_ID}-1-MINUTE-LAST-INTERNAL")
+ORDER_QTY = Decimal("0.0100")
+FAST_PERIOD = 5
+SLOW_PERIOD = 20
+
+
+class DualMovingAverageConfig(StrategyConfig):
+    """Configuration for the dual moving-average strategy."""
+
+    _CUSTOM_FIELDS = (
+        "instrument_id",
+        "bar_type",
+        "order_qty",
+        "fast_period",
+        "slow_period",
+        "trade_enabled",
+    )
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        for key in cls._CUSTOM_FIELDS:
+            kwargs.pop(key, None)
+        return super().__new__(cls, *args, **kwargs)
+
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        order_qty: Decimal,
+        fast_period: int,
+        slow_period: int,
+        trade_enabled: bool,
+        **_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = instrument_id
+        self.bar_type = bar_type
+        self.order_qty = order_qty
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        self.trade_enabled = trade_enabled
+
+
+class DualMovingAverage(Strategy):
+    """Trade when the fast simple moving average crosses the slow average."""
+
+    def __init__(self, config: DualMovingAverageConfig) -> None:
+        if config.fast_period <= 0:
+            raise ValueError("fast_period must be positive")
+        if config.slow_period <= config.fast_period:
+            raise ValueError("slow_period must be greater than fast_period")
+        if config.order_qty <= 0:
+            raise ValueError("order_qty must be positive")
+
+        super().__init__(config)
+        self._config = config
+        self._fast = SimpleMovingAverage(config.fast_period)
+        self._slow = SimpleMovingAverage(config.slow_period)
+        self._quantity: Quantity | None = None
+        self._previous_fast_above: bool | None = None
+        self._pending_side: OrderSide | None = None
+
+    def on_start(self) -> None:
+        instrument = self.cache.instrument(self._config.instrument_id)
+        if instrument is None:
+            self.log.error(
+                f"Could not find instrument for {self._config.instrument_id}"
+            )
+            self.stop()
+            return
+
+        self._quantity = Quantity.from_decimal_dp(
+            self._config.order_qty,
+            instrument.size_precision,
+        )
+        if self._quantity.as_decimal() <= 0:
+            self.log.error(
+                f"Order quantity {self._config.order_qty} rounds to zero for "
+                f"{self._config.instrument_id}",
+            )
+            self.stop()
+            return
+
+        self.register_indicator_for_bars(self._config.bar_type, self._fast)
+        self.register_indicator_for_bars(self._config.bar_type, self._slow)
+        self.subscribe_bars(self._config.bar_type)
+        mode = "trading" if self._config.trade_enabled else "signal-only"
+        self.log.info(
+            f"Started dual moving-average strategy in {mode} mode", LogColor.BLUE
+        )
+
+    def on_bar(self, bar: Bar) -> None:
+        if not self.indicators_initialized():
+            return
+
+        fast_above = self._fast.value > self._slow.value
+        self.log.info(
+            f"{bar.bar_type} close={bar.close} fast={self._fast.value:.6f} "
+            f"slow={self._slow.value:.6f}",
+            LogColor.CYAN,
+        )
+        if self._previous_fast_above is None:
+            self._previous_fast_above = fast_above
+            return
+        if fast_above == self._previous_fast_above:
+            return
+
+        self._previous_fast_above = fast_above
+        side = OrderSide.BUY if fast_above else OrderSide.SELL
+        self.log.info(f"Moving-average crossover signal: {side}", LogColor.BLUE)
+        if self._config.trade_enabled:
+            self._handle_signal(side)
+
+    def on_position_closed(self, event: PositionClosed) -> None:
+        if (
+            event.instrument_id != self._config.instrument_id
+            or self._pending_side is None
+        ):
+            return
+        side = self._pending_side
+        self._pending_side = None
+        self._submit_market_order(side)
+
+    def on_stop(self) -> None:
+        if self._config.trade_enabled:
+            self.cancel_all_orders(
+                self._config.instrument_id,
+                client_id=None,
+                strategy_only=True,
+            )
+            self.close_all_positions(
+                self._config.instrument_id,
+                time_in_force=TimeInForce.IOC,
+                reduce_only=True,
+            )
+        self.unsubscribe_bars(self._config.bar_type)
+
+    def on_reset(self) -> None:
+        self._quantity = None
+        self._previous_fast_above = None
+        self._pending_side = None
+        self._fast.reset()
+        self._slow.reset()
+
+    def _handle_signal(self, side: OrderSide) -> None:
+        if self._pending_side is not None:
+            return
+        if side == OrderSide.BUY and self.portfolio.is_net_long(
+            self._config.instrument_id
+        ):
+            return
+        if side == OrderSide.SELL and self.portfolio.is_net_short(
+            self._config.instrument_id
+        ):
+            return
+        if not self.portfolio.is_net_flat(self._config.instrument_id):
+            self._pending_side = side
+            self.close_all_positions(
+                self._config.instrument_id,
+                time_in_force=TimeInForce.IOC,
+                reduce_only=True,
+            )
+            return
+        self._submit_market_order(side)
+
+    def _submit_market_order(self, side: OrderSide) -> None:
+        if self._quantity is None:
+            return
+        order = self.order_factory.market(
+            instrument_id=self._config.instrument_id,
+            order_side=side,
+            quantity=self._quantity,
+            time_in_force=TimeInForce.IOC,
+        )
+        self.submit_order(order)
+
+
+def select_subaccount(requested: str | None, addresses: list[str]) -> str:
+    """Select a wallet-owned DeepX subaccount."""
+    if not addresses:
+        raise ValueError("the specified wallet currently has no DeepX subaccounts")
+    if requested is not None:
+        for address in addresses:
+            if address.lower() == requested.lower():
+                return address
+        raise ValueError("subaccount is absent from the specified wallet directory")
+    if len(addresses) != 1:
+        raise ValueError(
+            "specify --subaccount when the wallet has multiple subaccounts"
+        )
+    return addresses[0]
+
+
+def postgres_options() -> tuple[PostgresConnectOptions, PostgresCacheConfig]:
+    """Read durable transaction store settings from the environment."""
+    required = ("POSTGRES_USERNAME", "POSTGRES_PASSWORD", "POSTGRES_DATABASE")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise ValueError(f"missing PostgreSQL settings: {', '.join(missing)}")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = int(os.getenv("POSTGRES_PORT", "5432"))
+    username = os.environ["POSTGRES_USERNAME"]
+    password = os.environ["POSTGRES_PASSWORD"]
+    database = os.environ["POSTGRES_DATABASE"]
+    return (
+        PostgresConnectOptions(
+            host=host,
+            port=port,
+            user=username,
+            password=password,
+            database=database,
+        ),
+        PostgresCacheConfig(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            database=database,
+        ),
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--subaccount", help="AccountId20 from the specified wallet directory"
+    )
+    parser.add_argument(
+        "--trade",
+        action="store_true",
+        help="enable testnet order submission; otherwise only log crossover signals",
+    )
+    args = parser.parse_args()
+
+    builder = LiveNode.builder(
+        "DEEPX-DUAL-MA-001",
+        TraderId.from_str("TESTER-001"),
+        Environment.LIVE,
+    ).add_data_client(
+        None,
+        DeepXDataClientFactory(),
+        DeepXDataClientConfig(perpetual_only=True),
+    )
+
+    if args.trade:
+        if not os.environ.get("DEEPX_TESTNET_PRIVATE_KEY"):
+            parser.error(
+                "DEEPX_TESTNET_PRIVATE_KEY is required when --trade is enabled"
+            )
+        snapshot = get_deepx_wallet_account_snapshot(WALLET)
+        subaccount = select_subaccount(args.subaccount, snapshot.directory.addresses)
+        database, cache_database = postgres_options()
+        builder = (
+            builder.with_cache_database_factory(cache_database)
+            .with_timeout_connection(180)
+            .with_reconciliation(reconciliation=True)
+            .add_exec_client(
+                None,
+                DeepXExecutionClientFactory(),
+                DeepXExecutionClientConfig(
+                    account_id=AccountId.from_str("DEEPX-001"),
+                    subaccount_id=subaccount,
+                    postgres_cache_database_config=database,
+                ),
+            )
+        )
+
+    node = builder.build()
+    node.add_strategy(
+        DualMovingAverage(
+            DualMovingAverageConfig(
+                strategy_id=StrategyId.from_str("DEEPX-DUAL-MA-001"),
+                external_order_claims=[INSTRUMENT_ID],
+                instrument_id=INSTRUMENT_ID,
+                bar_type=BAR_TYPE,
+                order_qty=ORDER_QTY,
+                fast_period=FAST_PERIOD,
+                slow_period=SLOW_PERIOD,
+                trade_enabled=args.trade,
+            ),
+        ),
+    )
+    node.run()
+
+
+if __name__ == "__main__":
+    main()
