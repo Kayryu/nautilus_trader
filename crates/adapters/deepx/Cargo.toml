@@ -98,6 +98,21 @@ path = "bin/verify_rest_instruments.rs"
 doc = false
 
 [[bin]]
+name = "deepx-verify-runtime"
+path = "bin/verify_runtime.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-current-margin"
+path = "bin/verify_current_margin.rs"
+doc = false
+
+[[bin]]
+name = "deepx-verify-delegate-ownership"
+path = "bin/verify_delegate_ownership.rs"
+doc = false
+
+[[bin]]
 name = "deepx-verify-spot-instruments"
 path = "bin/verify_spot_instruments.rs"
 doc = false

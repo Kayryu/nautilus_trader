@@ -82,6 +82,11 @@ def check_account_candidate(
         )
     if snapshot.profile.status != "Active":
         raise ValueError("selected subaccount is not active")
+    exact_margin = snapshot.margin_ratio.exact_maintenance_margin_required
+    if exact_margin is None:
+        raise ValueError("selected subaccount has no exact margin requirement")
+    if Decimal(exact_margin) != 0:
+        raise ValueError("selected subaccount has a nonzero margin requirement")
     if Decimal(snapshot.margin_ratio.margin_required) != 0:
         raise ValueError("selected subaccount has a nonzero margin requirement")
     if any(Decimal(asset.balance_borrowed) != 0 for asset in snapshot.balances.assets):

@@ -56,13 +56,14 @@ pub use config::{
 pub use data::DeepXDataClient;
 pub use execution::{
     DeepXAccountOwnershipStartupError, DeepXAccountStreamReadError, DeepXAccountStreamStartupError,
-    DeepXExecutionClient, DeepXExecutionStartupError, DeepXExecutionStartupEvidence,
-    DeepXExecutionUpdateRoute, DeepXExternalOrderContext, DeepXFinalizedPerpOrderEvidence,
-    DeepXFinalizedPerpOrderEvidenceError, DeepXInstrumentStartupError,
-    DeepXMassReconciliationError, DeepXNonceRestorationError, DeepXOrderContextError,
-    DeepXOrderContextRestorationError, DeepXPerpOrderEvidence, DeepXPerpOrderEvidenceError,
-    DeepXPerpOrderMappingError, DeepXPerpPlacePreparationError, DeepXRestoredOrderContext,
-    DeepXRuntimeStartupError, DeepXTradeDedupError, DeepXTransactionRuntimeError,
+    DeepXBackendPerpOrderObservationError, DeepXExecutionClient, DeepXExecutionStartupError,
+    DeepXExecutionStartupEvidence, DeepXExecutionUpdateRoute, DeepXExternalOrderContext,
+    DeepXFinalizedPerpOrderEvidence, DeepXFinalizedPerpOrderEvidenceError,
+    DeepXInstrumentStartupError, DeepXMassReconciliationError, DeepXNonceRestorationError,
+    DeepXOrderContextError, DeepXOrderContextRestorationError, DeepXPerpOrderEvidence,
+    DeepXPerpOrderEvidenceError, DeepXPerpOrderMappingError, DeepXPerpPlacePreparationError,
+    DeepXRestoredOrderContext, DeepXRuntimeStartupError, DeepXTradeDedupError,
+    DeepXTransactionRuntimeError,
 };
 pub use factories::{DeepXDataClientFactory, DeepXExecutionClientFactory};
 pub use instruments::{parse_perpetual_instrument, parse_spot_instrument};
@@ -71,10 +72,10 @@ pub use providers::{
     DeepXSpotInstrumentUnsupported,
 };
 pub use rpc::{
-    DeepXAppliedRuntimeSnapshot, DeepXFinalizedAccountError, DeepXFinalizedAccountEvidence,
-    DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence, DeepXFinalizedCheckpoint,
-    DeepXFinalizedLendingError, DeepXFinalizedLendingEvidence, DeepXFinalizedMarginError,
-    DeepXFinalizedMarginEvidence, DeepXFinalizedPerpOrderSpecError,
+    DeepXAppliedRuntimeSnapshot, DeepXCurrentMarginEvidence, DeepXFinalizedAccountError,
+    DeepXFinalizedAccountEvidence, DeepXFinalizedChainTimeError, DeepXFinalizedChainTimeEvidence,
+    DeepXFinalizedCheckpoint, DeepXFinalizedLendingError, DeepXFinalizedLendingEvidence,
+    DeepXFinalizedMarginError, DeepXFinalizedMarginEvidence, DeepXFinalizedPerpOrderSpecError,
     DeepXFinalizedPerpOrderSpecEvidence, DeepXFinalizedPerpOrderStorageBatchEvidence,
     DeepXFinalizedPerpOrderStorageEvidence, DeepXFinalizedPerpOrdersError,
     DeepXFinalizedPerpOrdersEvidence, DeepXFinalizedPerpPositionsError,
@@ -100,7 +101,8 @@ pub use rpc::{
     observe_and_apply_finalized_spot_orders_by_id_evidence,
     observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
     observe_approved_finalized_read_only_runtime_snapshot,
-    observe_approved_finalized_runtime_snapshot, observe_finalized_account_evidence,
+    observe_approved_finalized_runtime_snapshot, observe_current_margin_evidence,
+    observe_current_runtime_snapshot_for_endpoints, observe_finalized_account_evidence,
     observe_finalized_accounts_evidence, observe_finalized_lending_evidence,
     observe_finalized_margin_evidence, observe_finalized_perp_order_evidence,
     observe_finalized_perp_order_spec_evidence, observe_finalized_perp_orders_by_id_evidence,
@@ -122,12 +124,12 @@ pub use signing::{
 pub use spot::{DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError};
 pub use transaction::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION, DeepXAbsenceEvidence,
-    DeepXAutomaticReplayDecision, DeepXBusinessCallBindingError, DeepXBusinessCallVerifier,
-    DeepXBusinessEventOutcome, DeepXCanonicalBlockEvidence, DeepXCanonicalBlockObservation,
-    DeepXCommittedFrameworkOrderOutbox, DeepXCommittedObservation, DeepXCommittedTransactionRecord,
-    DeepXDirectRuntimeIdentity, DeepXDispatchOutcome, DeepXDurableRecoveryObserver,
-    DeepXDurableSignedExtrinsic, DeepXFinalityCommitError, DeepXFinalityObservation,
-    DeepXFinalizedPerpTrade, DeepXFinalizedPerpTradeObservationError,
+    DeepXAutomaticReplayDecision, DeepXBackendOrderEvidence, DeepXBusinessCallBindingError,
+    DeepXBusinessCallVerifier, DeepXBusinessEventOutcome, DeepXCanonicalBlockEvidence,
+    DeepXCanonicalBlockObservation, DeepXCommittedFrameworkOrderOutbox, DeepXCommittedObservation,
+    DeepXCommittedTransactionRecord, DeepXDirectRuntimeIdentity, DeepXDispatchOutcome,
+    DeepXDurableRecoveryObserver, DeepXDurableSignedExtrinsic, DeepXFinalityCommitError,
+    DeepXFinalityObservation, DeepXFinalizedPerpTrade, DeepXFinalizedPerpTradeObservationError,
     DeepXFinalizedRecoveryCheckpoint, DeepXFinalizedRecoveryCollection,
     DeepXFinalizedRecoveryCommitError, DeepXFinalizedSpotTrade,
     DeepXFinalizedSpotTradeObservationError, DeepXFinalizedTransactionLocation,

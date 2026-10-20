@@ -227,6 +227,8 @@ pub enum DeepXTransactionState {
     InBlockFailed,
     /// The recorded inclusion is canonical at the finalized boundary.
     Finalized,
+    /// A hash-bound backend order record confirms a placement.
+    BackendConfirmed,
     /// Complete canonical scanning and a pool check proved absence.
     NotIncluded,
     /// Evidence is incomplete or conflicting and requires operator action.
@@ -245,6 +247,7 @@ impl DeepXTransactionState {
             Self::InBlockSuccess => "in-block-success",
             Self::InBlockFailed => "in-block-failed",
             Self::Finalized => "finalized",
+            Self::BackendConfirmed => "backend-confirmed",
             Self::NotIncluded => "not-included",
             Self::ActionRequired => "action-required",
         }
@@ -253,7 +256,10 @@ impl DeepXTransactionState {
     /// Returns whether automatic lifecycle mutation must stop.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Finalized | Self::ActionRequired)
+        matches!(
+            self,
+            Self::Finalized | Self::BackendConfirmed | Self::ActionRequired
+        )
     }
 
     /// Returns whether authoritative reconciliation evidence is still required.
@@ -504,6 +510,52 @@ impl DeepXAbsenceEvidence {
     }
 }
 
+/// A placement bound to the durable signed hash by a backend order record.
+///
+/// This records backend confirmation, not canonical inclusion or chain finality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepXBackendOrderEvidence {
+    /// Extrinsic hash returned by the backend order record.
+    extrinsic_hash: [u8; 32],
+    /// Timestamp-derived order ID verified against the durable reservation.
+    order_id: u64,
+    /// Block height reported by the backend, without a finality claim.
+    observed_block_number: u64,
+}
+
+impl DeepXBackendOrderEvidence {
+    pub(crate) const fn new(
+        extrinsic_hash: [u8; 32],
+        order_id: u64,
+        observed_block_number: u64,
+    ) -> Self {
+        Self {
+            extrinsic_hash,
+            order_id,
+            observed_block_number,
+        }
+    }
+
+    /// Returns the hash bound to the backend order record.
+    #[must_use]
+    pub const fn extrinsic_hash(&self) -> [u8; 32] {
+        self.extrinsic_hash
+    }
+
+    /// Returns the verified timestamp order ID.
+    #[must_use]
+    pub const fn order_id(&self) -> u64 {
+        self.order_id
+    }
+
+    /// Returns the block height reported by the backend.
+    #[must_use]
+    pub const fn observed_block_number(&self) -> u64 {
+        self.observed_block_number
+    }
+}
+
 /// An authoritative observation applied to a DeepX transaction lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeepXTransactionObservation {
@@ -519,6 +571,8 @@ pub enum DeepXTransactionObservation {
     Reorged(DeepXInclusionEvidence),
     /// The recorded inclusion was proved canonical at the finalized boundary.
     Finalized(DeepXInclusionEvidence),
+    /// A backend order record was bound to this signed placement.
+    BackendOrderConfirmed(DeepXBackendOrderEvidence),
     /// Complete canonical scanning and a submission-pool check proved absence.
     NotIncluded(DeepXAbsenceEvidence),
     /// Available evidence is incomplete or conflicting.
@@ -554,6 +608,15 @@ pub enum DeepXTransactionError {
     /// Finality evidence does not identify the previously recorded inclusion.
     #[error("DeepX finality evidence does not match the recorded inclusion")]
     FinalizationMismatch,
+    /// Backend order evidence conflicts with this transaction's signed hash.
+    #[error("DeepX backend order hash does not match the signed transaction")]
+    BackendOrderHashMismatch,
+    /// Backend order evidence is incomplete.
+    #[error("incomplete DeepX backend order evidence")]
+    IncompleteBackendOrderEvidence,
+    /// Backend order evidence conflicts with the previously committed observation.
+    #[error("conflicting DeepX backend order evidence")]
+    ConflictingBackendOrderEvidence,
     /// A complete scan cannot end before its first block.
     #[error("invalid DeepX absence scan range {first_scanned_block}..={finalized_block_number}")]
     InvalidAbsenceRange {
@@ -576,6 +639,8 @@ pub struct DeepXTransactionLifecycle {
     inclusion: Option<DeepXInclusionEvidence>,
     reverted_inclusion: Option<DeepXInclusionEvidence>,
     absence: Option<DeepXAbsenceEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_order: Option<DeepXBackendOrderEvidence>,
 }
 
 impl Default for DeepXTransactionLifecycle {
@@ -594,6 +659,7 @@ impl DeepXTransactionLifecycle {
             inclusion: None,
             reverted_inclusion: None,
             absence: None,
+            backend_order: None,
         }
     }
 
@@ -625,6 +691,12 @@ impl DeepXTransactionLifecycle {
     #[must_use]
     pub const fn absence(&self) -> Option<DeepXAbsenceEvidence> {
         self.absence
+    }
+
+    /// Returns the backend order evidence retained after confirmation.
+    #[must_use]
+    pub const fn backend_order(&self) -> Option<DeepXBackendOrderEvidence> {
+        self.backend_order
     }
 
     /// Applies one authoritative observation without performing I/O or persistence.
@@ -703,6 +775,29 @@ impl DeepXTransactionLifecycle {
                     Ok(false)
                 } else {
                     Err(DeepXTransactionError::FinalizationMismatch)
+                };
+            }
+            (
+                State::Submitting | State::Accepted | State::InBlockSuccess | State::NotIncluded,
+                Observation::BackendOrderConfirmed(e),
+            ) => {
+                if self.extrinsic_hash != Some(e.extrinsic_hash) {
+                    return Err(DeepXTransactionError::BackendOrderHashMismatch);
+                }
+                if e.order_id == 0 || e.observed_block_number == 0 {
+                    return Err(DeepXTransactionError::IncompleteBackendOrderEvidence);
+                }
+                self.inclusion = None;
+                self.reverted_inclusion = None;
+                self.absence = None;
+                self.backend_order = Some(e);
+                self.state = State::BackendConfirmed;
+            }
+            (State::BackendConfirmed, Observation::BackendOrderConfirmed(e)) => {
+                return if self.backend_order == Some(e) {
+                    Ok(false)
+                } else {
+                    Err(DeepXTransactionError::ConflictingBackendOrderEvidence)
                 };
             }
             (State::Submitting | State::Accepted, Observation::NotIncluded(e)) => {
@@ -862,6 +957,93 @@ mod tests {
             .apply(DeepXTransactionObservation::SubmissionStarted)
             .unwrap();
         lifecycle
+    }
+
+    #[rstest]
+    fn backend_confirmation_is_distinct_from_finality_and_idempotent() {
+        let mut lifecycle = submitting();
+        let evidence = DeepXBackendOrderEvidence {
+            extrinsic_hash: EXTRINSIC_HASH,
+            order_id: 42,
+            observed_block_number: 100,
+        };
+        assert!(
+            lifecycle
+                .apply(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+                .unwrap()
+        );
+        assert_eq!(lifecycle.state(), DeepXTransactionState::BackendConfirmed);
+        assert_eq!(lifecycle.backend_order(), Some(evidence));
+        assert_eq!(lifecycle.inclusion(), None);
+        assert!(!lifecycle.state().requires_reconciliation());
+        assert!(
+            !lifecycle
+                .apply(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+                .unwrap()
+        );
+        assert_eq!(
+            lifecycle.apply(DeepXTransactionObservation::BackendOrderConfirmed(
+                DeepXBackendOrderEvidence {
+                    order_id: 43,
+                    ..evidence
+                }
+            )),
+            Err(DeepXTransactionError::ConflictingBackendOrderEvidence),
+        );
+    }
+
+    #[rstest]
+    fn backend_confirmation_rejects_another_signed_hash() {
+        let mut lifecycle = submitting();
+        let result = lifecycle.apply(DeepXTransactionObservation::BackendOrderConfirmed(
+            DeepXBackendOrderEvidence {
+                extrinsic_hash: [9; 32],
+                order_id: 42,
+                observed_block_number: 100,
+            },
+        ));
+        assert_eq!(result, Err(DeepXTransactionError::BackendOrderHashMismatch));
+        assert_eq!(lifecycle.state(), DeepXTransactionState::Submitting);
+    }
+
+    #[rstest]
+    fn backend_confirmation_supersedes_old_absence_evidence() {
+        let mut lifecycle = submitting();
+        lifecycle
+            .apply(DeepXTransactionObservation::NotIncluded(absence()))
+            .unwrap();
+        assert!(lifecycle.absence().is_some());
+        let evidence = DeepXBackendOrderEvidence::new(EXTRINSIC_HASH, 42, 100);
+
+        lifecycle
+            .apply(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+            .unwrap();
+
+        assert_eq!(lifecycle.state(), DeepXTransactionState::BackendConfirmed);
+        assert_eq!(lifecycle.backend_order(), Some(evidence));
+        assert_eq!(lifecycle.absence(), None);
+        assert_eq!(lifecycle.inclusion(), None);
+    }
+
+    #[rstest]
+    fn backend_confirmation_discards_unfinalized_inclusion() {
+        let mut lifecycle = submitting();
+        lifecycle
+            .apply(DeepXTransactionObservation::Included(inclusion(
+                DeepXInclusionOutcome::Success,
+            )))
+            .unwrap();
+        assert!(lifecycle.inclusion().is_some());
+
+        lifecycle
+            .apply(DeepXTransactionObservation::BackendOrderConfirmed(
+                DeepXBackendOrderEvidence::new(EXTRINSIC_HASH, 42, 100),
+            ))
+            .unwrap();
+
+        assert_eq!(lifecycle.state(), DeepXTransactionState::BackendConfirmed);
+        assert_eq!(lifecycle.inclusion(), None);
+        assert_eq!(lifecycle.reverted_inclusion(), None);
     }
 
     #[rstest]

@@ -25,6 +25,7 @@ use std::{
 };
 
 use alloy::primitives::U256;
+use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_network::{
     http::{HttpClient, HttpRedirectPolicy, Method},
     retry::{RetryConfig, RetryManager},
@@ -81,7 +82,10 @@ use super::{
     retry::{deepx_http_retry_config, should_retry_http_error},
 };
 use crate::{
-    account::{DeepXAccountOwnershipError, DeepXAccountOwnershipProof, verify_account_ownership},
+    account::{
+        DeepXAccountOwnershipError, DeepXAccountOwnershipProof, verify_account_ownership,
+        verify_delegated_account_ownership,
+    },
     common::DeepXPrivateKey,
     signing::derive_signer_account_id,
 };
@@ -1648,7 +1652,7 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
-    /// record fields, or a response transaction hash that differs from the request.
+    /// record fields, or a response that does not identify the requested extrinsic hash.
     pub async fn get_perp_order_by_tx(&self, tx_hash: &str) -> Result<DeepXPerpOrderRecord> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -1684,10 +1688,10 @@ impl DeepXHttpClient {
                     "record has an invalid transaction hash".to_string(),
                 )
             })?;
-        if received_hash != expected_hash {
+        if received_hash != expected_hash || order.tx_hash_type != "EXTRINSIC_HASH" {
             return Err(invalid_account_response(
                 "perp order by transaction hash",
-                "record belongs to another transaction hash".to_string(),
+                "record does not identify the requested extrinsic hash".to_string(),
             ));
         }
         Ok(order)
@@ -1751,7 +1755,7 @@ impl DeepXHttpClient {
     /// # Errors
     ///
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
-    /// record fields, or a response transaction hash that differs from the request.
+    /// record fields, or a response that does not identify the requested extrinsic hash.
     pub async fn get_spot_order_by_tx(&self, tx_hash: &str) -> Result<DeepXSpotOrderRecord> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
@@ -1789,10 +1793,10 @@ impl DeepXHttpClient {
                     "record has an invalid transaction hash".to_string(),
                 )
             })?;
-        if received_hash != expected_hash {
+        if received_hash != expected_hash || order.tx_hash_type != "EXTRINSIC_HASH" {
             return Err(invalid_account_response(
                 "spot order by transaction hash",
-                "record belongs to another transaction hash".to_string(),
+                "record does not identify the requested extrinsic hash".to_string(),
             ));
         }
         Ok(order)
@@ -4770,28 +4774,62 @@ impl DeepXHttpClient {
         Ok(profile)
     }
 
-    /// Queries and verifies signer ownership of one configured subaccount.
+    /// Queries and verifies signer authority over one configured subaccount.
     ///
-    /// The wallet directory query is derived from `key`; the returned profile must bind the same
-    /// wallet authority and exact configured subaccount. A final directory read must retain the
-    /// same membership before an opaque proof is returned.
+    /// A direct signer must own the profile's wallet. A delegated signer must appear in both the
+    /// wallet's delegate directory and the delegate's reverse directory with current order
+    /// permission. Directory and profile reads are repeated before returning the proof.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid key or subaccount, failed REST reads, inconsistent account
-    /// directory or profile identities, changed membership, duplicate subaccounts, or an inactive
-    /// profile.
+    /// directory or profile identities, changed membership, invalid delegate permission, duplicate
+    /// subaccounts, or an inactive profile.
     pub async fn get_account_ownership_proof(
         &self,
         key: &DeepXPrivateKey,
         subaccount: &str,
     ) -> std::result::Result<DeepXAccountOwnershipProof, DeepXAccountOwnershipError> {
         let signer = derive_signer_account_id(key)?;
-        let wallet = format!("0x{}", nautilus_core::hex::encode(signer));
+        let signer_address = format!("0x{}", nautilus_core::hex::encode(signer));
+        let profile = self.get_subaccount_info(subaccount, None).await?;
+        let wallet = profile.authority.clone();
         let directory = self.get_wallet_subaccounts(&wallet).await?;
-        let profile = self.get_subaccount_info(subaccount, Some(&wallet)).await?;
-        let proof = verify_account_ownership(key, subaccount, &directory, &profile)?;
+        let delegated = !wallet.eq_ignore_ascii_case(&signer_address);
+        let (delegates, delegators) = if delegated {
+            (
+                Some(self.get_delegate_accounts(&wallet).await?),
+                Some(self.get_delegator_accounts(&signer_address).await?),
+            )
+        } else {
+            (None, None)
+        };
+        let verify = |directory: &DeepXWalletSubaccounts,
+                      profile: &DeepXSubaccountProfile,
+                      delegates: Option<&DeepXWalletDelegateAccounts>,
+                      delegators: Option<&DeepXDelegateWallets>| {
+            if let (Some(delegates), Some(delegators)) = (delegates, delegators) {
+                verify_delegated_account_ownership(
+                    key,
+                    subaccount,
+                    directory,
+                    profile,
+                    delegates,
+                    delegators,
+                    get_atomic_clock_realtime().get_time_ms(),
+                )
+            } else {
+                verify_account_ownership(key, subaccount, directory, profile)
+            }
+        };
+        let proof = verify(
+            &directory,
+            &profile,
+            delegates.as_ref(),
+            delegators.as_ref(),
+        )?;
         let final_directory = self.get_wallet_subaccounts(&wallet).await?;
+        let final_profile = self.get_subaccount_info(subaccount, Some(&wallet)).await?;
         let initial_set: HashSet<_> = directory
             .addresses
             .iter()
@@ -4802,8 +4840,29 @@ impl DeepXHttpClient {
             .iter()
             .map(|address| address.to_ascii_lowercase())
             .collect();
-        if initial_set != final_set {
+        if initial_set != final_set
+            || !profile
+                .authority
+                .eq_ignore_ascii_case(&final_profile.authority)
+            || !profile.address.eq_ignore_ascii_case(&final_profile.address)
+            || profile.status != final_profile.status
+            || profile.height != final_profile.height
+            || profile.created_at != final_profile.created_at
+        {
             return Err(DeepXAccountOwnershipError::DirectoryChanged);
+        }
+        if let (Some(delegates), Some(delegators)) = (delegates.as_ref(), delegators.as_ref()) {
+            let final_delegates = self.get_delegate_accounts(&wallet).await?;
+            let final_delegators = self.get_delegator_accounts(&signer_address).await?;
+            if delegates != &final_delegates || delegators != &final_delegators {
+                return Err(DeepXAccountOwnershipError::DirectoryChanged);
+            }
+            verify(
+                &final_directory,
+                &final_profile,
+                Some(&final_delegates),
+                Some(&final_delegators),
+            )?;
         }
         Ok(proof)
     }
@@ -8876,6 +8935,8 @@ mod tests {
             "0x2222222222222222222222222222222222222222222222222222222222222222";
         const EMPTY_TYPE_HASH: &str =
             "0x3333333333333333333333333333333333333333333333333333333333333333";
+        const OTHER_TYPE_HASH: &str =
+            "0x4444444444444444444444444444444444444444444444444444444444444444";
         let fixture: serde_json::Value = serde_json::from_str(PERP_ORDER_BY_TX_RESPONSE).unwrap();
         let app = Router::new().route(
             "/internal/v1/account/perp/order-by-tx",
@@ -8887,6 +8948,10 @@ mod tests {
                         EMPTY_TYPE_HASH => {
                             response["data"]["txHash"] = json!(EMPTY_TYPE_HASH);
                             response["data"]["txHashType"] = json!(" ");
+                        }
+                        OTHER_TYPE_HASH => {
+                            response["data"]["txHash"] = json!(OTHER_TYPE_HASH);
+                            response["data"]["txHashType"] = json!("TRANSACTION_HASH");
                         }
                         MISMATCH_HASH => {}
                         _ => unreachable!(),
@@ -8913,7 +8978,11 @@ mod tests {
                 ..
             })
         ));
-        for tx_hash in [INVALID_RESPONSE_HASH_REQUEST, EMPTY_TYPE_HASH] {
+        for tx_hash in [
+            INVALID_RESPONSE_HASH_REQUEST,
+            EMPTY_TYPE_HASH,
+            OTHER_TYPE_HASH,
+        ] {
             assert!(matches!(
                 client.get_perp_order_by_tx(tx_hash).await,
                 Err(DeepXHttpError::InvalidHistoryResponse {
@@ -9462,6 +9531,10 @@ mod tests {
         const TX_HASH: &str = "0x437279a6138febacf1a416ad24e3377f8c1ecd4ee0f9cdd6702f11f20d9e1750";
         const OTHER_HASH: &str =
             "0x1111111111111111111111111111111111111111111111111111111111111111";
+        const OTHER_TYPE_HASH: &str =
+            "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let fixture: serde_json::Value =
+            serde_json::from_str(SPOT_ORDER_BY_ID_CANCELED_RESPONSE).unwrap();
         let app = Router::new()
             .route(
                 SPOT_ORDER_BY_ID_PATH,
@@ -9469,7 +9542,16 @@ mod tests {
             )
             .route(
                 SPOT_ORDER_BY_TX_PATH,
-                get(|| async { SPOT_ORDER_BY_ID_CANCELED_RESPONSE }),
+                get(
+                    move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                        let mut response = fixture.clone();
+                        if query["txHash"] == OTHER_TYPE_HASH {
+                            response["data"]["txHash"] = json!(OTHER_TYPE_HASH);
+                            response["data"]["txHashType"] = json!("TRANSACTION_HASH");
+                        }
+                        async move { Json(response) }
+                    },
+                ),
             );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -9492,6 +9574,13 @@ mod tests {
         ));
         assert!(matches!(
             client.get_spot_order_by_tx(OTHER_HASH).await,
+            Err(DeepXHttpError::InvalidHistoryResponse {
+                endpoint: "spot order by transaction hash",
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.get_spot_order_by_tx(OTHER_TYPE_HASH).await,
             Err(DeepXHttpError::InvalidHistoryResponse {
                 endpoint: "spot order by transaction hash",
                 ..
@@ -12893,6 +12982,111 @@ mod tests {
             assert_eq!(proof.subaccount(), [0x11; 20]);
         }
         assert_eq!(observed_directory_reads.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::stable(false)]
+    #[case::revoked_during_read(true)]
+    #[tokio::test]
+    async fn account_ownership_proof_validates_current_delegate_directories(#[case] revoked: bool) {
+        let key = crate::common::DeepXPrivateKey::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &crate::common::DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let signer = format!(
+            "0x{}",
+            nautilus_core::hex::encode(derive_signer_account_id(&key).unwrap())
+        );
+        let wallet = "0x3333333333333333333333333333333333333333";
+        let subaccount = "0x1111111111111111111111111111111111111111";
+        let delegate_reads = Arc::new(AtomicUsize::new(0));
+        let counted_reads = Arc::clone(&delegate_reads);
+        let forward_signer = signer.clone();
+        let app = Router::new()
+            .route(
+                SUBACCOUNT_INFO_PATH,
+                get(move || async move {
+                    Json(json!({
+                        "code": 200, "msg": "success", "fail": false,
+                        "data": {
+                            "authority": wallet,
+                            "address": subaccount,
+                            "name": "test",
+                            "status": "Active",
+                            "spotPositions": [],
+                            "nextOrderId": 1,
+                            "spotMarginTradingEnabled": false,
+                            "marginStrategy": "Cross",
+                            "height": 1,
+                            "createdAt": 1,
+                        },
+                    }))
+                }),
+            )
+            .route(
+                WALLET_SUBACCOUNTS_PATH,
+                get(move || async move {
+                    Json(json!({
+                        "code": 200, "msg": "success", "fail": false,
+                        "data": [subaccount],
+                    }))
+                }),
+            )
+            .route(
+                DELEGATE_ACCOUNTS_PATH,
+                get(move || {
+                    let signer = forward_signer.clone();
+                    let reads = Arc::clone(&counted_reads);
+                    async move {
+                        let index = reads.fetch_add(1, Ordering::SeqCst);
+                        let mode = if revoked && index > 0 {
+                            "Disable"
+                        } else {
+                            "PlaceOrCancelOrder"
+                        };
+                        Json(json!({
+                            "code": 200, "msg": "success", "fail": false,
+                            "data": [{
+                                "delegateAddress": signer,
+                                "delegateName": "order bot",
+                                "validUntil": 4_000_000_000_000_u64,
+                                "mode": mode,
+                                "createTime": 1,
+                            }],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                DELEGATOR_ACCOUNTS_PATH,
+                get(move || async move {
+                    Json(json!({
+                        "code": 200, "msg": "success", "fail": false,
+                        "data": [wallet],
+                    }))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let result = client.get_account_ownership_proof(&key, subaccount).await;
+
+        if revoked {
+            assert!(matches!(
+                result,
+                Err(DeepXAccountOwnershipError::DirectoryChanged)
+            ));
+        } else {
+            let proof = result.unwrap();
+            assert_eq!(proof.signer(), derive_signer_account_id(&key).unwrap());
+            assert_eq!(proof.wallet(), [0x33; 20]);
+            assert_eq!(proof.subaccount(), [0x11; 20]);
+        }
+        assert_eq!(delegate_reads.load(Ordering::SeqCst), 2);
         server.abort();
     }
 

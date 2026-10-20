@@ -39,9 +39,14 @@ const FINALIZED_REJECTION_REASON: &str = "DeepX finalized transaction failed";
 const FINALIZED_CANCEL_REJECTION_REASON: &str = "DeepX finalized cancellation failed";
 const FINALIZED_MODIFY_REJECTION_REASON: &str = "DeepX finalized modification failed";
 
-/// Authoritative finalized evidence eligible for one terminal framework order event.
+/// Verified backend or finalized evidence eligible for one terminal framework order event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeepXFrameworkOrderTerminalEvidence {
+    /// A hash-bound backend order record proves the order was placed.
+    BackendAccepted {
+        /// Venue order ID verified against the durable nonce.
+        venue_order_id: u64,
+    },
     /// A matching finalized `PerpMarket.OrderPlaced` proves venue acceptance.
     Accepted {
         /// Venue order ID proved by the matching placement event.
@@ -111,7 +116,7 @@ impl DeepXFrameworkOrderEventEligibility {
         self.submitted_payload
     }
 
-    /// Returns authoritative finalized evidence for a terminal order event, when available.
+    /// Returns verified evidence for a terminal order event, when available.
     #[must_use]
     pub const fn terminal(&self) -> Option<DeepXFrameworkOrderTerminalEvidence> {
         self.terminal
@@ -183,8 +188,8 @@ pub enum DeepXFrameworkOrderEventAcknowledgementError {
 /// Classifies framework order-event eligibility from a Perp or Spot placement, or cancellation.
 ///
 /// Submission-pool acceptance proves only that transmission was acknowledged. Best-block
-/// inclusion remains reorganization-sensitive. Placement eligibility requires finalized business
-/// evidence, and cancellation eligibility requires finalized matching cancellation evidence.
+/// inclusion remains reorganization-sensitive. Placement eligibility can also follow a
+/// hash-bound backend order record; other terminal outcomes require finalized business evidence.
 /// Ambiguous and not-included outcomes never become terminal events.
 ///
 /// This pure boundary does not construct, persist, deduplicate, or emit framework events.
@@ -243,9 +248,16 @@ pub fn classify_perp_place_framework_order_events(
             | DeepXTransactionState::InBlockSuccess
             | DeepXTransactionState::InBlockFailed
             | DeepXTransactionState::Finalized
+            | DeepXTransactionState::BackendConfirmed
             | DeepXTransactionState::NotIncluded
     );
-    let terminal = if state == DeepXTransactionState::Finalized {
+    let terminal = if state == DeepXTransactionState::BackendConfirmed {
+        record.lifecycle().backend_order().map(|e| {
+            DeepXFrameworkOrderTerminalEvidence::BackendAccepted {
+                venue_order_id: e.order_id,
+            }
+        })
+    } else if state == DeepXTransactionState::Finalized {
         let inclusion = record
             .lifecycle()
             .inclusion()
@@ -335,6 +347,9 @@ pub fn stage_perp_framework_order_events(
     }
     if let Some(terminal) = eligibility.terminal() {
         let payload = match terminal {
+            DeepXFrameworkOrderTerminalEvidence::BackendAccepted { venue_order_id } => {
+                DeepXFrameworkOrderEventPayload::Accepted { venue_order_id }
+            }
             DeepXFrameworkOrderTerminalEvidence::Accepted { venue_order_id, .. } => {
                 DeepXFrameworkOrderEventPayload::Accepted { venue_order_id }
             }
@@ -900,6 +915,64 @@ mod tests {
         )
         .unwrap();
         record
+    }
+
+    #[rstest]
+    fn backend_confirmed_place_stages_durable_acceptance_without_inclusion() {
+        let mut record = submitted_record();
+        let evidence = super::super::DeepXBackendOrderEvidence {
+            extrinsic_hash: record.lifecycle().extrinsic_hash().unwrap(),
+            order_id: ORDER_ID,
+            observed_block_number: 101,
+        };
+        record
+            .apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+            .unwrap();
+        assert_eq!(record.lifecycle().inclusion(), None);
+        assert_eq!(
+            record.recovery_action(),
+            super::super::DeepXTransactionRecoveryAction::Complete
+        );
+        assert!(
+            stage_perp_framework_order_events(
+                &mut record,
+                UnixNanos::from(100),
+                UnixNanos::from(101),
+                true,
+            )
+            .unwrap()
+        );
+        let restored = DeepXTransactionRecord::decode(&record.encode().unwrap()).unwrap();
+        assert_eq!(restored.lifecycle().backend_order(), Some(evidence));
+        assert_eq!(
+            restored
+                .framework_order_outbox()
+                .unwrap()
+                .terminal()
+                .unwrap()
+                .payload(),
+            DeepXFrameworkOrderEventPayload::Accepted {
+                venue_order_id: ORDER_ID
+            },
+        );
+    }
+
+    #[rstest]
+    fn backend_order_with_wrong_nonce_cannot_change_durable_record() {
+        let mut record = submitted_record();
+        let original = record.clone();
+        let result = record.apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(
+            super::super::DeepXBackendOrderEvidence {
+                extrinsic_hash: record.lifecycle().extrinsic_hash().unwrap(),
+                order_id: ORDER_ID + 1,
+                observed_block_number: 101,
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(DeepXTransactionRecordError::InconsistentLifecycle)
+        ));
+        assert_eq!(record, original);
     }
 
     fn receipt(

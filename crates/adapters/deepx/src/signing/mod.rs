@@ -293,6 +293,10 @@ impl DeepXPerpPlaceParams {
             ("stop_loss", optional_u128(self.stop_loss)),
             ("reduce_only", Value::bool(self.reduce_only)),
             ("post_only", self.post_only.into_dynamic_value()),
+            (
+                "stp_mode",
+                Value::unnamed_variant("None", Vec::<Value>::new()),
+            ),
         ])
     }
 
@@ -354,6 +358,10 @@ impl DeepXSpotPlaceParams {
             ("order_type", self.order_type.into_dynamic_value()),
             ("post_only", self.post_only.into_dynamic_value()),
             ("reduce_only", Value::bool(self.reduce_only)),
+            (
+                "stp_mode",
+                Value::unnamed_variant("None", Vec::<Value>::new()),
+            ),
         ])]
     }
 }
@@ -1309,8 +1317,8 @@ fn sign_dynamic_pallet_call_with_runtime(
     let signer = Keypair::from_secret_key(*key.as_bytes()).map_err(|_| SigningError::InvalidKey)?;
     let account_id = derive_signer_account_id(key)?;
     let payload = subxt_core::dynamic::tx(pallet, call, arguments);
-    let transaction = tx::create_v4_signed(&payload, runtime.client_state, immortal_params(nonce))?
-        .sign(&signer);
+    let transaction =
+        tx::create_v4_signed(&payload, runtime.client_state, immortal_params(nonce))?.sign(&signer);
     let hash = transaction.hash_with(BlakeTwo256);
 
     Ok(SignedPalletExtrinsic {
@@ -1374,6 +1382,122 @@ mod tests {
             &DeepXKeyScheme::Secp256k1,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DeepX testnet Watch RPC"]
+    async fn current_runtime_signs_calls_offline_with_synthetic_key() {
+        let network = crate::config::DeepXNetworkConfig::default();
+        let endpoints = crate::rpc::observe_and_validate_rpc_endpoint_identities(&network)
+            .await
+            .unwrap();
+        let snapshot = crate::rpc::observe_current_runtime_snapshot_for_endpoints(
+            &network.environment,
+            &endpoints,
+        )
+        .await
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let permit = service.acquire().unwrap();
+        let key = key();
+        let signed = sign_no_op(&permit, &key, 0).unwrap();
+
+        assert_eq!(signed.runtime, *snapshot.identity());
+        assert_eq!(signed.signer, derive_signer_account_id(&key).unwrap());
+        assert_eq!(signed.extrinsic_hash, BlakeTwo256.hash(&signed.bytes).0);
+        assert!(!signed.bytes.is_empty());
+
+        let params = DeepXPerpPlaceParams {
+            subaccount: [0x11; 20],
+            market_id: 3,
+            is_long: true,
+            size: 1_000_000,
+            price: 2_500_000_000,
+            order_type: DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc),
+            take_profit: None,
+            stop_loss: None,
+            reduce_only: false,
+            post_only: DeepXPostOnlyParam::None,
+        };
+        let direct = sign_dynamic_pallet_call(
+            &permit,
+            &key,
+            "PerpMarket",
+            "place_order",
+            vec![params.into_dynamic_value()],
+            1,
+        )
+        .unwrap();
+        let placement = sign_perp_place_order(&permit, &key, params, 1).unwrap();
+        assert_eq!(placement.bytes, direct.bytes);
+        assert_eq!(placement.runtime, *snapshot.identity());
+        assert_eq!(placement.signer, signed.signer);
+        assert_eq!(
+            placement.extrinsic_hash,
+            BlakeTwo256.hash(&placement.bytes).0
+        );
+        assert_ne!(placement.extrinsic_hash, signed.extrinsic_hash);
+
+        let spot_params = DeepXSpotPlaceParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            is_buy: true,
+            quote_amount: [0x33; 32],
+            base_amount: [0x44; 32],
+            order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+            post_only: DeepXPostOnlyParam::None,
+            reduce_only: false,
+        };
+        let spot = sign_spot_place_order(&permit, &key, spot_params, 2).unwrap();
+        assert_eq!(spot.runtime, *snapshot.identity());
+        assert_eq!(spot.signer, signed.signer);
+        assert_eq!(spot.extrinsic_hash, BlakeTwo256.hash(&spot.bytes).0);
+        assert_ne!(spot.extrinsic_hash, placement.extrinsic_hash);
+
+        let cancel = DeepXPerpCancelParams {
+            subaccount: params.subaccount,
+            order_id: 42,
+            market_id: params.market_id,
+            fast_cancel: false,
+        };
+        let perp_cancel = sign_perp_cancel(&permit, &key, cancel, 3).unwrap();
+        assert_eq!(perp_cancel.runtime, *snapshot.identity());
+        assert_eq!(
+            perp_cancel.extrinsic_hash,
+            BlakeTwo256.hash(&perp_cancel.bytes).0
+        );
+
+        let modify = sign_perp_modify_order(
+            &permit,
+            &key,
+            DeepXPerpModifyParams {
+                cancel,
+                place: params,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(modify.runtime, *snapshot.identity());
+        assert_eq!(modify.extrinsic_hash, BlakeTwo256.hash(&modify.bytes).0);
+
+        let spot_cancel = sign_spot_cancel(
+            &permit,
+            &key,
+            DeepXSpotCancelParams {
+                subaccount: spot_params.subaccount,
+                pair: spot_params.pair,
+                order_id: 42,
+                is_buy: spot_params.is_buy,
+                fast_cancel: false,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(spot_cancel.runtime, *snapshot.identity());
+        assert_eq!(
+            spot_cancel.extrinsic_hash,
+            BlakeTwo256.hash(&spot_cancel.bytes).0
+        );
     }
 
     fn sign(
@@ -1531,6 +1655,43 @@ mod tests {
             &snapshot,
             &client_state,
             "PerpMarket",
+            "place_order",
+            arguments,
+            42,
+        );
+        assert!(signed.bytes().ends_with(&expected));
+    }
+
+    #[rstest]
+    fn spec376_spot_place_scale_encoding_is_exact() {
+        let (snapshot, client_state) = runtime();
+        let params = DeepXSpotPlaceParams {
+            subaccount: [0x11; 20],
+            pair: [0x22; 32],
+            is_buy: true,
+            quote_amount: [0x33; 32],
+            base_amount: [0x44; 32],
+            order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+            post_only: DeepXPostOnlyParam::None,
+            reduce_only: false,
+        };
+        let mut expected = vec![20, 1];
+        expected.extend_from_slice(&params.subaccount);
+        expected.extend_from_slice(&params.pair);
+        expected.push(1);
+        expected.extend_from_slice(&params.quote_amount);
+        expected.extend_from_slice(&params.base_amount);
+        expected.extend_from_slice(&[0, 0, 0, 0]);
+
+        let arguments = params.into_dynamic_arguments();
+        assert_eq!(
+            encode_call(&snapshot, "SpotMarket", "place_order", arguments.clone()),
+            expected,
+        );
+        let signed = sign(
+            &snapshot,
+            &client_state,
+            "SpotMarket",
             "place_order",
             arguments,
             42,

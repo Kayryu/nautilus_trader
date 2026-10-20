@@ -11,7 +11,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Verify finalized Spot and perpetual instrument discovery against the DeepX testnet.
+//! Verify current Spot and perpetual instrument discovery against the DeepX testnet.
 //! No account access, signing, WebSocket subscriptions, or transaction submission.
 
 use std::{cell::RefCell, rc::Rc};
@@ -71,10 +71,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    ensure!(
-        spot_count > 0,
-        "no finalized Spot instruments were published"
-    );
+    ensure!(spot_count > 0, "no current Spot instruments were published");
     ensure!(
         perpetual_count > 0,
         "no perpetual instruments were published"
@@ -82,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     client.disconnect().await?;
     ensure!(client.is_disconnected(), "client did not disconnect");
     println!(
-        "DeepX finalized instrument discovery verified spot={spot_count} perpetual={perpetual_count}; no credentials or transactions sent",
+        "DeepX current instrument discovery verified spot={spot_count} perpetual={perpetual_count}; no credentials or transactions sent",
     );
     Ok(())
 }

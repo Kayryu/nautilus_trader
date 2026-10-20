@@ -103,6 +103,16 @@ async fn main() -> anyhow::Result<()> {
             .exact_margin
             .as_ref()
             .context("validated margin ratio lacks exact values")?;
+        for asset in &subaccount.balances.assets {
+            println!(
+                "DeepX subaccount asset address={} symbol={} balance={} borrowed={} decimals={}",
+                subaccount.profile.address,
+                asset.symbol,
+                asset.balance,
+                asset.balance_borrowed,
+                asset.decimals,
+            );
+        }
         println!(
             "DeepX subaccount verified address={} name={} status={} height={} assets={} deposits_usd={} borrows_usd={} unrealized_pnl_usd={} equity_usd={} exact_collateral_usdc={} exact_maintenance_margin_required_usdc={} exact_uni_mmr={:?} collateral_display={} margin_required_display={} margin_ratio_display={:?}",
             subaccount.profile.address,

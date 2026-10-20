@@ -29,7 +29,7 @@ mod serial_tests {
     use ahash::AHashMap;
     use bytes::Bytes;
     use nautilus_common::{cache::database::CacheDatabaseAdapter, testing::wait_until_async};
-    use nautilus_core::UUID4;
+    use nautilus_core::{UUID4, UnixNanos};
     use nautilus_infrastructure::sql::{
         cache::{PostgresCacheDatabase, get_pg_cache_database},
         queries::DatabaseQueries,
@@ -39,7 +39,9 @@ mod serial_tests {
         enums::{CurrencyType, OrderSide, OrderType},
         events::{
             OrderEventAny,
-            order::spec::{OrderCancelRejectedSpec, OrderModifyRejectedSpec},
+            order::spec::{
+                OrderCancelRejectedSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+            },
         },
         identifiers::{
             AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
@@ -558,6 +560,70 @@ mod serial_tests {
                 assert_eq!(e.reason, reason);
             }
             other => panic!("Expected OrderModifyRejected, was {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_order_pending_cancel_insert_and_load() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+
+        let instrument = currency_pair_ethusdt();
+        DatabaseQueries::add_currency(pool, instrument.base_currency().unwrap())
+            .await
+            .unwrap();
+        DatabaseQueries::add_currency(pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument.clone()))
+            .await
+            .unwrap();
+
+        let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
+        let trader_id = TraderId::from("TRADER-PENDING-CANCEL");
+        let strategy_id = StrategyId::from("S-PENDING-CANCEL");
+        let instrument_id = instrument.id();
+        let account_id = AccountId::from("A-PENDING-CANCEL");
+        let venue_order_id = VenueOrderId::from("V-PENDING-CANCEL");
+        let event_id = UUID4::new();
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_001_u64);
+        let ts_init = UnixNanos::from(1_700_000_000_000_000_002_u64);
+        let event = OrderPendingCancelSpec::builder()
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .account_id(account_id)
+            .event_id(event_id)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .reconciliation(true)
+            .venue_order_id(venue_order_id)
+            .build();
+
+        DatabaseQueries::add_order_event(pool, Box::new(event), None)
+            .await
+            .unwrap();
+
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrderEventAny::PendingCancel(event) => {
+                assert_eq!(event.trader_id, trader_id);
+                assert_eq!(event.strategy_id, strategy_id);
+                assert_eq!(event.instrument_id, instrument_id);
+                assert_eq!(event.client_order_id, client_order_id);
+                assert_eq!(event.account_id, Some(account_id));
+                assert_eq!(event.event_id, event_id);
+                assert_eq!(event.ts_event, ts_event);
+                assert_eq!(event.ts_init, ts_init);
+                assert!(event.reconciliation);
+                assert_eq!(event.venue_order_id, Some(venue_order_id));
+            }
+            other => panic!("Expected OrderPendingCancel, was {other:?}"),
         }
     }
 

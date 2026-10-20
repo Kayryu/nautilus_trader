@@ -103,6 +103,7 @@ mod tests {
         assert_eq!(event.account_id, Some(AccountId::from("SIM-002")));
         assert_eq!(event.venue_order_id, Some(VenueOrderId::from("V-1")));
         assert!(event.reconciliation);
+        assert!(crate::events::OrderEvent::reconciliation(&event));
         assert_eq!(event.trader_id, TraderId::test_default());
     }
 

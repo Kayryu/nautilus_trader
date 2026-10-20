@@ -704,8 +704,13 @@ pub struct DeepXDelegateAccount {
     pub mode: DeepXDelegateMode,
     /// Initial configuration timestamp in Unix milliseconds.
     pub create_time: u64,
-    /// Backend-reported current activity flag.
+    /// Backend-reported activity flag, or true when omitted by current responses.
+    #[serde(default = "default_delegate_active")]
     pub active: bool,
+}
+
+fn default_delegate_active() -> bool {
+    true
 }
 
 /// Request-scoped delegate configurations for one wallet.

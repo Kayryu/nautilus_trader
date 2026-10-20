@@ -24,11 +24,11 @@ use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
 
 use crate::{
     config::DeepXNetworkConfig,
-    instruments::{parse_perpetual_instrument, parse_spot_instrument},
+    instruments::{parse_current_spot_instrument, parse_perpetual_instrument},
     providers::{DeepXMarketMetadata, DeepXMarketProvider},
     rpc::{
         observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-        observe_finalized_spot_market_spec_batch,
+        observe_current_spot_market_spec_batch,
     },
 };
 
@@ -46,8 +46,8 @@ pub struct DeepXSpotInstrumentUnsupported;
 
 /// Provides DeepX instruments from the failure-atomic public market catalog.
 ///
-/// With network configuration, it converts perpetual metadata and finalized-checkpoint-verified
-/// Spot metadata into standard instruments. Without network configuration it loads perpetuals
+/// With network configuration, it converts perpetual metadata and current-block-verified Spot
+/// metadata into standard instruments. Without network configuration it loads perpetuals
 /// only.
 ///
 /// Loading is failure-atomic: the store is replaced only after the complete catalog loads and
@@ -85,7 +85,7 @@ impl DeepXInstrumentProvider {
         }
     }
 
-    /// Creates a provider which verifies Spot constraints against finalized chain state.
+    /// Creates a provider which verifies Spot constraints against current chain state.
     #[must_use]
     pub fn with_network(catalog: DeepXMarketProvider, network: DeepXNetworkConfig) -> Self {
         let mut provider = Self::new(catalog);
@@ -165,26 +165,25 @@ impl DeepXInstrumentProvider {
                         .map_err(anyhow::Error::from)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                observe_finalized_spot_market_spec_batch(
+                observe_current_spot_market_spec_batch(
                     &network.environment,
                     &endpoints,
                     &capabilities,
                     &pairs,
                 )
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
             }
         } else {
             Vec::new()
         };
 
         if self.network.is_some() && spot_evidence.len() != spots.len() {
-            bail!("DeepX finalized Spot spec batch does not match the REST market count");
+            bail!("DeepX current Spot spec batch does not match the REST market count");
         }
         let mut evidence_by_pair = std::collections::BTreeMap::new();
         for evidence in spot_evidence {
             if evidence_by_pair.insert(evidence.pair(), evidence).is_some() {
-                bail!("duplicate DeepX finalized Spot spec pair");
+                bail!("duplicate DeepX current Spot spec pair");
             }
         }
 
@@ -197,14 +196,18 @@ impl DeepXInstrumentProvider {
                     )?;
                     let evidence = evidence_by_pair
                         .remove(&pair)
-                        .ok_or_else(|| anyhow::anyhow!("missing finalized DeepX Spot spec"))?;
-                    instruments.push(parse_spot_instrument(spot, &evidence, self.ts_init)?);
+                        .ok_or_else(|| anyhow::anyhow!("missing current DeepX Spot spec"))?;
+                    instruments.push(parse_current_spot_instrument(
+                        spot,
+                        &evidence,
+                        self.ts_init,
+                    )?);
                 }
                 DeepXMarketMetadata::Spot(_) => {}
             }
         }
         if !evidence_by_pair.is_empty() {
-            bail!("finalized DeepX Spot specs contain pairs absent from the REST catalog");
+            bail!("current DeepX Spot specs contain pairs absent from the REST catalog");
         }
         Ok((catalog, instruments))
     }

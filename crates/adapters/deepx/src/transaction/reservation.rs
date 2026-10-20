@@ -236,9 +236,9 @@ pub enum DeepXFrameworkOrderEventPayload {
     PendingCancel,
     /// A durable modification crossed the submission-start boundary.
     PendingUpdate,
-    /// Finalized business evidence proved venue acceptance.
+    /// Verified backend order or finalized business evidence proved venue acceptance.
     Accepted {
-        /// Venue order ID proved by the finalized placement event.
+        /// Venue order ID bound to the verified placement.
         venue_order_id: u64,
     },
     /// Finalized dispatch or business evidence proved venue rejection.
@@ -1190,6 +1190,26 @@ struct DeepXTransactionLifecycleWire {
     inclusion: Option<DeepXInclusionEvidenceWire>,
     reverted_inclusion: Option<DeepXInclusionEvidenceWire>,
     absence: Option<DeepXAbsenceEvidenceWire>,
+    #[serde(default)]
+    backend_order: Option<DeepXBackendOrderEvidenceWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeepXBackendOrderEvidenceWire {
+    extrinsic_hash: [u8; 32],
+    order_id: u64,
+    observed_block_number: u64,
+}
+
+impl DeepXBackendOrderEvidenceWire {
+    const fn into_evidence(self) -> super::DeepXBackendOrderEvidence {
+        super::DeepXBackendOrderEvidence::new(
+            self.extrinsic_hash,
+            self.order_id,
+            self.observed_block_number,
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -1370,7 +1390,9 @@ impl DeepXTransactionRecord {
             | DeepXTransactionState::NotIncluded => {
                 DeepXTransactionRecoveryAction::ReconciliationRequired
             }
-            DeepXTransactionState::Finalized => DeepXTransactionRecoveryAction::Complete,
+            DeepXTransactionState::Finalized | DeepXTransactionState::BackendConfirmed => {
+                DeepXTransactionRecoveryAction::Complete
+            }
             DeepXTransactionState::ActionRequired => {
                 DeepXTransactionRecoveryAction::OperatorActionRequired
             }
@@ -1395,7 +1417,9 @@ impl DeepXTransactionRecord {
                 DeepXAutomaticReplayDecision::ReconciliationRequired
             }
             DeepXTransactionState::NotIncluded => DeepXAutomaticReplayDecision::ReplacementRequired,
-            DeepXTransactionState::Finalized => DeepXAutomaticReplayDecision::Complete,
+            DeepXTransactionState::Finalized | DeepXTransactionState::BackendConfirmed => {
+                DeepXAutomaticReplayDecision::Complete
+            }
             DeepXTransactionState::ActionRequired => {
                 DeepXAutomaticReplayDecision::OperatorActionRequired
             }
@@ -1655,8 +1679,15 @@ impl DeepXTransactionRecord {
                 return Err(DeepXTransactionRecordError::InconsistentFrameworkContext);
             }
             if let Some(stage) = outbox.terminal {
-                let expected_payload = if self.lifecycle.state() == DeepXTransactionState::Finalized
+                let expected_payload = if self.lifecycle.state()
+                    == DeepXTransactionState::BackendConfirmed
                 {
+                    self.lifecycle.backend_order().map(|e| {
+                        DeepXFrameworkOrderEventPayload::Accepted {
+                            venue_order_id: e.order_id,
+                        }
+                    })
+                } else if self.lifecycle.state() == DeepXTransactionState::Finalized {
                     self.lifecycle.inclusion().map(|inclusion| {
                         match (self.identity.operation(), inclusion.outcome()) {
                             (
@@ -1775,6 +1806,28 @@ impl DeepXTransactionRecord {
                     && self.lifecycle.reverted_inclusion().is_none()
                     && self.lifecycle.absence().is_none()
             }
+            DeepXTransactionState::BackendConfirmed => {
+                self.lifecycle.extrinsic_hash().is_some()
+                    && self.lifecycle.inclusion().is_none()
+                    && self.lifecycle.reverted_inclusion().is_none()
+                    && self.lifecycle.absence().is_none()
+                    && matches!(
+                        self.identity.operation(),
+                        Some(
+                            DeepXTransactionOperation::PerpPlace { .. }
+                                | DeepXTransactionOperation::SpotPlace { .. }
+                        )
+                    )
+                    && matches!(
+                        self.identity.nonce(),
+                        DeepXNonceReservation::TimestampOrderId { value }
+                            if self.lifecycle.backend_order().is_some_and(|e| {
+                                e.order_id == value
+                                    && Some(e.extrinsic_hash) == self.lifecycle.extrinsic_hash()
+                                    && e.observed_block_number > 0
+                            })
+                    )
+            }
             DeepXTransactionState::NotIncluded => {
                 self.lifecycle.extrinsic_hash().is_some()
                     && self.lifecycle.inclusion().is_none()
@@ -1792,6 +1845,11 @@ impl DeepXTransactionRecord {
         if !consistent {
             return Err(DeepXTransactionRecordError::InconsistentLifecycle);
         }
+        if (self.lifecycle.state() == DeepXTransactionState::BackendConfirmed)
+            != self.lifecycle.backend_order().is_some()
+        {
+            return Err(DeepXTransactionRecordError::InconsistentLifecycle);
+        }
 
         if matches!(
             self.lifecycle.state(),
@@ -1800,6 +1858,7 @@ impl DeepXTransactionRecord {
                 | DeepXTransactionState::InBlockSuccess
                 | DeepXTransactionState::InBlockFailed
                 | DeepXTransactionState::Finalized
+                | DeepXTransactionState::BackendConfirmed
                 | DeepXTransactionState::NotIncluded
         ) && matches!(
             self.identity.operation(),
@@ -1867,6 +1926,10 @@ impl DeepXTransactionRecord {
                     .reverted_inclusion
                     .map(DeepXInclusionEvidenceWire::into_evidence),
                 absence,
+                backend_order: wire
+                    .lifecycle
+                    .backend_order
+                    .map(DeepXBackendOrderEvidenceWire::into_evidence),
             },
         };
         record.validate()?;
@@ -2441,6 +2504,19 @@ mod tests {
             DeepXTransactionRecord::decode(&serde_json::to_vec(&value).unwrap()),
             Err(DeepXTransactionRecordError::UnsupportedVersion(6)),
         ));
+    }
+
+    #[rstest]
+    fn existing_v8_record_without_backend_evidence_preserves_exact_encoding() {
+        let record =
+            DeepXTransactionRecord::created(identity(DeepXNonceReservation::TimestampOrderId {
+                value: 42,
+            }));
+        let encoded = record.encode().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("backend_order"));
+        let restored = DeepXTransactionRecord::decode(&encoded).unwrap();
+        assert_eq!(restored.lifecycle().backend_order(), None);
+        assert_eq!(restored.encode().unwrap(), encoded);
     }
 
     #[rstest]

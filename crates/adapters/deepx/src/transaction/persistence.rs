@@ -6707,6 +6707,76 @@ mod tests {
         assert_eq!(restored.committed(), acknowledged.committed());
     }
 
+    #[tokio::test]
+    async fn submission_acceptance_follows_framework_outbox_acknowledgement() {
+        let record = framework_submitting_record();
+        let store = TestStore::new(3, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+        let committed = DeepXCommittedTransactionRecord::acknowledge_committed(
+            &record,
+            DeepXTransactionRevision::new(3),
+        )
+        .unwrap();
+        let staged = commit_framework_order_event_staging(
+            &store,
+            &lease,
+            &committed,
+            &record,
+            UnixNanos::from(100),
+            UnixNanos::from(101),
+            false,
+        )
+        .await
+        .unwrap();
+        let receipt = framework_receipt(
+            record
+                .framework_order_context()
+                .unwrap()
+                .submitted_event_id(),
+            OrderEventApplicationStatus::Applied,
+            OrderEventPersistenceStatus::Persisted,
+        );
+        let acknowledged = commit_framework_order_event_acknowledgement(
+            &store,
+            &lease,
+            staged.committed(),
+            staged.record(),
+            receipt,
+        )
+        .await
+        .unwrap();
+        let submitted = submitted_for_bytes(
+            acknowledged
+                .record()
+                .signed_extrinsic()
+                .unwrap()
+                .bytes()
+                .to_vec(),
+        )
+        .await;
+
+        let accepted = commit_initial_submission_acceptance(
+            &store,
+            &lease,
+            acknowledged.committed(),
+            acknowledged.record(),
+            submitted,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(acknowledged.committed().revision().value(), 5);
+        assert_eq!(accepted.committed().revision().value(), 6);
+        assert_eq!(
+            accepted.record().lifecycle().state(),
+            DeepXTransactionState::Accepted,
+        );
+        assert_eq!(store.current_revision(), 6);
+    }
+
     #[rstest]
     #[case(
         UUID4::from_bytes([3; 16]),

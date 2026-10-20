@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::{
     common::{DeepXProductType, format_instrument_id},
     http::{DeepXPerpMarket, DeepXSpotMarket},
-    rpc::DeepXFinalizedSpotMarketSpecEvidence,
+    rpc::{DeepXCurrentSpotMarketSpec, DeepXFinalizedSpotMarketSpecEvidence},
 };
 
 /// Converts verified perpetual market metadata into a Nautilus instrument.
@@ -115,6 +115,28 @@ pub fn parse_spot_instrument(
     )
 }
 
+pub(crate) fn parse_current_spot_instrument(
+    market: &DeepXSpotMarket,
+    spec: &DeepXCurrentSpotMarketSpec,
+    ts_init: UnixNanos,
+) -> Result<InstrumentAny> {
+    let pair = nautilus_core::hex::decode_array::<32>(
+        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
+    )
+    .context("invalid DeepX Spot pair identity")?;
+    anyhow::ensure!(
+        pair == spec.pair(),
+        "DeepX Spot market pair differs from current spec"
+    );
+    parse_spot_instrument_with_spec(
+        market,
+        spec.min_order_size(),
+        spec.tick_size(),
+        spec.step_size(),
+        ts_init,
+    )
+}
+
 fn parse_spot_instrument_with_spec(
     market: &DeepXSpotMarket,
     min_order_size: u128,
@@ -142,19 +164,19 @@ fn parse_spot_instrument_with_spec(
     );
 
     let price_increment = scaled_runtime_decimal(tick_size, 6)
-        .context("invalid finalized DeepX Spot tick size")?
+        .context("invalid DeepX Spot tick size")?
         .normalize();
     anyhow::ensure!(
         price_increment == market.tick_size,
-        "DeepX Spot REST tick differs from the finalized runtime tick",
+        "DeepX Spot REST tick differs from the runtime tick",
     );
     let size_increment =
         Quantity::from_decimal(scaled_runtime_decimal(step_size, market.base_decimal)?.normalize())
-            .context("invalid finalized DeepX Spot quantity step")?;
+            .context("invalid DeepX Spot quantity step")?;
     let min_quantity = Quantity::from_decimal(
         scaled_runtime_decimal(min_order_size, market.base_decimal)?.normalize(),
     )
-    .context("invalid finalized DeepX Spot minimum quantity")?;
+    .context("invalid DeepX Spot minimum quantity")?;
     let price_increment =
         Price::from_decimal(price_increment).context("invalid DeepX Spot price increment")?;
     let base_currency = Currency::new_checked(

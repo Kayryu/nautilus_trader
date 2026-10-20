@@ -19,6 +19,8 @@ use thiserror::Error;
 
 use super::{DeepXAbsenceEvidence, DeepXInclusionEvidence};
 
+const MAX_RECOVERY_SCAN_BLOCKS: u64 = 1_000;
+
 /// Errors raised when a missed-block recovery scan cannot be planned safely.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DeepXRecoveryScanPlanError {
@@ -35,6 +37,16 @@ pub enum DeepXRecoveryScanPlanError {
     /// The configured scan batch cannot contain any blocks.
     #[error("DeepX recovery scan batch size must be greater than zero")]
     ZeroBatchSize,
+    /// A historical scan would exceed the bounded recovery work budget.
+    #[error(
+        "DeepX recovery scan requires {missing_blocks} blocks, exceeding the {max_blocks} block limit"
+    )]
+    ScanLimitExceeded {
+        /// Number of blocks between the durable checkpoint and finalized head.
+        missing_blocks: u64,
+        /// Maximum number of blocks a single recovery may inspect.
+        max_blocks: u64,
+    },
 }
 
 /// Inclusive canonical block interval for one bounded recovery request.
@@ -245,8 +257,8 @@ impl Iterator for DeepXRecoveryScanRanges {
 ///
 /// # Errors
 ///
-/// Returns an error when the finalized head moves behind the durable scan checkpoint or the batch
-/// size is zero.
+/// Returns an error when the finalized head moves behind the durable scan checkpoint, the batch
+/// size is zero, or the complete missed range exceeds the recovery work budget.
 pub fn plan_missed_block_scan(
     last_scanned_block: u64,
     finalized_block_number: u64,
@@ -263,6 +275,13 @@ pub fn plan_missed_block_scan(
     }
     if finalized_block_number == last_scanned_block {
         return Ok(DeepXMissedBlockScanPlan::UpToDate);
+    }
+    let missing_blocks = finalized_block_number - last_scanned_block;
+    if missing_blocks > MAX_RECOVERY_SCAN_BLOCKS {
+        return Err(DeepXRecoveryScanPlanError::ScanLimitExceeded {
+            missing_blocks,
+            max_blocks: MAX_RECOVERY_SCAN_BLOCKS,
+        });
     }
 
     Ok(DeepXMissedBlockScanPlan::Scan(DeepXRecoveryScanRanges {
@@ -490,6 +509,28 @@ mod tests {
         assert_eq!(
             plan_missed_block_scan(42, 42, 10),
             Ok(DeepXMissedBlockScanPlan::UpToDate),
+        );
+    }
+
+    #[rstest]
+    fn missed_block_scan_has_a_total_work_limit() {
+        let DeepXMissedBlockScanPlan::Scan(ranges) =
+            plan_missed_block_scan(42, 42 + MAX_RECOVERY_SCAN_BLOCKS, 100).unwrap()
+        else {
+            panic!("expected missed-block scan");
+        };
+        assert_eq!(
+            ranges
+                .map(|range| range.last_block() - range.first_block() + 1)
+                .sum::<u64>(),
+            MAX_RECOVERY_SCAN_BLOCKS,
+        );
+        assert_eq!(
+            plan_missed_block_scan(42, 43 + MAX_RECOVERY_SCAN_BLOCKS, 100),
+            Err(DeepXRecoveryScanPlanError::ScanLimitExceeded {
+                missing_blocks: MAX_RECOVERY_SCAN_BLOCKS + 1,
+                max_blocks: MAX_RECOVERY_SCAN_BLOCKS,
+            }),
         );
     }
 

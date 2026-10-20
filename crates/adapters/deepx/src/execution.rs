@@ -16,7 +16,7 @@
 //! Fail-closed DeepX execution client startup boundary.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
     sync::{
@@ -68,8 +68,8 @@ use thiserror::Error;
 use crate::{
     account::{
         DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedMarginBalance,
-        DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_finalized_flat_account_balances,
-        map_finalized_margin_balance_with_evidence,
+        DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_current_flat_usdc_balance,
+        map_finalized_flat_account_balances, map_finalized_margin_balance_with_evidence,
     },
     common::{
         DeepXEnvironment, DeepXPrivateKey,
@@ -80,7 +80,7 @@ use crate::{
         DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXRpcRole, DeepXValidatedRpcEndpoints,
     },
     http::{
-        DeepXAccountSortOrder, DeepXHttpClient, DeepXPerpAccountTradeRecord,
+        DeepXAccountSortOrder, DeepXHttpClient, DeepXHttpError, DeepXPerpAccountTradeRecord,
         DeepXPerpAccountTradesRequest, DeepXPerpHistoryOrdersRequest, DeepXPerpOpenOrdersRequest,
         DeepXPerpOrderRecord, DeepXPerpPositionRecord, DeepXPerpPositionsRequest,
         DeepXSpotAccountTradeRecord, DeepXSpotAccountTradesRequest, DeepXSpotHistoryOrdersRequest,
@@ -98,8 +98,7 @@ use crate::{
         DeepXFinalizedSpotOrderStorageBatchEvidence, DeepXFinalizedSpotOrdersError,
         DeepXRpcEndpointIdentityError, DeepXRpcMethodCapabilitiesError,
         DeepXRuntimeSnapshotObservationError, DeepXRuntimeSnapshotRefreshError,
-        DeepXStoredOrderStatus, DeepXStoredPerpOrderType, DeepXStoredPostOnlyParam,
-        DeepXStoredSpotOrderType, DeepXValidatedRpcMethodCapabilities,
+        DeepXValidatedRpcMethodCapabilities, observe_and_apply_current_submission_clock,
         observe_and_apply_finalized_account_evidence, observe_and_apply_finalized_chain_time,
         observe_and_apply_finalized_lending_evidence, observe_and_apply_finalized_margin_evidence,
         observe_and_apply_finalized_perp_order_evidence,
@@ -108,9 +107,7 @@ use crate::{
         observe_and_apply_finalized_perp_positions_evidence,
         observe_and_apply_finalized_spot_orders_by_id_evidence,
         observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-        observe_approved_finalized_runtime_snapshot_for_endpoints,
-        observe_finalized_account_evidence, observe_finalized_block_timestamp,
-        observe_finalized_timestamp_at_checkpoint,
+        observe_current_margin_evidence, observe_current_runtime_snapshot_for_endpoints,
     },
     signing::{
         DeepXPerpCancelParams, DeepXPerpModifyParams, DeepXPerpOrderType, DeepXPerpPlaceParams,
@@ -119,28 +116,28 @@ use crate::{
         RuntimeSnapshot, SigningError, derive_signer_account_id,
     },
     transaction::{
-        DeepXCommittedFrameworkOrderOutbox, DeepXCommittedObservation, DeepXDirectRuntimeIdentity,
-        DeepXDurableRecoveryObserver, DeepXFinalityCommitError, DeepXFinalizedRecoveryCommitError,
-        DeepXFinalizedTransactionLocation, DeepXFrameworkOrderContext,
-        DeepXFrameworkOrderEventMaterializationError, DeepXFrameworkOrderOutboxCommitError,
-        DeepXNonceReservation, DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier,
-        DeepXPerpModifyCallVerifier, DeepXPerpPlaceCallVerifier,
-        DeepXPerpProfitAndLossPointCallVerifier, DeepXPoolReconciliationCommitError,
-        DeepXPostgresSignerLease, DeepXPostgresTransactionStore, DeepXPreparedReservation,
-        DeepXPreparedSignedTransaction, DeepXPreparedSubmission, DeepXReorganizationCommitError,
-        DeepXReservationPreparationError, DeepXRestoredTransactionRecord,
-        DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
-        DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError,
-        DeepXSubmissionAttemptOutcome, DeepXSubmissionFailure, DeepXSubmissionPreparationError,
-        DeepXSubmissionScanCheckpoint, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
+        DeepXBackendOrderEvidence, DeepXCommittedFrameworkOrderOutbox, DeepXCommittedObservation,
+        DeepXDirectRuntimeIdentity, DeepXDurableRecoveryObserver, DeepXFinalityCommitError,
+        DeepXFinalizedRecoveryCommitError, DeepXFinalizedTransactionLocation,
+        DeepXFrameworkOrderContext, DeepXFrameworkOrderEventMaterializationError,
+        DeepXFrameworkOrderOutboxCommitError, DeepXNonceReservation, DeepXObservationCommitError,
+        DeepXPerpCancelCallVerifier, DeepXPerpCloseCallVerifier, DeepXPerpModifyCallVerifier,
+        DeepXPerpPlaceCallVerifier, DeepXPerpProfitAndLossPointCallVerifier,
+        DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
+        DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
+        DeepXPreparedSubmission, DeepXReorganizationCommitError, DeepXReservationPreparationError,
+        DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
+        DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier,
+        DeepXSubmissionAcceptanceCommitError, DeepXSubmissionAttemptOutcome,
+        DeepXSubmissionFailure, DeepXSubmissionPreparationError, DeepXSubmissionScanCheckpoint,
+        DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTransactionObservation,
         DeepXTransactionOperation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
         DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
         DeepXTransactionWatchError, commit_framework_order_event_acknowledgement,
         commit_framework_order_event_staging, commit_initial_submission_acceptance,
-        load_verified_committed_for_signer, match_finalized_perp_account_trade,
-        match_finalized_spot_account_trade, materialize_perp_framework_order_events,
-        observe_and_commit_finality, observe_and_commit_reorganization,
-        observe_finalized_perp_trades_at, observe_finalized_spot_trades_at,
+        commit_reconciliation_observation, load_verified_committed_for_signer,
+        materialize_perp_framework_order_events, observe_and_commit_finality,
+        observe_and_commit_reorganization,
         prepare_framework_perp_cancel_reservation as prepare_durable_framework_perp_cancel_reservation,
         prepare_framework_perp_modify_reservation as prepare_durable_framework_perp_modify_reservation,
         prepare_framework_perp_place_reservation as prepare_durable_framework_perp_place_reservation,
@@ -152,8 +149,7 @@ use crate::{
         prepare_signed_perp_place_transaction as prepare_durable_signed_perp_place_transaction,
         reconcile_not_included_checkpoint, reconcile_not_included_checkpoint_with_observer,
         reconcile_submission_pool, reconcile_submitted_perp_cancel_checkpoint,
-        reconcile_submitted_perp_modify_checkpoint, reconcile_submitted_perp_place_checkpoint,
-        reconcile_submitted_spot_cancel_checkpoint, reconcile_submitted_spot_place_checkpoint,
+        reconcile_submitted_perp_modify_checkpoint, reconcile_submitted_spot_cancel_checkpoint,
         restore_timestamp_nonce_allocator, submit_once_with_runtime_guard,
     },
     websocket::{
@@ -170,7 +166,6 @@ const ORDER_REPORT_PAGE_SIZE: u32 = 100;
 const ORDER_REPORT_MAX_PAGES: usize = 100;
 const FILL_REPORT_PAGE_SIZE: u32 = 100;
 const FILL_REPORT_MAX_PAGES: usize = 100;
-const FILL_REPORT_MAX_FINALIZED_BLOCKS: usize = 100;
 const ORDER_EVENT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT_STREAM_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const MAX_ORDER_LIST_FANOUT: usize = 20;
@@ -248,6 +243,132 @@ fn spot_limit_amounts(
     )?)?;
     anyhow::ensure!(base_amount > 0 && quote_amount > 0);
     Ok((base_amount, quote_amount))
+}
+
+fn verify_backend_spot_order_for_durable_place(
+    record: &DeepXSpotOrderRecord,
+    transaction: &DeepXTransactionRecord,
+    market: &DeepXSpotReportMarket,
+) -> Result<DeepXBackendOrderEvidence, DeepXBackendSpotOrderObservationError> {
+    use DeepXBackendSpotOrderObservationError as Error;
+
+    let identity = transaction.identity();
+    let Some(DeepXTransactionOperation::SpotPlace {
+        subaccount,
+        pair,
+        is_buy,
+        quote_amount,
+        base_amount,
+        order_type,
+        post_only,
+        reduce_only,
+    }) = identity.operation()
+    else {
+        return Err(Error::Mismatch("operation"));
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce() else {
+        return Err(Error::Mismatch("nonce domain"));
+    };
+    if record.order_id != order_id.to_string() {
+        return Err(Error::Mismatch("order ID"));
+    }
+    let owner = record
+        .maker
+        .strip_prefix("0x")
+        .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
+        .ok_or(Error::Mismatch("owner encoding"))?;
+    if owner != *subaccount {
+        return Err(Error::Mismatch("owner"));
+    }
+    let record_pair = record
+        .pair
+        .strip_prefix("0x")
+        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
+        .ok_or(Error::Mismatch("pair encoding"))?;
+    let market_pair = market
+        .pair
+        .strip_prefix("0x")
+        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
+        .ok_or(Error::Mismatch("catalog pair encoding"))?;
+    if record_pair != *pair || market_pair != *pair || record.pair_name != market.name {
+        return Err(Error::Mismatch("market"));
+    }
+    if *is_buy != (identity.order_side() == OrderSide::Buy)
+        || record.order_side != if *is_buy { "Buy" } else { "Sell" }
+    {
+        return Err(Error::Mismatch("direction"));
+    }
+    if !matches!(
+        order_type,
+        DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc | DeepXTimeInForce::Ioc)
+    ) || record.price_type != "Limit"
+    {
+        return Err(Error::Mismatch("order type"));
+    }
+    if *post_only != DeepXPostOnlyParam::None
+        || *reduce_only
+        || record.post_only != "None"
+        || record.reduce_only
+    {
+        return Err(Error::Mismatch("order flags"));
+    }
+
+    let exact_amount = |bytes: &[u8; 32], scale: u8| {
+        if bytes[16..].iter().any(|byte| *byte != 0) {
+            return Err(Error::AmountConversion("amount exceeds u128".to_string()));
+        }
+        let mut low_bytes = [0_u8; 16];
+        low_bytes.copy_from_slice(&bytes[..16]);
+        let raw = u128::from_le_bytes(low_bytes);
+        let signed = i128::try_from(raw).map_err(|e| Error::AmountConversion(e.to_string()))?;
+        scaled_i128_to_decimal(signed, u32::from(scale))
+            .map_err(|e| Error::AmountConversion(e.to_string()))
+    };
+    let expected_base = exact_amount(base_amount, market.base_decimal)?;
+    let expected_quote = exact_amount(quote_amount, market.quote_decimal)?;
+    if expected_base <= rust_decimal::Decimal::ZERO
+        || expected_quote <= rust_decimal::Decimal::ZERO
+        || record.price <= rust_decimal::Decimal::ZERO
+        || expected_base.checked_mul(record.price) != Some(expected_quote)
+    {
+        return Err(Error::Mismatch("price or signed amount"));
+    }
+    let improved_buy_fill =
+        *is_buy && record.status == "Filled" && record.base_amount > expected_base;
+    if (record.base_amount != expected_base && !improved_buy_fill)
+        || (*is_buy && record.quote_amount > expected_quote)
+        || (record.base_remaining_amount == record.base_amount
+            && record.quote_amount != expected_quote)
+        || record.base_remaining_amount < rust_decimal::Decimal::ZERO
+        || record.base_remaining_amount > record.base_amount
+        || record.quote_remaining_amount < rust_decimal::Decimal::ZERO
+        || record.quote_remaining_amount > record.quote_amount
+    {
+        return Err(Error::Mismatch("execution amounts"));
+    }
+    let signed = transaction
+        .signed_extrinsic()
+        .ok_or(Error::Mismatch("signed extrinsic"))?;
+    let extrinsic_hash = signed.extrinsic_hash();
+    let backend_hash = record
+        .tx_hash
+        .strip_prefix("0x")
+        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
+        .ok_or(Error::Mismatch("transaction hash encoding"))?;
+    if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash)
+        || backend_hash != extrinsic_hash
+        || record.tx_hash_type != "EXTRINSIC_HASH"
+    {
+        return Err(Error::Mismatch("transaction hash"));
+    }
+    if record.block_number == 0 {
+        return Err(Error::Mismatch("block number"));
+    }
+    Ok(DeepXBackendOrderEvidence::new(
+        extrinsic_hash,
+        order_id,
+        record.block_number,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -848,18 +969,6 @@ pub(crate) enum DeepXPositionReportError {
     /// The position quantity is not an exact multiple of the startup instrument increment.
     #[error("DeepX position report quantity does not align with instrument increment")]
     QuantityIncrementMismatch,
-    /// The raw storage entry price cannot be represented at the local instrument precision.
-    #[error("DeepX position report entry price cannot be represented: {0}")]
-    EntryPriceConversion(String),
-    /// The raw storage entry price would be rounded at the local instrument precision.
-    #[error("DeepX position report entry price loses precision")]
-    EntryPricePrecisionLoss,
-    /// The raw storage entry price is not an exact multiple of the instrument tick size.
-    #[error("DeepX position report entry price does not align with instrument increment")]
-    EntryPriceIncrementMismatch,
-    /// The finalized observation timestamp cannot be represented by the framework.
-    #[error("invalid DeepX finalized position observation timestamp")]
-    InvalidFinalizedTimestamp,
     /// A position update timestamp is malformed or before the Unix epoch.
     #[error("invalid DeepX position report updatedAt timestamp")]
     InvalidTimestamp,
@@ -927,6 +1036,15 @@ pub enum DeepXMassReconciliationError {
     /// A not-included transaction could not be reconciled from its finalized checkpoint.
     #[error(transparent)]
     FinalizedRecovery(#[from] DeepXFinalizedRecoveryCommitError),
+    /// A durable perpetual placement could not be bound to a backend order.
+    #[error(transparent)]
+    BackendPerpOrder(#[from] DeepXBackendPerpOrderObservationError),
+    /// A durable Spot placement could not be bound to a backend order.
+    #[error(transparent)]
+    BackendSpotOrder(#[from] DeepXBackendSpotOrderObservationError),
+    /// Backend order confirmation could not be committed durably.
+    #[error(transparent)]
+    BackendObservation(#[from] DeepXObservationCommitError),
     /// Framework outbox staging or acknowledgement could not be committed.
     #[error(transparent)]
     FrameworkOutboxCommit(#[from] DeepXFrameworkOrderOutboxCommitError),
@@ -1000,6 +1118,9 @@ pub enum DeepXTransactionRuntimeError {
     /// Finalized runtime-bound chain time could not be observed.
     #[error(transparent)]
     ChainTime(#[from] DeepXFinalizedChainTimeError),
+    /// Current runtime, timestamp, or separate recovery boundary could not be observed.
+    #[error("DeepX current submission clock observation failed: {0}")]
+    CurrentClock(#[source] anyhow::Error),
     /// Complete finalized raw account evidence could not be observed.
     #[error(transparent)]
     Account(#[from] DeepXFinalizedAccountError),
@@ -1051,8 +1172,8 @@ pub enum DeepXTransactionRuntimeError {
     /// Nautilus order side does not match the raw perpetual direction.
     #[error("DeepX transaction reservation order side and perpetual direction mismatch")]
     OrderSideMismatch,
-    /// Finalized chain time and the retained signing permit cover different runtimes.
-    #[error("DeepX finalized chain time does not match the retained signing runtime")]
+    /// Current chain time and the retained signing permit cover different runtimes.
+    #[error("DeepX current chain time does not match the retained signing runtime")]
     ChainTimeRuntimeMismatch,
     /// The supplied durable reservation is not a perpetual placement.
     #[error("DeepX durable reservation is not a perpetual placement")]
@@ -1294,6 +1415,31 @@ pub enum DeepXPerpOrderEvidenceError {
     /// The REST execution quantities are internally invalid.
     #[error("DeepX REST order has inconsistent execution quantities")]
     InvalidExecutionQuantities,
+}
+
+/// Errors while querying and binding one backend perpetual order to a durable placement.
+#[derive(Debug, Error)]
+pub enum DeepXBackendPerpOrderObservationError {
+    /// The durable placement cannot supply a hash-bound lookup identity.
+    #[error(transparent)]
+    Binding(#[from] DeepXPerpOrderEvidenceError),
+    /// The backend order lookup failed or returned an invalid response.
+    #[error(transparent)]
+    Http(#[from] DeepXHttpError),
+}
+
+/// Errors while binding a backend Spot order to one durable placement.
+#[derive(Debug, Error)]
+pub enum DeepXBackendSpotOrderObservationError {
+    /// The backend order lookup failed or returned an invalid response.
+    #[error(transparent)]
+    Http(#[from] DeepXHttpError),
+    /// Durable identity or backend order fields do not describe the same placement.
+    #[error("DeepX backend Spot order does not match the durable placement: {0}")]
+    Mismatch(&'static str),
+    /// A raw signed amount cannot be represented exactly as a decimal.
+    #[error("DeepX durable Spot amount cannot be converted exactly: {0}")]
+    AmountConversion(String),
 }
 
 /// Finalized transaction membership corroborated by an exact REST perpetual order record.
@@ -2395,6 +2541,7 @@ impl Drop for DeepXCancelAdmissionGuard {
 
 struct DeepXPerpPlaceSubmissionTask {
     runtime: Arc<DeepXExecutionTransactionRuntime>,
+    http: DeepXHttpClient,
     credential: DeepXPrivateKey,
     environment: DeepXEnvironment,
     endpoints: DeepXValidatedRpcEndpoints,
@@ -2402,11 +2549,13 @@ struct DeepXPerpPlaceSubmissionTask {
     ownership: DeepXAccountOwnershipProof,
     runtime_identity: crate::signing::ApprovedRuntimeIdentity,
     submission_url: String,
-    recovery_blocks_per_range: u64,
+    backend_order_timeout: Duration,
     receipt_timeout: Duration,
     params: DeepXPerpPlaceParams,
     order: OrderAny,
     instrument_id: InstrumentId,
+    catalog_market_id: u64,
+    market_metadata: DeepXPerpetualReportMetadata,
     client_order_id: ClientOrderId,
     order_side: OrderSide,
     order_context: OrderContext,
@@ -2417,6 +2566,7 @@ struct DeepXPerpPlaceSubmissionTask {
 
 struct DeepXSpotPlaceSubmissionTask {
     runtime: Arc<DeepXExecutionTransactionRuntime>,
+    http: DeepXHttpClient,
     credential: DeepXPrivateKey,
     environment: DeepXEnvironment,
     endpoints: DeepXValidatedRpcEndpoints,
@@ -2424,9 +2574,10 @@ struct DeepXSpotPlaceSubmissionTask {
     ownership: DeepXAccountOwnershipProof,
     runtime_identity: crate::signing::ApprovedRuntimeIdentity,
     submission_url: String,
-    recovery_blocks_per_range: u64,
+    backend_order_timeout: Duration,
     receipt_timeout: Duration,
     params: DeepXSpotPlaceParams,
+    market: DeepXSpotReportMarket,
     order: OrderAny,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
@@ -2996,251 +3147,10 @@ impl DeepXExecutionClient {
         Ok(report)
     }
 
-    fn validate_finalized_perp_order_record(
-        perpetual_instrument_ids: &HashMap<u64, InstrumentId>,
-        perpetual_report_metadata: &HashMap<InstrumentId, DeepXPerpetualReportMetadata>,
-        record: &DeepXPerpOrderRecord,
-        expected_market_id: u64,
-        finalized: &crate::rpc::DeepXPerpOrderStorageEvidence,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            u64::from(finalized.market_id()) == expected_market_id
-                && record.market_id == expected_market_id
-                && record.order_id.parse::<u64>()? == finalized.order_id()
-                && record.height == finalized.create_time(),
-            "DeepX Perpetual REST and finalized order identities differ",
-        );
-        let owner = record
-            .owner
-            .strip_prefix("0x")
-            .or_else(|| record.owner.strip_prefix("0X"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
-            .ok_or_else(|| anyhow::anyhow!("DeepX Perpetual order owner is invalid"))?;
-        anyhow::ensure!(
-            owner == finalized.owner() && record.is_long == finalized.is_long(),
-            "DeepX Perpetual REST and finalized order owner or side differ",
-        );
-        let instrument_id = perpetual_instrument_ids
-            .get(&expected_market_id)
-            .ok_or_else(|| anyhow::anyhow!("DeepX Perpetual order market is not loaded"))?;
-        let metadata = perpetual_report_metadata
-            .get(instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("DeepX Perpetual report metadata is unavailable"))?;
-        let runtime_decimal = |value: u128, scale: u32| -> anyhow::Result<rust_decimal::Decimal> {
-            let value = i128::try_from(value)?;
-            Ok(scaled_i128_to_decimal(value, scale)?)
-        };
-        anyhow::ensure!(
-            record.size == runtime_decimal(finalized.size(), u32::from(metadata.base_decimal))?
-                && record.size_filled
-                    == runtime_decimal(finalized.size_filled(), u32::from(metadata.base_decimal))?
-                && record.size_remain
-                    == runtime_decimal(finalized.size_remain(), u32::from(metadata.base_decimal))?
-                && record.leverage == scaled_i128_to_decimal(i128::from(finalized.leverage()), 3)?,
-            "DeepX Perpetual REST and finalized order size or leverage differ",
-        );
-        let expected_take_profit = finalized
-            .take_profit()
-            .map(|value| runtime_decimal(value, 6))
-            .transpose()?;
-        let expected_stop_loss = finalized
-            .stop_loss()
-            .map(|value| runtime_decimal(value, 6))
-            .transpose()?;
-        anyhow::ensure!(
-            record.take_profit == expected_take_profit && record.stop_loss == expected_stop_loss,
-            "DeepX Perpetual REST and finalized order trigger fields differ",
-        );
-        match finalized.order_type() {
-            DeepXStoredPerpOrderType::Limit(_) => anyhow::ensure!(
-                record.order_type == "Limit"
-                    && record.price == runtime_decimal(finalized.price(), 6)?
-                    && record.slippage.is_zero(),
-                "DeepX Perpetual REST and finalized limit order fields differ",
-            ),
-            DeepXStoredPerpOrderType::Market(slippage) => {
-                let expected_slippage = rust_decimal::Decimal::from(slippage.unwrap_or_default());
-                anyhow::ensure!(
-                    record.order_type == "Market" && record.slippage == expected_slippage,
-                    "DeepX Perpetual REST and finalized market order fields differ",
-                );
-            }
-            DeepXStoredPerpOrderType::Stop => anyhow::bail!(
-                "DeepX system stop orders cannot be represented by tracked order reports",
-            ),
-        }
-        let expected_status = match finalized.status() {
-            DeepXStoredOrderStatus::Open => "Open",
-            DeepXStoredOrderStatus::PartiallyFilled => "PartiallyFilled",
-            DeepXStoredOrderStatus::Filled => "Filled",
-            DeepXStoredOrderStatus::Canceled => "Canceled",
-            DeepXStoredOrderStatus::Rejected => "Rejected",
-            DeepXStoredOrderStatus::Expired => "Expired",
-        };
-        let expected_post_only = match finalized.post_only() {
-            DeepXStoredPostOnlyParam::None => "None",
-            DeepXStoredPostOnlyParam::MustPostOnly => "MustPostOnly",
-            DeepXStoredPostOnlyParam::Adaptive => "Adaptive",
-        };
-        anyhow::ensure!(
-            record.status == expected_status
-                && record.reduce_only == finalized.reduce_only()
-                && record.post_only == expected_post_only,
-            "DeepX Perpetual REST and finalized order lifecycle fields differ",
-        );
-        Ok(())
-    }
-
-    fn validate_finalized_spot_order_record(
-        record: &DeepXSpotOrderRecord,
-        market: &DeepXSpotReportMarket,
-        finalized: &crate::rpc::DeepXSpotOrderStorageEvidence,
-    ) -> anyhow::Result<()> {
-        let order_id = record.order_id.parse::<u64>()?;
-        let owner = record
-            .maker
-            .strip_prefix("0x")
-            .or_else(|| record.maker.strip_prefix("0X"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
-            .ok_or_else(|| anyhow::anyhow!("DeepX Spot order owner is invalid"))?;
-        let pair = record
-            .pair
-            .strip_prefix("0x")
-            .or_else(|| record.pair.strip_prefix("0X"))
-            .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
-            .ok_or_else(|| anyhow::anyhow!("DeepX Spot order pair is invalid"))?;
-        anyhow::ensure!(
-            order_id == finalized.order_id()
-                && record.block_number == finalized.create_time()
-                && owner == finalized.owner()
-                && pair == finalized.pair()
-                && pair
-                    == nautilus_core::hex::decode_array::<32>(
-                        normalize_spot_pair(&market.pair).as_str(),
-                    )?,
-            "DeepX Spot REST and finalized order identities differ",
-        );
-        let side_is_buy = match record.order_side.as_str() {
-            "Buy" => true,
-            "Sell" => false,
-            value => anyhow::bail!("unsupported DeepX Spot order side: {value}"),
-        };
-        anyhow::ensure!(
-            side_is_buy == finalized.is_buy() && record.reduce_only == finalized.reduce_only(),
-            "DeepX Spot REST and finalized order flags differ",
-        );
-        let to_decimal = |raw: [u8; 32], precision: u8| -> anyhow::Result<rust_decimal::Decimal> {
-            anyhow::ensure!(raw[16..].iter().all(|byte| *byte == 0));
-            let value = i128::try_from(u128::from_le_bytes(raw[..16].try_into()?))?;
-            Ok(scaled_i128_to_decimal(value, u32::from(precision))?)
-        };
-        anyhow::ensure!(
-            record.base_remaining_amount
-                == to_decimal(finalized.base_amount(), market.base_decimal)?
-                && record.quote_remaining_amount
-                    == to_decimal(finalized.quote_amount(), market.quote_decimal)?,
-            "DeepX Spot REST and finalized remaining amounts differ",
-        );
-        let expected_status = match finalized.status() {
-            DeepXStoredOrderStatus::Open => "Open",
-            DeepXStoredOrderStatus::PartiallyFilled => "PartiallyFilled",
-            DeepXStoredOrderStatus::Filled => "Filled",
-            DeepXStoredOrderStatus::Canceled => "Canceled",
-            DeepXStoredOrderStatus::Rejected => "Rejected",
-            DeepXStoredOrderStatus::Expired => "Expired",
-        };
-        let expected_post_only = match finalized.post_only() {
-            DeepXStoredPostOnlyParam::None => "None",
-            DeepXStoredPostOnlyParam::MustPostOnly => "MustPostOnly",
-            DeepXStoredPostOnlyParam::Adaptive => "Adaptive",
-        };
-        anyhow::ensure!(
-            record.status == expected_status && record.post_only == expected_post_only,
-            "DeepX Spot REST and finalized order lifecycle fields differ",
-        );
-        match finalized.order_type() {
-            DeepXStoredSpotOrderType::Limit(_) => {
-                let raw_price = finalized.price().ok_or_else(|| {
-                    anyhow::anyhow!("DeepX finalized Spot limit order has no price")
-                })?;
-                anyhow::ensure!(
-                    record.price == to_decimal(raw_price, market.quote_decimal)?,
-                    "DeepX Spot REST and finalized limit prices differ",
-                );
-            }
-            DeepXStoredSpotOrderType::Market(_) => {
-                anyhow::ensure!(record.price_type == "Market");
-            }
-            DeepXStoredSpotOrderType::Stop => anyhow::bail!(
-                "DeepX system Spot stop orders cannot be represented by tracked order reports",
-            ),
-        }
-        Ok(())
-    }
-
-    async fn validate_owned_finalized_spot_order_records(
-        &self,
-        market: &DeepXSpotReportMarket,
-        records: &[DeepXSpotOrderRecord],
-        require_complete_active_index: bool,
-    ) -> anyhow::Result<()> {
-        if self.config.execution_backend != DeepXExecutionBackend::DirectPallet {
-            return Ok(());
-        }
-        let mut ids = Vec::with_capacity(records.len());
-        let mut unique = HashSet::new();
-        for record in records {
-            let id = record.order_id.parse::<u64>()?;
-            anyhow::ensure!(
-                unique.insert(id),
-                "DeepX Spot order response duplicated order {id}"
-            );
-            ids.push(id);
-        }
-        let evidence = self
-            .observe_owned_finalized_spot_orders_by_id_evidence(&ids)
-            .await?;
-        if require_complete_active_index {
-            let mut observed_ids = ids.clone();
-            observed_ids.sort_unstable();
-            let pair =
-                nautilus_core::hex::decode_array::<32>(normalize_spot_pair(&market.pair).as_str())?;
-            let mut finalized_ids = evidence
-                .active_order_pairs()
-                .iter()
-                .filter_map(|(id, active_pair)| (*active_pair == pair).then_some(*id))
-                .collect::<Vec<_>>();
-            finalized_ids.sort_unstable();
-            anyhow::ensure!(
-                finalized_ids == observed_ids,
-                "DeepX REST active Spot order IDs differ from the finalized pair index",
-            );
-        }
-        anyhow::ensure!(
-            evidence.orders().len() == records.len(),
-            "DeepX finalized Spot order evidence is incomplete",
-        );
-        for record in records {
-            let id = record.order_id.parse::<u64>()?;
-            let finalized = evidence
-                .orders()
-                .iter()
-                .find(|order| order.order_id() == id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("DeepX Spot order {id} is absent from finalized storage")
-                })?;
-            Self::validate_finalized_spot_order_record(record, market, finalized)?;
-        }
-        Ok(())
-    }
-
     async fn build_tracked_spot_order_status_report(
         http: &DeepXHttpClient,
         account_id: AccountId,
         subaccount: &str,
-        endpoints: Option<&DeepXValidatedRpcEndpoints>,
-        capabilities: Option<&DeepXValidatedRpcMethodCapabilities>,
-        block_timestamps: &mut HashMap<u32, u64>,
         input: DeepXTrackedSpotReportInput<'_>,
     ) -> anyhow::Result<OrderStatusReport> {
         let DeepXTrackedSpotReportInput {
@@ -3454,37 +3364,14 @@ impl DeepXExecutionClient {
                 let cancel_height = record.cancel_height.ok_or_else(|| {
                     anyhow::anyhow!("DeepX canceled Spot order has no cancellation block height")
                 })?;
-                let block_number = u32::try_from(cancel_height).map_err(|_| {
-                    anyhow::anyhow!("DeepX Spot cancellation block height exceeds u32")
-                })?;
-                let endpoints = endpoints.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DeepX Spot cancellation report has no validated Watch endpoint"
-                    )
-                })?;
-                let capabilities = capabilities.ok_or_else(|| {
-                    anyhow::anyhow!("DeepX Spot cancellation report has no Watch method evidence")
-                })?;
-                let cancel_ms = match block_timestamps.get(&block_number) {
-                    Some(timestamp_ms) => *timestamp_ms,
-                    None => {
-                        let timestamp_ms = observe_finalized_block_timestamp(
-                            endpoints,
-                            capabilities,
-                            block_number,
-                        )
-                        .await?;
-                        block_timestamps.insert(block_number, timestamp_ms);
-                        timestamp_ms
-                    }
-                };
-                let cancel_ns = cancel_ms.checked_mul(1_000_000).ok_or_else(|| {
-                    anyhow::anyhow!("DeepX Spot cancellation timestamp overflows UnixNanos")
-                })?;
-                let cancel_time = UnixNanos::from(cancel_ns);
+                anyhow::ensure!(
+                    cancel_height >= record.block_number,
+                    "DeepX Spot cancellation block precedes order creation",
+                );
+                let cancel_time = get_atomic_clock_realtime().get_time_ns();
                 anyhow::ensure!(
                     cancel_time >= ts_last,
-                    "DeepX Spot cancellation precedes its latest execution or order creation"
+                    "DeepX Spot cancellation observation precedes its latest execution or order creation"
                 );
                 ts_last = cancel_time;
                 OrderStatus::Canceled
@@ -3537,7 +3424,6 @@ impl DeepXExecutionClient {
         record: &DeepXSpotOrderRecord,
         instrument_id: InstrumentId,
         market: &DeepXSpotReportMarket,
-        block_timestamps: &mut HashMap<u32, u64>,
         remaining_pages: &mut usize,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
@@ -3555,9 +3441,6 @@ impl DeepXExecutionClient {
             &self.http,
             self.core.account_id,
             subaccount,
-            self.runtime_rpc_endpoints.as_ref(),
-            self.runtime_rpc_capabilities.as_ref(),
-            block_timestamps,
             DeepXTrackedSpotReportInput {
                 record,
                 market,
@@ -3642,152 +3525,6 @@ impl DeepXExecutionClient {
             None,
             Some(record.entry_price),
         )))
-    }
-
-    fn validated_fill_subaccount(&self) -> anyhow::Result<[u8; 20]> {
-        let subaccount = self
-            .account_ownership
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("DeepX fill report has no validated account ownership"))?
-            .subaccount();
-        let configured = self
-            .config
-            .subaccount_id
-            .as_deref()
-            .and_then(|value| value.strip_prefix("0x"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok());
-        anyhow::ensure!(
-            configured == Some(subaccount),
-            "DeepX fill report subaccount differs from validated ownership",
-        );
-        Ok(subaccount)
-    }
-
-    async fn verify_owned_finalized_perp_fill_records(
-        &self,
-        records: &[DeepXPerpAccountTradeRecord],
-    ) -> anyhow::Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let endpoints = self
-            .runtime_rpc_endpoints
-            .as_ref()
-            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-        let capabilities = self
-            .runtime_rpc_capabilities
-            .as_ref()
-            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-        let subaccount = self.validated_fill_subaccount()?;
-
-        let mut by_block = BTreeMap::<u64, Vec<&DeepXPerpAccountTradeRecord>>::new();
-        for record in records {
-            let block_number = record.id / 1_000_000;
-            anyhow::ensure!(
-                block_number > 0,
-                "DeepX fill report has an invalid finalized block number",
-            );
-            by_block.entry(block_number).or_default().push(record);
-        }
-        anyhow::ensure!(
-            by_block.len() <= FILL_REPORT_MAX_FINALIZED_BLOCKS,
-            "DeepX fill report finalized block budget exceeded",
-        );
-        for (block_number, block_records) in by_block {
-            let trades = observe_finalized_perp_trades_at(
-                &self.config.network.environment,
-                endpoints,
-                capabilities,
-                block_number,
-            )
-            .await?;
-            for record in block_records {
-                let instrument_id = self
-                    .perpetual_instrument_ids
-                    .get(&record.market_id)
-                    .ok_or(DeepXFillReportError::UnknownMarket(record.market_id))?;
-                let metadata = self
-                    .perpetual_report_metadata
-                    .get(instrument_id)
-                    .ok_or(DeepXFillReportError::MarketIdentityMismatch)?;
-                match_finalized_perp_account_trade(
-                    &trades,
-                    record,
-                    subaccount,
-                    metadata.base_decimal,
-                    metadata.quote_decimal,
-                    metadata.quote_currency.code.as_str(),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn verify_owned_finalized_spot_fill_records(
-        &self,
-        records: &[DeepXSpotAccountTradeRecord],
-        remaining_blocks: &mut usize,
-    ) -> anyhow::Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let mut by_block = BTreeMap::<u64, Vec<&DeepXSpotAccountTradeRecord>>::new();
-        for record in records {
-            let block_number = record.id / 1_000_000;
-            anyhow::ensure!(
-                block_number > 0,
-                "DeepX Spot fill report has an invalid finalized block number",
-            );
-            by_block.entry(block_number).or_default().push(record);
-        }
-        anyhow::ensure!(
-            by_block.len() <= *remaining_blocks,
-            "DeepX Spot fill report finalized block budget exceeded",
-        );
-        *remaining_blocks -= by_block.len();
-        let endpoints = self
-            .runtime_rpc_endpoints
-            .as_ref()
-            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-        let capabilities = self
-            .runtime_rpc_capabilities
-            .as_ref()
-            .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-        let subaccount = self.validated_fill_subaccount()?;
-        for (block_number, block_records) in by_block {
-            let trades = observe_finalized_spot_trades_at(
-                &self.config.network.environment,
-                endpoints,
-                capabilities,
-                block_number,
-            )
-            .await?;
-            for record in block_records {
-                let instrument_id = self
-                    .spot_report_instruments_by_pair
-                    .get(&normalize_spot_pair(&record.pair))
-                    .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
-                let market = self
-                    .spot_report_markets
-                    .get(instrument_id)
-                    .ok_or(DeepXFillReportError::SpotMarketIdentityMismatch)?;
-                anyhow::ensure!(
-                    record.pair_name == market.name
-                        && normalize_spot_pair(&record.pair) == normalize_spot_pair(&market.pair),
-                    "DeepX Spot fill report market identity differs from validated catalog",
-                );
-                match_finalized_spot_account_trade(
-                    &trades,
-                    record,
-                    subaccount,
-                    market.base_decimal,
-                    market.quote_decimal,
-                    &market.base_symbol,
-                    &market.quote_symbol,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn build_fill_report(
@@ -4078,7 +3815,6 @@ impl DeepXExecutionClient {
         market: &DeepXSpotReportMarket,
         cmd: &GenerateFillReports,
         remaining_pages: &mut usize,
-        remaining_blocks: &mut usize,
     ) -> anyhow::Result<Vec<FillReport>> {
         let order_sides = if cmd.venue_order_id.is_some() {
             vec![
@@ -4089,7 +3825,6 @@ impl DeepXExecutionClient {
             vec![None]
         };
         let mut reports = Vec::new();
-        let mut records = Vec::new();
         for order_side in order_sides {
             if *remaining_pages == 0 {
                 return Err(DeepXFillReportError::PaginationBudgetExceeded.into());
@@ -4123,13 +3858,8 @@ impl DeepXExecutionClient {
                 {
                     continue;
                 }
-                records.push(record);
                 reports.push(report);
             }
-        }
-        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
-            self.verify_owned_finalized_spot_fill_records(&records, remaining_blocks)
-                .await?;
         }
         Ok(reports)
     }
@@ -4980,6 +4710,36 @@ impl DeepXExecutionClient {
         })
     }
 
+    /// Queries and binds one backend perpetual order by its durable extrinsic hash.
+    ///
+    /// This read does not change the transaction lifecycle, transmit signed bytes, or prove
+    /// canonical inclusion. A missing backend record never proves non-delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing or inconsistent durable hashes, backend lookup failure, or
+    /// order fields that do not match the durable placement and validated market catalog.
+    pub async fn observe_backend_perp_order_for_durable_place(
+        &self,
+        transaction: &DeepXTransactionRecord,
+    ) -> Result<DeepXPerpOrderEvidence, DeepXBackendPerpOrderObservationError> {
+        if !matches!(
+            transaction.identity().operation(),
+            Some(DeepXTransactionOperation::PerpPlace { .. })
+        ) {
+            return Err(DeepXPerpOrderEvidenceError::OperationMismatch.into());
+        }
+        let signed = transaction
+            .signed_extrinsic()
+            .ok_or(DeepXPerpOrderEvidenceError::MissingSignedExtrinsic)?;
+        if transaction.lifecycle().extrinsic_hash() != Some(signed.extrinsic_hash()) {
+            return Err(DeepXPerpOrderEvidenceError::DurableHashMismatch.into());
+        }
+        let hash = format!("0x{}", nautilus_core::hex::encode(signed.extrinsic_hash()));
+        let order = self.http.get_perp_order_by_tx(&hash).await?;
+        Ok(self.verify_perp_order_record_for_durable_place(&order, transaction)?)
+    }
+
     /// Binds one REST perpetual order observation to an exact durable placement.
     ///
     /// This pure verifier checks immutable transaction identity, the loaded market catalog, exact
@@ -4995,6 +4755,33 @@ impl DeepXExecutionClient {
         &self,
         record: &DeepXPerpOrderRecord,
         transaction: &DeepXTransactionRecord,
+    ) -> Result<DeepXPerpOrderEvidence, DeepXPerpOrderEvidenceError> {
+        let instrument_id = transaction.identity().instrument_id();
+        let catalog_market_id = self
+            .perpetual_market_ids
+            .get(&instrument_id)
+            .copied()
+            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
+        let metadata = self
+            .perpetual_report_metadata
+            .get(&instrument_id)
+            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
+        if self.perpetual_instrument_ids.get(&catalog_market_id) != Some(&instrument_id) {
+            return Err(DeepXPerpOrderEvidenceError::MarketMismatch);
+        }
+        Self::verify_perp_order_record_with_catalog(
+            record,
+            transaction,
+            catalog_market_id,
+            metadata,
+        )
+    }
+
+    fn verify_perp_order_record_with_catalog(
+        record: &DeepXPerpOrderRecord,
+        transaction: &DeepXTransactionRecord,
+        catalog_market_id: u64,
+        metadata: &DeepXPerpetualReportMetadata,
     ) -> Result<DeepXPerpOrderEvidence, DeepXPerpOrderEvidenceError> {
         let identity = transaction.identity();
         let Some(DeepXTransactionOperation::PerpPlace {
@@ -5030,20 +4817,7 @@ impl DeepXExecutionClient {
             return Err(DeepXPerpOrderEvidenceError::OwnerMismatch);
         }
 
-        let instrument_id = identity.instrument_id();
-        let catalog_market_id = self
-            .perpetual_market_ids
-            .get(&instrument_id)
-            .copied()
-            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
-        let metadata = self
-            .perpetual_report_metadata
-            .get(&instrument_id)
-            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
-        if catalog_market_id != u64::from(*market_id)
-            || record.market_id != catalog_market_id
-            || self.perpetual_instrument_ids.get(&catalog_market_id) != Some(&instrument_id)
-        {
+        if catalog_market_id != u64::from(*market_id) || record.market_id != catalog_market_id {
             return Err(DeepXPerpOrderEvidenceError::MarketMismatch);
         }
         if *is_long != (identity.order_side() == OrderSide::Buy) || record.is_long != *is_long {
@@ -5488,9 +5262,9 @@ impl DeepXExecutionClient {
     /// Collects and records complete read-only runtime startup evidence.
     ///
     /// The configured Submission, Watch, and Recovery endpoints must first identify the approved
-    /// chain and advertise every role-specific method. The built-in approved runtime is paired with
-    /// one finalized Watch checkpoint before any evidence is retained by this client. This operation
-    /// does not initialize the durable transaction runtime, sign, or submit transactions.
+    /// chain and advertise every role-specific method. The observed runtime comes from a current
+    /// canonical Watch block. This operation does not initialize the durable transaction runtime,
+    /// sign, or submit transactions.
     ///
     /// # Errors
     ///
@@ -5503,16 +5277,12 @@ impl DeepXExecutionClient {
             .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)?;
         let endpoints = observe_and_validate_rpc_endpoint_identities(&self.config.network).await?;
         let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints).await?;
-        let observation = observe_approved_finalized_runtime_snapshot_for_endpoints(
+        let snapshot = observe_current_runtime_snapshot_for_endpoints(
             &self.config.network.environment,
             &endpoints,
         )
         .await?;
-        let applied = DeepXAppliedRuntimeSnapshot::unchanged(
-            observation.checkpoint(),
-            observation.into_snapshot(),
-        );
-        self.record_runtime_validated(&applied, &endpoints, &capabilities)?;
+        self.record_runtime_snapshot_validated(&snapshot, &endpoints, &capabilities)?;
         Ok(())
     }
 
@@ -5529,9 +5299,18 @@ impl DeepXExecutionClient {
         endpoints: &DeepXValidatedRpcEndpoints,
         capabilities: &DeepXValidatedRpcMethodCapabilities,
     ) -> Result<(), DeepXExecutionStartupError> {
+        self.record_runtime_snapshot_validated(applied.snapshot(), endpoints, capabilities)
+    }
+
+    fn record_runtime_snapshot_validated(
+        &mut self,
+        snapshot: &RuntimeSnapshot,
+        endpoints: &DeepXValidatedRpcEndpoints,
+        capabilities: &DeepXValidatedRpcMethodCapabilities,
+    ) -> Result<(), DeepXExecutionStartupError> {
         self.startup
             .validate_next(DeepXExecutionStartupEvidence::RuntimeValidated)?;
-        let identity = applied.identity();
+        let identity = snapshot.identity();
         if identity.environment != self.config.network.environment {
             return Err(DeepXExecutionStartupError::RuntimeEnvironmentMismatch {
                 expected: self.config.network.environment.clone(),
@@ -5549,7 +5328,7 @@ impl DeepXExecutionClient {
         self.validate_configured_rpc_evidence(endpoints, capabilities)?;
         self.startup
             .record(DeepXExecutionStartupEvidence::RuntimeValidated)?;
-        self.runtime_snapshot = Some(applied.snapshot().clone());
+        self.runtime_snapshot = Some(snapshot.clone());
         self.runtime_rpc_endpoints = Some(endpoints.clone());
         self.runtime_rpc_capabilities = Some(capabilities.clone());
         Ok(())
@@ -5803,7 +5582,7 @@ impl DeepXExecutionClient {
     ///
     /// The returned frame proves a current observation for the owned subaccount, but it does not
     /// itself contain sufficient semantics to construct a framework [`AccountState`]. A caller can
-    /// use [`Self::complete_startup_with_finalized_flat_account_state`] for the strictly restricted
+    /// use [`Self::complete_startup_with_current_flat_account_state`] for the strictly restricted
     /// flat-account model, or obtain state from an independently authoritative provider before
     /// calling [`Self::complete_startup_with_account_state`]. Any failure clears all startup
     /// evidence, releases the durable signer lease, and closes the owned account connection.
@@ -6422,7 +6201,7 @@ impl DeepXExecutionClient {
         Ok(evidence)
     }
 
-    /// Observes finalized chain time and durably creates one perpetual placement reservation.
+    /// Observes current chain time and durably creates one perpetual placement reservation.
     ///
     /// The retained runtime owns the signer lease, nonce allocator, snapshot permit, and durable
     /// store used by this operation. It performs no signing or network submission.
@@ -6430,8 +6209,8 @@ impl DeepXExecutionClient {
     /// # Errors
     ///
     /// Returns an error unless the runtime is initialized, startup RPC evidence still matches,
-    /// account and market identities match their retained proofs, finalized runtime-bound chain
-    /// time is valid, and the exact created record commits durably.
+    /// account and market identities match their retained proofs, current runtime-bound chain
+    /// time and the separate finalized recovery boundary are valid, and the created record commits.
     #[allow(clippy::too_many_arguments)]
     pub async fn prepare_perp_place_reservation(
         &self,
@@ -6486,13 +6265,14 @@ impl DeepXExecutionClient {
         }
         validate_perp_place_order_side(order_side, params.is_long)?;
 
-        let chain_time = observe_and_apply_finalized_chain_time(
+        let chain_time = observe_and_apply_current_submission_clock(
             &self.config.network.environment,
             endpoints,
             capabilities,
             &runtime.snapshot_service,
         )
-        .await?;
+        .await
+        .map_err(DeepXTransactionRuntimeError::CurrentClock)?;
         let permit = runtime.snapshot_service.acquire()?;
         if chain_time.runtime_identity() != permit.snapshot().identity() {
             return Err(DeepXTransactionRuntimeError::ChainTimeRuntimeMismatch);
@@ -6508,8 +6288,8 @@ impl DeepXExecutionClient {
 
         let runtime_identity = DeepXDirectRuntimeIdentity::from(permit.snapshot().identity());
         let checkpoint = DeepXSubmissionScanCheckpoint::new(
-            u64::from(chain_time.checkpoint().block_number()),
-            chain_time.checkpoint().block_hash(),
+            u64::from(chain_time.scan_checkpoint().block_number()),
+            chain_time.scan_checkpoint().block_hash(),
         );
         let local_time_ms = get_atomic_clock_realtime().get_time_ms();
         let reservation = match framework_order_context {
@@ -7006,285 +6786,356 @@ impl DeepXExecutionClient {
                     received_genesis_hash,
                 });
             }
-            let action = match item.record().lifecycle().state() {
-                DeepXTransactionState::Submitting | DeepXTransactionState::Accepted => {
-                    if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpPlace { .. })
-                    ) {
-                        let verifier = DeepXPerpPlaceCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_submitted_perp_place_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            &verifier,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action()
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::SpotPlace { .. })
-                    ) {
-                        let verifier = DeepXSpotPlaceCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_submitted_spot_place_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            &verifier,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action()
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpCancel { .. })
-                    ) {
-                        let verifier = DeepXPerpCancelCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_submitted_perp_cancel_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            &verifier,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action()
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpModify { .. })
-                    ) {
-                        let verifier = DeepXPerpModifyCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_submitted_perp_modify_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            &verifier,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action()
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::SpotCancel {
-                            fast_cancel: false,
-                            ..
-                        })
-                    ) {
-                        let verifier = DeepXSpotCancelCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_submitted_spot_cancel_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            &verifier,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action()
-                    } else {
-                        reconcile_submission_pool(endpoints, store, lease, &item)
+            let action = if matches!(
+                item.record().identity().operation(),
+                Some(DeepXTransactionOperation::PerpPlace { .. })
+            ) && matches!(
+                item.record().lifecycle().state(),
+                DeepXTransactionState::Submitting
+                    | DeepXTransactionState::Accepted
+                    | DeepXTransactionState::InBlockSuccess
+                    | DeepXTransactionState::NotIncluded
+            ) {
+                let instrument_id = item.record().identity().instrument_id();
+                let catalog_market_id = self
+                    .perpetual_market_ids
+                    .get(&instrument_id)
+                    .copied()
+                    .ok_or(DeepXBackendPerpOrderObservationError::Binding(
+                        DeepXPerpOrderEvidenceError::UnknownInstrument,
+                    ))?;
+                let metadata = self.perpetual_report_metadata.get(&instrument_id).ok_or(
+                    DeepXBackendPerpOrderObservationError::Binding(
+                        DeepXPerpOrderEvidenceError::UnknownInstrument,
+                    ),
+                )?;
+                if self.perpetual_instrument_ids.get(&catalog_market_id) != Some(&instrument_id) {
+                    return Err(DeepXBackendPerpOrderObservationError::Binding(
+                        DeepXPerpOrderEvidenceError::MarketMismatch,
+                    )
+                    .into());
+                }
+                let Some(order) = poll_backend_perp_order_for_durable_place(
+                    &self.http,
+                    item.record(),
+                    catalog_market_id,
+                    metadata,
+                    Duration::from_secs(self.config.http_timeout_secs),
+                )
+                .await?
+                else {
+                    return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                        client_order_id,
+                        action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                    });
+                };
+                let DeepXNonceReservation::TimestampOrderId { value: order_id } =
+                    item.record().identity().nonce()
+                else {
+                    return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                        client_order_id,
+                        action: DeepXTransactionRecoveryAction::OperatorActionRequired,
+                    });
+                };
+                commit_reconciliation_observation(
+                    store,
+                    lease,
+                    item.committed(),
+                    item.record(),
+                    DeepXTransactionObservation::BackendOrderConfirmed(
+                        DeepXBackendOrderEvidence::new(
+                            order.extrinsic_hash(),
+                            order_id,
+                            order.observed_block_number(),
+                        ),
+                    ),
+                )
+                .await?
+                .record()
+                .recovery_action()
+            } else if matches!(
+                item.record().identity().operation(),
+                Some(DeepXTransactionOperation::SpotPlace { .. })
+            ) && matches!(
+                item.record().lifecycle().state(),
+                DeepXTransactionState::Submitting
+                    | DeepXTransactionState::Accepted
+                    | DeepXTransactionState::InBlockSuccess
+                    | DeepXTransactionState::NotIncluded
+            ) {
+                let instrument_id = item.record().identity().instrument_id();
+                let market = self.spot_report_markets.get(&instrument_id).ok_or(
+                    DeepXBackendSpotOrderObservationError::Mismatch("catalog market"),
+                )?;
+                let Some(order) = poll_backend_spot_order_for_durable_place(
+                    &self.http,
+                    item.record(),
+                    market,
+                    Duration::from_secs(self.config.http_timeout_secs),
+                )
+                .await?
+                else {
+                    return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                        client_order_id,
+                        action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                    });
+                };
+                commit_reconciliation_observation(
+                    store,
+                    lease,
+                    item.committed(),
+                    item.record(),
+                    DeepXTransactionObservation::BackendOrderConfirmed(order),
+                )
+                .await?
+                .record()
+                .recovery_action()
+            } else {
+                match item.record().lifecycle().state() {
+                    DeepXTransactionState::Submitting | DeepXTransactionState::Accepted => {
+                        if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpCancel { .. })
+                        ) {
+                            let verifier = DeepXPerpCancelCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_submitted_perp_cancel_checkpoint(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                store,
+                                lease,
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                &verifier,
+                            )
                             .await?
                             .record()
                             .recovery_action()
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpModify { .. })
+                        ) {
+                            let verifier = DeepXPerpModifyCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_submitted_perp_modify_checkpoint(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                store,
+                                lease,
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                &verifier,
+                            )
+                            .await?
+                            .record()
+                            .recovery_action()
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::SpotCancel {
+                                fast_cancel: false,
+                                ..
+                            })
+                        ) {
+                            let verifier = DeepXSpotCancelCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_submitted_spot_cancel_checkpoint(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                store,
+                                lease,
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                &verifier,
+                            )
+                            .await?
+                            .record()
+                            .recovery_action()
+                        } else {
+                            reconcile_submission_pool(endpoints, store, lease, &item)
+                                .await?
+                                .record()
+                                .recovery_action()
+                        }
                     }
-                }
-                DeepXTransactionState::InBlockSuccess | DeepXTransactionState::InBlockFailed => {
-                    match observe_and_commit_finality(endpoints, capabilities, store, lease, &item)
+                    DeepXTransactionState::InBlockSuccess
+                    | DeepXTransactionState::InBlockFailed => {
+                        match observe_and_commit_finality(
+                            endpoints,
+                            capabilities,
+                            store,
+                            lease,
+                            &item,
+                        )
                         .await
-                    {
-                        Ok(committed) => committed.record().recovery_action(),
-                        Err(DeepXFinalityCommitError::Watch(
-                            DeepXTransactionWatchError::FinalityEvidenceConflict(_),
-                        )) => observe_and_commit_reorganization(
-                            endpoints,
-                            capabilities,
-                            store,
-                            lease,
-                            &item,
-                        )
-                        .await?
-                        .record()
-                        .recovery_action(),
-                        Err(e) => return Err(e.into()),
+                        {
+                            Ok(committed) => committed.record().recovery_action(),
+                            Err(DeepXFinalityCommitError::Watch(
+                                DeepXTransactionWatchError::FinalityEvidenceConflict(_),
+                            )) => observe_and_commit_reorganization(
+                                endpoints,
+                                capabilities,
+                                store,
+                                lease,
+                                &item,
+                            )
+                            .await?
+                            .record()
+                            .recovery_action(),
+                            Err(e) => return Err(e.into()),
+                        }
                     }
+                    DeepXTransactionState::NotIncluded => {
+                        let committed = if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpPlace { .. })
+                        ) {
+                            let verifier = DeepXPerpPlaceCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::PerpPlace(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpClose { .. })
+                        ) {
+                            let verifier = DeepXPerpCloseCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::PerpClose(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpProfitAndLossPoint { .. })
+                        ) {
+                            let verifier = DeepXPerpProfitAndLossPointCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::SpotPlace { .. })
+                        ) {
+                            let verifier = DeepXSpotPlaceCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::SpotPlace(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::SpotCancel { .. })
+                        ) {
+                            let verifier = DeepXSpotCancelCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::OrdinarySpotCancel(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpCancel { .. })
+                        ) {
+                            let verifier = DeepXPerpCancelCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::PerpCancel(&verifier),
+                            )
+                            .await?
+                        } else if matches!(
+                            item.record().identity().operation(),
+                            Some(DeepXTransactionOperation::PerpModify { .. })
+                        ) {
+                            let verifier = DeepXPerpModifyCallVerifier::new(
+                                snapshot.clone(),
+                                self.credential.clone(),
+                            )?;
+                            reconcile_not_included_checkpoint_with_observer(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                (store, lease),
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                                DeepXDurableRecoveryObserver::PerpModify(&verifier),
+                            )
+                            .await?
+                        } else {
+                            reconcile_not_included_checkpoint(
+                                endpoints,
+                                capabilities,
+                                snapshot,
+                                store,
+                                lease,
+                                &item,
+                                self.config.recovery_blocks_per_range,
+                            )
+                            .await?
+                        };
+                        committed.record().recovery_action()
+                    }
+                    _ => item.record().recovery_action(),
                 }
-                DeepXTransactionState::NotIncluded => {
-                    let committed = if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpPlace { .. })
-                    ) {
-                        let verifier = DeepXPerpPlaceCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::PerpPlace(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpClose { .. })
-                    ) {
-                        let verifier = DeepXPerpCloseCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::PerpClose(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpProfitAndLossPoint { .. })
-                    ) {
-                        let verifier = DeepXPerpProfitAndLossPointCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::PerpProfitAndLossPoint(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::SpotPlace { .. })
-                    ) {
-                        let verifier = DeepXSpotPlaceCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::SpotPlace(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::SpotCancel { .. })
-                    ) {
-                        let verifier = DeepXSpotCancelCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::OrdinarySpotCancel(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpCancel { .. })
-                    ) {
-                        let verifier = DeepXPerpCancelCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::PerpCancel(&verifier),
-                        )
-                        .await?
-                    } else if matches!(
-                        item.record().identity().operation(),
-                        Some(DeepXTransactionOperation::PerpModify { .. })
-                    ) {
-                        let verifier = DeepXPerpModifyCallVerifier::new(
-                            snapshot.clone(),
-                            self.credential.clone(),
-                        )?;
-                        reconcile_not_included_checkpoint_with_observer(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            (store, lease),
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                            DeepXDurableRecoveryObserver::PerpModify(&verifier),
-                        )
-                        .await?
-                    } else {
-                        reconcile_not_included_checkpoint(
-                            endpoints,
-                            capabilities,
-                            snapshot,
-                            store,
-                            lease,
-                            &item,
-                            self.config.recovery_blocks_per_range,
-                        )
-                        .await?
-                    };
-                    committed.record().recovery_action()
-                }
-                _ => item.record().recovery_action(),
             };
             if action != DeepXTransactionRecoveryAction::Complete {
                 return Err(DeepXMassReconciliationError::UnresolvedTransaction {
@@ -7648,6 +7499,109 @@ impl DeepXExecutionClient {
         Ok(state)
     }
 
+    async fn observe_and_record_current_flat_account_state(
+        &mut self,
+        frame: &DeepXWsConfirmedBalancesFrame,
+    ) -> anyhow::Result<AccountState> {
+        self.startup
+            .validate_next(DeepXExecutionStartupEvidence::AccountStateInitialized)?;
+        if self.validate_owned_account_subscription()? != frame.subscription() {
+            anyhow::bail!("DeepX account subscription changed during startup");
+        }
+        let ownership = self
+            .account_ownership
+            .ok_or_else(|| anyhow::anyhow!("DeepX account ownership is unavailable"))?;
+        let endpoints = self
+            .runtime_rpc_endpoints
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX Watch RPC endpoints are unavailable"))?;
+        let capabilities = self
+            .runtime_rpc_capabilities
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX Watch RPC capabilities are unavailable"))?;
+        let snapshot = self
+            .runtime_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepX runtime snapshot is unavailable"))?;
+        self.validate_rpc_evidence(endpoints, capabilities)?;
+        self.verify_transaction_runtime().await?;
+        let balance = observe_current_flat_account_balance(
+            &self.http,
+            &self.credential,
+            ownership,
+            endpoints,
+            capabilities,
+            snapshot,
+            &self.perpetual_instrument_ids.keys().copied().collect(),
+            &self
+                .spot_report_markets
+                .values()
+                .map(|market| normalize_spot_pair(&market.pair))
+                .collect(),
+        )
+        .await?;
+        let now = get_atomic_clock_realtime().get_time_ns();
+        let state = AccountState::new(
+            self.core.account_id,
+            self.core.account_type,
+            vec![balance],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            now,
+            now,
+            None,
+        );
+        self.record_owned_account_state_initialized(frame, &state)?;
+        Ok(state)
+    }
+
+    /// Completes autonomous startup from current backend and canonical Watch evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and cleans up startup when the flat account, subscription, or durable
+    /// reconciliation cannot be proven.
+    pub async fn complete_startup_with_current_flat_account_state(
+        &mut self,
+        frame: &DeepXWsConfirmedBalancesFrame,
+        registration_timeout: Duration,
+    ) -> anyhow::Result<AccountState> {
+        let mut guard = DeepXStartupEpochGuard::new(self);
+        let result = async {
+            let state = guard
+                .client
+                .observe_and_record_current_flat_account_state(frame)
+                .await?;
+            guard
+                .client
+                .observe_and_record_mass_reconciliation_completed()
+                .await?;
+            guard
+                .client
+                .wait_for_owned_account_registration(registration_timeout)
+                .await?;
+            Ok::<AccountState, anyhow::Error>(state)
+        }
+        .await;
+        match result {
+            Ok(state) => {
+                guard.disarm();
+                Ok(state)
+            }
+            Err(startup_error) => {
+                let cleanup_result = guard.client.abort_startup().await;
+                guard.disarm();
+                if let Err(cleanup_error) = cleanup_result {
+                    anyhow::bail!(
+                        "DeepX startup failed: {startup_error:#}; startup cleanup also failed: {cleanup_error:#}"
+                    );
+                }
+                Err(startup_error)
+            }
+        }
+    }
+
     fn complete_account_registration_after_subscription_validation(
         &mut self,
     ) -> Result<(), DeepXExecutionStartupError> {
@@ -7863,57 +7817,73 @@ impl DeepXExecutionClient {
         Ok(())
     }
 
-    fn schedule_finalized_account_refresh(&self) -> anyhow::Result<()> {
+    fn schedule_current_account_refresh(&self) -> anyhow::Result<()> {
         let (Some(endpoints), Some(capabilities), Some(ownership), Some(snapshot)) = (
             self.runtime_rpc_endpoints.clone(),
             self.runtime_rpc_capabilities.clone(),
             self.account_ownership,
             self.runtime_snapshot.as_ref(),
         ) else {
-            log::warn!("DeepX account query cannot refresh without complete finalized evidence");
+            log::warn!("DeepX account query cannot refresh without complete runtime evidence");
             return Ok(());
         };
-        let environment = self.config.network.environment.clone();
-        let expected_runtime = snapshot.identity().clone();
-        let subaccount = ownership.subaccount();
+        let http = self.http.clone();
+        let credential = self.credential.clone();
+        let snapshot = snapshot.clone();
+        let perp_markets = self.perpetual_instrument_ids.keys().copied().collect();
+        let spot_pairs = self
+            .spot_report_markets
+            .values()
+            .map(|market| normalize_spot_pair(&market.pair))
+            .collect();
         let account_id = self.core.account_id;
         let account_type = self.core.account_type;
         let emitter = self.emitter.clone();
         let epoch = Arc::clone(&self.query_epoch);
+        let account_live = self.account_monitor_live.as_ref().map(Arc::clone);
         self.query_tasks.spawn(async move {
             let state = async {
-                let evidence = observe_finalized_account_evidence(
-                    &environment,
+                let balance = observe_current_flat_account_balance(
+                    &http,
+                    &credential,
+                    ownership,
                     &endpoints,
                     &capabilities,
-                    subaccount,
+                    &snapshot,
+                    &perp_markets,
+                    &spot_pairs,
                 )
                 .await?;
-                anyhow::ensure!(
-                    evidence.subaccount() == subaccount
-                        && evidence.runtime_identity() == &expected_runtime,
-                    "DeepX finalized account query evidence identity mismatch",
-                );
-                map_finalized_flat_account_balances(&evidence)?
-                    .into_account_state(
-                        account_id,
-                        account_type,
-                        get_atomic_clock_realtime().get_time_ns(),
-                    )
-                    .map_err(anyhow::Error::from)
+                let now = get_atomic_clock_realtime().get_time_ns();
+                Ok::<AccountState, anyhow::Error>(AccountState::new(
+                    account_id,
+                    account_type,
+                    vec![balance],
+                    Vec::new(),
+                    true,
+                    UUID4::new(),
+                    now,
+                    now,
+                    None,
+                ))
             }
             .await;
             match state {
                 Ok(state) => match epoch.lock() {
                     Ok(active) if *active => {
                         if let Err(e) = emitter.try_send_account_state(state) {
-                            log::error!("DeepX finalized account query dispatch failed: {e}");
+                            log::error!("DeepX current account query dispatch failed: {e}");
                         }
                     }
                     Ok(_) => {}
                     Err(_) => log::error!("DeepX account query epoch lock is poisoned"),
                 },
-                Err(e) => log::error!("DeepX finalized account query failed: {e:#}"),
+                Err(e) => {
+                    if let Some(live) = account_live {
+                        live.store(false, Ordering::Release);
+                    }
+                    log::error!("DeepX current account query failed: {e:#}");
+                }
             }
         })?;
         Ok(())
@@ -7931,6 +7901,189 @@ fn sort_recovery_outboxes(restored: &mut [DeepXRestoredTransactionRecord]) {
                     .cmp(right.record().identity().client_order_id())
             })
     });
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the observer binds distinct ownership, RPC, and market evidence"
+)]
+async fn observe_current_flat_account_balance(
+    http: &DeepXHttpClient,
+    credential: &DeepXPrivateKey,
+    ownership: DeepXAccountOwnershipProof,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    expected_perp_markets: &HashSet<u64>,
+    expected_spot_pairs: &HashSet<String>,
+) -> anyhow::Result<AccountBalance> {
+    let subaccount = format!("0x{}", nautilus_core::hex::encode(ownership.subaccount()));
+    anyhow::ensure!(
+        http.get_account_ownership_proof(credential, &subaccount)
+            .await?
+            == ownership,
+        "DeepX account authority changed before balance observation",
+    );
+    let balance = observe_current_flat_account_balance_unowned(
+        http,
+        ownership.subaccount(),
+        endpoints,
+        capabilities,
+        snapshot,
+        expected_perp_markets,
+        expected_spot_pairs,
+    )
+    .await?;
+    anyhow::ensure!(
+        http.get_account_ownership_proof(credential, &subaccount)
+            .await?
+            == ownership,
+        "DeepX account authority changed during balance observation",
+    );
+    Ok(balance)
+}
+
+async fn observe_current_flat_account_balance_unowned(
+    http: &DeepXHttpClient,
+    subaccount_id: [u8; 20],
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    snapshot: &RuntimeSnapshot,
+    expected_perp_markets: &HashSet<u64>,
+    expected_spot_pairs: &HashSet<String>,
+) -> anyhow::Result<AccountBalance> {
+    let subaccount = format!("0x{}", nautilus_core::hex::encode(subaccount_id));
+    let perp_markets = http.get_perp_markets().await?;
+    let spot_markets = http.get_spot_markets().await?;
+    let perp_ids: HashSet<_> = perp_markets.iter().map(|market| market.id).collect();
+    let spot_pairs: HashSet<_> = spot_markets
+        .iter()
+        .map(|market| normalize_spot_pair(&market.pair))
+        .collect();
+    anyhow::ensure!(
+        !perp_ids.is_empty()
+            && !spot_pairs.is_empty()
+            && perp_ids.len() == perp_markets.len()
+            && spot_pairs.len() == spot_markets.len()
+            && &perp_ids == expected_perp_markets
+            && &spot_pairs == expected_spot_pairs,
+        "DeepX current market coverage differs from startup catalog",
+    );
+    let balances = http.get_subaccount_balances(&subaccount).await?;
+    let margin = http.get_subaccount_margin_ratio(&subaccount).await?;
+    let first = observe_current_margin_evidence(endpoints, capabilities, subaccount_id).await?;
+    let balance = map_current_flat_usdc_balance(&balances, &margin, &first)?;
+
+    for market_id in perp_ids {
+        let positions = http
+            .get_perp_position_pages(
+                &DeepXPerpPositionsRequest {
+                    subaccount: subaccount.clone(),
+                    market_id: Some(market_id),
+                    only_closed: Some(false),
+                    cursor: None,
+                    page_size: Some(POSITION_REPORT_PAGE_SIZE),
+                },
+                POSITION_REPORT_MAX_PAGES,
+            )
+            .await?;
+        anyhow::ensure!(
+            positions
+                .iter()
+                .flat_map(|page| &page.items)
+                .all(is_verified_closed_perp_position),
+            "DeepX flat account has an open or unverified perpetual position",
+        );
+        let orders = http
+            .get_perp_open_order_pages(
+                &DeepXPerpOpenOrdersRequest {
+                    subaccount: subaccount.clone(),
+                    market_id: Some(market_id),
+                    is_long: None,
+                    cursor: None,
+                    page_size: Some(ORDER_REPORT_PAGE_SIZE),
+                    sort: DeepXAccountSortOrder::Descending,
+                },
+                ORDER_REPORT_MAX_PAGES,
+            )
+            .await?;
+        anyhow::ensure!(
+            orders.iter().all(|page| page.items.is_empty()),
+            "DeepX flat account has an open perpetual order",
+        );
+    }
+    for pair in &spot_pairs {
+        let orders = http
+            .get_spot_open_order_pages(
+                &DeepXSpotOpenOrdersRequest {
+                    subaccount: subaccount.clone(),
+                    name: None,
+                    pair: Some(format!("0x{pair}")),
+                    order_side: None,
+                    cursor: None,
+                    sort: DeepXAccountSortOrder::Descending,
+                    page_size: Some(ORDER_REPORT_PAGE_SIZE),
+                },
+                ORDER_REPORT_MAX_PAGES,
+            )
+            .await?;
+        anyhow::ensure!(
+            orders.iter().all(|page| page.items.is_empty()),
+            "DeepX flat account has an open Spot order",
+        );
+    }
+
+    let final_balances = http.get_subaccount_balances(&subaccount).await?;
+    let final_margin = http.get_subaccount_margin_ratio(&subaccount).await?;
+    let final_chain =
+        observe_current_margin_evidence(endpoints, capabilities, subaccount_id).await?;
+    anyhow::ensure!(
+        first.initial().total_margin_required() == final_chain.initial().total_margin_required()
+            && first.maintenance().total_margin_required()
+                == final_chain.maintenance().total_margin_required()
+            && first.initial().total_collateral() <= final_chain.initial().total_collateral()
+            && first.maintenance().total_collateral()
+                <= final_chain.maintenance().total_collateral()
+            && first.block_number() <= final_chain.block_number()
+            && (first.block_number() != final_chain.block_number()
+                || first.block_hash() == final_chain.block_hash()),
+        "DeepX current margin changed or chain head regressed during observation",
+    );
+    let final_balance =
+        map_current_flat_usdc_balance(&final_balances, &final_margin, &final_chain)?;
+    anyhow::ensure!(
+        balance == final_balance,
+        "DeepX account balance changed during observation",
+    );
+    let final_perp_markets = http.get_perp_markets().await?;
+    let final_spot_markets = http.get_spot_markets().await?;
+    let final_perp: HashSet<_> = final_perp_markets.iter().map(|market| market.id).collect();
+    let final_spot: HashSet<_> = final_spot_markets
+        .iter()
+        .map(|market| normalize_spot_pair(&market.pair))
+        .collect();
+    anyhow::ensure!(
+        final_perp.len() == final_perp_markets.len()
+            && final_spot.len() == final_spot_markets.len()
+            && final_perp == *expected_perp_markets
+            && final_spot == *expected_spot_pairs,
+        "DeepX market coverage changed during balance observation",
+    );
+    let current_runtime =
+        observe_current_runtime_snapshot_for_endpoints(&snapshot.identity().environment, endpoints)
+            .await?;
+    anyhow::ensure!(
+        current_runtime.identity() == snapshot.identity(),
+        "DeepX runtime changed during account observation",
+    );
+    Ok(balance)
+}
+
+fn is_verified_closed_perp_position(position: &DeepXPerpPositionRecord) -> bool {
+    position.status == "Closed"
+        && position.close_block_num.is_some()
+        && position.close_time.is_some()
+        && position.close_event_idx.is_some()
 }
 
 fn recovery_outbox_order(record: &DeepXTransactionRecord) -> (u8, u64, u64) {
@@ -7969,7 +8122,7 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
                     },
             "DeepX Spot order ownership or side differs from validated command"
         );
-        let chain_time = observe_and_apply_finalized_chain_time(
+        let chain_time = observe_and_apply_current_submission_clock(
             &task.environment,
             &task.endpoints,
             &task.capabilities,
@@ -7980,7 +8133,7 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
         anyhow::ensure!(
             chain_time.runtime_identity() == permit.snapshot().identity()
                 && chain_time.runtime_identity() == &task.runtime_identity,
-            "DeepX finalized chain time runtime identity changed before Spot reservation"
+            "DeepX current chain time runtime identity changed before Spot reservation"
         );
         Ok::<_, anyhow::Error>((chain_time, permit))
     }
@@ -7991,8 +8144,8 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
         return Ok(());
     };
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
-        u64::from(chain_time.checkpoint().block_number()),
-        chain_time.checkpoint().block_hash(),
+        u64::from(chain_time.scan_checkpoint().block_number()),
+        chain_time.scan_checkpoint().block_hash(),
     );
     let reservation = prepare_durable_framework_spot_place_reservation(
         &task.runtime.store,
@@ -8057,7 +8210,7 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
         false,
     )
     .await?;
-    deliver_spot_place_outbox(&task, staged).await?;
+    let submitting = deliver_spot_place_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
     let outcome = submit_once_with_runtime_guard(
         submitting,
@@ -8103,57 +8256,90 @@ async fn run_spot_place_submission_task(task: DeepXSpotPlaceSubmissionTask) -> a
     };
     task.order_contexts
         .bind_tracked_venue_order_id(task.client_order_id, venue_order_id)?;
-    let restored = load_verified_committed_for_signer(&task.runtime.store, &task.runtime.lease)
-        .await?
-        .into_iter()
-        .find(|item| item.record().identity().client_order_id() == task.client_order_id.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "DeepX accepted Spot order {} is missing from durable signer records",
-                task.client_order_id
-            )
-        })?;
-    let reconciliation_verifier = DeepXSpotPlaceCallVerifier::new(
-        submission_permit.snapshot().clone(),
-        task.credential.clone(),
-    )?;
-    let reconciled = reconcile_submitted_spot_place_checkpoint(
-        &task.endpoints,
-        &task.capabilities,
-        submission_permit.snapshot(),
+    drop(submission_permit);
+    let Some(order) = poll_backend_spot_order_for_durable_place(
+        &task.http,
+        accepted.record(),
+        &task.market,
+        task.backend_order_timeout,
+    )
+    .await?
+    else {
+        log::warn!(
+            "DeepX Spot order {} remains accepted pending backend order indexing",
+            task.client_order_id,
+        );
+        return Ok(());
+    };
+    let confirmed = commit_reconciliation_observation(
         &task.runtime.store,
         &task.runtime.lease,
-        &restored,
-        task.recovery_blocks_per_range,
-        &reconciliation_verifier,
+        accepted.committed(),
+        accepted.record(),
+        DeepXTransactionObservation::BackendOrderConfirmed(order),
     )
     .await?;
-    drop(submission_permit);
-    if reconciled.record().recovery_action() != DeepXTransactionRecoveryAction::Complete {
-        log::warn!(
-            "DeepX Spot order {} remains pending finalized reconciliation: {:?}",
-            task.client_order_id,
-            reconciled.record().recovery_action(),
-        );
-    }
     let staged = commit_framework_order_event_staging(
         &task.runtime.store,
         &task.runtime.lease,
-        reconciled.committed(),
-        reconciled.record(),
+        confirmed.committed(),
+        confirmed.record(),
         get_atomic_clock_realtime().get_time_ns(),
         get_atomic_clock_realtime().get_time_ns(),
         false,
     )
     .await?;
-    deliver_spot_place_outbox(&task, staged).await?;
+    let _ = deliver_spot_place_outbox(&task, staged).await?;
     Ok(())
+}
+
+async fn poll_backend_spot_order_for_durable_place(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    market: &DeepXSpotReportMarket,
+    timeout: Duration,
+) -> Result<Option<DeepXBackendOrderEvidence>, DeepXBackendSpotOrderObservationError> {
+    let signed =
+        transaction
+            .signed_extrinsic()
+            .ok_or(DeepXBackendSpotOrderObservationError::Mismatch(
+                "signed extrinsic",
+            ))?;
+    if transaction.lifecycle().extrinsic_hash() != Some(signed.extrinsic_hash()) {
+        return Err(DeepXBackendSpotOrderObservationError::Mismatch(
+            "durable transaction hash",
+        ));
+    }
+    let hash = format!("0x{}", nautilus_core::hex::encode(signed.extrinsic_hash()));
+    let lookup = async {
+        loop {
+            match http.get_spot_order_by_tx(&hash).await {
+                Ok(record) => {
+                    return verify_backend_spot_order_for_durable_place(
+                        &record,
+                        transaction,
+                        market,
+                    )
+                    .map(Some);
+                }
+                Err(DeepXHttpError::Api {
+                    code: crate::http::models::DeepXResponseCode::Api(10008 | 10020),
+                    ..
+                }) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
 }
 
 async fn deliver_spot_place_outbox(
     task: &DeepXSpotPlaceSubmissionTask,
     staged: DeepXCommittedFrameworkOrderOutbox,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DeepXRestoredTransactionRecord> {
     let mut record = staged.record().clone();
     let mut committed = staged.committed().clone();
     for event in materialize_perp_framework_order_events(&record)? {
@@ -8181,14 +8367,14 @@ async fn deliver_spot_place_outbox(
         record = acknowledged.record().clone();
         committed = acknowledged.committed().clone();
     }
-    Ok(())
+    Ok(DeepXRestoredTransactionRecord::new(record, committed)?)
 }
 
 async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> anyhow::Result<()> {
     let preflight = async {
         task.order_contexts.register(task.order_context)?;
         validate_perp_place_order_side(task.order_side, task.params.is_long)?;
-        let chain_time = observe_and_apply_finalized_chain_time(
+        let chain_time = observe_and_apply_current_submission_clock(
             &task.environment,
             &task.endpoints,
             &task.capabilities,
@@ -8199,7 +8385,7 @@ async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> a
         anyhow::ensure!(
             chain_time.runtime_identity() == permit.snapshot().identity()
                 && chain_time.runtime_identity() == &task.runtime_identity,
-            "DeepX finalized chain time runtime identity changed before reservation"
+            "DeepX current chain time runtime identity changed before reservation"
         );
         Ok::<_, anyhow::Error>((chain_time, permit))
     }
@@ -8211,8 +8397,8 @@ async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> a
     };
     let market_ids = HashMap::from([(task.instrument_id, u64::from(task.params.market_id))]);
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
-        u64::from(chain_time.checkpoint().block_number()),
-        chain_time.checkpoint().block_hash(),
+        u64::from(chain_time.scan_checkpoint().block_number()),
+        chain_time.scan_checkpoint().block_hash(),
     );
     let reservation = prepare_durable_framework_perp_place_reservation(
         &task.runtime.store,
@@ -8289,7 +8475,7 @@ async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> a
         false,
     )
     .await?;
-    deliver_perp_place_outbox(&task, staged).await?;
+    let submitting = deliver_perp_place_outbox(&task, staged).await?;
     let submission_url = task.submission_url.clone();
     let outcome = submit_once_with_runtime_guard(
         submitting,
@@ -8337,60 +8523,101 @@ async fn run_perp_place_submission_task(task: DeepXPerpPlaceSubmissionTask) -> a
     task.order_contexts
         .bind_tracked_venue_order_id(task.client_order_id, venue_order_id)?;
 
-    let reconciliation_verifier = DeepXPerpPlaceCallVerifier::new(
-        submission_permit.snapshot().clone(),
-        task.credential.clone(),
-    )?;
-    let restored = load_verified_committed_for_signer(&task.runtime.store, &task.runtime.lease)
-        .await?
-        .into_iter()
-        .find(|item| item.record().identity().client_order_id() == task.client_order_id.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "DeepX accepted order {} is missing from durable signer records",
-                task.client_order_id
-            )
-        })?;
-    let reconciled = reconcile_submitted_perp_place_checkpoint(
-        &task.endpoints,
-        &task.capabilities,
-        submission_permit.snapshot(),
+    drop(submission_permit);
+    let Some(order) = poll_backend_perp_order_for_durable_place(
+        &task.http,
+        accepted.record(),
+        task.catalog_market_id,
+        &task.market_metadata,
+        task.backend_order_timeout,
+    )
+    .await?
+    else {
+        log::warn!(
+            "DeepX perpetual order {} remains accepted pending backend order indexing",
+            task.client_order_id,
+        );
+        return Ok(());
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: order_id } =
+        accepted.record().identity().nonce()
+    else {
+        anyhow::bail!("DeepX perpetual placement has an unsupported nonce domain");
+    };
+    let confirmed = commit_reconciliation_observation(
         &task.runtime.store,
         &task.runtime.lease,
-        &restored,
-        task.recovery_blocks_per_range,
-        &reconciliation_verifier,
+        accepted.committed(),
+        accepted.record(),
+        DeepXTransactionObservation::BackendOrderConfirmed(DeepXBackendOrderEvidence::new(
+            order.extrinsic_hash(),
+            order_id,
+            order.observed_block_number(),
+        )),
     )
     .await?;
-    drop(submission_permit);
-    if reconciled.record().recovery_action() != DeepXTransactionRecoveryAction::Complete {
-        log::warn!(
-            "DeepX perpetual order {} remains pending finalized reconciliation: {:?}",
-            task.client_order_id,
-            reconciled.record().recovery_action(),
-        );
-    }
 
     let ts_event = get_atomic_clock_realtime().get_time_ns();
     let ts_init = get_atomic_clock_realtime().get_time_ns();
     let staged = commit_framework_order_event_staging(
         &task.runtime.store,
         &task.runtime.lease,
-        reconciled.committed(),
-        reconciled.record(),
+        confirmed.committed(),
+        confirmed.record(),
         ts_event,
         ts_init,
         false,
     )
     .await?;
-    deliver_perp_place_outbox(&task, staged).await?;
+    let _ = deliver_perp_place_outbox(&task, staged).await?;
     Ok(())
+}
+
+async fn poll_backend_perp_order_for_durable_place(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    catalog_market_id: u64,
+    metadata: &DeepXPerpetualReportMetadata,
+    timeout: Duration,
+) -> Result<Option<DeepXPerpOrderEvidence>, DeepXBackendPerpOrderObservationError> {
+    let signed = transaction
+        .signed_extrinsic()
+        .ok_or(DeepXPerpOrderEvidenceError::MissingSignedExtrinsic)?;
+    if transaction.lifecycle().extrinsic_hash() != Some(signed.extrinsic_hash()) {
+        return Err(DeepXPerpOrderEvidenceError::DurableHashMismatch.into());
+    }
+    let hash = format!("0x{}", nautilus_core::hex::encode(signed.extrinsic_hash()));
+    let lookup = async {
+        loop {
+            match http.get_perp_order_by_tx(&hash).await {
+                Ok(record) => {
+                    return DeepXExecutionClient::verify_perp_order_record_with_catalog(
+                        &record,
+                        transaction,
+                        catalog_market_id,
+                        metadata,
+                    )
+                    .map(Some)
+                    .map_err(DeepXBackendPerpOrderObservationError::from);
+                }
+                Err(DeepXHttpError::Api {
+                    code: crate::http::models::DeepXResponseCode::Api(10008 | 10020),
+                    ..
+                }) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
 }
 
 async fn deliver_perp_place_outbox(
     task: &DeepXPerpPlaceSubmissionTask,
     staged: DeepXCommittedFrameworkOrderOutbox,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DeepXRestoredTransactionRecord> {
     let mut record = staged.record().clone();
     let mut committed = staged.committed().clone();
     for event in materialize_perp_framework_order_events(&record)? {
@@ -8414,7 +8641,7 @@ async fn deliver_perp_place_outbox(
         record = acknowledged.record().clone();
         committed = acknowledged.committed().clone();
     }
-    Ok(())
+    Ok(DeepXRestoredTransactionRecord::new(record, committed)?)
 }
 
 async fn run_perp_cancel_task(task: DeepXPerpCancelTask) -> anyhow::Result<()> {
@@ -8510,7 +8737,7 @@ async fn run_perp_cancel_task(task: DeepXPerpCancelTask) -> anyhow::Result<()> {
         ),
     )?;
 
-    let chain_time = observe_and_apply_finalized_chain_time(
+    let chain_time = observe_and_apply_current_submission_clock(
         &task.environment,
         &task.endpoints,
         &task.capabilities,
@@ -8522,12 +8749,12 @@ async fn run_perp_cancel_task(task: DeepXPerpCancelTask) -> anyhow::Result<()> {
         || chain_time.runtime_identity() != &task.runtime_identity
     {
         anyhow::bail!(
-            "DeepX finalized chain time runtime identity changed before cancel reservation"
+            "DeepX current chain time runtime identity changed before cancel reservation"
         );
     }
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
-        u64::from(chain_time.checkpoint().block_number()),
-        chain_time.checkpoint().block_hash(),
+        u64::from(chain_time.scan_checkpoint().block_number()),
+        chain_time.scan_checkpoint().block_hash(),
     );
     let reservation = prepare_durable_framework_perp_cancel_reservation(
         &task.runtime.store,
@@ -8782,7 +9009,7 @@ async fn run_spot_cancel_task(task: DeepXSpotCancelTask) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let chain_time = observe_and_apply_finalized_chain_time(
+    let chain_time = observe_and_apply_current_submission_clock(
         &task.environment,
         &task.endpoints,
         &task.capabilities,
@@ -8794,12 +9021,12 @@ async fn run_spot_cancel_task(task: DeepXSpotCancelTask) -> anyhow::Result<()> {
         || chain_time.runtime_identity() != &task.runtime_identity
     {
         anyhow::bail!(
-            "DeepX finalized chain time runtime identity changed before Spot cancel reservation"
+            "DeepX current chain time runtime identity changed before Spot cancel reservation"
         );
     }
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
-        u64::from(chain_time.checkpoint().block_number()),
-        chain_time.checkpoint().block_hash(),
+        u64::from(chain_time.scan_checkpoint().block_number()),
+        chain_time.scan_checkpoint().block_hash(),
     );
     let reservation = prepare_durable_framework_spot_cancel_reservation(
         &task.runtime.store,
@@ -9204,7 +9431,7 @@ async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
         &task.perpetual_market_ids,
         &identity,
     )?;
-    let chain_time = observe_and_apply_finalized_chain_time(
+    let chain_time = observe_and_apply_current_submission_clock(
         &task.environment,
         &task.endpoints,
         &task.capabilities,
@@ -9215,11 +9442,11 @@ async fn run_perp_modify_task(task: DeepXPerpModifyTask) -> anyhow::Result<()> {
     anyhow::ensure!(
         chain_time.runtime_identity() == reservation_permit.snapshot().identity()
             && chain_time.runtime_identity() == &task.runtime_identity,
-        "DeepX finalized chain time runtime identity changed before modify reservation"
+        "DeepX current chain time runtime identity changed before modify reservation"
     );
     let checkpoint = DeepXSubmissionScanCheckpoint::new(
-        u64::from(chain_time.checkpoint().block_number()),
-        chain_time.checkpoint().block_hash(),
+        u64::from(chain_time.scan_checkpoint().block_number()),
+        chain_time.scan_checkpoint().block_hash(),
     );
     let reservation = prepare_durable_framework_perp_modify_reservation(
         &task.runtime.store,
@@ -9483,7 +9710,7 @@ impl ExecutionClient for DeepXExecutionClient {
                 .await?;
             guard
                 .client
-                .complete_startup_with_finalized_flat_account_state(&frame, timeout)
+                .complete_startup_with_current_flat_account_state(&frame, timeout)
                 .await?;
             guard.client.activate_query_tasks().await?;
             let snapshot_service = guard
@@ -9577,8 +9804,14 @@ impl ExecutionClient for DeepXExecutionClient {
                 .ok_or(DeepXTransactionRuntimeError::SnapshotIdentityMismatch)?
                 .identity()
                 .clone();
+            let market = self
+                .spot_report_markets
+                .get(&cmd.instrument_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("DeepX Spot market is absent from catalog"))?;
             let task = DeepXSpotPlaceSubmissionTask {
                 runtime,
+                http: self.http.clone(),
                 credential: self.credential.clone(),
                 environment: self.config.network.environment.clone(),
                 endpoints,
@@ -9586,9 +9819,10 @@ impl ExecutionClient for DeepXExecutionClient {
                 ownership,
                 runtime_identity,
                 submission_url,
-                recovery_blocks_per_range: self.config.recovery_blocks_per_range,
+                backend_order_timeout: Duration::from_secs(self.config.http_timeout_secs),
                 receipt_timeout: Duration::from_secs(self.config.websocket_timeout_secs),
                 params,
+                market,
                 order,
                 instrument_id: cmd.instrument_id,
                 client_order_id: cmd.client_order_id,
@@ -9652,8 +9886,24 @@ impl ExecutionClient for DeepXExecutionClient {
             .identity()
             .clone();
         let environment = self.config.network.environment.clone();
+        let catalog_market_id = self
+            .perpetual_market_ids
+            .get(&cmd.instrument_id)
+            .copied()
+            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
+        let market_metadata = *self
+            .perpetual_report_metadata
+            .get(&cmd.instrument_id)
+            .ok_or(DeepXPerpOrderEvidenceError::UnknownInstrument)?;
+        anyhow::ensure!(
+            catalog_market_id == u64::from(params.market_id)
+                && self.perpetual_instrument_ids.get(&catalog_market_id)
+                    == Some(&cmd.instrument_id),
+            "DeepX perpetual market catalog is inconsistent before order submission"
+        );
         let task = DeepXPerpPlaceSubmissionTask {
             runtime,
+            http: self.http.clone(),
             credential: self.credential.clone(),
             environment,
             endpoints,
@@ -9661,11 +9911,13 @@ impl ExecutionClient for DeepXExecutionClient {
             ownership,
             runtime_identity,
             submission_url,
-            recovery_blocks_per_range: self.config.recovery_blocks_per_range,
+            backend_order_timeout: Duration::from_secs(self.config.http_timeout_secs),
             receipt_timeout: Duration::from_secs(self.config.websocket_timeout_secs),
             params,
             order,
             instrument_id: cmd.instrument_id,
+            catalog_market_id,
+            market_metadata,
             client_order_id: cmd.client_order_id,
             order_side: cmd.order_init.order_side,
             order_context: order_context_from_submit_order(&cmd),
@@ -10246,32 +10498,17 @@ impl ExecutionClient for DeepXExecutionClient {
             state
         };
         self.emitter.try_send_account_state(state)?;
-        self.schedule_finalized_account_refresh()
+        self.schedule_current_account_refresh()
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         let query = self.prepare_tracked_order_query(&cmd)?;
         let http = self.http.clone();
         let account_id = query.account_id;
-        let endpoints = self.runtime_rpc_endpoints.clone();
-        let capabilities = self.runtime_rpc_capabilities.clone();
-        let execution_backend = self.config.execution_backend;
-        let environment = self.config.network.environment.clone();
-        let snapshot_service = self
-            .transaction_runtime
-            .as_ref()
-            .map(|runtime| runtime.snapshot_service.clone());
-        let owned_subaccount = self
-            .account_ownership
-            .as_ref()
-            .map(DeepXAccountOwnershipProof::subaccount);
-        let perpetual_instrument_ids = self.perpetual_instrument_ids.clone();
-        let perpetual_report_metadata = self.perpetual_report_metadata.clone();
         let emitter = self.emitter.clone();
         let epoch = Arc::clone(&self.query_epoch);
         self.query_tasks.spawn(async move {
             let result = async {
-                let mut block_timestamps = HashMap::new();
                 if let Some(market) = query.spot_market.as_ref() {
                     let side = if query.context.identity.order_side == OrderSide::Buy {
                         DeepXSpotOrderSide::Buy
@@ -10291,9 +10528,6 @@ impl ExecutionClient for DeepXExecutionClient {
                         &http,
                         account_id,
                         &query.subaccount,
-                        endpoints.as_ref(),
-                        capabilities.as_ref(),
-                        &mut block_timestamps,
                         DeepXTrackedSpotReportInput {
                             record: &record,
                             market,
@@ -10315,41 +10549,6 @@ impl ExecutionClient for DeepXExecutionClient {
                             query.venue_order_id.as_str(),
                         )
                         .await?;
-                    if execution_backend == DeepXExecutionBackend::DirectPallet {
-                        let endpoints = endpoints.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("DeepX order query has no validated RPC endpoints")
-                        })?;
-                        let capabilities = capabilities.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("DeepX order query has no validated RPC capabilities")
-                        })?;
-                        let snapshot_service = snapshot_service.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("DeepX order query has no runtime snapshot service")
-                        })?;
-                        let subaccount = owned_subaccount.ok_or_else(|| {
-                            anyhow::anyhow!("DeepX order query has no validated account ownership")
-                        })?;
-                        let order_id = record.order_id.parse::<u64>()?;
-                        let finalized = observe_and_apply_finalized_perp_order_evidence(
-                            &environment,
-                            endpoints,
-                            capabilities,
-                            snapshot_service,
-                            subaccount,
-                            order_id,
-                        )
-                        .await?;
-                        anyhow::ensure!(
-                            finalized.subaccount() == subaccount,
-                            "DeepX finalized Perpetual order belongs to another subaccount",
-                        );
-                        Self::validate_finalized_perp_order_record(
-                            &perpetual_instrument_ids,
-                            &perpetual_report_metadata,
-                            &record,
-                            market_id,
-                            finalized.order(),
-                        )?;
-                    }
                     Self::build_tracked_order_status_report_from_context(
                         &record,
                         market_id,
@@ -10406,15 +10605,11 @@ impl ExecutionClient for DeepXExecutionClient {
                     order_side: side,
                 })
                 .await?;
-            let mut block_timestamps = HashMap::new();
             return Ok(Some(
                 Self::build_tracked_spot_order_status_report(
                     &self.http,
                     self.core.account_id,
                     subaccount,
-                    self.runtime_rpc_endpoints.as_ref(),
-                    self.runtime_rpc_capabilities.as_ref(),
-                    &mut block_timestamps,
                     DeepXTrackedSpotReportInput {
                         record: &record,
                         market,
@@ -10436,28 +10631,6 @@ impl ExecutionClient for DeepXExecutionClient {
             .http
             .get_perp_order_by_id(subaccount, market_id, venue_order_id.as_str())
             .await?;
-        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
-            let order_id = record.order_id.parse::<u64>()?;
-            let finalized = self
-                .observe_owned_finalized_perp_order_evidence(order_id)
-                .await?;
-            anyhow::ensure!(
-                finalized.subaccount()
-                    == self
-                        .account_ownership
-                        .as_ref()
-                        .ok_or(DeepXTransactionRuntimeError::PerpOrdersAccountIdentityMismatch)?
-                        .subaccount(),
-                "DeepX finalized Perpetual order belongs to another subaccount",
-            );
-            Self::validate_finalized_perp_order_record(
-                &self.perpetual_instrument_ids,
-                &self.perpetual_report_metadata,
-                &record,
-                market_id,
-                finalized.order(),
-            )?;
-        }
         Ok(Some(self.build_tracked_order_status_report(
             &record,
             market_id,
@@ -10545,14 +10718,6 @@ impl ExecutionClient for DeepXExecutionClient {
             }
         };
 
-        let finalized_perp_orders = if market_ids.is_empty()
-            || self.config.execution_backend != DeepXExecutionBackend::DirectPallet
-        {
-            None
-        } else {
-            Some(self.observe_owned_finalized_perp_orders_evidence().await?)
-        };
-
         let mut reports = Vec::new();
         let mut remaining_pages = ORDER_REPORT_MAX_PAGES;
         for market_id in market_ids {
@@ -10578,27 +10743,6 @@ impl ExecutionClient for DeepXExecutionClient {
             let mut observed_open_order_ids = HashSet::new();
             for record in open_pages.into_iter().flat_map(|page| page.items) {
                 let venue_order_id = VenueOrderId::new(record.order_id.as_str());
-                if let Some(evidence) = finalized_perp_orders.as_ref() {
-                    let finalized = evidence
-                        .orders()
-                        .iter()
-                        .find(|order| {
-                            u64::from(order.market_id()) == market_id
-                                && order.order_id().to_string() == record.order_id
-                        })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "DeepX active Perpetual order {venue_order_id} is absent from finalized storage"
-                            )
-                        })?;
-                    Self::validate_finalized_perp_order_record(
-                        &self.perpetual_instrument_ids,
-                        &self.perpetual_report_metadata,
-                        &record,
-                        market_id,
-                        finalized,
-                    )?;
-                }
                 anyhow::ensure!(
                     observed_open_order_ids.insert(record.order_id.clone()),
                     "DeepX active Perpetual order response duplicated order {}",
@@ -10615,20 +10759,6 @@ impl ExecutionClient for DeepXExecutionClient {
                     "DeepX active-order response contains closed order {venue_order_id}",
                 );
                 reports.push(report);
-            }
-
-            if let Some(evidence) = finalized_perp_orders.as_ref() {
-                let finalized_market_orders = evidence
-                    .orders()
-                    .iter()
-                    .filter(|order| u64::from(order.market_id()) == market_id);
-                for order in finalized_market_orders {
-                    anyhow::ensure!(
-                        observed_open_order_ids.contains(&order.order_id().to_string()),
-                        "DeepX finalized active Perpetual order {} is absent from REST active orders",
-                        order.order_id(),
-                    );
-                }
             }
 
             if !cmd.open_only {
@@ -10654,50 +10784,13 @@ impl ExecutionClient for DeepXExecutionClient {
                     .into_iter()
                     .flat_map(|page| page.items)
                     .collect::<Vec<_>>();
-                if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
-                    let mut order_ids = Vec::with_capacity(history_records.len());
-                    let mut unique_order_ids = HashSet::new();
-                    for record in &history_records {
-                        let order_id = record.order_id.parse::<u64>()?;
-                        anyhow::ensure!(
-                            unique_order_ids.insert(order_id),
-                            "DeepX Perpetual history response duplicated order {}",
-                            record.order_id,
-                        );
-                        order_ids.push(order_id);
-                    }
-                    let evidence = self
-                        .observe_owned_finalized_perp_orders_by_id_evidence(&order_ids)
-                        .await?;
-                    anyhow::ensure!(
-                        evidence.orders().len() == history_records.len(),
-                        "DeepX finalized Perpetual history evidence is incomplete",
-                    );
-                    for record in &history_records {
-                        let order_id = record.order_id.parse::<u64>()?;
-                        let finalized = evidence
-                            .orders()
-                            .iter()
-                            .find(|order| {
-                                u64::from(order.market_id()) == market_id
-                                    && order.order_id() == order_id
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "DeepX Perpetual history order {} is absent from finalized storage",
-                                    record.order_id,
-                                )
-                            })?;
-                        Self::validate_finalized_perp_order_record(
-                            &self.perpetual_instrument_ids,
-                            &self.perpetual_report_metadata,
-                            record,
-                            market_id,
-                            finalized,
-                        )?;
-                    }
-                }
+                let mut observed_history_order_ids = HashSet::new();
                 for record in history_records {
+                    anyhow::ensure!(
+                        observed_history_order_ids.insert(record.order_id.clone()),
+                        "DeepX Perpetual history response duplicated order {}",
+                        record.order_id,
+                    );
                     let venue_order_id = VenueOrderId::new(record.order_id.as_str());
                     reports.push(self.build_tracked_order_status_report(
                         &record,
@@ -10709,7 +10802,6 @@ impl ExecutionClient for DeepXExecutionClient {
             }
         }
 
-        let mut block_timestamps = HashMap::new();
         for instrument_id in spot_instruments {
             let market = self
                 .spot_report_markets
@@ -10741,15 +10833,12 @@ impl ExecutionClient for DeepXExecutionClient {
                 .into_iter()
                 .flat_map(|page| page.items)
                 .collect::<Vec<_>>();
-            self.validate_owned_finalized_spot_order_records(market, &open_records, true)
-                .await?;
             for record in open_records {
                 let report = self
                     .build_tracked_spot_order_status_report_for_record(
                         &record,
                         instrument_id,
                         market,
-                        &mut block_timestamps,
                         &mut remaining_pages,
                         cmd.ts_init,
                     )
@@ -10787,15 +10876,12 @@ impl ExecutionClient for DeepXExecutionClient {
                     .into_iter()
                     .flat_map(|page| page.items)
                     .collect::<Vec<_>>();
-                self.validate_owned_finalized_spot_order_records(market, &history_records, false)
-                    .await?;
                 for record in history_records {
                     reports.push(
                         self.build_tracked_spot_order_status_report_for_record(
                             &record,
                             instrument_id,
                             market,
-                            &mut block_timestamps,
                             &mut remaining_pages,
                             cmd.ts_init,
                         )
@@ -10849,7 +10935,6 @@ impl ExecutionClient for DeepXExecutionClient {
                 return Err(DeepXFillReportError::SpotMarketIdentityMismatch.into());
             }
             let mut remaining_pages = FILL_REPORT_MAX_PAGES;
-            let mut remaining_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
             let reports = self
                 .collect_spot_fill_reports_for_market(
                     subaccount,
@@ -10857,7 +10942,6 @@ impl ExecutionClient for DeepXExecutionClient {
                     market,
                     &cmd,
                     &mut remaining_pages,
-                    &mut remaining_blocks,
                 )
                 .await?;
             if cmd.venue_order_id.is_some() {
@@ -10906,10 +10990,7 @@ impl ExecutionClient for DeepXExecutionClient {
         }
 
         let mut reports = Vec::new();
-        let mut perp_records = Vec::new();
-        let mut spot_records = Vec::new();
         let mut remaining_pages = FILL_REPORT_MAX_PAGES;
-        let mut remaining_spot_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
         if !self.perpetual_market_ids.is_empty() {
             let selected_markets = if cmd.venue_order_id.is_some() && market_id.is_none() {
                 let mut ids = self
@@ -10967,7 +11048,6 @@ impl ExecutionClient for DeepXExecutionClient {
                         {
                             continue;
                         }
-                        perp_records.push(record);
                         reports.push(report);
                     }
                 }
@@ -10985,7 +11065,6 @@ impl ExecutionClient for DeepXExecutionClient {
                             market,
                             &cmd,
                             &mut remaining_pages,
-                            &mut remaining_spot_blocks,
                         )
                         .await?,
                     );
@@ -11028,22 +11107,12 @@ impl ExecutionClient for DeepXExecutionClient {
                     {
                         continue;
                     }
-                    spot_records.push(record);
                     reports.push(report);
                 }
             }
         }
         if cmd.venue_order_id.is_some() {
             validate_targeted_fill_identity(&reports)?;
-        }
-        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
-            self.verify_owned_finalized_perp_fill_records(&perp_records)
-                .await?;
-            self.verify_owned_finalized_spot_fill_records(
-                &spot_records,
-                &mut remaining_spot_blocks,
-            )
-            .await?;
         }
         Ok(self.merge_validated_fill_reports(reports)?)
     }
@@ -11096,122 +11165,6 @@ impl ExecutionClient for DeepXExecutionClient {
                     }))
         {
             return Err(DeepXPositionReportError::MarketIdentityMismatch.into());
-        }
-
-        if self.config.execution_backend == DeepXExecutionBackend::DirectPallet {
-            let evidence = self
-                .observe_owned_finalized_perp_positions_evidence()
-                .await?;
-            let ownership = self
-                .account_ownership
-                .as_ref()
-                .ok_or(DeepXTransactionRuntimeError::PerpPositionsAccountIdentityMismatch)?;
-            if evidence.subaccount() != ownership.subaccount() {
-                return Err(
-                    DeepXTransactionRuntimeError::PerpPositionsAccountIdentityMismatch.into(),
-                );
-            }
-            let endpoints = self
-                .runtime_rpc_endpoints
-                .as_ref()
-                .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-            let capabilities = self
-                .runtime_rpc_capabilities
-                .as_ref()
-                .ok_or(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable)?;
-            let timestamp_ms = observe_finalized_timestamp_at_checkpoint(
-                endpoints,
-                capabilities,
-                evidence.checkpoint(),
-            )
-            .await?;
-            let timestamp_ns = timestamp_ms
-                .checked_mul(1_000_000)
-                .ok_or(DeepXPositionReportError::InvalidFinalizedTimestamp)?;
-            let ts_event = UnixNanos::from(timestamp_ns);
-            let mut reports = Vec::new();
-            for position in evidence.positions() {
-                let raw_market_id = u64::from(position.market_id());
-                if market_id.is_some_and(|selected| selected != raw_market_id) {
-                    continue;
-                }
-                if position.owner() != evidence.subaccount() {
-                    return Err(
-                        DeepXTransactionRuntimeError::PerpPositionsAccountIdentityMismatch.into(),
-                    );
-                }
-                let instrument_id = self
-                    .perpetual_instrument_ids
-                    .get(&raw_market_id)
-                    .copied()
-                    .ok_or(DeepXPositionReportError::UnknownMarket(raw_market_id))?;
-                if self.perpetual_market_ids.get(&instrument_id) != Some(&raw_market_id) {
-                    return Err(DeepXPositionReportError::MarketIdentityMismatch.into());
-                }
-                let metadata = self
-                    .perpetual_report_metadata
-                    .get(&instrument_id)
-                    .copied()
-                    .ok_or(DeepXPositionReportError::MarketIdentityMismatch)?;
-                let raw_quantity =
-                    i128::try_from(position.base_asset_amount()).map_err(|error| {
-                        DeepXPositionReportError::QuantityConversion(error.to_string())
-                    })?;
-                let base_amount =
-                    scaled_i128_to_decimal(raw_quantity, u32::from(metadata.base_decimal))
-                        .map_err(|error| {
-                            DeepXPositionReportError::QuantityConversion(error.to_string())
-                        })?;
-                if base_amount % metadata.size_increment != rust_decimal::Decimal::ZERO {
-                    return Err(DeepXPositionReportError::QuantityIncrementMismatch.into());
-                }
-                let quantity = Quantity::from_decimal_dp(base_amount, metadata.size_precision)
-                    .map_err(|error| {
-                        DeepXPositionReportError::QuantityConversion(error.to_string())
-                    })?;
-                if quantity.as_decimal() != base_amount {
-                    return Err(DeepXPositionReportError::QuantityPrecisionLoss.into());
-                }
-                let raw_entry_price = i128::try_from(position.entry_price()).map_err(|error| {
-                    DeepXPositionReportError::EntryPriceConversion(error.to_string())
-                })?;
-                let entry_price = scaled_i128_to_decimal(raw_entry_price, 6).map_err(|error| {
-                    DeepXPositionReportError::EntryPriceConversion(error.to_string())
-                })?;
-                if entry_price % metadata.price_increment != rust_decimal::Decimal::ZERO {
-                    return Err(DeepXPositionReportError::EntryPriceIncrementMismatch.into());
-                }
-                let entry_price_value =
-                    Price::from_decimal_dp(entry_price, metadata.price_precision).map_err(
-                        |error| DeepXPositionReportError::EntryPriceConversion(error.to_string()),
-                    )?;
-                if entry_price_value.as_decimal() != entry_price {
-                    return Err(DeepXPositionReportError::EntryPricePrecisionLoss.into());
-                }
-                reports.push(PositionStatusReport::new(
-                    self.core.account_id,
-                    instrument_id,
-                    if position.is_long() {
-                        PositionSide::Long
-                    } else {
-                        PositionSide::Short
-                    },
-                    quantity,
-                    ts_event,
-                    cmd.ts_init,
-                    None,
-                    None,
-                    Some(entry_price),
-                ));
-            }
-            if let Some(start) = cmd.start {
-                reports.retain(|report| report.ts_last >= start);
-            }
-            if let Some(end) = cmd.end {
-                reports.retain(|report| report.ts_last <= end);
-            }
-            reports.sort_by_key(|report| report.instrument_id);
-            return Ok(reports);
         }
 
         let pages = self
@@ -11423,7 +11376,6 @@ mod tests {
         extract::ws::{Message as WsMessage, WebSocketUpgrade},
         routing::{get, post},
     };
-    use futures_util::FutureExt;
     use nautilus_common::{
         cache::Cache,
         live::runner::replace_exec_event_sender,
@@ -11455,12 +11407,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        account::verify_account_ownership,
+        account::{verify_account_ownership, verify_delegated_account_ownership},
         common::consts::DEEPX_TESTNET_GENESIS_HASH,
         config::{DeepXObservedRpcEndpoint, validate_rpc_endpoint_identities},
         http::{
-            DeepXAccountPage, DeepXApiResponse, DeepXPerpMarket, DeepXPerpOrderRecord,
-            DeepXSubaccountProfile, DeepXWalletSubaccounts,
+            DeepXAccountPage, DeepXApiResponse, DeepXDelegateAccount, DeepXDelegateMode,
+            DeepXDelegateWallets, DeepXPerpMarket, DeepXPerpOrderRecord, DeepXSubaccountProfile,
+            DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
         },
         instruments::parse_perpetual_instrument,
         rpc::{DeepXValidatedRpcMethodCapabilities, observe_and_validate_rpc_method_capabilities},
@@ -11480,6 +11433,70 @@ mod tests {
             DeepXWsConfirmedBalancesFrame, DeepXWsError,
         },
     };
+
+    #[rstest]
+    #[case::second("a4676ec9a5600686234b8d9d413d04bc2d8fda70")]
+    #[case::third("492da9b1c5ccb8099562be29c2f3ce536161eb74")]
+    #[tokio::test]
+    #[ignore = "requires live DeepX testnet REST and Watch RPC"]
+    async fn live_flat_subaccount_reads_complete_backend_exposure_without_a_key(
+        #[case] subaccount_hex: &str,
+    ) {
+        let network = crate::config::DeepXNetworkConfig::default();
+        let http = DeepXHttpClient::from_network_config(&network, Some(20), None).unwrap();
+        let endpoints = observe_and_validate_rpc_endpoint_identities(&network)
+            .await
+            .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        let snapshot =
+            observe_current_runtime_snapshot_for_endpoints(&DeepXEnvironment::Testnet, &endpoints)
+                .await
+                .unwrap();
+        let perp_markets = http
+            .get_perp_markets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|market| market.id)
+            .collect();
+        let spot_pairs = http
+            .get_spot_markets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|market| normalize_spot_pair(&market.pair))
+            .collect();
+        let subaccount = hex::decode_array::<20>(subaccount_hex).unwrap();
+        let balance = observe_current_flat_account_balance_unowned(
+            &http,
+            subaccount,
+            &endpoints,
+            &capabilities,
+            &snapshot,
+            &perp_markets,
+            &spot_pairs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(balance.total, balance.free);
+        assert_eq!(balance.locked, Money::zero(balance.currency));
+    }
+
+    #[rstest]
+    fn flat_account_accepts_only_complete_closed_position_evidence() {
+        let response: DeepXApiResponse<DeepXAccountPage<DeepXPerpPositionRecord>> =
+            serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
+        let open = &response.data.items[0];
+        let closed = &response.data.items[1];
+        assert!(!is_verified_closed_perp_position(open));
+        assert!(is_verified_closed_perp_position(closed));
+
+        let mut incomplete = closed.clone();
+        incomplete.close_event_idx = None;
+        assert!(!is_verified_closed_perp_position(&incomplete));
+    }
 
     const GENESIS_FIXTURE: &str = include_str!(
         "../test_data/runtime/testnet/\
@@ -12979,7 +12996,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RuntimeStartupRpcState {
         advertise_submission: bool,
-        fail_finalized_head: bool,
+        fail_current_head: bool,
     }
 
     async fn runtime_startup_rpc(
@@ -12996,6 +13013,8 @@ mod tests {
                     "chain_getHeader",
                     "eth_call",
                     "state_getStorage",
+                    "state_getMetadata",
+                    "state_getRuntimeVersion",
                     "state_queryStorageAt",
                     "state_call",
                 ];
@@ -13005,23 +13024,35 @@ mod tests {
                 json!({ "methods": methods })
             }
             "chain_getBlockHash" => {
-                if request["params"].get(0).and_then(Value::as_u64) == Some(19_592_700) {
+                if request["params"] == json!([]) && state.fail_current_head {
+                    return Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "error": { "code": -32000, "message": "injected current head failure" },
+                    }));
+                }
+                if request["params"] == json!([])
+                    || request["params"].get(0).and_then(Value::as_u64) == Some(19_592_700)
+                {
                     serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap()["result"].clone()
                 } else {
                     serde_json::from_str::<Value>(GENESIS_FIXTURE).unwrap()["result"].clone()
                 }
             }
-            "chain_getFinalizedHead" => {
-                if state.fail_finalized_head {
+            "chain_getFinalizedHead" => panic!("runtime startup must not query finalized head"),
+            "chain_getHeader" => json!({ "number": "0x12af5fc" }),
+            "state_getRuntimeVersion" => {
+                if request["params"] == json!([format!("0x{}", "00".repeat(32))]) {
                     return Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": request["id"],
-                        "error": { "code": -32000, "message": "injected finalized head failure" },
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "error": { "code": -32000, "message": "unknown block" },
                     }));
                 }
-                serde_json::from_str::<Value>(FINALIZED_HEAD_FIXTURE).unwrap()["result"].clone()
+                json!({ "specVersion": 376, "transactionVersion": 1 })
             }
-            "chain_getHeader" => json!({ "number": "0x12af5fc" }),
+            "state_getMetadata" => {
+                serde_json::from_str::<Value>(METADATA_FIXTURE).unwrap()["result"].clone()
+            }
             method => panic!("unexpected method {method}"),
         };
         Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
@@ -13029,7 +13060,7 @@ mod tests {
 
     async fn runtime_startup_rpc_url(
         advertise_submission: bool,
-        fail_finalized_head: bool,
+        fail_current_head: bool,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -13037,7 +13068,7 @@ mod tests {
             .route("/", post(runtime_startup_rpc))
             .with_state(RuntimeStartupRpcState {
                 advertise_submission,
-                fail_finalized_head,
+                fail_current_head,
             });
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         format!("http://{address}")
@@ -13885,6 +13916,67 @@ mod tests {
         assert_eq!(client.account_ownership, Some(proof));
     }
 
+    #[rstest]
+    fn account_ownership_startup_accepts_current_order_delegate() {
+        let mut client = test_client();
+        record_instruments_loaded(&mut client);
+        client.restore_order_contexts([]).unwrap();
+        client
+            .startup
+            .record(DeepXExecutionStartupEvidence::RuntimeValidated)
+            .unwrap();
+        let subaccount = client.config.subaccount_id.clone().unwrap();
+        let signer = derive_signer_account_id(&client.credential).unwrap();
+        let signer_address = format!("0x{}", hex::encode(signer));
+        let wallet = format!("0x{}", hex::encode([0x33; 20]));
+        let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.clone()]);
+        let profile = DeepXSubaccountProfile {
+            authority: wallet.clone(),
+            address: subaccount.clone(),
+            name: "test".to_string(),
+            status: "Active".to_string(),
+            spot_positions: Vec::new(),
+            next_order_id: 1,
+            spot_margin_trading_enabled: false,
+            margin_strategy: "Cross".to_string(),
+            height: 1,
+            created_at: 1,
+        };
+        let delegates = DeepXWalletDelegateAccounts::new(
+            wallet.clone(),
+            vec![DeepXDelegateAccount {
+                delegate_address: signer_address.clone(),
+                delegate_name: "test".to_string(),
+                valid_until: 2_000,
+                mode: DeepXDelegateMode::PlaceOrCancelOrder,
+                create_time: 1,
+                active: true,
+            }],
+        );
+        let delegators = DeepXDelegateWallets::new(signer_address, vec![wallet]);
+        let proof = verify_delegated_account_ownership(
+            &client.credential,
+            &subaccount,
+            &directory,
+            &profile,
+            &delegates,
+            &delegators,
+            1_000,
+        )
+        .unwrap();
+
+        client.record_account_ownership_validated(proof).unwrap();
+
+        assert_eq!(client.account_ownership, Some(proof));
+        assert_ne!(proof.wallet(), proof.signer());
+        assert!(
+            client
+                .startup
+                .validate_next(DeepXExecutionStartupEvidence::AccountStreamConfirmed)
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     #[cfg(any())]
     async fn account_stream_startup_accepts_current_subscription() {
@@ -14213,6 +14305,360 @@ mod tests {
                 reduce_only: true,
                 post_only: DeepXPostOnlyParam::MustPostOnly,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_perp_order_lookup_binds_durable_place_without_chain_history() {
+        let mut client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let mut response: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = response["data"]["items"][2].take();
+        order["owner"] = json!(rest_order.owner);
+        order["txHash"] = json!(rest_order.tx_hash);
+        response = json!({ "code": 200, "msg": "success", "fail": false, "data": order });
+        let expected_hash = rest_order.tx_hash.clone();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/internal/v1/account/perp/order-by-tx",
+            get({
+                let gets = Arc::clone(&gets);
+                move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                    let mut response = response.clone();
+                    let expected_hash = expected_hash.clone();
+                    let gets = Arc::clone(&gets);
+                    async move {
+                        assert_eq!(query.len(), 1);
+                        assert_eq!(query["txHash"], expected_hash);
+                        if gets.fetch_add(1, Ordering::Relaxed) == 1 {
+                            response["data"]["owner"] =
+                                json!("0x1111111111111111111111111111111111111111");
+                        }
+                        Json(response)
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let unsigned = DeepXTransactionRecord::created(transaction.identity().clone());
+        assert!(matches!(
+            client
+                .observe_backend_perp_order_for_durable_place(&unsigned)
+                .await,
+            Err(DeepXBackendPerpOrderObservationError::Binding(
+                DeepXPerpOrderEvidenceError::MissingSignedExtrinsic
+            ))
+        ));
+        assert_eq!(gets.load(Ordering::Relaxed), 0);
+
+        let evidence = client
+            .observe_backend_perp_order_for_durable_place(&transaction)
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence.extrinsic_hash(),
+            transaction.signed_extrinsic().unwrap().extrinsic_hash()
+        );
+        assert_eq!(evidence.observed_block_number(), rest_order.height);
+        assert_eq!(gets.load(Ordering::Relaxed), 1);
+
+        assert!(matches!(
+            client
+                .observe_backend_perp_order_for_durable_place(&transaction)
+                .await,
+            Err(DeepXBackendPerpOrderObservationError::Binding(
+                DeepXPerpOrderEvidenceError::OwnerMismatch
+            ))
+        ));
+        assert_eq!(gets.load(Ordering::Relaxed), 2);
+    }
+
+    fn backend_spot_order_fixture() -> (
+        DeepXSpotOrderRecord,
+        DeepXTransactionRecord,
+        DeepXSpotReportMarket,
+    ) {
+        let response: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+        ))
+        .unwrap();
+        let mut record: DeepXSpotOrderRecord =
+            serde_json::from_value(response["data"].clone()).unwrap();
+        let market = DeepXSpotReportMarket {
+            name: record.pair_name.clone(),
+            pair: record.pair.clone(),
+            base_symbol: "ETH".to_string(),
+            quote_symbol: "USDC".to_string(),
+            base_decimal: 18,
+            quote_decimal: 6,
+            is_paused: false,
+            maker_fee_rate: rust_decimal::Decimal::ZERO,
+            taker_fee_rate: rust_decimal::Decimal::ZERO,
+        };
+        let as_u256 = |value: rust_decimal::Decimal, scale| {
+            let raw = u128::try_from(decimal_to_scaled_i128(value, scale).unwrap()).unwrap();
+            let mut bytes = [0_u8; 32];
+            bytes[..16].copy_from_slice(&raw.to_le_bytes());
+            bytes
+        };
+        let nonce = record.order_id.parse().unwrap();
+        let signer = [0x77; 20];
+        let runtime = test_runtime_snapshot().identity().clone();
+        let identity = DeepXTransactionIdentity::new_spot_place(
+            ClientOrderId::new("O-DEEPX-SPOT-REST-EVIDENCE"),
+            signer,
+            InstrumentId::from("ETH-USDC.DEEPX"),
+            OrderSide::Sell,
+            DeepXNonceReservation::TimestampOrderId { value: nonce },
+            DeepXDirectRuntimeIdentity::from(&runtime),
+            DeepXSpotPlaceParams {
+                subaccount: hex::decode_array(record.maker.trim_start_matches("0x")).unwrap(),
+                pair: hex::decode_array(record.pair.trim_start_matches("0x")).unwrap(),
+                is_buy: false,
+                quote_amount: as_u256(record.quote_amount, 6),
+                base_amount: as_u256(record.base_amount, 18),
+                order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+                post_only: DeepXPostOnlyParam::None,
+                reduce_only: false,
+            },
+        );
+        let bytes = vec![16, 2, 3, 4, 5];
+        let extrinsic_hash = BlakeTwo256.hash(&bytes).0;
+        let mut transaction = DeepXTransactionRecord::created_with_submission_scan_checkpoint(
+            identity,
+            DeepXSubmissionScanCheckpoint::new(100, [3; 32]),
+        );
+        transaction
+            .record_signed(&SignedPalletExtrinsic {
+                bytes,
+                extrinsic_hash,
+                signer,
+                nonce,
+                runtime,
+            })
+            .unwrap();
+        transaction
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        record.tx_hash = format!("0x{}", hex::encode(extrinsic_hash));
+        (record, transaction, market)
+    }
+
+    #[rstest]
+    fn backend_spot_order_binds_exact_durable_placement() {
+        let (record, mut transaction, market) = backend_spot_order_fixture();
+        let evidence =
+            verify_backend_spot_order_for_durable_place(&record, &transaction, &market).unwrap();
+        assert_eq!(evidence.order_id(), record.order_id.parse::<u64>().unwrap());
+        assert_eq!(evidence.observed_block_number(), record.block_number);
+        transaction
+            .apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+            .unwrap();
+        let restored = DeepXTransactionRecord::decode(&transaction.encode().unwrap()).unwrap();
+        assert_eq!(
+            restored.lifecycle().state(),
+            DeepXTransactionState::BackendConfirmed
+        );
+        assert_eq!(restored.lifecycle().backend_order(), Some(evidence));
+        assert_eq!(restored.lifecycle().inclusion(), None);
+    }
+
+    #[rstest]
+    #[case("owner")]
+    #[case("pair")]
+    #[case("amount")]
+    #[case("price")]
+    #[case("hash")]
+    fn backend_spot_order_rejects_mismatched_fields(#[case] field: &str) {
+        let (mut record, transaction, market) = backend_spot_order_fixture();
+        match field {
+            "owner" => record.maker = format!("0x{}", "11".repeat(20)),
+            "pair" => record.pair = format!("0x{}", "22".repeat(32)),
+            "amount" => record.base_amount += rust_decimal::Decimal::ONE,
+            "price" => record.price += rust_decimal::Decimal::ONE,
+            "hash" => record.tx_hash = format!("0x{}", "33".repeat(32)),
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_backend_spot_order_for_durable_place(&record, &transaction, &market).is_err()
+        );
+        assert_eq!(
+            transaction.lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+    }
+
+    #[tokio::test]
+    async fn live_spot_backend_order_lookup_waits_for_indexing() {
+        let (record, transaction, market) = backend_spot_order_fixture();
+        let mut response: Value = serde_json::from_str(include_str!(
+            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+        ))
+        .unwrap();
+        response["data"]["txHash"] = json!(record.tx_hash);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/internal/v1/account/spot/order-by-tx",
+            get({
+                let gets = Arc::clone(&gets);
+                move || {
+                    let gets = Arc::clone(&gets);
+                    let response = response.clone();
+                    async move {
+                        if gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                            Json(json!({"code": 10008, "fail": true, "msg": "Order 'order' not found.", "data": null}))
+                        } else {
+                            Json(response)
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let evidence = poll_backend_spot_order_for_durable_place(
+            &http,
+            &transaction,
+            &market,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence.observed_block_number(), record.block_number);
+        assert_eq!(gets.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn live_spot_backend_order_lookup_timeout_keeps_transaction_unconfirmed() {
+        let (_, transaction, market) = backend_spot_order_fixture();
+        let router = Router::new().route(
+            "/internal/v1/account/spot/order-by-tx",
+            get(|| async {
+                Json(json!({"code": 10020, "fail": true, "msg": "not found", "data": null}))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let evidence = poll_backend_spot_order_for_durable_place(
+            &http,
+            &transaction,
+            &market,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert!(evidence.is_none());
+        assert_eq!(
+            transaction.lifecycle().state(),
+            DeepXTransactionState::Submitting
+        );
+    }
+
+    #[tokio::test]
+    async fn live_backend_order_lookup_waits_for_indexing_then_binds_order() {
+        let client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let mut response: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = response["data"]["items"][2].take();
+        order["owner"] = json!(rest_order.owner);
+        order["txHash"] = json!(rest_order.tx_hash);
+        let success = json!({ "code": 200, "msg": "success", "fail": false, "data": order });
+        let gets = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/internal/v1/account/perp/order-by-tx",
+            get({
+                let gets = Arc::clone(&gets);
+                move || {
+                    let gets = Arc::clone(&gets);
+                    let success = success.clone();
+                    async move {
+                        if gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                            Json(json!({"code": 10008, "fail": true, "msg": "Order 'order' not found.", "data": null}))
+                        } else {
+                            Json(success)
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = transaction.identity().instrument_id();
+        let evidence = poll_backend_perp_order_for_durable_place(
+            &http,
+            &transaction,
+            client.perpetual_market_ids[&instrument_id],
+            &client.perpetual_report_metadata[&instrument_id],
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence.observed_block_number(), rest_order.height);
+        assert_eq!(gets.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn live_backend_order_lookup_timeout_keeps_transaction_unconfirmed() {
+        let client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let router = Router::new().route(
+            "/internal/v1/account/perp/order-by-tx",
+            get(|| async {
+                Json(json!({"code": 10020, "fail": true, "msg": "not found", "data": null}))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = transaction.identity().instrument_id();
+        let evidence = poll_backend_perp_order_for_durable_place(
+            &http,
+            &transaction,
+            client.perpetual_market_ids[&instrument_id],
+            &client.perpetual_report_metadata[&instrument_id],
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert!(evidence.is_none());
+        assert_eq!(
+            transaction.lifecycle().state(),
+            DeepXTransactionState::Signed
         );
     }
 
@@ -16252,7 +16698,7 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn mass_reconciliation_selects_verified_operation_observer(
+    async fn mass_reconciliation_routes_placements_to_backend_and_cancels_to_chain_observer(
         #[case] corrupt: bool,
         #[values(0, 1, 2, 3, 4, 5, 6)] operation: u8,
     ) {
@@ -16392,7 +16838,30 @@ mod tests {
             &lease,
         )
         .await;
-        if operation == 6 {
+        if operation <= 2 {
+            let expected = matches!(
+                (operation, &result),
+                (
+                    0,
+                    Err(DeepXMassReconciliationError::BackendPerpOrder(
+                        DeepXBackendPerpOrderObservationError::Binding(
+                            DeepXPerpOrderEvidenceError::UnknownInstrument,
+                        ),
+                    )),
+                ) | (
+                    1 | 2,
+                    Err(DeepXMassReconciliationError::BackendSpotOrder(
+                        DeepXBackendSpotOrderObservationError::Mismatch("catalog market"),
+                    )),
+                )
+            );
+            assert!(expected, "unexpected placement recovery result: {result:?}");
+            assert_eq!(store.current_revision(), 4);
+            assert_eq!(
+                store.persisted_record().lifecycle().state(),
+                DeepXTransactionState::NotIncluded
+            );
+        } else if operation == 6 {
             assert!(matches!(result, Err(DeepXMassReconciliationError::FinalizedRecovery(
                 DeepXFinalizedRecoveryCommitError::Watch(DeepXTransactionWatchError::SpotEventVerification(
                     crate::transaction::DeepXSpotCancelEventVerificationError::FastCancelUnsupported
@@ -17332,7 +17801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_order_report_generation_uses_validated_catalog_and_rest_record() {
+    async fn direct_pallet_tracked_order_report_uses_validated_rest_record() {
         const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
         let mut fixture: Value =
             serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
@@ -17388,7 +17857,6 @@ mod tests {
             ..Default::default()
         };
         let mut client = DeepXExecutionClient::new(core, config).unwrap();
-        client.config.execution_backend = DeepXExecutionBackend::LegacyEvm;
         let mut provider = DeepXMarketProvider::new(client.http.clone());
         provider.load_all().await.unwrap();
         client.record_instruments_loaded(&provider).unwrap();
@@ -17497,14 +17965,10 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
-        let mut block_timestamps = HashMap::new();
         let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &client.http,
             client.core.account_id,
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -17759,14 +18223,10 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
-        let mut block_timestamps = HashMap::new();
         let error = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &client.http,
             client.core.account_id,
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -17873,15 +18333,11 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
 
-        let mut block_timestamps = HashMap::new();
         let mut remaining_pages = 1;
         let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -17972,14 +18428,10 @@ mod tests {
             maker_fee_rate: rust_decimal::Decimal::ZERO,
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
-        let mut block_timestamps = HashMap::new();
         let report = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -18005,9 +18457,6 @@ mod tests {
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -18029,9 +18478,6 @@ mod tests {
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -18054,9 +18500,6 @@ mod tests {
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            None,
-            None,
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -18075,53 +18518,20 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn finalized_spot_order_validation_fails_before_requiring_instrument_cache() {
-        let (client, cache) = test_client_with_cache();
-        let _borrow = cache.borrow_mut();
-        let market = DeepXSpotReportMarket {
-            name: "ETH/USDC".to_string(),
-            pair: format!("0x{}", "11".repeat(32)),
-            base_symbol: "ETH".to_string(),
-            quote_symbol: "USDC".to_string(),
-            base_decimal: 18,
-            quote_decimal: 6,
-            is_paused: false,
-            maker_fee_rate: rust_decimal::Decimal::ZERO,
-            taker_fee_rate: rust_decimal::Decimal::ZERO,
-        };
-
-        let error = client
-            .validate_owned_finalized_spot_order_records(&market, &[], true)
-            .now_or_never()
-            .expect("empty validation must complete before suspension")
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "DeepX transaction runtime has not been initialized"
-        );
-    }
-
     #[rstest]
     #[case(TimeInForce::Gtc, "UserCanceled", false, false)]
     #[case(TimeInForce::Ioc, "IocUnfilled", false, false)]
     #[case(TimeInForce::Ioc, "IocUnfilled", true, false)]
     #[case(TimeInForce::Gtc, "IocUnfilled", false, true)]
     #[tokio::test]
-    async fn tracked_spot_canceled_report_uses_finalized_cancel_block_time(
+    async fn tracked_spot_canceled_report_uses_backend_status_observation_time(
         #[case] time_in_force: TimeInForce,
         #[case] cancel_reason: &str,
         #[case] partially_filled: bool,
         #[case] conflicts_with_context: bool,
     ) {
         let cancel_height = 188_574_100u32;
-        let cancel_timestamp_ms = 1_800_000_000_123u64;
-        let genesis_hash =
-            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
-        let canceled_hash = format!("0x{}", "11".repeat(32));
-        let finalized_hash = format!("0x{}", "22".repeat(32));
-        let router = Router::new()
-            .route(
+        let router = Router::new().route(
                 "/internal/v1/account/spot/trades",
                 get(|| async {
                     Json(json!({
@@ -18148,85 +18558,10 @@ mod tests {
                         "fail": false,
                     }))
                 }),
-            )
-            .route(
-                "/",
-                post({
-                let canceled_hash = canceled_hash.clone();
-                let finalized_hash = finalized_hash.clone();
-                move |Json(request): Json<Value>| {
-                    let canceled_hash = canceled_hash.clone();
-                    let finalized_hash = finalized_hash.clone();
-                    async move {
-                        let result = match request["method"].as_str().unwrap() {
-                            "rpc_methods" => json!({
-                                "methods": [
-                                    "author_pendingExtrinsics",
-                                    "author_submitExtrinsic",
-                                    "chain_getBlock",
-                                    "chain_getBlockHash",
-                                    "chain_getFinalizedHead",
-                                    "chain_getHeader",
-                                    "eth_call",
-                                    "state_getStorage",
-                                    "state_queryStorageAt",
-                                    "state_call",
-                                ],
-                            }),
-                            "chain_getFinalizedHead" => json!(finalized_hash),
-                            "chain_getHeader" => {
-                                if request["params"][0] == finalized_hash {
-                                    json!({"number": format!("0x{:x}", cancel_height + 100)})
-                                } else {
-                                    json!({"number": format!("0x{cancel_height:x}")})
-                                }
-                            }
-                            "chain_getBlockHash" => {
-                                assert_eq!(request["params"][0], cancel_height);
-                                json!(canceled_hash)
-                            }
-                            "state_getStorage" => json!(format!(
-                                "0x{}",
-                                hex::encode(cancel_timestamp_ms.to_le_bytes())
-                            )),
-                            method => panic!("unexpected cancellation-time RPC method {method}"),
-                        };
-                        Json(json!({
-                            "jsonrpc": "2.0",
-                            "id": request["id"],
-                            "result": result,
-                        }))
-                    }
-                }
-                }),
             );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let rpc_url = format!("http://{address}");
-        let network = crate::config::DeepXNetworkConfig {
-            base_url_rpc_submission: Some(rpc_url.clone()),
-            base_url_rpc_watch: Some(rpc_url.clone()),
-            base_url_rpc_recovery: Some(rpc_url.clone()),
-            ..Default::default()
-        };
-        let endpoints = validate_rpc_endpoint_identities(
-            &network,
-            [
-                DeepXObservedRpcEndpoint::new(
-                    DeepXRpcRole::Submission,
-                    rpc_url.clone(),
-                    genesis_hash,
-                ),
-                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, rpc_url.clone(), genesis_hash),
-                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, rpc_url, genesis_hash),
-            ],
-        )
-        .unwrap();
-        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
-            .await
-            .unwrap();
-
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
             "../test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
@@ -18271,15 +18606,11 @@ mod tests {
             taker_fee_rate: rust_decimal::Decimal::ZERO,
         };
         let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
-        let mut block_timestamps = HashMap::new();
-
+        let observed_before = get_atomic_clock_realtime().get_time_ns();
         let result = DeepXExecutionClient::build_tracked_spot_order_status_report(
             &http,
             AccountId::from("DEEPX-001"),
             TEST_SUBACCOUNT,
-            Some(&endpoints),
-            Some(&capabilities),
-            &mut block_timestamps,
             DeepXTrackedSpotReportInput {
                 record: &record,
                 market: &market,
@@ -18290,6 +18621,7 @@ mod tests {
             },
         )
         .await;
+        let observed_after = get_atomic_clock_realtime().get_time_ns();
         if conflicts_with_context {
             assert_eq!(
                 result.unwrap_err().to_string(),
@@ -18311,14 +18643,30 @@ mod tests {
                 rust_decimal::Decimal::ZERO
             }
         );
-        assert_eq!(
-            report.ts_last,
-            UnixNanos::from(cancel_timestamp_ms * 1_000_000)
-        );
-        assert_eq!(
-            block_timestamps.get(&cancel_height),
-            Some(&cancel_timestamp_ms)
-        );
+        assert!(report.ts_last >= observed_before);
+        assert!(report.ts_last <= observed_after);
+        if time_in_force == TimeInForce::Gtc {
+            record.cancel_height = Some(record.block_number - 1);
+            let error = DeepXExecutionClient::build_tracked_spot_order_status_report(
+                &http,
+                AccountId::from("DEEPX-001"),
+                TEST_SUBACCOUNT,
+                DeepXTrackedSpotReportInput {
+                    record: &record,
+                    market: &market,
+                    venue_order_id: VenueOrderId::from(record.order_id.as_str()),
+                    context: OrderContext::from(&order),
+                    ts_init: UnixNanos::from(123_456_789),
+                    remaining_pages: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "DeepX Spot cancellation block precedes order creation"
+            );
+        }
         server.abort();
     }
 
@@ -18449,7 +18797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_order_reports_require_finalized_runtime_evidence() {
+    async fn direct_order_reports_use_backend_without_historical_rpc() {
         let fixture: Value = serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
         let mut open_order = fixture["data"]["items"][2].clone();
         open_order["status"] = "Open".into();
@@ -18463,6 +18811,14 @@ mod tests {
         history_response["data"]["items"] = json!([]);
         let mut client = order_reports_test_client(open_response, history_response).await;
         client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
+        let tracked = tracked_limit_order();
+        client.register_order(&tracked).unwrap();
+        client
+            .bind_tracked_venue_order_id(
+                tracked.client_order_id(),
+                VenueOrderId::from("1789445053841"),
+            )
+            .unwrap();
         let command = GenerateOrderStatusReports::new(
             UUID4::new(),
             UnixNanos::default(),
@@ -18474,14 +18830,13 @@ mod tests {
             None,
         );
 
-        let error = ExecutionClient::generate_order_status_reports(&client, &command)
+        let reports = ExecutionClient::generate_order_status_reports(&client, &command)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "DeepX transaction runtime has not been initialized"
-        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].client_order_id, Some(tracked.client_order_id()));
+        assert_eq!(reports[0].order_status, OrderStatus::Accepted);
     }
 
     #[tokio::test]
@@ -18776,9 +19131,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_report_generation_converts_only_current_open_lifecycle() {
+    async fn direct_position_reports_use_current_backend_lifecycle() {
         let response = serde_json::from_str(PERP_POSITIONS_ACCOUNT_RESPONSE).unwrap();
-        let client = position_report_test_client(response).await;
+        let mut client = position_report_test_client(response).await;
+        client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
         let instrument_id = InstrumentId::from("ETH-USDC-PERP.DEEPX");
         let ts_init = UnixNanos::from(123_456_789);
         let command = GeneratePositionStatusReports::new(
@@ -19379,28 +19735,6 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn spot_fill_report_rejects_exhausted_finalized_block_budget_before_rpc() {
-        let response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
-        ))
-        .unwrap();
-        let record: DeepXSpotAccountTradeRecord =
-            serde_json::from_value(response["data"]["items"][2].clone()).unwrap();
-        let client = test_client();
-        let mut remaining_blocks = 0;
-
-        let error = client
-            .verify_owned_finalized_spot_fill_records(&[record], &mut remaining_blocks)
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "DeepX Spot fill report finalized block budget exceeded",
-        );
-    }
-
     #[rstest]
     #[case(false)]
     #[case(true)]
@@ -19540,7 +19874,6 @@ mod tests {
                 None,
             );
             let mut remaining_pages = 1;
-            let mut remaining_blocks = FILL_REPORT_MAX_FINALIZED_BLOCKS;
             let market = client.spot_report_markets.get(&instrument_id).unwrap();
             let error = client
                 .collect_spot_fill_reports_for_market(
@@ -19549,7 +19882,6 @@ mod tests {
                     market,
                     &budget_cmd,
                     &mut remaining_pages,
-                    &mut remaining_blocks,
                 )
                 .await
                 .unwrap_err();
@@ -19569,13 +19901,11 @@ mod tests {
             None,
             None,
         );
-        let error = ExecutionClient::generate_fill_reports(&client, command)
+        let direct_reports = ExecutionClient::generate_fill_reports(&client, command)
             .await
-            .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<DeepXExecutionStartupError>(),
-            Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
-        ));
+            .unwrap();
+        assert_eq!(direct_reports.len(), 1);
+        assert_eq!(direct_reports[0].trade_id, reports[0].trade_id);
         if all_markets {
             let unfiltered = GenerateFillReports::new(
                 UUID4::new(),
@@ -19587,13 +19917,11 @@ mod tests {
                 None,
                 None,
             );
-            let error = ExecutionClient::generate_fill_reports(&client, unfiltered)
+            let direct_reports = ExecutionClient::generate_fill_reports(&client, unfiltered)
                 .await
-                .unwrap_err();
-            assert!(matches!(
-                error.downcast_ref::<DeepXExecutionStartupError>(),
-                Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
-            ));
+                .unwrap();
+            assert_eq!(direct_reports.len(), 1);
+            assert_eq!(direct_reports[0].trade_id, reports[0].trade_id);
         }
         server.abort();
     }
@@ -19633,7 +19961,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_pallet_fill_reports_require_finalized_rpc_evidence() {
+    async fn direct_pallet_fill_reports_use_backend_without_historical_rpc() {
         let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
         let mut client = fill_report_test_client(response).await;
         client.config.execution_backend = DeepXExecutionBackend::DirectPallet;
@@ -19648,14 +19976,12 @@ mod tests {
             None,
         );
 
-        let error = ExecutionClient::generate_fill_reports(&client, command)
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error.downcast_ref::<DeepXExecutionStartupError>(),
-            Some(DeepXExecutionStartupError::RuntimeRpcEvidenceUnavailable),
-        ));
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].trade_id, TradeId::from("185969410000051"));
     }
 
     #[tokio::test]

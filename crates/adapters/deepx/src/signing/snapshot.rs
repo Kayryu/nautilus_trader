@@ -34,17 +34,22 @@ use thiserror::Error;
 use super::DeepXRuntimeConfig;
 use crate::common::DeepXEnvironment;
 
-const TESTNET_MIN_SPEC_VERSION: u32 = 376;
 const TESTNET_SPEC_376_GENESIS_HASH: &str =
     "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
+#[cfg(test)]
+const TESTNET_MIN_SPEC_VERSION: u32 = 376;
+#[cfg(test)]
 const TESTNET_SPEC_376_METADATA_SHA256: &str =
     "57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447";
+#[cfg(test)]
 const TESTNET_TRANSACTION_VERSION: u32 = 1;
+#[cfg(test)]
 const TESTNET_SPEC_376_METADATA_RESPONSE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/test_data/runtime/testnet/",
     "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
 ));
+#[cfg(test)]
 const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckNonZeroSender",
     "CheckSpecVersion",
@@ -57,17 +62,10 @@ const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "CheckPriority",
 ];
 
-#[derive(Clone, Copy)]
-struct ApprovedTestnetRuntime {
-    genesis_hash: &'static str,
-    metadata_sha256: &'static str,
-    signed_extensions: &'static [&'static str],
-}
-
-/// Runtime identity approved by the captured DeepX testnet fixture set.
+/// Runtime identity validated against the DeepX testnet genesis and observed metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovedRuntimeIdentity {
-    /// DeepX deployment associated with the fixture set.
+    /// DeepX deployment associated with the observed runtime.
     pub environment: DeepXEnvironment,
     /// Testnet genesis hash.
     pub genesis_hash: [u8; 32],
@@ -96,15 +94,9 @@ pub enum SnapshotError {
     /// The built-in approved metadata fixture cannot be decoded.
     #[error("invalid built-in DeepX runtime metadata")]
     InvalidBuiltInMetadata,
-    /// The metadata does not match the approved testnet SHA-256.
-    #[error("DeepX runtime metadata hash is not approved")]
-    MetadataHashMismatch,
-    /// The observed deployment or runtime version differs from the approved fixture.
-    #[error("DeepX genesis or runtime version is not approved")]
+    /// The observed genesis is not testnet or a runtime version is zero.
+    #[error("invalid DeepX genesis or runtime version")]
     RuntimeIdentityMismatch,
-    /// The signed-extension sequence differs from the approved fixture.
-    #[error("DeepX runtime signed-extension sequence is not approved")]
-    SignedExtensionsMismatch,
     /// An unknown non-empty transaction extension would make signing ambiguous.
     #[error("unsupported non-empty DeepX transaction extension: {0}")]
     UnsupportedTransactionExtension(String),
@@ -696,12 +688,12 @@ impl RuntimeSnapshot {
         }
     }
 
-    /// Builds a runtime identity currently approved for DeepX testnet signing.
+    /// Builds a signing runtime from metadata observed on the DeepX testnet chain.
     ///
     /// # Errors
     ///
-    /// Returns an error unless the observed genesis, runtime versions, metadata hash, extension
-    /// order, and extension encodings match the captured finalized fixture.
+    /// Returns an error for another genesis, invalid metadata, zero runtime versions, or
+    /// unsupported signing extensions.
     pub fn approved_testnet(
         environment: &DeepXEnvironment,
         observed_genesis_hash: [u8; 32],
@@ -709,21 +701,40 @@ impl RuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let approved_runtime = approved_testnet_runtime(observed_spec_version)?;
-        let (identity, interfaces, metadata) = validate_testnet_runtime_snapshot(
+        Self::observed_testnet(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-            approved_runtime,
+        )
+    }
+
+    /// Builds a signing runtime from metadata observed on the configured testnet chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another genesis, invalid metadata or unsupported signing extensions.
+    pub(crate) fn observed_testnet(
+        environment: &DeepXEnvironment,
+        observed_genesis_hash: [u8; 32],
+        observed_spec_version: u32,
+        observed_transaction_version: u32,
+        metadata_bytes: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        let (identity, interfaces, metadata) = validate_observed_testnet_runtime(
+            environment,
+            observed_genesis_hash,
+            observed_spec_version,
+            observed_transaction_version,
+            metadata_bytes,
         )?;
         let client_state = ClientState {
             metadata,
             genesis_hash: H256::from(identity.genesis_hash),
             runtime_version: RuntimeVersion {
-                spec_version: observed_spec_version,
-                transaction_version: TESTNET_TRANSACTION_VERSION,
+                spec_version: identity.spec_version,
+                transaction_version: identity.transaction_version,
             },
         };
 
@@ -740,6 +751,7 @@ impl RuntimeSnapshot {
     ///
     /// Returns an error when the built-in fixture fails identity, integrity, or interface
     /// validation.
+    #[cfg(test)]
     pub(crate) fn built_in_testnet() -> Result<Self, SnapshotError> {
         Self::approved_testnet(
             &DeepXEnvironment::Testnet,
@@ -750,7 +762,7 @@ impl RuntimeSnapshot {
         )
     }
 
-    /// Returns the approved identity associated with this snapshot.
+    /// Returns the validated runtime identity associated with this snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
         &self.identity
@@ -772,27 +784,24 @@ impl RuntimeSnapshot {
 }
 
 impl DeepXReadOnlyRuntimeSnapshot {
-    /// Builds a fixture-approved DeepX testnet snapshot which cannot authorize signing.
+    /// Builds a read-only runtime from metadata observed on the configured testnet chain.
     ///
     /// # Errors
     ///
-    /// Returns an error unless the observed genesis, runtime versions, metadata hash, extension
-    /// order, and extension encodings match a captured finalized read-only fixture.
-    pub fn approved_testnet(
+    /// Returns an error for another genesis, invalid metadata or unsupported extensions.
+    pub(crate) fn observed_testnet(
         environment: &DeepXEnvironment,
         observed_genesis_hash: [u8; 32],
         observed_spec_version: u32,
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let approved_runtime = approved_testnet_runtime(observed_spec_version)?;
-        let (identity, interfaces, metadata) = validate_testnet_runtime_snapshot(
+        let (identity, interfaces, metadata) = validate_observed_testnet_runtime(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-            approved_runtime,
         )?;
         Ok(Self {
             identity,
@@ -801,12 +810,35 @@ impl DeepXReadOnlyRuntimeSnapshot {
         })
     }
 
+    /// Builds a read-only runtime from observed DeepX testnet metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for another genesis, invalid metadata, zero runtime versions, or
+    /// unsupported extensions.
+    pub fn approved_testnet(
+        environment: &DeepXEnvironment,
+        observed_genesis_hash: [u8; 32],
+        observed_spec_version: u32,
+        observed_transaction_version: u32,
+        metadata_bytes: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        Self::observed_testnet(
+            environment,
+            observed_genesis_hash,
+            observed_spec_version,
+            observed_transaction_version,
+            metadata_bytes,
+        )
+    }
+
     /// Builds the approved DeepX testnet read-only runtime from built-in metadata.
     ///
     /// # Errors
     ///
     /// Returns an error when the built-in fixture fails identity, integrity, or interface
     /// validation.
+    #[cfg(test)]
     pub(crate) fn built_in_testnet() -> Result<Self, SnapshotError> {
         Self::approved_testnet(
             &DeepXEnvironment::Testnet,
@@ -817,7 +849,7 @@ impl DeepXReadOnlyRuntimeSnapshot {
         )
     }
 
-    /// Returns the fixture-approved identity associated with this read-only snapshot.
+    /// Returns the validated runtime identity associated with this read-only snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
         &self.identity
@@ -834,25 +866,12 @@ impl DeepXReadOnlyRuntimeSnapshot {
     }
 }
 
-fn approved_testnet_runtime(spec_version: u32) -> Result<ApprovedTestnetRuntime, SnapshotError> {
-    if spec_version < TESTNET_MIN_SPEC_VERSION {
-        return Err(SnapshotError::RuntimeIdentityMismatch);
-    }
-
-    Ok(ApprovedTestnetRuntime {
-        genesis_hash: TESTNET_SPEC_376_GENESIS_HASH,
-        metadata_sha256: TESTNET_SPEC_376_METADATA_SHA256,
-        signed_extensions: TESTNET_SPEC_376_SIGNED_EXTENSIONS,
-    })
-}
-
-fn validate_testnet_runtime_snapshot(
+fn validate_observed_testnet_runtime(
     environment: &DeepXEnvironment,
     observed_genesis_hash: [u8; 32],
     observed_spec_version: u32,
     observed_transaction_version: u32,
     metadata_bytes: &[u8],
-    approved_runtime: ApprovedTestnetRuntime,
 ) -> Result<
     (
         ApprovedRuntimeIdentity,
@@ -866,38 +885,29 @@ fn validate_testnet_runtime_snapshot(
             environment.to_string(),
         ));
     }
-    let genesis_hash = decode_32(approved_runtime.genesis_hash)?;
-    if observed_genesis_hash != genesis_hash
-        || observed_transaction_version != TESTNET_TRANSACTION_VERSION
+    if observed_genesis_hash != decode_32(TESTNET_SPEC_376_GENESIS_HASH)?
+        || observed_spec_version == 0
+        || observed_transaction_version == 0
     {
         return Err(SnapshotError::RuntimeIdentityMismatch);
     }
-    let approved_metadata_hash = decode_32(approved_runtime.metadata_sha256)?;
-    let actual_metadata_hash: [u8; 32] = digest(&SHA256, metadata_bytes)
-        .as_ref()
-        .try_into()
-        .map_err(|_| SnapshotError::InvalidApprovedIdentity)?;
-    if actual_metadata_hash != approved_metadata_hash {
-        return Err(SnapshotError::MetadataHashMismatch);
-    }
 
     let metadata = metadata::decode_from(metadata_bytes)?;
+    validate_unknown_extensions(&metadata)?;
     let signed_extensions = metadata
         .extrinsic()
         .transaction_extensions_to_use_for_encoding()
         .map(|extension| extension.identifier().to_string())
-        .collect::<Vec<_>>();
-    if signed_extensions != approved_runtime.signed_extensions {
-        return Err(SnapshotError::SignedExtensionsMismatch);
-    }
-    validate_unknown_extensions(&metadata)?;
+        .collect();
+    let mut metadata_sha256 = [0; 32];
+    metadata_sha256.copy_from_slice(digest(&SHA256, metadata_bytes).as_ref());
     let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata)?;
     let identity = ApprovedRuntimeIdentity {
         environment: environment.clone(),
-        genesis_hash,
-        metadata_sha256: actual_metadata_hash,
+        genesis_hash: observed_genesis_hash,
+        metadata_sha256,
         spec_version: observed_spec_version,
-        transaction_version: TESTNET_TRANSACTION_VERSION,
+        transaction_version: observed_transaction_version,
         signed_extensions,
     };
 
@@ -979,6 +989,7 @@ fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
     hex::decode_array(value).map_err(|_| SnapshotError::InvalidApprovedIdentity)
 }
 
+#[cfg(test)]
 fn built_in_testnet_metadata() -> Result<Vec<u8>, SnapshotError> {
     let response: serde_json::Value = serde_json::from_str(TESTNET_SPEC_376_METADATA_RESPONSE)
         .map_err(|_| SnapshotError::InvalidBuiltInMetadata)?;
@@ -1057,10 +1068,11 @@ mod tests {
     }
 
     #[rstest]
+    #[case(365)]
     #[case(376)]
     #[case(377)]
     #[case(u32::MAX)]
-    fn signing_policy_approves_spec_376_and_later(#[case] spec_version: u32) {
+    fn testnet_signing_accepts_observed_runtime_versions(#[case] spec_version: u32) {
         let metadata = spec_376_metadata_bytes();
         let genesis = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
 
@@ -1081,28 +1093,53 @@ mod tests {
     }
 
     #[rstest]
-    #[case(365)]
-    #[case(366)]
-    #[case(367)]
-    #[case(368)]
-    #[case(369)]
-    #[case(370)]
-    #[case(371)]
-    #[case(372)]
-    #[case(375)]
-    fn signing_policy_rejects_versions_before_376(#[case] spec_version: u32) {
-        assert!(matches!(
-            approved_testnet_runtime(spec_version),
-            Err(SnapshotError::RuntimeIdentityMismatch),
-        ));
+    fn public_testnet_constructors_accept_valid_metadata_without_a_fixture_hash() {
+        let fixture = spec_376_metadata_bytes();
+        let mut input = fixture.as_slice();
+        let mut decoded = RuntimeMetadataPrefixed::decode(&mut input).unwrap();
+        let RuntimeMetadata::V14(metadata) = &mut decoded.1 else {
+            panic!("Expected V14 fixture metadata");
+        };
+        metadata
+            .pallets
+            .iter_mut()
+            .find_map(|pallet| pallet.constants.first_mut())
+            .unwrap()
+            .docs
+            .push("Updated runtime documentation".to_string());
+        let changed = decoded.encode();
+        let genesis = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
+
+        let signing = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis,
+            377,
+            2,
+            &changed,
+        )
+        .unwrap();
+        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis,
+            377,
+            2,
+            &changed,
+        )
+        .unwrap();
+
+        assert_ne!(
+            signing.identity().metadata_sha256,
+            decode_32(TESTNET_SPEC_376_METADATA_SHA256).unwrap()
+        );
+        assert_eq!(signing.identity(), read_only.identity());
+        assert_eq!(signing.identity().spec_version, 377);
+        assert_eq!(signing.identity().transaction_version, 2);
     }
 
     #[rstest]
-    fn spec_376_read_only_approval_rejects_identity_drift() {
+    fn read_only_runtime_rejects_invalid_identity_and_metadata() {
         let genesis_hash = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
         let metadata = spec_376_metadata_bytes();
-        let mut changed_metadata = metadata.clone();
-        changed_metadata[100] ^= 1;
 
         for result in [
             DeepXReadOnlyRuntimeSnapshot::approved_testnet(
@@ -1115,7 +1152,7 @@ mod tests {
             DeepXReadOnlyRuntimeSnapshot::approved_testnet(
                 &DeepXEnvironment::Testnet,
                 genesis_hash,
-                375,
+                0,
                 TESTNET_TRANSACTION_VERSION,
                 &metadata,
             ),
@@ -1123,7 +1160,7 @@ mod tests {
                 &DeepXEnvironment::Testnet,
                 genesis_hash,
                 376,
-                2,
+                0,
                 &metadata,
             ),
         ] {
@@ -1138,9 +1175,9 @@ mod tests {
                 genesis_hash,
                 376,
                 TESTNET_TRANSACTION_VERSION,
-                &changed_metadata,
+                &metadata[..metadata.len() / 2],
             ),
-            Err(SnapshotError::MetadataHashMismatch),
+            Err(SnapshotError::InvalidMetadata(_)),
         ));
     }
 
@@ -1724,9 +1761,8 @@ mod tests {
     }
 
     #[rstest]
-    fn rejects_metadata_outside_the_approved_fixture_identity() {
-        let mut bytes = spec_376_metadata_bytes();
-        bytes[100] ^= 1;
+    fn rejects_malformed_observed_metadata() {
+        let bytes = spec_376_metadata_bytes();
 
         assert!(matches!(
             DeepXReadOnlyRuntimeSnapshot::approved_testnet(
@@ -1734,19 +1770,71 @@ mod tests {
                 decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
                 376,
                 TESTNET_TRANSACTION_VERSION,
-                &bytes,
+                &bytes[..bytes.len() / 2],
             ),
-            Err(SnapshotError::MetadataHashMismatch),
+            Err(SnapshotError::InvalidMetadata(_)),
         ));
     }
 
     #[rstest]
-    fn rejects_runtime_versions_outside_the_approved_fixture_identity() {
+    fn observed_runtime_accepts_new_spec_without_a_metadata_allowlist() {
+        let genesis = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
+        let metadata = spec_376_metadata_bytes();
+        let snapshot = RuntimeSnapshot::observed_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis,
+            377,
+            2,
+            &metadata,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.identity().genesis_hash, genesis);
+        assert_eq!(snapshot.identity().spec_version, 377);
+        assert_eq!(snapshot.identity().transaction_version, 2);
+        assert_eq!(snapshot.client_state().runtime_version.spec_version, 377);
+        assert_eq!(
+            snapshot.client_state().runtime_version.transaction_version,
+            2
+        );
+        assert_eq!(snapshot.identity().metadata_sha256, {
+            let mut hash = [0; 32];
+            hash.copy_from_slice(digest(&SHA256, &metadata).as_ref());
+            hash
+        });
+        let read_only = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis,
+            377,
+            2,
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(read_only.identity(), snapshot.identity());
+        assert_eq!(read_only.interfaces(), snapshot.interfaces());
+    }
+
+    #[rstest]
+    fn observed_runtime_rejects_another_genesis() {
+        assert!(matches!(
+            RuntimeSnapshot::observed_testnet(
+                &DeepXEnvironment::Testnet,
+                [0; 32],
+                377,
+                1,
+                &spec_376_metadata_bytes(),
+            ),
+            Err(SnapshotError::RuntimeIdentityMismatch),
+        ));
+    }
+
+    #[rstest]
+    fn rejects_zero_runtime_version() {
         assert!(matches!(
             RuntimeSnapshot::approved_testnet(
                 &DeepXEnvironment::Testnet,
                 decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
-                372,
+                0,
                 TESTNET_TRANSACTION_VERSION,
                 &spec_376_metadata_bytes(),
             ),

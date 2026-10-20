@@ -509,8 +509,40 @@ impl<'r> FromRow<'r, PgRow> for OrderModifyRejectedRow {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderPendingCancelRow {
-    fn from_row(_row: &'r PgRow) -> Result<Self, sqlx::Error> {
-        todo!()
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
+        let trader_id = row.try_get::<&str, _>("trader_id").map(TraderId::from)?;
+        let strategy_id = row
+            .try_get::<&str, _>("strategy_id")
+            .map(StrategyId::from)?;
+        let instrument_id = row
+            .try_get::<&str, _>("instrument_id")
+            .map(InstrumentId::from)?;
+        let client_order_id = row
+            .try_get::<&str, _>("client_order_id")
+            .map(ClientOrderId::from)?;
+        let account_id = row
+            .try_get::<Option<&str>, _>("account_id")?
+            .map(AccountId::from);
+        let event_id = row.try_get::<&str, _>("id").map(UUID4::from)?;
+        let ts_event = row.try_get::<&str, _>("ts_event").map(UnixNanos::from)?;
+        let ts_init = row.try_get::<&str, _>("ts_init").map(UnixNanos::from)?;
+        let reconciliation = row.try_get::<bool, _>("reconciliation")?;
+        let venue_order_id = row
+            .try_get::<Option<&str>, _>("venue_order_id")?
+            .map(VenueOrderId::from);
+        let order_event = OrderPendingCancel::new(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            account_id,
+            event_id,
+            ts_event,
+            ts_init,
+            reconciliation,
+            venue_order_id,
+        );
+        Ok(Self(order_event))
     }
 }
 

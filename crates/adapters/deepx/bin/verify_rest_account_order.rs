@@ -84,10 +84,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!(
-        "DeepX account order verified owner={} market_id={} order_id={} tx_hash={} tx_hash_type={} side={} type={} status={} size={} filled={} remaining={} created_at={} updated_at={}",
+        "DeepX account order verified owner={} market_id={} order_id={} height={} tx_hash={} tx_hash_type={} side={} type={} status={} size={} filled={} remaining={} created_at={} updated_at={}",
         order.owner,
         order.market_id,
         order.order_id,
+        order.height,
         order.tx_hash,
         order.tx_hash_type,
         if order.is_long { "buy" } else { "sell" },

@@ -95,16 +95,28 @@ def test_rejects_missing_or_ambiguous_subaccount(
 def test_account_candidate_rejects_observed_exposure() -> None:
     """Stop before execution startup when the public snapshot already shows exposure."""
 
-    def account(status: str, margin: str, borrowed: str) -> SimpleNamespace:
+    def account(
+        status: str,
+        margin: str,
+        borrowed: str,
+        exact_margin: str | None = "0",
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             profile=SimpleNamespace(address=ADDRESSES[0], status=status),
-            margin_ratio=SimpleNamespace(margin_required=margin),
+            margin_ratio=SimpleNamespace(
+                margin_required=margin,
+                exact_maintenance_margin_required=exact_margin,
+            ),
             balances=SimpleNamespace(assets=[SimpleNamespace(balance_borrowed=borrowed)]),
         )
 
     check_account_candidate(ADDRESSES[0], [account("Active", "0", "0")])
     with pytest.raises(ValueError, match="nonzero margin"):
         check_account_candidate(ADDRESSES[0], [account("Active", "99.64", "0")])
+    with pytest.raises(ValueError, match="no exact margin"):
+        check_account_candidate(ADDRESSES[0], [account("Active", "0", "0", None)])
+    with pytest.raises(ValueError, match="nonzero margin"):
+        check_account_candidate(ADDRESSES[0], [account("Active", "0", "0", "0.00000001")])
     with pytest.raises(ValueError, match="outstanding borrowing"):
         check_account_candidate(ADDRESSES[0], [account("Active", "0", "1")])
     with pytest.raises(ValueError, match="not active"):

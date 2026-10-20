@@ -62,8 +62,8 @@ amount values are converted from the node's fixed atomic scales and must match t
 instrument's precision and increments exactly. The node payload has no exchange timestamp or
 sequence, so event and initialization timestamps use local receive time and the adapter assigns a
 local monotonically increasing sequence. A disconnect clears the framework book before bounded
-reconnection; publication resumes only after a new full snapshot. Spot instruments still require
-finalized Watch RPC metadata evidence; book subscription itself does not submit Spot orders.
+reconnection; publication resumes only after a new full snapshot. Spot instrument constraints are
+read at one current, hash-pinned Watch block; book subscription itself does not submit Spot orders.
 Closing the framework data receiver stops an idle Spot book task and retires its subscription.
 `request_book_depth` returns one correlated current Spot snapshot from a separate Watch RPC
 subscription. It requests one to ten levels (default ten), preserves actual node order counts, and
@@ -209,14 +209,28 @@ This opt-in boundary does not activate framework trading commands.
 `get_rest_transaction_status` reads one already-submitted hash from the primary backend, and
 `poll_rest_transaction_status` adds explicit attempt, interval, deadline, and cancellation limits.
 Neither follows redirects, performs hidden retries, switches backends, or resubmits an extrinsic.
-Only pending observations and retryable idempotent-read failures continue polling. Best-chain
-results, decode failures, invalid hashes/schema, and nonretryable errors stop; interruptions retain
-the last valid observation. Backend not-found (`10020`) never proves non-delivery or non-inclusion.
+Only pending observations, backend lookup lag (`10020`), and retryable idempotent-read failures
+continue polling. Best-chain results, decode failures, invalid hashes/schema, and other
+nonretryable errors stop; interruptions retain the last valid observation. Backend not-found
+(`10020`) never proves non-delivery or non-inclusion.
 Order IDs are exact decimal `u64` values, with empty/absent IDs retained as `None`; the raw JSON
 preserves uninterpreted fields and numeric lexemes. These observations cannot finalize records or
 emit order success by themselves. Nine operation-variant tests exercise durable acceptance followed
 by pending/best polling while leaving the durable record at Accepted. Automatic execution-client
 polling remains unwired, and successful live backend status responses have not been verified.
+For the specified wallet's extrinsic
+`0x1c043fa52b71f963d57402c539051dfb347404d7498d5055640258ce63467dd5`, a read-only
+testnet query returned `10020` from `/chain/tx/status`, while `/account/perp/order-by-tx`
+returned that exact hash, owner `0xa4676ec9a5600686234b8d9d413d04bc2d8fda70`, and height
+`20930726`. The order response can locate a candidate block, but it does not prove finality or
+allow nonce reuse. The public Watch RPC returned that block's hash but not its body, so the
+existing finalized transaction-location observer could not verify the historical extrinsic.
+On 2026-10-19 the same wallet's order hash
+`0x22b9a40b35c01aacc99718d59419deb2df0b63f6c7b505dfdfc627a5733cd1a9` returned
+`10020` from `/chain/tx/status` while `/account/perp/order-by-tx` returned `200`, the exact hash,
+order ID `1791945280743`, and height `19354956`. The status lookup is therefore insufficient as
+the sole durable recovery source for old transactions; the order index retains placement evidence
+after status lookup no longer finds the hash.
 
 `get_perp_open_orders_raw`, `get_perp_history_orders_raw`, `get_perp_account_trades_raw`, and
 `get_perp_funding_fees_raw` expose one strictly validated, cursor-aware account page for an exact
@@ -358,8 +372,9 @@ reduce-only, status/quantity consistency, exact filled-quantity precision, and t
 time-in-force only from immutable local context because REST omits it. System-generated `Stop`
 orders, `Adaptive` post-only values, quote-denominated quantities, external or unbound orders,
 missing perpetual `updatedTime`, and incomplete average-fill evidence fail closed. Spot status
-reports reconstruct filled base quantity from bounded order-specific trade history; canceled orders
-require the timestamp read from their exact finalized cancellation block. The single-order framework
+reports reconstruct filled base quantity from bounded order-specific trade history. Because the
+backend omits cancellation time, canceled reports use the local observation time for `ts_last`;
+this is not the exact cancellation time. The single-order framework
 report method resolves only a locally bound client or venue order ID, checks any supplied identity
 against immutable local context, resolves markets only from the failure-atomic startup catalog
 snapshot, and then performs the bounded configuration-owned REST read. The snapshot retains Spot
@@ -377,8 +392,7 @@ perpetual orders. It reads active pages for every selected startup market and, u
 is set, also reads history pages, with one shared 100-page budget across all selected markets,
 endpoints, and filled Spot order trade lookups. Reads requiring more pages reject the complete
 report.
-Spot canceled-order reports additionally require finalized timestamp evidence at each
-reported cancellation height. Every venue order must bind to retained tracked or terminal `OrderContext`, because REST
+Every venue order must bind to retained tracked or terminal `OrderContext`, because REST
 does not provide authoritative time-in-force. An external or unbound order rejects the complete
 result rather than being omitted or assigned invented semantics. Active pages must contain only
 open statuses; conflicting evidence for one venue order across active and history reads fails
@@ -436,10 +450,13 @@ state. They require exact 20-byte addresses and reject returned identity mismatc
 subaccounts or asset symbols, invalid asset precision, negative lending values, and invalid profile
 timestamps. Financial JSON numbers and strings decode directly to `Decimal`; unknown
 `spotPositions` entries remain raw JSON. The profile reader can require an independently derived
-signer wallet authority. `get_account_ownership_proof` additionally binds the locally derived signer,
-the wallet identity retained by the directory query, the configured AccountId20 subaccount, and an
-active matching profile into an opaque proof. Execution startup requires that proof after runtime
-validation and clears it on reset.
+wallet authority. `get_account_ownership_proof` binds the locally derived signer, the configured
+AccountId20 subaccount, its active profile, and the owning wallet directory. A delegate signer also
+requires matching forward and reverse delegate directories, `PlaceOrCancelOrder` mode, and an
+unexpired grant. Directories and profile identity are read again before returning the proof.
+`deepx-verify-delegate-ownership <subaccount>` checks this path without submitting a transaction;
+it reads the signing key from `DEEPX_TESTNET_PRIVATE_KEY`. Execution startup requires the proof
+after runtime validation and clears it on reset.
 The margin-ratio reader now requires the testnet response's `exactMargin` decimal values. Legacy
 `collateral`, `marginRequired`, and `marginRatio` are rounded displays; exact collateral,
 maintenance requirement, and dimensionless `uniMMR` remain separate REST observations. The
@@ -516,8 +533,9 @@ reconciliation behavior is inferred from that endpoint.
 current startup event already registered in the shared execution cache. It requires a connected
 startup epoch, exact trader/client/account identity, no parameter extensions, and proof that the
 current startup account event remains in the cache. It ignores locally calculated account states,
-performs no REST read, does not construct balances or margins, and never replays a prior startup
-epoch after disconnect or reset.
+performs no REST read synchronously, and never replays a prior startup epoch after disconnect or
+reset. It also schedules a fresh backend account observation; if that observation succeeds, a new
+reported `AccountState` is dispatched asynchronously.
 
 `DeepXWsAccountConnection` implements the documented credential-free `user_balances` subscription
 for one exact subaccount under `market: all`. It disables compression, withholds bounded data until
@@ -636,10 +654,11 @@ revokes the epoch and its outstanding runtime signing permits synchronously befo
 resources. A permit already past its final pre-transport check remains an in-flight attempt that
 requires durable reconciliation.
 
-The framework `ExecutionClient::connect` path now coordinates startup autonomously for the strict
-flat-account subset. It prepares the startup epoch, builds the authoritative account state from one
-finalized chain checkpoint through `complete_startup_with_finalized_flat_account_state`, completes
-durable reconciliation and exact cache registration, and only then enables query tasks. This path
+The framework `ExecutionClient::connect` path coordinates startup autonomously for the strict
+flat-account subset. It prepares the startup epoch, checks current backend balances and exposure
+against hash-pinned current-chain margin through
+`complete_startup_with_current_flat_account_state`, completes durable reconciliation and exact
+cache registration, and only then enables query tasks. This path
 requires a configured PostgreSQL durable transaction store, an active signer-owned subaccount, and
 a current acknowledged account WebSocket subscription. The configured wallet address itself is
 not a substitute for a subaccount: callers must select an active entry from the wallet directory.
@@ -661,11 +680,30 @@ normal ingress. Execution clients are temporarily detached from the engine durin
 connect futures and restored on completion, timeout, or cancellation. This prevents durable
 startup outbox replay from waiting on an event buffered behind its own connection future.
 
-REST and WebSocket observations remain mutable and are used only for ownership and subscription
-liveness. The autonomous account-state values come exclusively from one finalized chain checkpoint
-and are accepted only when both margin requirements are zero, positions and active orders are
-empty, borrowing is absent, and every deposit is fully withdrawable. Any non-flat account fails
-closed. This startup support does not authorize mutations or enable trading commands.
+REST and WebSocket observations remain mutable. The autonomous account-state path accepts one
+positive USDC deposit only when exact backend collateral agrees with current-chain collateral,
+both margin requirements are zero, borrowing is absent, and validated position and open-order
+pages contain no open exposure for every current market. Historical `Closed` positions are accepted
+only when their closing block, time, and event index are present; other position statuses fail
+closed. It rechecks authority, market coverage, balances, margin,
+and runtime identity before publishing. These REST reads are not an atomic venue snapshot and do
+not prove pool liquidity for withdrawal. Any non-flat account fails closed.
+The before-and-after balance check compares mapped USDC money and margin evidence; changing
+market-price or rounded USD display fields do not invalidate an otherwise stable flat account.
+An ignored, read-only testnet test exercised the complete market-scoped account observation for
+`0xa4676ec9a5600686234b8d9d413d04bc2d8fda70` and
+`0x492da9b1c5ccb8099562be29c2f3ce536161eb74` without a private key. The former retained a
+fully closed market-3 position, which the backend returned even with `onlyClosed=false`.
+`deepx-verify-current-margin <subaccount>` checks both current margin directions through the
+production hash-pinned Watch observer without a private key or transaction. A read-only testnet
+query for `0x492da9b1c5ccb8099562be29c2f3ce536161eb74` at block `22510354` returned
+`10.000059` USDC collateral and zero required margin in both directions, matching the backend's
+exact collateral at the time of observation.
+
+DirectPallet reservations now read signing metadata and `Timestamp.Now` at a hash-checked current
+Watch block. Timestamp storage must agree with the block's inherent. A separate finalized head is
+retained only as the pre-submission boundary for durable recovery scans; it does not select the
+runtime metadata or timestamp used for signing.
 
 `bin/verify_sdk_signing.py` independently checks complete signed regression bytes using the
 reviewed DeepX Python SDK `_native_py.py` blob `0108f89d79366f13e747ef59c75ce73a543dc404`,
@@ -724,11 +762,20 @@ milestone; development now proceeds with the Phase E execution client, private e
 report reconciliation. Any future submission retry must be bounded and retransmit only the exact
 durably recorded signed extrinsic. It must never allocate a new order identity or nonce after an
 ambiguous outcome.
+The public testnet RPC exposes historical block hashes beyond its block-body retention window.
+In one read-only check, block `22540000` had a body while block `22500000` returned `null` from
+`chain_getBlock` despite having a canonical hash. A recovery scan whose pre-submission checkpoint
+falls outside that moving window cannot complete through this RPC. Backend order records can
+corroborate a placement by exact extrinsic hash and call fields and commit `BackendConfirmed`
+without claiming chain finality. Historical recovery scans stop before inspecting blocks if more
+than 1,000 blocks separate the durable checkpoint and finalized head. This limit leaves the
+transaction unresolved; it does not prove absence or permit nonce reuse.
 
 The Rust client implements the Nautilus `ExecutionClient` framework boundary for identity,
 account-state emission, and lifecycle handling. Its Rust execution factory validates the typed
 testnet configuration and constructs a disconnected framework client. Canonical recovery scans
-default to ranges of 100 finalized blocks and require a non-zero configured range size. Timestamp
+default to ranges of 100 finalized blocks, inspect at most 1,000 blocks in total, and require a
+non-zero configured range size. Timestamp
 nonce restoration uses a configurable non-zero clock-drift limit which defaults to five seconds.
 Execution configuration accepts an optional `postgres_cache_database_config` for the durable
 transaction store. Its non-zero `websocket_timeout_secs`, defaulting to 30 seconds, bounds WebSocket
@@ -737,11 +784,12 @@ validation, the execution client
 can acquire and retain the PostgreSQL signer lease, restore the complete durable signer record set,
 and seed its timestamp nonce allocator. Reset, stop, and disconnect drop that runtime and release
 the lease. Startup mass reconciliation uses only this client-owned store and lease; callers cannot
-inject a temporary persistence boundary. The runtime retains a snapshot service backed by the
-built-in spec-376 metadata and identity. Node runtime compatibility is assumed: startup and
-read-only operations do not call `state_getRuntimeVersion`, `state_getMetadata`, or
-`state_call(Core_version)`. They still validate the configured genesis with
-`chain_getBlockHash(0)`, bind reads to a finalized canonical checkpoint, and preserve repeated-read
+inject a temporary persistence boundary. Signing startup reads runtime version and metadata at
+one current Watch block, confirms that block remains canonical, and validates the configured
+genesis. `deepx-verify-runtime` independently checks current runtime discovery against the live
+testnet. Other read-only RPC observations fetch metadata at their finalized checkpoint; historical event
+verifiers fetch metadata at the event block. Both validate the configured testnet genesis. These
+reads still bind to finalized canonical checkpoints and preserve repeated-read
 and timestamp consistency checks. The chain-time operation strictly decodes `Timestamp.Now` as one
 non-zero SCALE `u64` from that exact block hash. It does not allocate a nonce, sign, persist a
 transaction, submit, or replay. A separate client-owned perpetual placement reservation
@@ -837,6 +885,9 @@ GTC versus IOC remains a fact retained by the durable signed call rather than RE
 returned height is explicitly a mutable backend observation: this verifier does not establish
 canonical inclusion, dispatch success, a business event, or finality, and it does not emit a
 framework event or relax the submission gate.
+`observe_backend_perp_order_for_durable_place` performs the hash-bound backend lookup and applies
+that verifier after checking the durable operation and signed/lifecycle hashes locally. Lookup
+failure is not absence evidence; the method neither transmits bytes nor changes durable state.
 `observe_finalized_transaction_location` independently waits until the Watch endpoint's finalized
 head reaches a requested REST height, then recomputes every extrinsic hash in that exact canonical
 block and returns only one unique matching index. A missing or duplicate target fails closed.
@@ -859,22 +910,16 @@ linear-perpetual maker rebates and taker commissions when the supplied instrumen
 and liquidity side match that catalog; values requiring quote-currency rounding fail instead of
 being estimated. The raw wallet-grouped reader preserves zero-sized records, while account-trade
 validation and framework fill conversion reject non-positive quantities and prices. It can replay
-the current account state, refresh it from one finalized checkpoint when fully withdrawable and
-exposure-free, and asynchronously query one tracked perpetual order after startup. Open exposure or
-incomplete evidence leaves the existing account state unchanged.
-DirectPallet perpetual fill reports require every returned REST trade to match the owner, market,
-order, financial values, and trade ID of a finalized `PerpMarket.NewTrade` event. The read is
-limited to 100 distinct finalized blocks per report request and returns no reports when historical
-runtime or event evidence is unavailable. The known testnet historical runtime inconsistency
-currently prevents this check for affected blocks. DirectPallet Spot fill reports likewise require
-each REST record to match a finalized `SpotMarket.OrderMatched` event at its encoded block height,
-using the validated market's base and quote decimals. The same 100-block limit applies separately
-to Spot observations. No reports are returned when the historical Spot runtime or event evidence
-is unavailable.
-An offline execution test serves the contributor wallet's two captured market-3 partial fills and
-their complete event batch through local REST and RPC endpoints. It proves report-path wiring under
-approved fixture data, not a successful live historical RPC recheck or a storage proof.
-Autonomous network startup is operational only for the strict finalized flat-account subset.
+the current account state, refresh it from current backend and canonical Watch evidence for a
+flat account, and asynchronously query one tracked perpetual order after startup. Open exposure or
+incomplete evidence leaves the existing account state unchanged and revokes live connection status.
+Single and bulk order reports use validated account-scoped REST records without requiring historical
+order storage from the chain. DirectPallet Perpetual and Spot fill reports use validated, bounded
+account-scoped REST trade pages and exact framework conversion without historical event lookups.
+Current Perpetual position reports likewise use validated backend lifecycle pages. Separate
+read-only chain event verifiers remain available for forensic checks; report generation does not
+require them.
+Autonomous network startup is operational only for the strict current flat-account subset.
 Framework `submit_order` supports validated perpetual Limit GTC/IOC and Market IOC orders, plus
 Spot base-quantity Limit GTC/IOC orders, through durable DirectPallet pipelines. Each records the
 reservation, signed bytes, submitting transition, hash-verified acceptance, and `OrderSubmitted`
@@ -886,8 +931,11 @@ deny an order whose first submission may still be unresolved.
 Failures during the read-only chain-time and identity preflight emit `OrderDenied` before any
 nonce reservation. Once reservation begins, uncertain persistence or transmission outcomes remain
 with durable recovery and do not produce a speculative terminal order event.
-Finalized reconciliation alone can authorize a terminal event, and a
-Spot acceptance requires its matching indexed `StateOrderBuy` or `StateOrderSell` event. Spot
+Live submission and startup recovery can authorize Perpetual and Spot `OrderAccepted` from a backend
+order record bound to the durable signed hash, owner, market, order ID, and exact order terms. Live
+submission waits only for a bounded indexing interval; a missing backend record leaves the durable
+transaction accepted for later recovery. Backend confirmation is not a claim of chain finality.
+Other terminal events still require finalized reconciliation. Spot
 testnet order validation and fill behavior remain unverified.
 Tracked local perpetual and Spot Limit GTC order cancellations use separate durable transaction
 keys and `OrderPendingCancel` receipts before one-shot DirectPallet submission. `OrderCanceled` and
@@ -908,10 +956,10 @@ Mass status is available only with its explicit incomplete-report marker.
 
 The execution client can collect the runtime startup step through one read-only coordinator. It
 validates chain identity and advertised methods for the configured Submission, Watch, and Recovery
-RPC roles, bootstraps from the identity-validated Watch endpoint, and atomically applies a second
-finalized fixture-approved snapshot before retaining any evidence. Any failure leaves the startup
-gate unchanged. This runtime-validation coordinator does not initialize PostgreSQL transaction
-state, connect an account stream, or authorize signing; those remain later startup gates.
+RPC roles, then observes runtime metadata at one current canonical Watch block. The testnet
+genesis and observed metadata are validated before startup advances. This coordinator does not
+initialize PostgreSQL transaction state, connect an account stream, or authorize signing; those
+remain later startup gates.
 
 The following ownership step also has a read-only coordinator. It derives the wallet identity from
 the configured signing key, retrieves the wallet directory and configured subaccount profile, and
@@ -1039,7 +1087,7 @@ margin rules. From the repository root, run the read-only live data tester with
 with `.venv/bin/python examples/backtest/deepx_ema_cross_ethusdc_trades.py`. The backtest accepts
 `--start-ms` and `--end-ms` together for a fixed UTC millisecond window and sends no transactions.
 `load_deepx_spot_trade_ticks(market_name, start_ms, end_ms, limit=1000, max_pages=100)` uses the
-bounded public Spot history and a finalized-chain-verified current Spot instrument. It likewise
+bounded public Spot history and a current-chain-verified Spot instrument. It likewise
 returns chronological replay ticks and does not reconstruct historical trading rules. Run the
 simulated Spot example with
 `.venv/bin/python examples/backtest/deepx_ema_cross_ethusdc_spot_trades.py`. The public testnet
@@ -1047,7 +1095,7 @@ runtime observed on 2026-10-14 used genesis hash
 `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`, specification
 376, and metadata SHA-256
 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447`.
-The read-only runtime snapshot and Spot storage decoder approve this captured identity. A public
+The read-only runtime observer validates the configured genesis and decodes node metadata. A public
 run loaded 1,000 exact Spot ticks and simulated eight fills. The Spot example disables optional
 portfolio analysis and omits the account report because the shared analysis path converts
 18-decimal ETH money to `f64` and panics; fill and position reports remain available.
@@ -1059,12 +1107,18 @@ PostgreSQL store configured through `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, an
 `POSTGRES_DATABASE` (`POSTGRES_HOST` and `POSTGRES_PORT` are optional). By default the tester only
 connects and subscribes. `--submit-order` opts into one ETH-USDC perpetual IOC market buy of
 `0.0010` and a reduce-only shutdown close request scoped to the tester's positions. These are real
-testnet transactions and are not guaranteed to fill or close. Account ownership, finalized
-flat-account state, runtime identity, durable recovery, and signing remain enforced by the Rust
+testnet transactions and are not guaranteed to fill or close. Account ownership, current backend
+flat-account checks, runtime identity, durable recovery, and signing remain enforced by the Rust
 client. The public snapshot preflight rejects inactive accounts, nonzero margin requirements, and
-outstanding borrowing; it does not establish the finalized flat-account proof. A 2026-10-13
+outstanding borrowing; it does not establish the later current flat-account check. A 2026-10-13
 read-only snapshot returned three owned subaccounts, one with a nonzero margin requirement.
 Live execution startup and submission have not been verified against this wallet.
+On 2026-10-19, read-only current-account checks passed for its second and third subaccounts.
+The first subaccount changed its backend USDC balance during the bounded market and exposure
+reads, so the flat-account startup check rejected that mixed-time observation. The current-chain
+collateral also increased by small amounts during the read; the adapter accepts such an increase
+only while it remains at least the exact backend balance and both chain margin requirements stay
+zero. Backend balance changes still reject the observation.
 
 `get_perp_order_book` exposes one exact, potentially price-aggregated REST snapshot for a required
 perpetual market ID. It validates the echoed book and per-level market identity, positive prices
@@ -1117,9 +1171,9 @@ values, and unique case-insensitive names and pairs. `get_spot_market_by_name` a
 `get_spot_market_by_pair` bind the returned identity to the exact selector. The live verifier
 cross-checks stable ETH/USDC metadata across the directory and both lookups while deliberately
 excluding mutable price and nullable 24-hour change observations. The REST tick is checked against
-the finalized runtime tick at its `1e6` scale; minimum order and step sizes use base-token atomic
-units at `baseDecimal` precision. The instrument verifier loads both listed Spot pairs together
-with the Perpetual catalog at one finalized checkpoint.
+the current runtime tick at its `1e6` scale; minimum order and step sizes use base-token atomic
+units at `baseDecimal` precision. The instrument verifier loads all listed Spot pairs together
+with the Perpetual catalog using one current block hash.
 
 Separate account-Spot probes on 2026-09-17 found terminal empty order and trade pages for all four
 subaccounts registered to the contributor wallet. A subaccount discovered from a contemporaneous
@@ -1181,13 +1235,13 @@ historical trades, matching raw bucket times/rates and request correlation with 
 
 The Rust data factory validates a strict testnet `DeepXDataClientConfig` and constructs a
 disconnected framework client with the DeepX identity, read-only cache view, and framework clock.
-Its `connect` method loads the public catalog, verifies every Spot spec at a shared finalized
-checkpoint, and publishes Spot and Perpetual instruments through the framework data event sender,
+Its `connect` method loads the public catalog, verifies every Spot spec at a shared current block
+hash, and publishes Spot and Perpetual instruments through the framework data event sender,
 then enables `request_instrument` and `request_instruments`. Each explicit request independently
 reloads and validates the complete catalog before returning a correlated response; a failed
 refresh emits no partial response and does not change the connected instrument store. It
 can use `perpetual_only=true` to load and publish only public Perpetual instruments without
-requesting Spot metadata or finalized Spot specs. The default remains full discovery. It
+requesting Spot metadata or current Spot specs. The default remains full discovery. It
 requires a live data receiver and rejects unsupported history parameters, filters, and foreign
 identities. Disconnect, stop, reset, and dispose
 clear readiness and instruments; reconnect reloads. REST readiness alone does not open a socket;
@@ -1519,7 +1573,7 @@ specified wallet's current Spot wallet-history response contains empty `ETH/USDC
 subaccount groups, so no wallet-owned live Spot trade could be matched to a finalized event.
 `observe_finalized_spot_trades_at` now reads a requested finalized block through the validated
 Watch RPC endpoint, rejects inconsistent runtime responses at the current finalized checkpoint
-before event reads, requires fixture-approved metadata at the requested block, compares two
+before event reads, validates metadata observed at the requested block, compares two
 complete event storage reads, and rechecks the canonical block hash before returning decoded
 matches. The
 verifier's `--finalized` mode applies this read to at most 20 distinct blocks after bounded
@@ -1546,14 +1600,15 @@ A read-only Perpetual verifier run for block `187071212` and wallet
 `0x781ed35b167068c93dfadab41dfb680edaca4e50` on 2026-10-09 stopped when historical
 `state_call(Core_version)` returned spec 371 instead of the captured spec 369.
 
-The checked-in spec-376 fixture supplies the adapter's built-in metadata and signing identity. The
-adapter does not capture or approve runtime identity from a configured node. The fixture binds metadata
+The adapter observes signing metadata and runtime version at a current Watch block and validates
+the configured testnet genesis and supported transaction extensions. The checked-in spec-376 fixture
+remains available for offline tests. It binds metadata
 SHA-256 `57f1bedf1e04522176a2b422af9249d5c990693fb92d11327870d8ef751a8447` to block
 `19592700` on genesis `0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7`.
-Its signed extensions use `CheckNonceEra` where the approved old-chain captures use
-`CheckMortality`. Read-only and signing permits accept spec 376 and later runtime versions when
-the genesis hash, transaction version, metadata hash, and signed extensions continue to match this
-exact baseline identity. A public verifier rediscovered three Spot and eight Perpetual instruments
+Its signed extensions use `CheckNonceEra` where the old-chain captures use `CheckMortality`.
+Read-only and signing permits validate observed metadata under the testnet genesis instead of
+requiring the fixture's metadata hash or runtime version. A public verifier rediscovered three Spot
+and eight Perpetual instruments
 after the upgrade. The pinned SDK and Rust agree on complete offline spec-376
 `Subaccount.no_op`, `System.remark`, and `PerpMarket.place_order` bytes. Separately, an already
 finalized spec-376 `PerpMarket.cancel_order` in block `18476010` recovers its encoded signer only
@@ -1561,6 +1616,11 @@ with spec 376, transaction version 1, and the new genesis hash as both implicit 
 `system_dryRunAt` of the old offline remark vector returned transaction-validity code `0x01000b`
 (`IndeterminateImplicit`), so that probe does not establish live acceptance. No new transaction or
 durable recovery on spec 376 has been validated.
+Current spec-377 metadata adds an optional `stp_mode` field to both Perpetual and Spot order
+placement. The adapter encodes `None` for each. An ignored read-only test fetched current metadata
+and signed both placement calls, both cancellation calls, `Subaccount.modify_orders`, and
+`Subaccount.no_op` offline with a synthetic key; it did not submit a transaction or verify order
+acceptance.
 On spec 376, a read-only Spot data tester observed 15 managed 20-level books, quotes, and trades
 without recovery warnings. The public Spot backtest replayed 1,000 ticks and submitted two simulated
 orders; the Perpetual backtest submitted eight simulated orders. Neither backtest sent a transaction.
@@ -1568,10 +1628,10 @@ The specification 371 finalized capture records block `195884340`, metadata SHA-
 `4a620bad9f2482b5511f4637d03d5e7907b903f4bab5af439f664963724cda15`, and the canonical block-hash
 binding. Its metadata differs from the specification 369 capture only at the encoded runtime
 version byte. The checked-in runtime source retains the same signed-extension tuple and transaction
-version, and the pinned Python SDK independently reproduced exact `System.remark`, `Subaccount.no_op`,
-and `PerpMarket.place_order` extrinsics for specification 371. The signing gate accepts the exact
-spec-376 baseline identity for runtime versions 376 and later; older versions and identity drift
-still fail closed.
+version, and the pinned Python SDK independently reproduced exact `System.remark`,
+`Subaccount.no_op`, and `PerpMarket.place_order` extrinsics for specification 371. Live signing uses
+the observed runtime identity; invalid genesis, metadata, and unsupported transaction extensions
+fail closed.
 
 Sanitized public REST fixtures under `test_data/http/testnet` include sidecar manifests when a
 capture is associated with the independently verified testnet runtime identity. REST responses are

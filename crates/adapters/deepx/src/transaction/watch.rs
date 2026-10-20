@@ -14,8 +14,7 @@
 
 //! Fail-closed DeepX canonical block and submission-pool observations.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
 use nautilus_core::hex;
@@ -78,6 +77,69 @@ async fn execute_rpc_read_with_retry<T: for<'de> Deserialize<'de>>(
         }
     }
     client.execute_rpc_call(request).await
+}
+
+async fn execute_optional_rpc_read_with_retry<T: for<'de> Deserialize<'de>>(
+    client: &BlockchainHttpRpcClient,
+    request: serde_json::Value,
+) -> anyhow::Result<Option<T>> {
+    for delay_ms in [250, 500] {
+        match client.execute_optional_rpc_call(request.clone()).await {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) | Err(_) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
+        }
+    }
+    client.execute_optional_rpc_call(request).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoricalRuntimeVersion {
+    spec_version: u32,
+    transaction_version: u32,
+}
+
+async fn observe_historical_read_only_runtime(
+    environment: &DeepXEnvironment,
+    genesis_hash: [u8; 32],
+    watch_url: &str,
+    block_hash: [u8; 32],
+) -> Result<DeepXReadOnlyRuntimeSnapshot, DeepXHistoricalRuntimeError> {
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let encoded_hash = format!("0x{}", hex::encode(block_hash));
+    let version: HistoricalRuntimeVersion = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getRuntimeVersion", "params": [encoded_hash],
+        }))
+        .await
+        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
+    let encoded_metadata: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getMetadata", "params": [encoded_hash],
+        }))
+        .await
+        .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
+            method: "state_getMetadata",
+            source,
+        })?;
+    let metadata = encoded_metadata
+        .strip_prefix("0x")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| hex::decode(value).ok())
+        .ok_or(DeepXHistoricalRuntimeError::InvalidMetadata)?;
+    DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+        environment,
+        genesis_hash,
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )
+    .map_err(DeepXHistoricalRuntimeError::from)
 }
 
 trait RuntimeMetadataView {
@@ -1200,8 +1262,8 @@ pub enum DeepXFinalizedDelegateObservationError {
     /// The supplied location is above the observed finalized head.
     #[error("DeepX delegate block {requested} is above finalized block {finalized}")]
     NotFinalized { requested: u64, finalized: u64 },
-    /// The endpoint did not preserve the captured historical runtime semantics.
-    #[error("DeepX historical delegate runtime selection is inconsistent: {0}")]
+    /// The historical runtime request or validation failed.
+    #[error("failed to observe DeepX historical delegate runtime: {0}")]
     HistoricalRuntime(#[from] DeepXHistoricalRuntimeError),
     /// Canonical block or event-storage observation failed.
     #[error("failed to observe DeepX delegate block: {0}")]
@@ -1231,13 +1293,13 @@ pub enum DeepXFinalizedDelegateObservationError {
 
 /// Observes one delegate mode change from the exact finalized Watch block.
 ///
-/// Historical metadata must match an approved runtime. The target extrinsic membership and
-/// complete event storage are each checked twice. The caller must independently prove that the
+/// Historical metadata must match the configured testnet genesis. The target extrinsic membership
+/// and complete event storage are each checked twice. The caller must independently prove that the
 /// target signed extrinsic encodes the expected wallet call; this does not submit or activate it.
 ///
 /// # Errors
 ///
-/// Returns an error for non-finality, unapproved runtime, changed block or event evidence, or
+/// Returns an error for non-finality, invalid runtime, changed block or event evidence, or
 /// failed, missing, duplicate, or conflicting mode-change evidence.
 pub async fn observe_finalized_delegate_mode_change_at(
     environment: &DeepXEnvironment,
@@ -1307,7 +1369,7 @@ async fn observe_finalized_delegate_mode_change_at_inner(
 ///
 /// # Errors
 ///
-/// Returns an error for non-finality, unapproved runtime, changed block or event evidence, or
+/// Returns an error for non-finality, invalid runtime, changed block or event evidence, or
 /// missing, duplicate, failed, or conflicting account-change evidence.
 pub async fn observe_finalized_delegate_account_change_at(
     environment: &DeepXEnvironment,
@@ -1493,12 +1555,13 @@ async fn observe_finalized_delegate_change_at_inner<T>(
         return Err(Error::LocationChanged);
     }
 
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != *environment
-        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
+    let snapshot = observe_historical_read_only_runtime(
+        environment,
+        endpoints.genesis_hash(),
+        watch_url,
+        location.block_hash(),
+    )
+    .await?;
     if expected_runtime.is_some_and(|runtime| runtime != snapshot.identity()) {
         return Err(Error::RuntimeMismatch);
     }
@@ -1742,8 +1805,8 @@ pub enum DeepXFinalizedPerpTradeObservationError {
     /// The requested height is above the observed finalized head.
     #[error("DeepX trade block {requested} is above finalized block {finalized}")]
     NotFinalized { requested: u64, finalized: u64 },
-    /// The Watch endpoint did not preserve the captured historical runtime.
-    #[error("DeepX historical trade runtime selection is inconsistent: {0}")]
+    /// The historical runtime request or validation failed.
+    #[error("failed to observe DeepX historical trade runtime: {0}")]
     HistoricalRuntime(#[from] DeepXHistoricalRuntimeError),
     /// Canonical block or event-storage observation failed.
     #[error("failed to observe DeepX finalized trade block: {0}")]
@@ -1836,12 +1899,13 @@ pub async fn observe_finalized_perp_trades_at(
         }
         .into());
     }
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != *environment
-        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
+    let snapshot = observe_historical_read_only_runtime(
+        environment,
+        endpoints.genesis_hash(),
+        watch_url,
+        block_hash,
+    )
+    .await?;
     let first = fetch_system_events(watch_url, block_hash, block_number).await?;
     let second = fetch_system_events(watch_url, block_hash, block_number).await?;
     if first != second {
@@ -1869,8 +1933,8 @@ pub enum DeepXFinalizedSpotTradeObservationError {
     /// The requested height is above the observed finalized head.
     #[error("DeepX Spot trade block {requested} is above finalized block {finalized}")]
     NotFinalized { requested: u64, finalized: u64 },
-    /// The Watch endpoint did not preserve the captured historical runtime.
-    #[error("DeepX historical Spot trade runtime selection is inconsistent: {0}")]
+    /// The historical runtime request or validation failed.
+    #[error("failed to observe DeepX historical Spot trade runtime: {0}")]
     HistoricalRuntime(#[from] DeepXHistoricalRuntimeError),
     /// Canonical block or event storage observation failed.
     #[error("failed to observe DeepX finalized Spot trade block: {0}")]
@@ -1961,12 +2025,13 @@ pub async fn observe_finalized_spot_trades_at(
         }
         .into());
     }
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != *environment
-        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
+    let snapshot = observe_historical_read_only_runtime(
+        environment,
+        endpoints.genesis_hash(),
+        watch_url,
+        block_hash,
+    )
+    .await?;
     let first = fetch_system_events(watch_url, block_hash, block_number).await?;
     let second = fetch_system_events(watch_url, block_hash, block_number).await?;
     if first != second {
@@ -4164,7 +4229,7 @@ async fn observe_canonical_block_at(
     target_extrinsic_hash: [u8; 32],
 ) -> Result<DeepXCanonicalBlockObservation, DeepXTransactionWatchError> {
     let client = BlockchainHttpRpcClient::new(endpoint_url.to_string(), None, None);
-    let encoded_hash: Option<String> = execute_rpc_read_with_retry(
+    let encoded_hash: Option<String> = execute_optional_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -4181,7 +4246,7 @@ async fn observe_canonical_block_at(
     let encoded_hash =
         encoded_hash.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let block_hash = decode_hash(&encoded_hash)?;
-    let response: Option<RpcBlockResponse> = execute_rpc_read_with_retry(
+    let response: Option<RpcBlockResponse> = execute_optional_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -4627,7 +4692,7 @@ async fn collect_finalized_recovery_scan_inner(
     }
 
     let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
-    let encoded_checkpoint_hash: Option<String> = execute_rpc_read_with_retry(
+    let encoded_checkpoint_hash: Option<String> = execute_optional_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -4667,7 +4732,7 @@ async fn collect_finalized_recovery_scan_inner(
         source,
     })?;
     let finalized_hash = decode_hash(&encoded_finalized_hash)?;
-    let finalized_header: Option<RpcBlockHeader> = execute_rpc_read_with_retry(
+    let finalized_header: Option<RpcBlockHeader> = execute_optional_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -5096,6 +5161,63 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[tokio::test]
+    async fn historical_runtime_uses_metadata_at_the_requested_block() {
+        let block_hash = [0x42; 32];
+        let encoded_hash = format!("0x{}", hex::encode(block_hash));
+        let metadata: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+        )))
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let calls = Arc::clone(&calls);
+                let encoded_hash = encoded_hash.clone();
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let encoded_hash = encoded_hash.clone();
+                    let metadata = metadata.clone();
+                    async move {
+                        assert_eq!(request["params"], json!([encoded_hash]));
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        let result = match request["method"].as_str().unwrap() {
+                            "state_getRuntimeVersion" => json!({
+                                "specVersion": 377,
+                                "transactionVersion": 2,
+                            }),
+                            "state_getMetadata" => metadata["result"].clone(),
+                            method => panic!("unexpected historical runtime RPC: {method}"),
+                        };
+                        Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let genesis_hash =
+            hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
+                .unwrap();
+
+        let snapshot = observe_historical_read_only_runtime(
+            &DeepXEnvironment::Testnet,
+            genesis_hash,
+            &format!("http://{address}"),
+            block_hash,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.identity().spec_version, 377);
+        assert_eq!(snapshot.identity().transaction_version, 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn rpc_read_retries_transient_transport_failures() {
@@ -7622,6 +7744,7 @@ mod tests {
         finalized_block: u64,
         finalized_hash: Option<String>,
         block_extrinsics: Arc<BTreeMap<u64, Vec<String>>>,
+        unavailable_blocks: Arc<HashSet<u64>>,
         pool_extrinsics: Arc<[String]>,
         event_storage: Arc<BTreeMap<(u64, String), String>>,
         post_checkpoint_requests: Arc<AtomicUsize>,
@@ -7672,16 +7795,20 @@ mod tests {
             }
             "chain_getBlock" => {
                 let number = decode_mock_block_hash(request["params"][0].as_str().unwrap());
-                json!({
-                    "block": {
-                        "header": { "number": format!("0x{number:x}") },
-                        "extrinsics": state
-                            .block_extrinsics
-                            .get(&number)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                    },
-                })
+                if state.unavailable_blocks.contains(&number) {
+                    Value::Null
+                } else {
+                    json!({
+                        "block": {
+                            "header": { "number": format!("0x{number:x}") },
+                            "extrinsics": state
+                                .block_extrinsics
+                                .get(&number)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                        },
+                    })
+                }
             }
             "state_getStorage" => {
                 let key = request["params"][0].as_str().unwrap();
@@ -7767,6 +7894,7 @@ mod tests {
             finalized_block,
             finalized_hash,
             block_extrinsics: Arc::new(block_extrinsics),
+            unavailable_blocks: Arc::new(HashSet::new()),
             pool_extrinsics: Arc::from(pool_extrinsics),
             event_storage: Arc::new(event_storage),
             post_checkpoint_requests: Arc::clone(&post_checkpoint_requests),
@@ -7801,6 +7929,46 @@ mod tests {
             .await
             .unwrap();
         (endpoints, capabilities, post_checkpoint_requests)
+    }
+
+    async fn unavailable_block_endpoints(block_number: u64) -> DeepXValidatedRpcEndpoints {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = RecoveryRpcState {
+            finalized_block: block_number,
+            finalized_hash: None,
+            block_extrinsics: Arc::new(BTreeMap::new()),
+            unavailable_blocks: Arc::new(HashSet::from([block_number])),
+            pool_extrinsics: Arc::from([]),
+            event_storage: Arc::new(BTreeMap::new()),
+            post_checkpoint_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", post(recovery_rpc))
+                    .with_state(state),
+            )
+            .await
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let config = DeepXNetworkConfig {
+            base_url_rpc: Some(url.clone()),
+            ..Default::default()
+        };
+        let genesis_hash =
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap();
+        validate_rpc_endpoint_identities(
+            &config,
+            [
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Submission, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Watch, url.clone(), genesis_hash),
+                DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url, genesis_hash),
+            ],
+        )
+        .unwrap()
     }
 
     #[rstest]
@@ -8027,6 +8195,7 @@ mod tests {
             finalized_block,
             finalized_hash: None,
             block_extrinsics: Arc::new(block_extrinsics),
+            unavailable_blocks: Arc::new(HashSet::new()),
             pool_extrinsics: Arc::from(pool_extrinsics),
             event_storage: Arc::new(BTreeMap::new()),
             post_checkpoint_requests: Arc::new(AtomicUsize::new(0)),
@@ -8119,6 +8288,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(observation.extrinsic_index(), None);
+    }
+
+    #[tokio::test]
+    async fn canonical_block_reports_unavailable_null_result() {
+        let endpoints = unavailable_block_endpoints(42).await;
+
+        let error = observe_canonical_block(&endpoints, 42, [9; 32])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXTransactionWatchError::BlockUnavailable(42),
+        ));
     }
 
     #[tokio::test]
@@ -8298,6 +8481,32 @@ mod tests {
             panic!("expected a completed recovery scan");
         };
         assert_eq!(scan.classify(), DeepXRecoveryDecision::ActionRequired);
+    }
+
+    #[tokio::test]
+    async fn finalized_recovery_scan_rejects_excessive_history_before_block_reads() {
+        let (endpoints, capabilities, post_checkpoint_requests) =
+            recovery_endpoints(1_040, None, BTreeMap::new(), vec![]).await;
+
+        let error = collect_finalized_recovery_scan(
+            &endpoints,
+            &capabilities,
+            39,
+            decode_hash(&block_hash(39)).unwrap(),
+            100,
+            [9; 32],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXTransactionWatchError::ScanPlan(DeepXRecoveryScanPlanError::ScanLimitExceeded {
+                missing_blocks: 1_001,
+                max_blocks: 1_000,
+            }),
+        ));
+        assert_eq!(post_checkpoint_requests.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

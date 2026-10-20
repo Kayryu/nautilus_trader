@@ -154,6 +154,13 @@ struct ObservedBlockHeader {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedRuntimeVersion {
+    spec_version: u32,
+    transaction_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
 struct ObservedTimestampBlockResponse {
     block: ObservedTimestampBlock,
 }
@@ -254,14 +261,14 @@ impl DeepXFinalizedCheckpoint {
     }
 }
 
-/// Approved runtime metadata paired with its observed finalized checkpoint.
+/// Validated runtime metadata paired with its observed finalized checkpoint.
 #[derive(Clone, Debug)]
 pub struct DeepXObservedRuntimeSnapshot {
     snapshot: RuntimeSnapshot,
     checkpoint: DeepXFinalizedCheckpoint,
 }
 
-/// Read-only runtime approval paired with its observed finalized checkpoint.
+/// Validated read-only runtime paired with its observed finalized checkpoint.
 #[derive(Clone, Debug)]
 pub struct DeepXObservedReadOnlyRuntimeSnapshot {
     snapshot: DeepXReadOnlyRuntimeSnapshot,
@@ -269,7 +276,7 @@ pub struct DeepXObservedReadOnlyRuntimeSnapshot {
 }
 
 impl DeepXObservedReadOnlyRuntimeSnapshot {
-    /// Returns the fixture-approved read-only runtime snapshot.
+    /// Returns the read-only runtime snapshot observed at the checkpoint.
     #[must_use]
     pub const fn snapshot(&self) -> &DeepXReadOnlyRuntimeSnapshot {
         &self.snapshot
@@ -283,7 +290,7 @@ impl DeepXObservedReadOnlyRuntimeSnapshot {
 }
 
 impl DeepXObservedRuntimeSnapshot {
-    /// Returns the fixture-approved immutable runtime snapshot.
+    /// Returns the immutable runtime snapshot observed at the checkpoint.
     #[must_use]
     pub const fn snapshot(&self) -> &RuntimeSnapshot {
         &self.snapshot
@@ -321,17 +328,6 @@ impl PartialEq for DeepXAppliedRuntimeSnapshot {
 impl Eq for DeepXAppliedRuntimeSnapshot {}
 
 impl DeepXAppliedRuntimeSnapshot {
-    pub(crate) const fn unchanged(
-        checkpoint: DeepXFinalizedCheckpoint,
-        snapshot: RuntimeSnapshot,
-    ) -> Self {
-        Self {
-            checkpoint,
-            update: DeepXRuntimeSnapshotUpdate::Unchanged,
-            snapshot,
-        }
-    }
-
     /// Returns the finalized checkpoint used for the approved observation.
     #[must_use]
     pub const fn checkpoint(&self) -> DeepXFinalizedCheckpoint {
@@ -363,6 +359,28 @@ pub struct DeepXFinalizedChainTimeEvidence {
     checkpoint: DeepXFinalizedCheckpoint,
     runtime_identity: ApprovedRuntimeIdentity,
     timestamp_ms: u64,
+}
+
+/// Current-chain timestamp and runtime with a separate finalized recovery boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct DeepXCurrentSubmissionClockEvidence {
+    scan_checkpoint: DeepXFinalizedCheckpoint,
+    runtime_identity: ApprovedRuntimeIdentity,
+    timestamp_ms: u64,
+}
+
+impl DeepXCurrentSubmissionClockEvidence {
+    pub(crate) const fn scan_checkpoint(&self) -> DeepXFinalizedCheckpoint {
+        self.scan_checkpoint
+    }
+
+    pub(crate) const fn runtime_identity(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    pub(crate) const fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
 }
 
 impl DeepXFinalizedChainTimeEvidence {
@@ -430,6 +448,33 @@ impl DeepXFinalizedSpotMarketSpecEvidence {
     /// Returns the raw runtime quantity step size.
     #[must_use]
     pub const fn step_size(&self) -> u128 {
+        self.step_size
+    }
+}
+
+/// Spot order constraints read from one current, hash-pinned runtime state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeepXCurrentSpotMarketSpec {
+    pair: [u8; 32],
+    min_order_size: u128,
+    tick_size: u128,
+    step_size: u128,
+}
+
+impl DeepXCurrentSpotMarketSpec {
+    pub(crate) const fn pair(&self) -> [u8; 32] {
+        self.pair
+    }
+
+    pub(crate) const fn min_order_size(&self) -> u128 {
+        self.min_order_size
+    }
+
+    pub(crate) const fn tick_size(&self) -> u128 {
+        self.tick_size
+    }
+
+    pub(crate) const fn step_size(&self) -> u128 {
         self.step_size
     }
 }
@@ -513,6 +558,48 @@ impl DeepXMarginDirection {
 pub struct DeepXMarginRequirement {
     total_collateral: u128,
     total_margin_required: u128,
+}
+
+/// Initial and maintenance margin observed at one current canonical Watch block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXCurrentMarginEvidence {
+    block_hash: [u8; 32],
+    block_number: u32,
+    subaccount: [u8; 20],
+    initial: DeepXMarginRequirement,
+    maintenance: DeepXMarginRequirement,
+}
+
+impl DeepXCurrentMarginEvidence {
+    /// Returns the canonical block hash used for the margin calls.
+    #[must_use]
+    pub const fn block_hash(&self) -> [u8; 32] {
+        self.block_hash
+    }
+
+    /// Returns the current block number used for the margin calls.
+    #[must_use]
+    pub const fn block_number(&self) -> u32 {
+        self.block_number
+    }
+
+    /// Returns the observed subaccount.
+    #[must_use]
+    pub const fn subaccount(&self) -> [u8; 20] {
+        self.subaccount
+    }
+
+    /// Returns initial margin and weighted collateral in runtime quote units.
+    #[must_use]
+    pub const fn initial(&self) -> DeepXMarginRequirement {
+        self.initial
+    }
+
+    /// Returns maintenance margin and weighted collateral in runtime quote units.
+    #[must_use]
+    pub const fn maintenance(&self) -> DeepXMarginRequirement {
+        self.maintenance
+    }
 }
 
 impl DeepXMarginRequirement {
@@ -1482,7 +1569,7 @@ pub enum DeepXRpcEndpointIdentityError {
     Validation(#[from] DeepXRpcEndpointValidationError),
 }
 
-/// Errors raised while collecting an approved finalized DeepX runtime snapshot.
+/// Errors raised while collecting a DeepX runtime snapshot.
 #[derive(Debug, Error)]
 pub enum DeepXRuntimeSnapshotObservationError {
     /// The network configuration is unsupported.
@@ -1500,9 +1587,15 @@ pub enum DeepXRuntimeSnapshotObservationError {
     /// The endpoint returned a hash other than one prefixed 32-byte value.
     #[error("DeepX runtime snapshot returned an invalid {0}")]
     InvalidHash(&'static str),
-    /// The finalized header returned a malformed or out-of-range block number.
-    #[error("DeepX runtime snapshot returned an invalid finalized block number: {0}")]
+    /// The block header returned a malformed or out-of-range block number.
+    #[error("DeepX runtime snapshot returned an invalid block number: {0}")]
     InvalidBlockNumber(String),
+    /// The current block ceased to be canonical during metadata observation.
+    #[error("DeepX runtime snapshot block is no longer canonical")]
+    InvalidCheckpoint,
+    /// The endpoint did not reject a runtime query at an invalid block hash.
+    #[error("DeepX Watch RPC ignored an invalid runtime block hash")]
+    BlockHashIgnored,
     /// The endpoint returned metadata other than one prefixed hexadecimal value.
     #[error("DeepX runtime snapshot returned invalid metadata")]
     InvalidMetadata,
@@ -1560,9 +1653,16 @@ pub enum DeepXHistoricalRuntimeError {
         #[source]
         source: anyhow::Error,
     },
+    /// Historical metadata is missing or is not a complete hex-encoded SCALE value.
+    #[error("invalid DeepX historical runtime metadata")]
+    InvalidMetadata,
+    /// Historical metadata or runtime identity failed validation.
+    #[error("invalid DeepX historical runtime: {0}")]
+    Snapshot(#[from] SnapshotError),
 }
 
 /// Errors raised while reading `Timestamp.Now` from a finalized historical block.
+#[cfg(test)]
 #[derive(Debug, Error)]
 pub(crate) enum DeepXFinalizedBlockTimeError {
     /// Watch capability evidence does not belong to the validated endpoint or lacks required reads.
@@ -2106,16 +2206,16 @@ pub async fn observe_and_validate_rpc_method_capabilities(
     })
 }
 
-/// Collects an approved runtime snapshot pinned to one finalized DeepX block.
+/// Collects a signing runtime from one finalized DeepX block.
 ///
 /// The ordinary configured RPC endpoint is used without asserting role-specific method support.
-/// Runtime version and metadata reads are both pinned to the finalized hash returned by the same
-/// endpoint. This function does not install the snapshot or authorize signing.
+/// Runtime version and metadata reads use the same block hash returned by the endpoint. This
+/// function does not install the snapshot or authorize signing.
 ///
 /// # Errors
 ///
 /// Returns an error for unsupported configuration, request or response failure, malformed hashes
-/// or metadata, or a runtime snapshot which differs from the approved testnet fixture identity.
+/// or metadata, another genesis, or unsupported signing extensions.
 pub async fn observe_approved_finalized_runtime_snapshot(
     config: &DeepXNetworkConfig,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
@@ -2134,29 +2234,31 @@ pub async fn observe_approved_finalized_runtime_snapshot(
             source,
         })?;
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
-    let snapshot = RuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != config.environment
-        || snapshot.identity().genesis_hash != genesis_hash
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
+    let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
+    let snapshot = RuntimeSnapshot::observed_testnet(
+        &config.environment,
+        genesis_hash,
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )?;
     Ok(DeepXObservedRuntimeSnapshot {
         snapshot,
         checkpoint,
     })
 }
 
-/// Collects a read-only approved runtime snapshot pinned to one finalized DeepX block.
+/// Collects a read-only runtime snapshot pinned to one finalized DeepX block.
 ///
 /// The returned type cannot initialize a signing service or authorize transaction encoding. This
-/// permits exact captured runtime fixtures to support finalized evidence reads independently from
-/// the stricter signing-runtime allowlist.
+/// permits observed runtime metadata to support finalized evidence reads without authorizing
+/// signing.
 ///
 /// # Errors
 ///
 /// Returns an error for unsupported configuration, request or response failure, malformed hashes
-/// or metadata, or a runtime snapshot outside the read-only fixture allowlist.
+/// or metadata, another genesis, or unsupported runtime extensions.
 pub async fn observe_approved_finalized_read_only_runtime_snapshot(
     config: &DeepXNetworkConfig,
 ) -> Result<DeepXObservedReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
@@ -2164,7 +2266,7 @@ pub async fn observe_approved_finalized_read_only_runtime_snapshot(
     observe_approved_finalized_read_only_runtime_snapshot_at(&config.environment, url).await
 }
 
-/// Collects an approved runtime snapshot from the chain-identity-validated Watch endpoint.
+/// Collects a signing runtime from the chain-identity-validated Watch endpoint.
 ///
 /// This bootstrap observation initializes a snapshot service before its first atomic refresh. The
 /// endpoint set must already have passed complete role identity validation; this function does not
@@ -2173,22 +2275,206 @@ pub async fn observe_approved_finalized_read_only_runtime_snapshot(
 /// # Errors
 ///
 /// Returns an error for request or response failure, malformed hashes or metadata, or a runtime
-/// snapshot which differs from the approved testnet fixture identity.
+/// snapshot with another genesis or unsupported signing extensions.
 pub(crate) async fn observe_approved_finalized_runtime_snapshot_for_endpoints(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
-    let snapshot = RuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != *environment
-        || snapshot.identity().genesis_hash != endpoints.genesis_hash()
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
-    let checkpoint =
-        observe_finalized_checkpoint_at(endpoints.url_for(DeepXRpcRole::Watch).to_string()).await?;
+    let url = endpoints.url_for(DeepXRpcRole::Watch).to_string();
+    let checkpoint = observe_finalized_checkpoint_at(url.clone()).await?;
+    let client = BlockchainHttpRpcClient::new(url, None, None);
+    let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
+    let snapshot = RuntimeSnapshot::observed_testnet(
+        environment,
+        endpoints.genesis_hash(),
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )?;
     Ok(DeepXObservedRuntimeSnapshot {
         snapshot,
         checkpoint,
+    })
+}
+
+/// Observes signing metadata at the current canonical Watch block.
+///
+/// # Errors
+///
+/// Returns an error for an invalid runtime, RPC failure, or a block that changed canonical hash.
+pub async fn observe_current_runtime_snapshot_for_endpoints(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+) -> Result<RuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
+    Ok(
+        observe_current_runtime_snapshot_with_checkpoint(environment, endpoints)
+            .await?
+            .0,
+    )
+}
+
+async fn observe_current_runtime_snapshot_with_checkpoint(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+) -> Result<(RuntimeSnapshot, [u8; 32], u32), DeepXRuntimeSnapshotObservationError> {
+    let client = BlockchainHttpRpcClient::new(
+        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
+        None,
+        None,
+    );
+    let encoded_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
+    let block_hash = decode_prefixed_hash(&encoded_hash, "current block hash")?;
+    let header: ObservedBlockHeader = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getHeader", "params": [encoded_hash],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getHeader",
+            source,
+        })?;
+    let block_number = decode_block_number(&header.number)?;
+    let rejection: RpcNodeHttpResponse<ObservedRuntimeVersion> = client
+        .execute_rpc_response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getRuntimeVersion",
+            "params": [format!("0x{}", "00".repeat(32))],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
+    if rejection.jsonrpc.as_deref() != Some("2.0")
+        || rejection.id != Some(1)
+        || rejection.result.is_some()
+        || rejection.error.is_none()
+    {
+        return Err(DeepXRuntimeSnapshotObservationError::BlockHashIgnored);
+    }
+    let (version, metadata) = observe_runtime_metadata_at(&client, block_hash).await?;
+    let snapshot = RuntimeSnapshot::observed_testnet(
+        environment,
+        endpoints.genesis_hash(),
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )?;
+    let canonical_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [block_number],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
+    if decode_prefixed_hash(&canonical_hash, "canonical runtime block hash")? != block_hash {
+        return Err(DeepXRuntimeSnapshotObservationError::InvalidCheckpoint);
+    }
+    Ok((snapshot, block_hash, block_number))
+}
+
+/// Reads current runtime and chain time while retaining a finalized recovery scan boundary.
+///
+/// The timestamp storage, block inherent, and runtime metadata are read at one current canonical
+/// hash. A finalized head is queried only as a durable pre-submission scan starting point.
+pub(crate) async fn observe_and_apply_current_submission_clock(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    service: &DeepXRuntimeSnapshotService,
+) -> anyhow::Result<DeepXCurrentSubmissionClockEvidence> {
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    anyhow::ensure!(
+        watch.role() == DeepXRpcRole::Watch
+            && watch.endpoint_url() == watch_url
+            && [
+                "chain_getBlockHash",
+                "chain_getHeader",
+                "chain_getBlock",
+                "chain_getFinalizedHead",
+                "state_getStorage",
+            ]
+            .into_iter()
+            .all(|method| watch.methods().contains(method)),
+        "DeepX Watch RPC capabilities do not authorize current submission clock reads",
+    );
+    let (snapshot, block_hash, block_number) =
+        observe_current_runtime_snapshot_with_checkpoint(environment, endpoints).await?;
+    service.apply_validated(&snapshot)?;
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let encoded_hash = format!("0x{}", hex::encode(block_hash));
+    let rejected: RpcNodeHttpResponse<String> = client
+        .execute_rpc_response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getStorage",
+            "params": [timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))],
+        }))
+        .await?;
+    if rejected.jsonrpc.as_deref() != Some("2.0")
+        || rejected.id != Some(1)
+        || rejected.result.is_some()
+        || rejected.error.is_none()
+    {
+        service.halt_for_inconsistent_evidence()?;
+        anyhow::bail!("DeepX Watch RPC ignored an invalid timestamp block hash");
+    }
+    let encoded_time: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getStorage",
+            "params": [timestamp_now_storage_key(), encoded_hash],
+        }))
+        .await?;
+    let timestamp_ms = match decode_timestamp_now(&encoded_time) {
+        Ok(timestamp_ms) => timestamp_ms,
+        Err(e) => {
+            service.halt_for_inconsistent_evidence()?;
+            return Err(e.into());
+        }
+    };
+    let block: ObservedTimestampBlockResponse = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlock",
+            "params": [encoded_hash],
+        }))
+        .await?;
+    let block_number_matches = decode_block_number(&block.block.header.number)
+        .is_ok_and(|received| received == block_number);
+    let inherent_time = decode_timestamp_set_inherent(&block.block.extrinsics);
+    if !block_number_matches || !inherent_time.is_ok_and(|received| received == timestamp_ms) {
+        service.halt_for_inconsistent_evidence()?;
+        anyhow::bail!("DeepX current timestamp storage and block inherent differ");
+    }
+    let canonical_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [block_number],
+        }))
+        .await?;
+    anyhow::ensure!(
+        decode_prefixed_hash(&canonical_hash, "canonical submission block hash")? == block_hash,
+        "DeepX current submission clock block is no longer canonical",
+    );
+    let scan_checkpoint = observe_finalized_checkpoint_at(watch_url.to_string()).await?;
+    Ok(DeepXCurrentSubmissionClockEvidence {
+        scan_checkpoint,
+        runtime_identity: snapshot.identity().clone(),
+        timestamp_ms,
     })
 }
 
@@ -2220,16 +2506,16 @@ pub async fn observe_and_apply_approved_finalized_runtime_snapshot(
     })
 }
 
-/// Observes fixture-approved runtime identity and `Timestamp.Now` at one finalized Watch block.
+/// Observes runtime identity and `Timestamp.Now` at one finalized Watch block.
 ///
-/// The built-in runtime snapshot is applied before timestamp storage is read from the exact same
+/// The observed runtime snapshot is applied before timestamp storage is read from the exact same
 /// checkpoint. `Timestamp.Now` must also agree with the block inherent and independent storage
 /// query. Inconsistent checkpoint evidence blocks new signing permits even when a later check fails.
 /// This function performs no nonce allocation, signing, or submission.
 ///
 /// # Errors
 ///
-/// Returns an error unless capability evidence authorizes the required Watch reads, the built-in
+/// Returns an error unless capability evidence authorizes the required Watch reads, the observed
 /// runtime snapshot can be applied at a finalized checkpoint, and all timestamp observations agree.
 pub async fn observe_and_apply_finalized_chain_time(
     environment: &DeepXEnvironment,
@@ -2278,31 +2564,6 @@ pub async fn observe_and_apply_finalized_chain_time(
     })
 }
 
-/// Reads `Timestamp.Now` at an already observed finalized checkpoint.
-///
-/// The supplied checkpoint is used directly as the state-query block hash, so the timestamp can
-/// be paired with other evidence read from that exact checkpoint without observing unrelated
-/// account components.
-///
-/// # Errors
-///
-/// Returns an error unless Watch capability evidence authorizes storage reads and the timestamp is
-/// one exact non-zero SCALE `u64` value.
-pub(crate) async fn observe_finalized_timestamp_at_checkpoint(
-    endpoints: &DeepXValidatedRpcEndpoints,
-    capabilities: &DeepXValidatedRpcMethodCapabilities,
-    checkpoint: DeepXFinalizedCheckpoint,
-) -> Result<u64, DeepXFinalizedChainTimeError> {
-    let watch_capabilities = capabilities.for_role(DeepXRpcRole::Watch);
-    if watch_capabilities.role() != DeepXRpcRole::Watch
-        || watch_capabilities.endpoint_url() != endpoints.url_for(DeepXRpcRole::Watch)
-        || !watch_capabilities.methods().contains("state_getStorage")
-    {
-        return Err(DeepXFinalizedChainTimeError::RpcCapabilitiesMismatch);
-    }
-    observe_finalized_chain_time_at(endpoints.url_for(DeepXRpcRole::Watch), checkpoint).await
-}
-
 /// Reads `Timestamp.Now` at `block_number` after proving the height is finalized.
 ///
 /// The block hash is resolved by height from the identity-validated Watch endpoint, then its
@@ -2313,6 +2574,7 @@ pub(crate) async fn observe_finalized_timestamp_at_checkpoint(
 ///
 /// Returns an error unless Watch capability evidence authorizes every required method and the
 /// requested canonical block is finalized with one exact non-zero SCALE timestamp.
+#[cfg(test)]
 pub(crate) async fn observe_finalized_block_timestamp(
     endpoints: &DeepXValidatedRpcEndpoints,
     capabilities: &DeepXValidatedRpcMethodCapabilities,
@@ -2497,6 +2759,92 @@ pub async fn observe_finalized_margin_evidence(
     })
 }
 
+/// Observes both margin directions at one current canonical Watch block.
+///
+/// This observation has no finality guarantee and must be rechecked before account publication.
+///
+/// # Errors
+///
+/// Returns an error for unsupported RPC capabilities, malformed or inconsistent margin evidence,
+/// an ignored block-hash parameter, or a block removed from the canonical chain.
+pub async fn observe_current_margin_evidence(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> anyhow::Result<DeepXCurrentMarginEvidence> {
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    anyhow::ensure!(
+        watch.role() == DeepXRpcRole::Watch
+            && watch.endpoint_url() == watch_url
+            && ["chain_getBlockHash", "chain_getHeader", "state_call"]
+                .into_iter()
+                .all(|method| watch.methods().contains(method)),
+        "DeepX Watch RPC capabilities do not authorize current margin reads",
+    );
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let encoded_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [],
+        }))
+        .await?;
+    let block_hash = decode_prefixed_hash(&encoded_hash, "current margin block hash")?;
+    let header: ObservedBlockHeader = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getHeader", "params": [encoded_hash],
+        }))
+        .await?;
+    let block_number = decode_block_number(&header.number)?;
+    let input = (
+        vec![subaccount],
+        DeepXMarginDirection::Initial.as_runtime_u8(),
+    )
+        .encode();
+    let rejection: RpcNodeHttpResponse<String> = client
+        .execute_rpc_response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_call",
+            "params": [
+                DEEPX_MARGIN_RUNTIME_API_METHOD,
+                format!("0x{}", hex::encode(input)),
+                format!("0x{}", "00".repeat(32)),
+            ],
+        }))
+        .await?;
+    anyhow::ensure!(
+        rejection.jsonrpc.as_deref() == Some("2.0")
+            && rejection.id == Some(1)
+            && rejection.result.is_none()
+            && rejection.error.is_some(),
+        "DeepX Watch RPC ignored an invalid margin block hash",
+    );
+    let first = observe_margin_requirements_at_hash(&client, block_hash, subaccount).await?;
+    let second = observe_margin_requirements_at_hash(&client, block_hash, subaccount).await?;
+    anyhow::ensure!(
+        first == second,
+        "DeepX margin changed at a fixed block hash"
+    );
+    let canonical_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [block_number],
+        }))
+        .await?;
+    anyhow::ensure!(
+        decode_prefixed_hash(&canonical_hash, "canonical margin block hash")? == block_hash,
+        "DeepX current margin block is no longer canonical",
+    );
+    Ok(DeepXCurrentMarginEvidence {
+        block_hash,
+        block_number,
+        subaccount,
+        initial: first.0,
+        maintenance: first.1,
+    })
+}
+
 /// Observes raw Spot market constraints at one approved finalized Watch checkpoint.
 ///
 /// The call reads metadata-typed `SpotMarket.SpotMarkets` at one finalized block hash. The result
@@ -2618,6 +2966,116 @@ pub async fn observe_finalized_spot_market_spec_batch(
         .await
         .map_err(|e| DeepXFinalizedSpotMarketSpecError::Checkpoint(Box::new(e)))?;
     Ok(evidence)
+}
+
+pub(crate) async fn observe_current_spot_market_spec_batch(
+    environment: &DeepXEnvironment,
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    pairs: &[[u8; 32]],
+) -> anyhow::Result<Vec<DeepXCurrentSpotMarketSpec>> {
+    anyhow::ensure!(
+        !pairs.is_empty() && pairs.len() <= 256,
+        "invalid DeepX Spot spec batch size"
+    );
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    anyhow::ensure!(
+        watch.role() == DeepXRpcRole::Watch
+            && watch.endpoint_url() == watch_url
+            && watch.methods().contains("chain_getBlockHash")
+            && watch.methods().contains("chain_getHeader")
+            && watch.methods().contains("state_getStorage"),
+        "DeepX Watch RPC capabilities do not authorize current Spot market reads",
+    );
+    let mut unique = BTreeSet::new();
+    anyhow::ensure!(
+        pairs.iter().all(|pair| unique.insert(*pair)),
+        "duplicate DeepX Spot market pair",
+    );
+    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let encoded_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [],
+        }))
+        .await?;
+    let block_hash = decode_prefixed_hash(&encoded_hash, "current block hash")?;
+    let header: ObservedBlockHeader = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getHeader", "params": [encoded_hash],
+        }))
+        .await?;
+    let block_number = decode_block_number(&header.number)?;
+    let (version, metadata) = observe_runtime_metadata_at(&client, block_hash).await?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+        environment,
+        endpoints.genesis_hash(),
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )?;
+    let rejection: RpcNodeHttpResponse<String> = client
+        .execute_rpc_response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "state_getStorage",
+            "params": [spot_market_storage_key(pairs[0]), format!("0x{}", "00".repeat(32))],
+        }))
+        .await?;
+    anyhow::ensure!(
+        rejection.jsonrpc.as_deref() == Some("2.0")
+            && rejection.id == Some(1)
+            && rejection.result.is_none()
+            && rejection.error.is_some(),
+        "DeepX Watch RPC ignored an invalid Spot market block hash",
+    );
+    let mut specs = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let key = spot_market_storage_key(*pair);
+        let read = || async {
+            client
+                .execute_rpc_call::<Option<String>>(json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "state_getStorage", "params": [key, encoded_hash],
+                }))
+                .await
+        };
+        let first = read().await?;
+        let second = read().await?;
+        anyhow::ensure!(
+            first == second,
+            "DeepX current Spot market storage changed at a fixed hash"
+        );
+        let (min_order_size, tick_size, step_size) = first
+            .as_deref()
+            .and_then(|encoded| {
+                decode_finalized_spot_market_storage(encoded, snapshot.metadata(), *pair)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid current DeepX Spot market spec for {}",
+                    hex::encode(pair)
+                )
+            })?;
+        specs.push(DeepXCurrentSpotMarketSpec {
+            pair: *pair,
+            min_order_size,
+            tick_size,
+            step_size,
+        });
+    }
+    let canonical_hash: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "chain_getBlockHash", "params": [block_number],
+        }))
+        .await?;
+    anyhow::ensure!(
+        decode_prefixed_hash(&canonical_hash, "canonical Spot market block hash")? == block_hash,
+        "DeepX current Spot market block is no longer canonical",
+    );
+    Ok(specs)
 }
 
 async fn observe_spot_market_spec_at(
@@ -4738,7 +5196,15 @@ async fn observe_finalized_margin_requirements_with_client(
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
-    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
+    observe_margin_requirements_at_hash(client, checkpoint.block_hash(), subaccount).await
+}
+
+async fn observe_margin_requirements_at_hash(
+    client: &BlockchainHttpRpcClient,
+    block_hash: [u8; 32],
+    subaccount: [u8; 20],
+) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
+    let block_hash = format!("0x{}", hex::encode(block_hash));
     let observe = |direction: DeepXMarginDirection| {
         let input = (vec![subaccount], direction.as_runtime_u8()).encode();
         client.execute_rpc_call::<String>(json!({
@@ -4804,14 +5270,6 @@ fn timestamp_now_storage_key() -> String {
     format!("0x{}", hex::encode(encoded))
 }
 
-async fn observe_finalized_chain_time_at(
-    watch_url: &str,
-    checkpoint: DeepXFinalizedCheckpoint,
-) -> Result<u64, DeepXFinalizedChainTimeError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    observe_finalized_chain_time_with_client(&client, checkpoint).await
-}
-
 async fn observe_finalized_chain_time_with_client(
     client: &BlockchainHttpRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
@@ -4865,17 +5323,56 @@ async fn observe_approved_finalized_read_only_runtime_snapshot_at(
             source,
         })?;
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet()?;
-    if snapshot.identity().environment != *environment
-        || snapshot.identity().genesis_hash != genesis_hash
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch.into());
-    }
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
+    let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+        environment,
+        genesis_hash,
+        version.spec_version,
+        version.transaction_version,
+        &metadata,
+    )?;
     Ok(DeepXObservedReadOnlyRuntimeSnapshot {
         snapshot,
         checkpoint,
     })
+}
+
+async fn observe_runtime_metadata_at(
+    client: &BlockchainHttpRpcClient,
+    block_hash: [u8; 32],
+) -> Result<(ObservedRuntimeVersion, Vec<u8>), DeepXRuntimeSnapshotObservationError> {
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let version = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getRuntimeVersion",
+            "params": [block_hash],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
+    let encoded_metadata: String = client
+        .execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "state_getMetadata",
+            "params": [block_hash],
+        }))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getMetadata",
+            source,
+        })?;
+    let metadata = encoded_metadata
+        .strip_prefix("0x")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| hex::decode(value).ok())
+        .ok_or(DeepXRuntimeSnapshotObservationError::InvalidMetadata)?;
+    Ok((version, metadata))
 }
 
 async fn observe_finalized_checkpoint_at(
@@ -5535,6 +6032,79 @@ mod tests {
         assert_eq!(initial.total_margin_required(), 250_000);
         assert_eq!(maintenance.total_collateral(), 900_000);
         assert_eq!(maintenance.total_margin_required(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn current_margin_rejects_ignored_hash_and_reorganization() {
+        const BLOCK_HASH: &str =
+            "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let subaccount = [0x11; 20];
+        for (ignored_hash, reorganized) in [(false, false), (true, false), (false, true)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let router = Router::new().route(
+                "/",
+                post({
+                    let calls = Arc::clone(&calls);
+                    move |Json(request): Json<Value>| {
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            let response = match request["method"].as_str().unwrap() {
+                                "chain_getBlockHash" => {
+                                    let hash = if reorganized && request["params"] == json!([42]) {
+                                        format!("0x{}", "33".repeat(32))
+                                    } else {
+                                        BLOCK_HASH.to_string()
+                                    };
+                                    json!({"jsonrpc": "2.0", "id": 1, "result": hash})
+                                }
+                                "chain_getHeader" => {
+                                    assert_eq!(request["params"], json!([BLOCK_HASH]));
+                                    json!({"jsonrpc": "2.0", "id": 1,
+                                        "result": {"number": "0x2a"}})
+                                }
+                                "state_call" => {
+                                    assert_eq!(
+                                        request["params"][0],
+                                        DEEPX_MARGIN_RUNTIME_API_METHOD
+                                    );
+                                    let hash = request["params"][2].as_str().unwrap();
+                                    if hash == format!("0x{}", "00".repeat(32)) && !ignored_hash {
+                                        json!({"jsonrpc": "2.0", "id": 1,
+                                            "error": {"code": -32000, "message": "unknown block"}})
+                                    } else {
+                                        assert!(hash == BLOCK_HASH || ignored_hash);
+                                        calls.fetch_add(1, Ordering::Relaxed);
+                                        let data = BTreeMap::from([(
+                                            subaccount,
+                                            (10_000_000_u128, 0_u128),
+                                        )])
+                                        .encode();
+                                        json!({"jsonrpc": "2.0", "id": 1,
+                                            "result": format!("0x{}", hex::encode(data))})
+                                    }
+                                }
+                                method => panic!("unexpected current margin method: {method}"),
+                            };
+                            Json(response)
+                        }
+                    }
+                }),
+            );
+            let watch_url = spawn_server(router).await;
+            let endpoints =
+                validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+            let capabilities = validated_capabilities(&endpoints);
+            let result =
+                observe_current_margin_evidence(&endpoints, &capabilities, subaccount).await;
+            if ignored_hash || reorganized {
+                assert!(result.is_err());
+            } else {
+                let margin = result.unwrap();
+                assert_eq!(margin.initial().total_collateral(), 10_000_000);
+                assert_eq!(margin.maintenance().total_margin_required(), 0);
+                assert_eq!(calls.load(Ordering::Relaxed), 4);
+            }
+        }
     }
 
     #[tokio::test]
@@ -6284,7 +6854,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert_eq!(
             observation.snapshot().identity().spec_version,
             DEEPX_SPEC_376_VERSION,
@@ -6318,7 +6888,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(read_only_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(read_only_calls.load(Ordering::Relaxed), 5);
         assert_eq!(
             observation.snapshot().identity().spec_version,
             DEEPX_SPEC_376_VERSION
@@ -6364,6 +6934,9 @@ mod tests {
                 let header = header.clone();
                 let spot_market_storage = spot_market_storage.clone();
                 async move {
+                    if let Some(response) = read_only_runtime_rpc_response(&request) {
+                        return Json(response);
+                    }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
                     let response = match index {
                         0 => genesis,
@@ -6524,6 +7097,137 @@ mod tests {
             assert_eq!(evidence[0].step_size(), 100_000_000_000_000);
             assert_eq!(calls.load(Ordering::Relaxed), 12);
         }
+    }
+
+    #[rstest]
+    #[case::stable(false, false, false)]
+    #[case::changed(true, false, false)]
+    #[case::reorganized(false, true, false)]
+    #[case::hash_ignored(false, false, true)]
+    #[tokio::test]
+    async fn current_spot_market_spec_reads_one_hash_without_finality(
+        #[case] changed: bool,
+        #[case] reorganized: bool,
+        #[case] hash_ignored: bool,
+    ) {
+        const CURRENT_HASH: &str =
+            "0x4242424242424242424242424242424242424242424242424242424242424242";
+        let pair =
+            hex::decode_array("9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
+                .unwrap();
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
+        let stored: Value = serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let calls = Arc::clone(&calls);
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let metadata = metadata.clone();
+                    let stored = stored.clone();
+                    async move {
+                        let index = calls.fetch_add(1, Ordering::Relaxed);
+                        let response = match request["method"].as_str().unwrap() {
+                            "chain_getBlockHash" => {
+                                assert!(
+                                    request["params"] == json!([])
+                                        || request["params"] == json!([42])
+                                );
+                                let hash = if reorganized && index == 7 {
+                                    format!("0x{}", "43".repeat(32))
+                                } else {
+                                    CURRENT_HASH.to_string()
+                                };
+                                json!({"jsonrpc": "2.0", "id": 1, "result": hash})
+                            }
+                            "chain_getHeader" => {
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                json!({"jsonrpc": "2.0", "id": 1, "result": {
+                                    "number": "0x2a",
+                                }})
+                            }
+                            "state_getRuntimeVersion" => {
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                json!({"jsonrpc": "2.0", "id": 1, "result": {
+                                    "specVersion": 377, "transactionVersion": 2,
+                                }})
+                            }
+                            "state_getMetadata" => {
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                metadata
+                            }
+                            "state_getStorage" => {
+                                assert_eq!(request["params"][0], spot_market_storage_key(pair));
+                                if request["params"][1] == format!("0x{}", "00".repeat(32)) {
+                                    if hash_ignored {
+                                        return Json(json!({"jsonrpc": "2.0", "id": 1,
+                                            "result": stored["result"]}));
+                                    }
+                                    return Json(json!({"jsonrpc": "2.0", "id": 1,
+                                        "error": {"code": -32000, "message": "unknown block"}}));
+                                }
+                                assert_eq!(request["params"][1], CURRENT_HASH);
+                                let mut encoded = stored["result"].as_str().unwrap().to_string();
+                                if changed && index == 6 {
+                                    encoded.push_str("00");
+                                }
+                                json!({"jsonrpc": "2.0", "id": 1, "result": encoded})
+                            }
+                            method => panic!("unexpected current Spot spec RPC: {method}"),
+                        };
+                        Json(response)
+                    }
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+
+        let result = observe_current_spot_market_spec_batch(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &[pair],
+        )
+        .await;
+
+        if hash_ignored {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ignored an invalid")
+            );
+        } else if changed {
+            assert!(result.unwrap_err().to_string().contains("storage changed"));
+        } else if reorganized {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no longer canonical")
+            );
+        } else {
+            let specs = result.unwrap();
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].pair(), pair);
+            assert_eq!(specs[0].min_order_size(), 100_000_000_000_000);
+            assert_eq!(specs[0].tick_size(), 10_000);
+            assert_eq!(specs[0].step_size(), 100_000_000_000_000);
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            if hash_ignored {
+                5
+            } else if changed {
+                7
+            } else {
+                8
+            }
+        );
     }
 
     #[rstest]
@@ -6766,6 +7470,9 @@ mod tests {
                 let finalized_head = finalized_head.clone();
                 let header = header.clone();
                 async move {
+                    if let Some(response) = read_only_runtime_rpc_response(&request) {
+                        return Json(response);
+                    }
                     let index = calls.fetch_add(1, Ordering::Relaxed);
                     let response = match index {
                         0 => genesis,
@@ -7026,6 +7733,9 @@ mod tests {
                                 ),
                             })
                         }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            read_only_runtime_rpc_response(&request).unwrap()
+                        }
                         _ => panic!("unexpected read-only finalized margin request"),
                     };
                     Json(response)
@@ -7053,7 +7763,7 @@ mod tests {
         assert_eq!(evidence.checkpoint().block_number(), 19_592_700);
         assert_eq!(evidence.initial().total_collateral(), 1_000_000);
         assert_eq!(evidence.maintenance().total_margin_required(), 100_000);
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
     }
 
     #[tokio::test]
@@ -7101,6 +7811,9 @@ mod tests {
                                 }],
                             })
                         }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            read_only_runtime_rpc_response(&request).unwrap()
+                        }
                         _ => panic!("unexpected read-only finalized position request"),
                     };
                     Json(response)
@@ -7130,7 +7843,7 @@ mod tests {
         assert_eq!(evidence.positions().len(), 1);
         assert_eq!(evidence.positions()[0].market_id(), 3);
         assert_eq!(evidence.positions()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
     }
 
     #[tokio::test]
@@ -7187,6 +7900,9 @@ mod tests {
                                 }],
                             })
                         }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            read_only_runtime_rpc_response(&request).unwrap()
+                        }
                         _ => panic!("unexpected read-only finalized order request"),
                     };
                     Json(response)
@@ -7216,7 +7932,7 @@ mod tests {
         assert_eq!(evidence.orders()[0].order_id(), 42);
         assert_eq!(evidence.orders()[0].market_id(), 3);
         assert_eq!(evidence.orders()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
     }
 
     #[tokio::test]
@@ -7277,6 +7993,9 @@ mod tests {
                                 }],
                             })
                         }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            read_only_runtime_rpc_response(&request).unwrap()
+                        }
                         _ => panic!("unexpected read-only finalized Spot order request"),
                     };
                     Json(response)
@@ -7310,7 +8029,7 @@ mod tests {
         assert_eq!(evidence.orders()[0].is_buy(), order.is_buy());
         assert_eq!(evidence.orders()[0].quote_amount(), order.quote_amount());
         assert_eq!(evidence.orders()[0].base_amount(), order.base_amount());
-        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
     }
 
     #[tokio::test]
@@ -7465,6 +8184,9 @@ mod tests {
                                 }],
                             })
                         }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            read_only_runtime_rpc_response(&request).unwrap()
+                        }
                         _ => panic!("unexpected complete finalized account request"),
                     };
                     Json(response)
@@ -7513,7 +8235,7 @@ mod tests {
         assert_eq!(evidence.spot_orders().orders().len(), 1);
         assert_eq!(evidence.spot_orders().orders()[0].pair(), [0x22; 32]);
         assert_eq!(evidence.spot_orders().orders()[0].owner(), subaccount);
-        assert_eq!(calls.load(Ordering::Relaxed), 16);
+        assert_eq!(calls.load(Ordering::Relaxed), 18);
     }
 
     #[tokio::test]
@@ -7653,6 +8375,9 @@ mod tests {
                                 })
                                 .collect::<Vec<_>>();
                             json!([{ "block": FINALIZED_HASH, "changes": changes }])
+                        }
+                        "state_getRuntimeVersion" | "state_getMetadata" => {
+                            return Json(read_only_runtime_rpc_response(&request).unwrap());
                         }
                         method => panic!("unexpected account batch RPC method: {method}"),
                     };
@@ -7916,7 +8641,7 @@ mod tests {
 
         assert_eq!(applied.update(), DeepXRuntimeSnapshotUpdate::Unchanged);
         assert_eq!(applied.identity().spec_version, DEEPX_SPEC_376_VERSION);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
         assert!(service.acquire().is_ok());
     }
 
@@ -7951,7 +8676,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(evidence.timestamp_ms(), timestamp_ms);
-        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(calls.load(Ordering::Relaxed), 7);
         assert!(service.acquire().is_ok());
     }
 
@@ -8111,7 +8836,7 @@ mod tests {
             .await,
             Err(DeepXFinalizedChainTimeError::Rpc(_))
         ));
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert!(service.acquire().is_ok());
     }
 
@@ -8181,7 +8906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_built_in_runtime_snapshot_without_online_version_check() {
+    async fn uses_observed_runtime_version() {
         let calls = Arc::new(AtomicUsize::new(0));
         let rpc_url = spawn_runtime_snapshot_server(367, Arc::clone(&calls)).await;
         let config = DeepXNetworkConfig {
@@ -8194,11 +8919,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            observation.snapshot().identity().spec_version,
-            DEEPX_SPEC_376_VERSION
-        );
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(observation.snapshot().identity().spec_version, 367);
     }
 
     #[tokio::test]
@@ -8345,6 +9067,278 @@ mod tests {
         RuntimeSnapshot::from_read_only_for_test(read_only)
     }
 
+    fn read_only_runtime_rpc_response(request: &Value) -> Option<Value> {
+        match request["method"].as_str()? {
+            "state_getRuntimeVersion" => {
+                assert_eq!(request["params"], json!([FINALIZED_HASH]));
+                Some(json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {
+                        "specVersion": DEEPX_SPEC_376_VERSION,
+                        "transactionVersion": 1,
+                    },
+                }))
+            }
+            "state_getMetadata" => {
+                assert_eq!(request["params"], json!([FINALIZED_HASH]));
+                Some(serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap())
+            }
+            _ => None,
+        }
+    }
+
+    #[rstest]
+    #[case::canonical(false, false)]
+    #[case::reorganized(true, false)]
+    #[case::hash_ignored(false, true)]
+    #[tokio::test]
+    async fn current_signing_runtime_rechecks_canonical_block(
+        #[case] reorganized: bool,
+        #[case] hash_ignored: bool,
+    ) {
+        const CURRENT_HASH: &str =
+            "0x4242424242424242424242424242424242424242424242424242424242424242";
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let calls = Arc::clone(&calls);
+                move |Json(request): Json<Value>| {
+                    let calls = Arc::clone(&calls);
+                    let metadata = metadata.clone();
+                    async move {
+                        let index = calls.fetch_add(1, Ordering::Relaxed);
+                        let result = match request["method"].as_str().unwrap() {
+                            "chain_getBlockHash" => {
+                                assert!(
+                                    request["params"] == json!([])
+                                        || request["params"] == json!([42])
+                                );
+                                if reorganized && index == 5 {
+                                    json!(format!("0x{}", "43".repeat(32)))
+                                } else {
+                                    json!(CURRENT_HASH)
+                                }
+                            }
+                            "chain_getHeader" => {
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                json!({"number": "0x2a"})
+                            }
+                            "state_getRuntimeVersion" => {
+                                if request["params"] == json!([format!("0x{}", "00".repeat(32))]) {
+                                    if hash_ignored {
+                                        return Json(json!({"jsonrpc": "2.0", "id": 1,
+                                            "result": {"specVersion": 377, "transactionVersion": 2}}));
+                                    }
+                                    return Json(json!({"jsonrpc": "2.0", "id": 1,
+                                        "error": {"code": -32000, "message": "unknown block"}}));
+                                }
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                json!({"specVersion": 377, "transactionVersion": 2})
+                            }
+                            "state_getMetadata" => {
+                                assert_eq!(request["params"], json!([CURRENT_HASH]));
+                                metadata["result"].clone()
+                            }
+                            method => panic!("unexpected current runtime RPC: {method}"),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                    }
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+
+        let result =
+            observe_current_runtime_snapshot_for_endpoints(&DeepXEnvironment::Testnet, &endpoints)
+                .await;
+
+        if hash_ignored {
+            assert!(matches!(
+                result,
+                Err(DeepXRuntimeSnapshotObservationError::BlockHashIgnored)
+            ));
+        } else if reorganized {
+            assert!(matches!(
+                result,
+                Err(DeepXRuntimeSnapshotObservationError::InvalidCheckpoint)
+            ));
+        } else {
+            let snapshot = result.unwrap();
+            assert_eq!(snapshot.identity().spec_version, 377);
+            assert_eq!(snapshot.identity().transaction_version, 2);
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            if hash_ignored { 3 } else { 6 }
+        );
+    }
+
+    #[rstest]
+    #[case::valid(false, false, false, false)]
+    #[case::later_recovery_head(false, false, false, true)]
+    #[case::ignored_storage_hash(true, false, false, false)]
+    #[case::conflicting_inherent(false, true, false, false)]
+    #[case::reorganized(false, false, true, false)]
+    #[tokio::test]
+    async fn current_submission_clock_keeps_time_current_and_scan_boundary_finalized(
+        #[case] ignored_storage_hash: bool,
+        #[case] conflicting_inherent: bool,
+        #[case] reorganized: bool,
+        #[case] later_recovery_head: bool,
+    ) {
+        const CURRENT_HASH: &str =
+            "0x4242424242424242424242424242424242424242424242424242424242424242";
+        const RECOVERY_HASH: &str =
+            "0x4141414141414141414141414141414141414141414141414141414141414141";
+        let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
+        let canonical_reads = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let canonical_reads = Arc::clone(&canonical_reads);
+                move |Json(request): Json<Value>| {
+                let metadata = metadata.clone();
+                let canonical_reads = Arc::clone(&canonical_reads);
+                async move {
+                    let params = &request["params"];
+                    let response = match request["method"].as_str().unwrap() {
+                        "chain_getBlockHash" => {
+                            assert!(params == &json!([]) || params == &json!([42]));
+                            let hash = if params == &json!([42])
+                                && reorganized
+                                && canonical_reads.fetch_add(1, Ordering::Relaxed) == 1
+                            {
+                                format!("0x{}", "43".repeat(32))
+                            } else {
+                                CURRENT_HASH.to_string()
+                            };
+                            json!({"jsonrpc": "2.0", "id": 1, "result": hash})
+                        }
+                        "chain_getHeader" => {
+                            let number = if params == &json!([CURRENT_HASH]) {
+                                "0x2a"
+                            } else {
+                                assert_eq!(params, &json!([RECOVERY_HASH]));
+                                    if later_recovery_head { "0x2b" } else { "0x29" }
+                            };
+                            json!({"jsonrpc": "2.0", "id": 1,
+                                "result": {"number": number}})
+                        }
+                        "state_getRuntimeVersion" => {
+                            if params == &json!([format!("0x{}", "00".repeat(32))]) {
+                                json!({"jsonrpc": "2.0", "id": 1,
+                                    "error": {"code": -32000, "message": "unknown block"}})
+                            } else {
+                                assert_eq!(params, &json!([CURRENT_HASH]));
+                                json!({"jsonrpc": "2.0", "id": 1,
+                                    "result": {"specVersion": 376, "transactionVersion": 1}})
+                            }
+                        }
+                        "state_getMetadata" => {
+                            assert_eq!(params, &json!([CURRENT_HASH]));
+                            json!({"jsonrpc": "2.0", "id": 1,
+                                "result": metadata["result"]})
+                        }
+                        "state_getStorage" => {
+                            if params[1] == format!("0x{}", "00".repeat(32)) {
+                                if ignored_storage_hash {
+                                    json!({"jsonrpc": "2.0", "id": 1,
+                                        "result": format!("0x{}", hex::encode(1_000_u64.to_le_bytes()))})
+                                } else {
+                                    json!({"jsonrpc": "2.0", "id": 1,
+                                        "error": {"code": -32000, "message": "unknown block"}})
+                                }
+                            } else {
+                                assert_eq!(params[1], CURRENT_HASH);
+                                json!({"jsonrpc": "2.0", "id": 1,
+                                    "result": format!("0x{}", hex::encode(1_000_u64.to_le_bytes()))})
+                            }
+                        }
+                        "chain_getBlock" => {
+                            assert_eq!(params, &json!([CURRENT_HASH]));
+                            let mut call = vec![4, 2, 0];
+                            call.extend(Compact(if conflicting_inherent { 1_001_u64 } else { 1_000_u64 }).encode());
+                            json!({"jsonrpc": "2.0", "id": 1,
+                                "result": {"block": {"header": {"number": "0x2a"},
+                                    "extrinsics": [format!("0x{}", hex::encode(call.encode()))]}}})
+                        }
+                        "chain_getFinalizedHead" => {
+                            json!({"jsonrpc": "2.0", "id": 1, "result": RECOVERY_HASH})
+                        }
+                        method => panic!("unexpected submission clock method: {method}"),
+                    };
+                    Json(response)
+                }
+                }
+            }),
+        );
+        let watch_url = spawn_server(router).await;
+        let endpoints =
+            validated_role_endpoints("http://127.0.0.1:1", &watch_url, "http://127.0.0.1:2");
+        let capabilities = validated_capabilities(&endpoints);
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+        let result = observe_and_apply_current_submission_clock(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &service,
+        )
+        .await;
+        if ignored_storage_hash || conflicting_inherent || reorganized {
+            assert!(result.is_err());
+            if reorganized {
+                assert!(service.acquire().is_ok());
+            } else {
+                assert!(matches!(
+                    service.acquire(),
+                    Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent)
+                ));
+            }
+        } else {
+            let clock = result.unwrap();
+            assert_eq!(clock.timestamp_ms(), 1_000);
+            assert_eq!(
+                clock.scan_checkpoint().block_number(),
+                if later_recovery_head { 43 } else { 41 },
+            );
+            assert_eq!(
+                clock.runtime_identity(),
+                service.acquire().unwrap().snapshot().identity()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live DeepX testnet Watch RPC"]
+    async fn live_current_submission_clock_uses_current_runtime_and_time() {
+        let network = DeepXNetworkConfig::default();
+        let endpoints = observe_and_validate_rpc_endpoint_identities(&network)
+            .await
+            .unwrap();
+        let capabilities = observe_and_validate_rpc_method_capabilities(&endpoints)
+            .await
+            .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(approved_runtime_snapshot());
+        let clock = observe_and_apply_current_submission_clock(
+            &DeepXEnvironment::Testnet,
+            &endpoints,
+            &capabilities,
+            &service,
+        )
+        .await
+        .unwrap();
+        assert!(clock.timestamp_ms() > 0);
+        assert!(clock.scan_checkpoint().block_number() > 0);
+        assert_eq!(
+            clock.runtime_identity(),
+            service.acquire().unwrap().snapshot().identity()
+        );
+    }
+
     async fn spawn_runtime_snapshot_server(spec_version: u32, calls: Arc<AtomicUsize>) -> String {
         spawn_runtime_snapshot_server_with(
             spec_version,
@@ -8376,7 +9370,6 @@ mod tests {
                 "number": FINALIZED_BLOCK_NUMBER_HEX
             }
         });
-        let _ = (spec_version, transaction_version, metadata);
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
@@ -8384,6 +9377,7 @@ mod tests {
                 let genesis = genesis.clone();
                 let finalized_head = finalized_head.clone();
                 let finalized_header = finalized_header.clone();
+                let metadata = metadata.clone();
                 let on_request = on_request.clone();
                 async move {
                     calls.fetch_add(1, Ordering::Relaxed);
@@ -8407,6 +9401,20 @@ mod tests {
                         "chain_getHeader" => {
                             assert_eq!(request["params"], json!([FINALIZED_HASH]));
                             finalized_header
+                        }
+                        "state_getRuntimeVersion" => {
+                            assert_eq!(request["params"], json!([FINALIZED_HASH]));
+                            json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": {
+                                    "specVersion": spec_version,
+                                    "transactionVersion": transaction_version,
+                                },
+                            })
+                        }
+                        "state_getMetadata" => {
+                            assert_eq!(request["params"], json!([FINALIZED_HASH]));
+                            metadata
                         }
                         "state_getStorage" => {
                             assert_eq!(
@@ -8462,5 +9470,89 @@ mod tests {
             }),
         );
         spawn_server(router).await
+    }
+
+    #[rstest]
+    fn current_flat_usdc_balance_requires_backend_exact_collateral_and_chain_coverage() {
+        use crate::{
+            account::map_current_flat_usdc_balance,
+            http::{
+                DeepXSubaccountBalanceAsset, DeepXSubaccountBalances, DeepXSubaccountMarginRatio,
+                models::DeepXExactMargin,
+            },
+        };
+
+        let amount = rust_decimal::Decimal::new(10_000_000, 6);
+        let zero = rust_decimal::Decimal::ZERO;
+        let mut balances = DeepXSubaccountBalances {
+            address: format!("0x{}", hex::encode([0x11; 20])),
+            assets: vec![DeepXSubaccountBalanceAsset {
+                symbol: "USDC".to_string(),
+                decimals: 6,
+                price: rust_decimal::Decimal::ONE,
+                balance: amount,
+                balance_usd: amount,
+                balance_borrowed: zero,
+                balance_borrowed_usd: zero,
+                borrow_interest: zero,
+                borrow_interest_usd: zero,
+            }],
+        };
+        let mut margin = DeepXSubaccountMarginRatio {
+            collateral: amount,
+            margin_required: zero,
+            margin_ratio: None,
+            exact_margin: Some(DeepXExactMargin {
+                total_collateral: amount,
+                maint_margin_req: zero,
+                uni_mmr: None,
+            }),
+        };
+        let mut current = DeepXCurrentMarginEvidence {
+            block_hash: [0x22; 32],
+            block_number: 42,
+            subaccount: [0x11; 20],
+            initial: DeepXMarginRequirement {
+                total_collateral: 10_000_000,
+                total_margin_required: 0,
+            },
+            maintenance: DeepXMarginRequirement {
+                total_collateral: 10_000_000,
+                total_margin_required: 0,
+            },
+        };
+        let mapped = map_current_flat_usdc_balance(&balances, &margin, &current).unwrap();
+        balances.assets[0].price = rust_decimal::Decimal::new(2, 0);
+        balances.assets[0].balance_usd = rust_decimal::Decimal::new(9, 0);
+        assert_eq!(
+            map_current_flat_usdc_balance(&balances, &margin, &current).unwrap(),
+            mapped,
+        );
+
+        balances.assets[0].balance_borrowed = rust_decimal::Decimal::new(1, 6);
+        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
+        balances.assets[0].balance_borrowed = zero;
+
+        current.initial.total_margin_required = 1;
+        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
+        current.initial.total_margin_required = 0;
+
+        margin.exact_margin.as_mut().unwrap().total_collateral =
+            rust_decimal::Decimal::new(9_999_999, 6);
+        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
+        margin.exact_margin.as_mut().unwrap().total_collateral = amount;
+
+        current.initial.total_collateral = 10_000_001;
+        current.maintenance.total_collateral = 10_000_001;
+        assert_eq!(
+            map_current_flat_usdc_balance(&balances, &margin, &current).unwrap(),
+            mapped,
+        );
+        current.initial.total_collateral = 9_999_999;
+        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
+        current.initial.total_collateral = 10_000_000;
+
+        current.maintenance.total_collateral = 9_999_999;
+        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
     }
 }

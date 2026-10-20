@@ -22,7 +22,9 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
-use crate::http::{DeepXHttpClient, DeepXHttpError, Result, should_retry_http_error};
+use crate::http::{
+    DeepXHttpClient, DeepXHttpError, Result, models::DeepXResponseCode, should_retry_http_error,
+};
 
 /// Documented backend confirmation states, none of which proves canonical finality.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -148,10 +150,11 @@ pub async fn get_rest_transaction_status(
 
 /// Polls status with bounded GET attempts, an overall deadline, and cancellation.
 ///
-/// Only `pending` or retryable idempotent-read errors continue polling. `best`, `decode_failed`,
-/// malformed results, hash mismatch, and nonretryable errors stop immediately. The result retains
-/// the last valid observation when subsequent reads fail, time out, or are cancelled. This API
-/// never transmits an extrinsic or advances transaction/order lifecycle state.
+/// Only `pending`, backend lookup lag (`10020`), or retryable idempotent-read errors continue
+/// polling. `best`, `decode_failed`, malformed results, hash mismatch, and other nonretryable
+/// errors stop immediately. The result retains the last valid observation when subsequent reads
+/// fail, time out, or are cancelled. This API never transmits an extrinsic or advances
+/// transaction/order lifecycle state.
 ///
 /// # Errors
 ///
@@ -214,7 +217,14 @@ async fn poll_status_attempts(
                 }
             }
             Err(e) => {
-                let retryable = should_retry_http_error(&e);
+                let retryable = should_retry_http_error(&e)
+                    || matches!(
+                        e,
+                        DeepXHttpError::Api {
+                            code: DeepXResponseCode::Api(10020),
+                            ..
+                        }
+                    );
                 result.last_error = Some(e);
 
                 if !retryable {
@@ -310,7 +320,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::http::models::DeepXResponseCode;
 
     const HASH: [u8; 32] = [0xab; 32];
 
@@ -636,7 +645,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(200, json!({"code":10020,"fail":true,"msg":"not found","data":null}).to_string())]
     #[case(200, json!({"code":10018,"fail":true,"msg":"unauthorized","data":null}).to_string())]
     #[case(200, json!({"code":"19_0","fail":true,"msg":"runtime failure","data":null}).to_string())]
     #[case(200, success_body("finalized", "42"))]
@@ -666,6 +674,63 @@ mod tests {
         assert!(result.last_observation.is_none());
         assert!(result.last_error.is_some());
         assert_eq!(server.gets.load(Ordering::Relaxed), 1);
+        assert_eq!(server.posts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn backend_lookup_lag_retries_without_replay() {
+        let server = status_server(vec![
+            (
+                200,
+                json!({"code":10020,"fail":true,"msg":"not found","data":null}).to_string(),
+            ),
+            (200, success_body("best", "42")),
+        ])
+        .await;
+        let result = poll_rest_transaction_status(
+            &client(&server),
+            HASH,
+            policy(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.termination, DeepXRestStatusPollTermination::Best);
+        assert_eq!(result.attempts, 2);
+        assert_eq!(result.last_observation.unwrap().order_id(), Some(42));
+        assert!(result.last_error.is_none());
+        assert_eq!(server.gets.load(Ordering::Relaxed), 2);
+        assert_eq!(server.posts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn backend_lookup_lag_stops_at_attempt_limit() {
+        let not_found = json!({"code":10020,"fail":true,"msg":"not found","data":null}).to_string();
+        let server = status_server(vec![(200, not_found.clone()), (200, not_found)]).await;
+        let result = poll_rest_transaction_status(
+            &client(&server),
+            HASH,
+            policy(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.termination,
+            DeepXRestStatusPollTermination::AttemptLimit
+        );
+        assert_eq!(result.attempts, 2);
+        assert!(result.last_observation.is_none());
+        assert!(matches!(
+            result.last_error,
+            Some(DeepXHttpError::Api {
+                code: DeepXResponseCode::Api(10020),
+                ..
+            })
+        ));
+        assert_eq!(server.gets.load(Ordering::Relaxed), 2);
         assert_eq!(server.posts.load(Ordering::Relaxed), 0);
     }
 
