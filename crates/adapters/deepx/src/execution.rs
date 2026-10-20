@@ -168,7 +168,24 @@ const FILL_REPORT_PAGE_SIZE: u32 = 100;
 const FILL_REPORT_MAX_PAGES: usize = 100;
 const ORDER_EVENT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT_STREAM_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+const ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS: usize = 3;
 const MAX_ORDER_LIST_FANOUT: usize = 20;
+
+#[derive(Debug, Error)]
+#[error(
+    "DeepX account balance changed during observation: initial={initial:?}, final={final_balance:?}"
+)]
+struct DeepXAccountBalanceChangedError {
+    initial: AccountBalance,
+    final_balance: AccountBalance,
+}
+
+fn should_retry_account_balance_observation(error: &anyhow::Error, attempt: usize) -> bool {
+    attempt < ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS
+        && error
+            .downcast_ref::<DeepXAccountBalanceChangedError>()
+            .is_some()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DeepXPerpetualReportMetadata {
@@ -7918,29 +7935,40 @@ async fn observe_current_flat_account_balance(
     expected_spot_pairs: &HashSet<String>,
 ) -> anyhow::Result<AccountBalance> {
     let subaccount = format!("0x{}", nautilus_core::hex::encode(ownership.subaccount()));
-    anyhow::ensure!(
-        http.get_account_ownership_proof(credential, &subaccount)
-            .await?
-            == ownership,
-        "DeepX account authority changed before balance observation",
-    );
-    let balance = observe_current_flat_account_balance_unowned(
-        http,
-        ownership.subaccount(),
-        endpoints,
-        capabilities,
-        snapshot,
-        expected_perp_markets,
-        expected_spot_pairs,
-    )
-    .await?;
-    anyhow::ensure!(
-        http.get_account_ownership_proof(credential, &subaccount)
-            .await?
-            == ownership,
-        "DeepX account authority changed during balance observation",
-    );
-    Ok(balance)
+    for attempt in 1..=ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS {
+        anyhow::ensure!(
+            http.get_account_ownership_proof(credential, &subaccount)
+                .await?
+                == ownership,
+            "DeepX account authority changed before balance observation",
+        );
+        let result = observe_current_flat_account_balance_unowned(
+            http,
+            ownership.subaccount(),
+            endpoints,
+            capabilities,
+            snapshot,
+            expected_perp_markets,
+            expected_spot_pairs,
+        )
+        .await;
+        anyhow::ensure!(
+            http.get_account_ownership_proof(credential, &subaccount)
+                .await?
+                == ownership,
+            "DeepX account authority changed during balance observation",
+        );
+        match result {
+            Ok(balance) => return Ok(balance),
+            Err(e) if should_retry_account_balance_observation(&e, attempt) => {
+                log::warn!(
+                    "DeepX account balance observation was unstable on attempt {attempt}/{ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS}: {e}",
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("account balance observation loop always returns on its final attempt")
 }
 
 async fn observe_current_flat_account_balance_unowned(
@@ -8051,10 +8079,13 @@ async fn observe_current_flat_account_balance_unowned(
     );
     let final_balance =
         map_current_flat_usdc_balance(&final_balances, &final_margin, &final_chain)?;
-    anyhow::ensure!(
-        balance == final_balance,
-        "DeepX account balance changed during observation",
-    );
+    if balance != final_balance {
+        return Err(DeepXAccountBalanceChangedError {
+            initial: balance,
+            final_balance,
+        }
+        .into());
+    }
     let final_perp_markets = http.get_perp_markets().await?;
     let final_spot_markets = http.get_spot_markets().await?;
     let final_perp: HashSet<_> = final_perp_markets.iter().map(|market| market.id).collect();
@@ -9641,6 +9672,10 @@ impl ExecutionClient for DeepXExecutionClient {
 
     fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
         false
+    }
+
+    fn provides_durable_order_submission_resolution(&self) -> bool {
+        true
     }
 
     fn generate_account_state(
@@ -11496,6 +11531,34 @@ mod tests {
         let mut incomplete = closed.clone();
         incomplete.close_event_idx = None;
         assert!(!is_verified_closed_perp_position(&incomplete));
+    }
+
+    #[rstest]
+    fn account_balance_observation_retry_is_narrow_and_bounded() {
+        let currency = Currency::USDC();
+        let initial = AccountBalance::new_checked(
+            Money::from("1000 USDC"),
+            Money::zero(currency),
+            Money::from("1000 USDC"),
+        )
+        .unwrap();
+        let final_balance = AccountBalance::new_checked(
+            Money::from("1001 USDC"),
+            Money::zero(currency),
+            Money::from("1001 USDC"),
+        )
+        .unwrap();
+        let changed = anyhow::Error::new(DeepXAccountBalanceChangedError {
+            initial,
+            final_balance,
+        })
+        .context("full account observation failed");
+        let unrelated = anyhow::anyhow!("DeepX flat account has an open perpetual order");
+
+        assert!(should_retry_account_balance_observation(&changed, 1));
+        assert!(should_retry_account_balance_observation(&changed, 2));
+        assert!(!should_retry_account_balance_observation(&changed, 3));
+        assert!(!should_retry_account_balance_observation(&unrelated, 1));
     }
 
     const GENESIS_FIXTURE: &str = include_str!(

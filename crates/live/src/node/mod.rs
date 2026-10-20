@@ -2849,7 +2849,15 @@ impl LiveNode {
             if self.state() == NodeState::ShuttingDown {
                 return;
             }
-            let result = self.exec_manager.check_inflight_orders();
+            let durable_submission_clients = self
+                .exec_clients
+                .iter()
+                .filter(|client| client.provides_durable_order_submission_resolution())
+                .map(LiveExecutionClient::client_id)
+                .collect();
+            let result = self
+                .exec_manager
+                .check_inflight_orders_with_durable_clients(&durable_submission_clients);
             self.process_reconciliation_events(&result.events);
             for cmd in result.queries {
                 AsyncRunner::handle_exec_command(cmd);

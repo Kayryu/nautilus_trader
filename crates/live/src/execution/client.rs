@@ -213,6 +213,12 @@ impl ExecutionClient for LiveExecutionClient {
             .provides_bulk_position_coverage(instrument_id)
     }
 
+    fn provides_durable_order_submission_resolution(&self) -> bool {
+        self.client
+            .borrow()
+            .provides_durable_order_submission_resolution()
+    }
+
     fn generate_account_state(
         &self,
         balances: Vec<AccountBalance>,

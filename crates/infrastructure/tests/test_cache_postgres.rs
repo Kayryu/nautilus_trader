@@ -36,11 +36,14 @@ mod serial_tests {
     };
     use nautilus_model::{
         accounts::AccountAny,
-        enums::{CurrencyType, OrderSide, OrderType},
+        enums::{CurrencyType, OrderSide, OrderStatus, OrderType},
         events::{
             OrderEventAny,
             order::spec::{
-                OrderCancelRejectedSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+                OrderCancelRejectedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderEmulatedSpec,
+                OrderExpiredSpec, OrderModifyRejectedSpec, OrderPendingCancelSpec,
+                OrderPendingUpdateSpec, OrderRejectedSpec, OrderReleasedSpec, OrderTriggeredSpec,
+                OrderUpdatedSpec,
             },
         },
         identifiers::{
@@ -53,7 +56,7 @@ mod serial_tests {
         },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
-        types::{Currency, Quantity},
+        types::{Currency, Price, Quantity},
     };
     use ustr::Ustr;
 
@@ -564,9 +567,281 @@ mod serial_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_order_canceled_insert_and_load() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let instrument = currency_pair_ethusdt();
+        DatabaseQueries::add_currency(pool, instrument.base_currency().unwrap())
+            .await
+            .unwrap();
+        DatabaseQueries::add_currency(pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument.clone()))
+            .await
+            .unwrap();
+
+        let trader_id = TraderId::from("TRADER-CANCELED");
+        let strategy_id = StrategyId::from("S-CANCELED");
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
+        let event_id = UUID4::new();
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_005_u64);
+        let ts_init = UnixNanos::from(1_700_000_000_000_000_006_u64);
+        let venue_order_id = VenueOrderId::from("V-CANCELED");
+        let account_id = AccountId::from("A-CANCELED");
+        let event = OrderCanceledSpec::builder()
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .event_id(event_id)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .reconciliation(true)
+            .venue_order_id(venue_order_id)
+            .account_id(account_id)
+            .build();
+
+        DatabaseQueries::add_order_event(pool, Box::new(event), None)
+            .await
+            .unwrap();
+
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OrderEventAny::Canceled(event) => {
+                assert_eq!(event.trader_id, trader_id);
+                assert_eq!(event.strategy_id, strategy_id);
+                assert_eq!(event.instrument_id, instrument_id);
+                assert_eq!(event.client_order_id, client_order_id);
+                assert_eq!(event.event_id, event_id);
+                assert_eq!(event.ts_event, ts_event);
+                assert_eq!(event.ts_init, ts_init);
+                assert!(event.reconciliation);
+                assert_eq!(event.venue_order_id, Some(venue_order_id));
+                assert_eq!(event.account_id, Some(account_id));
+            }
+            other => panic!("Expected OrderCanceled, was {other:?}"),
+        }
+
+        sqlx::query(r#"DELETE FROM "order_event" WHERE client_order_id = $1"#)
+            .bind(client_order_id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_remaining_order_events_insert_and_load() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let instrument = currency_pair_ethusdt();
+        DatabaseQueries::add_currency(pool, instrument.base_currency().unwrap())
+            .await
+            .unwrap();
+        DatabaseQueries::add_currency(pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument.clone()))
+            .await
+            .unwrap();
+
+        let trader_id = TraderId::from("TRADER-REMAINING-EVENTS");
+        let strategy_id = StrategyId::from("S-REMAINING-EVENTS");
+        let instrument_id = instrument.id();
+        let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
+        let venue_order_id = VenueOrderId::from("V-REMAINING-EVENTS");
+        let account_id = AccountId::from("A-REMAINING-EVENTS");
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_007_u64);
+        let ts_init = UnixNanos::from(1_700_000_000_000_000_008_u64);
+        let released_price = Price::from("22000.50");
+        let updated_quantity = Quantity::from("2.5");
+        let updated_price = Price::from("22001.00");
+        let updated_trigger_price = Price::from("21900.00");
+
+        let events: Vec<Box<dyn nautilus_model::events::OrderEvent>> = vec![
+            Box::new(
+                OrderDeniedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .reason(Ustr::from("TEST_DENIED"))
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .build(),
+            ),
+            Box::new(
+                OrderEmulatedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .build(),
+            ),
+            Box::new(
+                OrderExpiredSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .reconciliation(true)
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ),
+            Box::new(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(account_id)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .reconciliation(true)
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            ),
+            Box::new(
+                OrderReleasedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .released_price(released_price)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .build(),
+            ),
+            Box::new(
+                OrderTriggeredSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .reconciliation(true)
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .build(),
+            ),
+            Box::new(
+                OrderUpdatedSpec::builder()
+                    .trader_id(trader_id)
+                    .strategy_id(strategy_id)
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .quantity(updated_quantity)
+                    .ts_event(ts_event)
+                    .ts_init(ts_init)
+                    .reconciliation(true)
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .price(updated_price)
+                    .trigger_price(updated_trigger_price)
+                    .is_quote_quantity(true)
+                    .build(),
+            ),
+        ];
+        for event in events {
+            DatabaseQueries::add_order_event(pool, event, None)
+                .await
+                .unwrap();
+        }
+
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 7);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Denied(event) if event.reason == Ustr::from("TEST_DENIED")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, OrderEventAny::Emulated(_)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Expired(event)
+                if event.reconciliation
+                    && event.venue_order_id == Some(venue_order_id)
+                    && event.account_id == Some(account_id)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::PendingUpdate(event)
+                if event.reconciliation
+                    && event.venue_order_id == Some(venue_order_id)
+                    && event.account_id == Some(account_id)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Released(event) if event.released_price == released_price
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Triggered(event)
+                if event.reconciliation
+                    && event.venue_order_id == Some(venue_order_id)
+                    && event.account_id == Some(account_id)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            OrderEventAny::Updated(event)
+                if event.quantity == updated_quantity
+                    && event.reconciliation
+                    && event.venue_order_id == Some(venue_order_id)
+                    && event.account_id == Some(account_id)
+                    && event.price == Some(updated_price)
+                    && event.trigger_price == Some(updated_trigger_price)
+                    && event.protection_price.is_none()
+                    && event.is_quote_quantity
+        )));
+
+        sqlx::query(r#"DELETE FROM "order_event" WHERE client_order_id = $1"#)
+            .bind(client_order_id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_order_pending_cancel_insert_and_load() {
         let db = get_test_pg_cache_database().await.expect("connect db");
         let pool = &db.pool;
+        let trader_id = TraderId::from("TRADER-PENDING-CANCEL");
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_001_u64);
+
+        sqlx::query(
+            r#"
+            DELETE FROM "order_event"
+            WHERE client_order_id IN (
+                SELECT client_order_id
+                FROM "order_event"
+                WHERE kind = 'OrderPendingCancel'
+                  AND trader_id = $1
+                  AND ts_event = $2
+            )
+            "#,
+        )
+        .bind(trader_id.to_string())
+        .bind(ts_event.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
 
         let instrument = currency_pair_ethusdt();
         DatabaseQueries::add_currency(pool, instrument.base_currency().unwrap())
@@ -580,14 +855,27 @@ mod serial_tests {
             .unwrap();
 
         let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
-        let trader_id = TraderId::from("TRADER-PENDING-CANCEL");
         let strategy_id = StrategyId::from("S-PENDING-CANCEL");
         let instrument_id = instrument.id();
         let account_id = AccountId::from("A-PENDING-CANCEL");
         let venue_order_id = VenueOrderId::from("V-PENDING-CANCEL");
         let event_id = UUID4::new();
-        let ts_event = UnixNanos::from(1_700_000_000_000_000_001_u64);
         let ts_init = UnixNanos::from(1_700_000_000_000_000_002_u64);
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .ts_init(ts_init)
+            .submit(true)
+            .build();
+        for order_event in order.events() {
+            DatabaseQueries::add_order_event(pool, order_event.clone().into_boxed(), None)
+                .await
+                .unwrap();
+        }
         let event = OrderPendingCancelSpec::builder()
             .trader_id(trader_id)
             .strategy_id(strategy_id)
@@ -609,8 +897,12 @@ mod serial_tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 1);
-        match &events[0] {
+        assert_eq!(events.len(), 3);
+        let pending_cancel = events
+            .iter()
+            .find(|event| matches!(event, OrderEventAny::PendingCancel(_)))
+            .unwrap();
+        match pending_cancel {
             OrderEventAny::PendingCancel(event) => {
                 assert_eq!(event.trader_id, trader_id);
                 assert_eq!(event.strategy_id, strategy_id);
@@ -625,6 +917,130 @@ mod serial_tests {
             }
             other => panic!("Expected OrderPendingCancel, was {other:?}"),
         }
+        let loaded_order = DatabaseQueries::load_order(pool, &client_order_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_order.status(), OrderStatus::Rejected);
+
+        sqlx::query(r#"DELETE FROM "order_event" WHERE client_order_id = $1"#)
+            .bind(client_order_id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_order_rejected_insert_and_load() {
+        let db = get_test_pg_cache_database().await.expect("connect db");
+        let pool = &db.pool;
+        let trader_id = TraderId::from("TRADER-REJECTED");
+        let strategy_id = StrategyId::from("S-REJECTED");
+        let account_id = AccountId::from("A-REJECTED");
+        let reason = Ustr::from("INFLIGHT_TIMEOUT");
+        let event_id = UUID4::new();
+        let ts_event = UnixNanos::from(1_700_000_000_000_000_003_u64);
+        let ts_init = UnixNanos::from(1_700_000_000_000_000_004_u64);
+
+        sqlx::query(
+            r#"
+            DELETE FROM "order_event"
+            WHERE client_order_id IN (
+                SELECT client_order_id
+                FROM "order_event"
+                WHERE kind = 'OrderRejected'
+                  AND trader_id = $1
+                  AND ts_event = $2
+            )
+            "#,
+        )
+        .bind(trader_id.to_string())
+        .bind(ts_event.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let instrument = currency_pair_ethusdt();
+        DatabaseQueries::add_currency(pool, instrument.base_currency().unwrap())
+            .await
+            .unwrap();
+        DatabaseQueries::add_currency(pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument.clone()))
+            .await
+            .unwrap();
+
+        let client_order_id = ClientOrderId::from(UUID4::new().to_string().as_str());
+        let instrument_id = instrument.id();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .ts_init(ts_init)
+            .submit(true)
+            .build();
+        for order_event in order.events() {
+            DatabaseQueries::add_order_event(pool, order_event.clone().into_boxed(), None)
+                .await
+                .unwrap();
+        }
+        let event = OrderRejectedSpec::builder()
+            .trader_id(trader_id)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .account_id(account_id)
+            .reason(reason)
+            .event_id(event_id)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build();
+
+        DatabaseQueries::add_order_event(pool, Box::new(event), None)
+            .await
+            .unwrap();
+
+        let events = DatabaseQueries::load_order_events(pool, &client_order_id)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 3);
+        let rejected = events
+            .iter()
+            .find(|event| matches!(event, OrderEventAny::Rejected(_)))
+            .unwrap();
+        match rejected {
+            OrderEventAny::Rejected(event) => {
+                assert_eq!(event.trader_id, trader_id);
+                assert_eq!(event.strategy_id, strategy_id);
+                assert_eq!(event.instrument_id, instrument_id);
+                assert_eq!(event.client_order_id, client_order_id);
+                assert_eq!(event.account_id, account_id);
+                assert_eq!(event.reason, reason);
+                assert_eq!(event.event_id, event_id);
+                assert_eq!(event.ts_event, ts_event);
+                assert_eq!(event.ts_init, ts_init);
+                assert!(!event.reconciliation);
+                assert!(!event.due_post_only);
+            }
+            other => panic!("Expected OrderRejected, was {other:?}"),
+        }
+        assert!(
+            DatabaseQueries::load_order(pool, &client_order_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        sqlx::query(r#"DELETE FROM "order_event" WHERE client_order_id = $1"#)
+            .bind(client_order_id.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     /// Tests that data is flushed immediately with the current hardcoded `buffer_interval=0`.

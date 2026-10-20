@@ -4543,13 +4543,16 @@ mod tests {
     use nautilus_common::clock::TestClock;
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
-        events::order::spec::OrderFilledSpec,
+        events::order::spec::{
+            OrderAcceptedSpec, OrderFilledSpec, OrderRejectedSpec, OrderSubmittedSpec,
+        },
         identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::builder::OrderTestBuilder,
         types::Price,
     };
     use rstest::*;
+    use ustr::Ustr;
 
     use super::*;
 
@@ -4709,6 +4712,55 @@ mod tests {
             Some(&owner_id)
         );
         assert_eq!(cache.borrow().venue_order_id(&claimant_id), None);
+    }
+
+    #[rstest]
+    fn process_with_receipt_applies_acceptance_after_inflight_timeout_rejection() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(TestClock::new())),
+            Rc::clone(&cache),
+            None,
+        );
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Rejected(
+                OrderRejectedSpec::builder()
+                    .reason(Ustr::from("INFLIGHT_TIMEOUT"))
+                    .build(),
+            ))
+            .unwrap();
+        let client_order_id = order.client_order_id();
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        let accepted =
+            OrderEventAny::Accepted(OrderAcceptedSpec::builder().reconciliation(true).build());
+
+        let result = engine.process_with_receipt(&accepted);
+
+        assert_eq!(
+            result.receipt.application,
+            OrderEventApplicationStatus::Applied
+        );
+        assert_eq!(
+            result.receipt.persistence,
+            OrderEventPersistenceStatus::NotConfigured
+        );
+        let cached_order = cache.borrow().order_owned(&client_order_id).unwrap();
+        assert_eq!(cached_order.status(), OrderStatus::Accepted);
+        assert_eq!(cached_order.last_event(), &accepted);
     }
 
     fn position_for_account(

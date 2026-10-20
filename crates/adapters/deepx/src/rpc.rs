@@ -20,7 +20,7 @@ mod spot_margin;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Formatter},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy::{
@@ -381,6 +381,14 @@ impl DeepXCurrentSubmissionClockEvidence {
     pub(crate) const fn timestamp_ms(&self) -> u64 {
         self.timestamp_ms
     }
+}
+
+fn advance_submission_timestamp(timestamp_ms: u64, elapsed: Duration) -> anyhow::Result<u64> {
+    let elapsed_ms = u64::try_from(elapsed.as_millis())
+        .map_err(|_| anyhow::anyhow!("DeepX current submission clock observation overflowed"))?;
+    timestamp_ms
+        .checked_add(elapsed_ms)
+        .ok_or_else(|| anyhow::anyhow!("DeepX current submission clock overflowed"))
 }
 
 impl DeepXFinalizedChainTimeEvidence {
@@ -2396,6 +2404,7 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
     capabilities: &DeepXValidatedRpcMethodCapabilities,
     service: &DeepXRuntimeSnapshotService,
 ) -> anyhow::Result<DeepXCurrentSubmissionClockEvidence> {
+    let observation_started = Instant::now();
     let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
     let watch = capabilities.for_role(DeepXRpcRole::Watch);
     anyhow::ensure!(
@@ -2439,7 +2448,7 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
             "params": [timestamp_now_storage_key(), encoded_hash],
         }))
         .await?;
-    let timestamp_ms = match decode_timestamp_now(&encoded_time) {
+    let observed_timestamp_ms = match decode_timestamp_now(&encoded_time) {
         Ok(timestamp_ms) => timestamp_ms,
         Err(e) => {
             service.halt_for_inconsistent_evidence()?;
@@ -2456,7 +2465,9 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
     let block_number_matches = decode_block_number(&block.block.header.number)
         .is_ok_and(|received| received == block_number);
     let inherent_time = decode_timestamp_set_inherent(&block.block.extrinsics);
-    if !block_number_matches || !inherent_time.is_ok_and(|received| received == timestamp_ms) {
+    if !block_number_matches
+        || !inherent_time.is_ok_and(|received| received == observed_timestamp_ms)
+    {
         service.halt_for_inconsistent_evidence()?;
         anyhow::bail!("DeepX current timestamp storage and block inherent differ");
     }
@@ -2471,6 +2482,8 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
         "DeepX current submission clock block is no longer canonical",
     );
     let scan_checkpoint = observe_finalized_checkpoint_at(watch_url.to_string()).await?;
+    let timestamp_ms =
+        advance_submission_timestamp(observed_timestamp_ms, observation_started.elapsed())?;
     Ok(DeepXCurrentSubmissionClockEvidence {
         scan_checkpoint,
         runtime_identity: snapshot.identity().clone(),
@@ -9300,7 +9313,7 @@ mod tests {
             }
         } else {
             let clock = result.unwrap();
-            assert_eq!(clock.timestamp_ms(), 1_000);
+            assert!(clock.timestamp_ms() >= 1_000);
             assert_eq!(
                 clock.scan_checkpoint().block_number(),
                 if later_recovery_head { 43 } else { 41 },
@@ -9310,6 +9323,15 @@ mod tests {
                 service.acquire().unwrap().snapshot().identity()
             );
         }
+    }
+
+    #[rstest]
+    fn submission_timestamp_advances_by_observation_latency() {
+        assert_eq!(
+            advance_submission_timestamp(1_000, Duration::from_millis(9_775)).unwrap(),
+            10_775,
+        );
+        assert!(advance_submission_timestamp(u64::MAX, Duration::from_millis(1)).is_err());
     }
 
     #[tokio::test]

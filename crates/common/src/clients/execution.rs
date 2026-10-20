@@ -80,6 +80,14 @@ pub trait ExecutionClient {
         true
     }
 
+    /// Returns whether this client durably resolves submitted orders to a terminal state.
+    ///
+    /// When enabled, live reconciliation continues querying submitted orders after the generic
+    /// retry budget instead of rejecting them with an inflight timeout.
+    fn provides_durable_order_submission_resolution(&self) -> bool {
+        false
+    }
+
     /// Generates and publishes the account state event.
     ///
     /// Implementations may publish synchronously. Callers must release shared state borrows,

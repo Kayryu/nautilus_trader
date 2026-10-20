@@ -200,9 +200,7 @@ impl BlockchainHttpRpcClient {
         if !has_result {
             let raw_response = String::from_utf8_lossy(bytes.as_ref());
             let preview = rpc_response_preview(&raw_response);
-            anyhow::bail!(
-                "Response missing both result and error fields\nRaw response: {preview}"
-            );
+            anyhow::bail!("Response missing both result and error fields\nRaw response: {preview}");
         }
 
         Ok(parsed.result)

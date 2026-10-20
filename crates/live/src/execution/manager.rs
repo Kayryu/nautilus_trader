@@ -1790,6 +1790,16 @@ impl ExecutionManager {
     /// the venue for the order's current status. At max retries, generates terminal events
     /// (rejection or cancellation) based on the order's status.
     pub fn check_inflight_orders(&mut self) -> InflightCheckResult {
+        self.check_inflight_orders_with_durable_clients(&IndexSet::new())
+    }
+
+    /// Checks inflight orders while allowing the specified clients to retain ownership of
+    /// submitted-order terminal resolution beyond the generic retry budget. Such submitted
+    /// orders remain tracked and continue producing venue queries.
+    pub fn check_inflight_orders_with_durable_clients(
+        &mut self,
+        durable_submission_clients: &IndexSet<ClientId>,
+    ) -> InflightCheckResult {
         let mut result = InflightCheckResult::default();
         let now = dst::time::Instant::now();
         let threshold = Duration::from_millis(self.config.inflight_threshold_ms);
@@ -1828,7 +1838,7 @@ impl ExecutionManager {
                     continue;
                 }
 
-                check.retry_count += 1;
+                check.retry_count = check.retry_count.saturating_add(1);
                 check.last_query_at = Some(now);
                 self.order_query_recency.mark(client_order_id);
                 self.recon_check_retries
@@ -1836,12 +1846,32 @@ impl ExecutionManager {
 
                 if check.retry_count >= self.config.inflight_max_retries {
                     let ts_now = self.clock.borrow().timestamp_ns();
+                    let mut keep_tracking = false;
 
                     if let Some(order) = self.get_order(client_order_id) {
                         match order.status() {
                             OrderStatus::Submitted => {
-                                // Generate rejection for submitted orders that never got accepted
-                                if let Some(event) = create_reconciliation_rejected(
+                                let client_id =
+                                    self.cache.borrow().client_id(&client_order_id).copied();
+                                if client_id.is_some_and(|client_id| {
+                                    durable_submission_clients.contains(&client_id)
+                                }) {
+                                    result.queries.push(TradingCommand::QueryOrder(
+                                        QueryOrder::new(
+                                            order.trader_id(),
+                                            client_id,
+                                            order.strategy_id(),
+                                            order.instrument_id(),
+                                            order.client_order_id(),
+                                            order.venue_order_id(),
+                                            UUID4::new(),
+                                            ts_now,
+                                            None,
+                                            None,
+                                        ),
+                                    ));
+                                    keep_tracking = true;
+                                } else if let Some(event) = create_reconciliation_rejected(
                                     &order,
                                     Some("INFLIGHT_TIMEOUT"),
                                     ts_now,
@@ -1870,8 +1900,9 @@ impl ExecutionManager {
                             }
                         }
                     }
-                    // Remove from inflight checks regardless of whether order exists
-                    self.clear_recon_tracking(&client_order_id, true);
+                    if !keep_tracking {
+                        self.clear_recon_tracking(&client_order_id, true);
+                    }
                 } else if let Some(order) = self.get_order(client_order_id) {
                     // Intermediate retry: query the venue for current order status
                     let ts_now = self.clock.borrow().timestamp_ns();
@@ -6891,6 +6922,71 @@ mod tests {
         assert!(second.events.is_empty());
         assert!(second.queries.is_empty());
         assert!(!manager.inflight_checks.contains_key(&client_order_id));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[cfg_attr(
+        not(all(feature = "simulation", madsim)),
+        tokio::test(start_paused = true)
+    )]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn test_inflight_submitted_timeout_respects_durable_client_resolution(
+        #[case] durable_resolution: bool,
+    ) {
+        let client_order_id = ClientOrderId::from("O-DURABLE-SUBMISSION");
+        let client_id = ClientId::from("DURABLE");
+        let account_id = AccountId::from("TEST-001");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(crypto_perpetual_ethusdt().id())
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id);
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_order(order, None, Some(client_id), false)
+            .unwrap();
+        cache.borrow_mut().update_order(&submitted).unwrap();
+        let mut manager = ExecutionManager::new(
+            clock,
+            cache,
+            ExecutionManagerConfig {
+                inflight_threshold_ms: 100,
+                inflight_max_retries: 1,
+                ..Default::default()
+            },
+        )
+        .expect("valid config");
+        manager.register_inflight(client_order_id);
+        dst::time::sleep(Duration::from_millis(101)).await;
+
+        let durable_clients = if durable_resolution {
+            IndexSet::from([client_id])
+        } else {
+            IndexSet::new()
+        };
+        let result = manager.check_inflight_orders_with_durable_clients(&durable_clients);
+
+        if durable_resolution {
+            let [TradingCommand::QueryOrder(query)] = result.queries.as_slice() else {
+                panic!("expected one query for a durably resolved submission");
+            };
+            assert_eq!(query.client_order_id, client_order_id);
+            assert!(result.events.is_empty());
+            assert!(manager.inflight_checks.contains_key(&client_order_id));
+        } else {
+            assert!(result.queries.is_empty());
+            assert!(matches!(
+                result.events.as_slice(),
+                [OrderEventAny::Rejected(_)]
+            ));
+            assert!(!manager.inflight_checks.contains_key(&client_order_id));
+        }
     }
 
     #[rstest]

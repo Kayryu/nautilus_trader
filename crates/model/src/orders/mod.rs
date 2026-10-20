@@ -865,8 +865,21 @@ impl OrderCore {
                 .take_while(|event| !matches!(event, OrderEventAny::Canceled(_)))
                 .any(|event| matches!(event, OrderEventAny::Filled(_)));
 
+        let is_inflight_timeout_recovery = self.status == OrderStatus::Rejected
+            && matches!(
+                (&event, self.events.last()),
+                (
+                    OrderEventAny::Accepted(accepted),
+                    Some(OrderEventAny::Rejected(rejected)),
+                ) if accepted.reconciliation
+                    && !rejected.reconciliation
+                    && rejected.reason.as_str() == "INFLIGHT_TIMEOUT"
+            );
+
         let new_status = if is_reclose_after_fill {
             OrderStatus::Canceled
+        } else if is_inflight_timeout_recovery {
+            OrderStatus::Accepted
         } else {
             self.status.transition(&event)?
         };
@@ -951,6 +964,10 @@ impl OrderCore {
             OrderEventAny::Expired(event) => self.expired(event),
             OrderEventAny::Filled(event) => self.filled(event, source_status),
             OrderEventAny::FillVoided(event) => self.fill_voided(event, source_status),
+        }
+
+        if is_inflight_timeout_recovery {
+            self.ts_closed = None;
         }
 
         self.ts_last = event.ts_event();
@@ -3745,6 +3762,93 @@ mod tests {
             report.cancel_reason,
             Some("INSUFFICIENT_MARGIN".to_string())
         );
+    }
+
+    #[rstest]
+    fn test_reconciliation_acceptance_recovers_inflight_timeout_rejection() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let mut order = order;
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        let rejected = OrderRejectedSpec::builder()
+            .reason(Ustr::from("INFLIGHT_TIMEOUT"))
+            .ts_event(UnixNanos::from(3_000))
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .reconciliation(true)
+            .ts_event(UnixNanos::from(4_000))
+            .build();
+
+        order.apply(OrderEventAny::Rejected(rejected)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.events().len(), 4);
+        assert_eq!(order.ts_accepted(), Some(UnixNanos::from(4_000)));
+        assert_eq!(order.ts_closed(), None);
+    }
+
+    #[rstest]
+    fn test_reconciliation_acceptance_does_not_recover_venue_rejection() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let mut order = order;
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        let rejected = OrderRejectedSpec::builder()
+            .reason(Ustr::from("INSUFFICIENT_MARGIN"))
+            .build();
+        let accepted = OrderAcceptedSpec::builder().reconciliation(true).build();
+
+        order.apply(OrderEventAny::Rejected(rejected)).unwrap();
+        let result = order.apply(OrderEventAny::Accepted(accepted));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.status(), OrderStatus::Rejected);
+        assert_eq!(order.events().len(), 3);
+    }
+
+    #[rstest]
+    fn test_reconciliation_acceptance_does_not_recover_reconciliation_rejection() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let mut order = order;
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        let rejected = OrderRejectedSpec::builder()
+            .reason(Ustr::from("INFLIGHT_TIMEOUT"))
+            .reconciliation(true)
+            .build();
+        let accepted = OrderAcceptedSpec::builder().reconciliation(true).build();
+
+        order.apply(OrderEventAny::Rejected(rejected)).unwrap();
+        let result = order.apply(OrderEventAny::Accepted(accepted));
+
+        assert!(matches!(result, Err(OrderError::InvalidStateTransition)));
+        assert_eq!(order.status(), OrderStatus::Rejected);
+        assert_eq!(order.events().len(), 3);
     }
 
     #[rstest]
