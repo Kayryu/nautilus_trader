@@ -180,6 +180,7 @@ pub struct LiveNode {
     handle: LiveNodeHandle,
     exec_manager: ExecutionManager,
     exec_clients: Vec<LiveExecutionClient>,
+    order_report_errors: Rc<RefCell<IndexMap<ClientId, String>>>,
     socket_registry: SocketReconnectRegistry,
     cache_database_factory: Option<Box<dyn CacheDatabaseFactory>>,
     external_msgbus: Option<ExternalMessageBusIngress>,
@@ -214,6 +215,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients,
+            order_report_errors: Rc::new(RefCell::new(IndexMap::new())),
             socket_registry,
             cache_database_factory,
             external_msgbus,
@@ -288,6 +290,7 @@ impl LiveNode {
             handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients: Vec::new(),
+            order_report_errors: Rc::new(RefCell::new(IndexMap::new())),
             socket_registry: SocketReconnectRegistry::default(),
             cache_database_factory: None,
             external_msgbus: None,
@@ -414,7 +417,7 @@ impl LiveNode {
 
         if let Err(e) = self.connect_exec_clients(connection_deadline).await {
             return self
-                .abort_startup_with_error("Execution client connection timed out", e)
+                .abort_startup_with_error("Execution client connection failed", e)
                 .await;
         }
 
@@ -1154,7 +1157,7 @@ impl LiveNode {
             Ok(status) => status,
             Err(e) => {
                 let result = self
-                    .abort_startup_with_error("Execution client connection timed out", e)
+                    .abort_startup_with_error("Execution client connection failed", e)
                     .await;
                 Self::drain_channels(
                     &mut time_evt_rx,
@@ -2058,7 +2061,7 @@ impl LiveNode {
         let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
         dst::time::timeout(remaining, self.kernel.connect_exec_clients())
             .await
-            .map_err(|_| anyhow::anyhow!("exec-connect timeout"))
+            .map_err(|_| anyhow::anyhow!("exec-connect timeout"))?
     }
 
     /// Connects execution clients and checks all engines are connected.
@@ -2928,13 +2931,17 @@ impl LiveNode {
             .prepare_open_order_report_check(UUID4::new(), &client_refs);
         let command = check.command.clone();
         let clients = self.exec_clients.clone();
+        let order_report_errors = Rc::clone(&self.order_report_errors);
         let deadline = dst::time::Instant::now() + self.config.timeout_reconciliation;
 
         Some(OpenOrderReportTask {
             future: Box::pin(async move {
                 let remaining = deadline.saturating_duration_since(dst::time::Instant::now());
-                match dst::time::timeout(remaining, request_open_order_reports(clients, command))
-                    .await
+                match dst::time::timeout(
+                    remaining,
+                    request_open_order_reports(clients, command, order_report_errors),
+                )
+                .await
                 {
                     Ok(result) => ReportTaskOutcome::Completed(OpenOrderReportResult {
                         check,
@@ -3339,6 +3346,7 @@ async fn recv_external_msgbus_message(
 async fn request_open_order_reports(
     clients: Vec<LiveExecutionClient>,
     command: GenerateOrderStatusReports,
+    previous_errors: Rc<RefCell<IndexMap<ClientId, String>>>,
 ) -> OpenOrderReportQueryResult {
     let mut all_reports = Vec::new();
     let mut queried_clients = IndexSet::new();
@@ -3350,6 +3358,7 @@ async fn request_open_order_reports(
 
         match client.generate_order_status_reports(&command).await {
             Ok(reports) => {
+                previous_errors.borrow_mut().shift_remove(&client_id);
                 all_reports.extend(
                     reports
                         .into_iter()
@@ -3358,10 +3367,14 @@ async fn request_open_order_reports(
             }
             Err(e) => {
                 failed_clients.insert(client_id);
-                log::warn!(
-                    "Failed to generate order status reports from {}: {e}",
-                    client.client_id()
-                );
+                let error = e.to_string();
+                if record_order_report_error(&mut previous_errors.borrow_mut(), client_id, &error) {
+                    log::warn!("Failed to generate order status reports from {client_id}: {error}");
+                } else {
+                    log::debug!(
+                        "Repeated failure to generate order status reports from {client_id}: {error}"
+                    );
+                }
             }
         }
     }
@@ -3371,6 +3384,22 @@ async fn request_open_order_reports(
         queried_clients,
         failed_clients,
     }
+}
+
+fn record_order_report_error(
+    previous_errors: &mut IndexMap<ClientId, String>,
+    client_id: ClientId,
+    error: &str,
+) -> bool {
+    if previous_errors
+        .get(&client_id)
+        .is_some_and(|previous| previous == error)
+    {
+        return false;
+    }
+
+    previous_errors.insert(client_id, error.to_string());
+    true
 }
 
 async fn request_position_reports(
@@ -4115,6 +4144,7 @@ mod tests {
         sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         event: OrderEventAny,
         connected: bool,
+        connect_error: Option<&'static str>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -4163,6 +4193,10 @@ mod tests {
         }
 
         async fn connect(&mut self) -> anyhow::Result<()> {
+            if let Some(error) = self.connect_error {
+                anyhow::bail!(error);
+            }
+
             let (envelope, receipt_rx) =
                 nautilus_common::messages::AcknowledgedOrderEvent::with_receipt_channel(
                     self.event.clone(),
@@ -6631,6 +6665,42 @@ mod tests {
         assert!(!reconciliation_check_due(last, at_interval, interval));
     }
 
+    #[test]
+    fn test_record_order_report_error_deduplicates_until_recovery() {
+        let client_id = ClientId::from("TEST-REPORTS");
+        let other_client_id = ClientId::from("OTHER-REPORTS");
+        let mut previous_errors = IndexMap::new();
+
+        assert!(record_order_report_error(
+            &mut previous_errors,
+            client_id,
+            "missing context",
+        ));
+        assert!(!record_order_report_error(
+            &mut previous_errors,
+            client_id,
+            "missing context",
+        ));
+        assert!(record_order_report_error(
+            &mut previous_errors,
+            client_id,
+            "request failed",
+        ));
+        assert!(record_order_report_error(
+            &mut previous_errors,
+            other_client_id,
+            "request failed",
+        ));
+
+        previous_errors.shift_remove(&client_id);
+
+        assert!(record_order_report_error(
+            &mut previous_errors,
+            client_id,
+            "request failed",
+        ));
+    }
+
     #[cfg_attr(
         not(all(feature = "simulation", madsim)),
         tokio::test(start_paused = true)
@@ -8151,6 +8221,7 @@ mod tests {
                 sender: exec_evt_tx,
                 event,
                 connected: false,
+                connect_error: None,
             }))
             .unwrap();
         let exec_engine = Rc::clone(&node.kernel.exec_engine);
@@ -8181,6 +8252,7 @@ mod tests {
             ),
         )
         .await
+        .unwrap()
         .unwrap();
 
         assert!(pending.ack_order_evts.is_empty());
@@ -8193,6 +8265,42 @@ mod tests {
                 .unwrap()
                 .status(),
             OrderStatus::Submitted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detached_connect_propagates_client_error_immediately() {
+        let node = LiveNode::build("FailedConnectNode".to_string(), None).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("ETHUSDT-PERP.RECEIPT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1))
+            .build();
+        let event = TestOrderEventStubs::submitted(&order, AccountId::from("RECEIPT-001"));
+        let (exec_evt_tx, _exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(ReceiptConnectClient {
+                sender: exec_evt_tx,
+                event,
+                connected: false,
+                connect_error: Some("TLS handshake failed"),
+            }))
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            ExecutionEngine::connect_detached(&node.kernel.exec_engine),
+        )
+        .await
+        .expect("failed connection should return without waiting")
+        .expect_err("failed connection should propagate");
+
+        assert!(error.to_string().contains("TLS handshake failed"));
+        assert_eq!(
+            node.kernel.exec_engine.borrow().client_ids(),
+            vec![ClientId::from("RECEIPT")]
         );
     }
 
@@ -8213,6 +8321,7 @@ mod tests {
                 sender: exec_evt_tx,
                 event,
                 connected: false,
+                connect_error: None,
             }))
             .unwrap();
 

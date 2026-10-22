@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use nautilus_network::{
     transport::{BoxedWsTransport, Message},
@@ -273,9 +274,9 @@ impl DeepXWsReadConnection {
             .map_err(|_| super::DeepXWsError::ReceiveTimeout)?;
         let message = match message {
             Some(Ok(message)) => message,
-            Some(Err(_)) => {
+            Some(Err(e)) => {
                 self.closed = true;
-                anyhow::bail!("DeepX WebSocket receive failed");
+                return Err(e).context("DeepX WebSocket receive failed");
             }
             None => {
                 self.closed = true;

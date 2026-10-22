@@ -25,11 +25,16 @@ use serde::Deserialize;
 use super::public::{DeepXWsPublicChannel, DeepXWsPublicFrame};
 use crate::http::{DeepXPerpTrade, DeepXPerpTradesPage, DeepXSpotMarket, DeepXSpotTrade};
 
+#[derive(Debug, thiserror::Error)]
+#[error("unseen older DeepX trade requires stream recovery")]
+pub(crate) struct DeepXWsTradeRecoveryRequired;
+
 /// A subscription-owned public trade stream; fresh connections require explicit reconciliation.
 ///
 /// The first page seeds identities without emitting history as new live executions. Subsequent
-/// pages emit unseen trades chronologically. Unknown trades older than the delivery watermark
-/// require explicit recovery rather than silent filtering. No numeric trade-ID ordering is assumed.
+/// pages emit unseen trades chronologically. Late trades within the retained identity window are
+/// accepted; trades older than that window require explicit recovery rather than silent filtering.
+/// No numeric trade-ID ordering is assumed.
 #[derive(Clone, Debug)]
 pub struct DeepXWsTradeStream {
     market_id: u16,
@@ -63,12 +68,12 @@ impl DeepXWsTradeStream {
     /// Validates and atomically applies a public trade page, returning only new executions.
     ///
     /// Failed batches leave all initialization, identity and watermark state unchanged. Retained
-    /// equal-watermark IDs are never evicted, preventing duplicate delivery at timestamp ties.
+    /// boundary timestamp IDs are never evicted, preventing duplicate delivery at timestamp ties.
     ///
     /// # Errors
     ///
-    /// Returns an error for foreign scope, malformed/unordered trades, conflicting IDs, unseen
-    /// older executions or a page/timestamp tie exceeding the retained identity capacity.
+    /// Returns an error for foreign scope, malformed/unordered trades, conflicting IDs, executions
+    /// older than the retained identity window or a boundary timestamp tie exceeding capacity.
     pub fn ingest(&mut self, frame: &DeepXWsPublicFrame) -> anyhow::Result<Vec<DeepXPerpTrade>> {
         let DeepXWsPublicFrame::Data {
             market,
@@ -189,6 +194,7 @@ impl DeepXWsTradeStream {
         let mut ids = BTreeSet::new();
         let mut previous = None;
         let mut validated = Vec::with_capacity(trades.len());
+        let retained_boundary_ms = self.recent.values().map(|(time, _)| *time).min();
         for trade in trades {
             anyhow::ensure!(
                 trade.market_id == u64::from(self.market_id) && trade.id != 0,
@@ -219,11 +225,10 @@ impl DeepXWsTradeStream {
                     *retained == trade,
                     "DeepX trade ID conflicts with retained execution"
                 );
-            } else if self.initialized {
-                anyhow::ensure!(
-                    self.watermark_ms.is_none_or(|watermark| time >= watermark),
-                    "unseen older DeepX trade requires stream recovery"
-                );
+            } else if self.initialized
+                && retained_boundary_ms.is_some_and(|boundary| time < boundary)
+            {
+                return Err(DeepXWsTradeRecoveryRequired.into());
             }
             validated.push((time, trade));
         }
@@ -249,8 +254,8 @@ impl DeepXWsTradeStream {
                     .ok_or_else(|| anyhow::anyhow!("DeepX retained trade identity is missing"))?
                     .0;
                 anyhow::ensure!(
-                    oldest_time < watermark,
-                    "DeepX equal-timestamp identity capacity exhausted"
+                    oldest_time < time,
+                    "DeepX boundary-timestamp identity capacity exhausted"
                 );
                 next.order.pop_front();
                 next.recent.remove(&oldest);
@@ -258,7 +263,19 @@ impl DeepXWsTradeStream {
             if self.initialized {
                 emitted.push(trade.clone());
             }
-            next.order.push_back(trade.id);
+            let insert_at = next
+                .order
+                .iter()
+                .position(|id| {
+                    let retained_time = next
+                        .recent
+                        .get(id)
+                        .expect("retained trade identity must be present")
+                        .0;
+                    (retained_time, *id) > (time, trade.id)
+                })
+                .unwrap_or(next.order.len());
+            next.order.insert(insert_at, trade.id);
             next.recent.insert(trade.id, (time, trade));
         }
         next.initialized = true;
@@ -736,13 +753,17 @@ mod tests {
         let mut items = vec![trade(3, 3), trade(2, 2)];
         match mutation {
             "price" => items[1]["price"] = json!("1"),
-            "old" => items[1] = trade(9, 1),
+            "old" => items[1] = trade(9, 0),
             "ordering" => items.reverse(),
             "duplicate" => items[1] = items[0].clone(),
             "market" => items[0]["marketId"] = json!(3),
             _ => items[0]["createdAt"] = json!("2026-09-14T09:39:03.000001Z"),
         }
-        assert!(stream.ingest(&frame(items)).is_err());
+        let e = stream.ingest(&frame(items)).unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<DeepXWsTradeRecoveryRequired>().is_some(),
+            mutation == "old"
+        );
         assert_eq!(stream.recent, before.recent);
         assert_eq!(stream.order, before.order);
         assert_eq!(stream.watermark_ms, before.watermark_ms);
@@ -753,6 +774,26 @@ mod tests {
                 .id,
             3
         );
+    }
+
+    #[rstest]
+    fn accepts_unseen_late_trade_within_retained_identity_window() {
+        let mut stream = DeepXWsTradeStream::new(2, NonZeroUsize::new(4).unwrap());
+        stream
+            .ingest(&frame(vec![trade(4, 4), trade(1, 1)]))
+            .unwrap();
+
+        let emitted = stream
+            .ingest(&frame(vec![trade(5, 5), trade(3, 3), trade(2, 2)]))
+            .unwrap();
+
+        assert_eq!(
+            emitted.iter().map(|trade| trade.id).collect::<Vec<_>>(),
+            vec![2, 3, 5]
+        );
+        assert_eq!(stream.order.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        let latest: jiff::Timestamp = emitted[2].created_at.parse().unwrap();
+        assert_eq!(stream.watermark_ms, Some(latest.as_millisecond()));
     }
 
     #[rstest]

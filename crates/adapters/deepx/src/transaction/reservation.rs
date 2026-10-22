@@ -1199,16 +1199,22 @@ struct DeepXTransactionLifecycleWire {
 struct DeepXBackendOrderEvidenceWire {
     extrinsic_hash: [u8; 32],
     order_id: u64,
-    observed_block_number: u64,
+    observed_block_number: Option<u64>,
 }
 
 impl DeepXBackendOrderEvidenceWire {
     const fn into_evidence(self) -> super::DeepXBackendOrderEvidence {
-        super::DeepXBackendOrderEvidence::new(
-            self.extrinsic_hash,
-            self.order_id,
-            self.observed_block_number,
-        )
+        match self.observed_block_number {
+            Some(block_number) => super::DeepXBackendOrderEvidence::new(
+                self.extrinsic_hash,
+                self.order_id,
+                block_number,
+            ),
+            None => super::DeepXBackendOrderEvidence::from_rest_transaction_status(
+                self.extrinsic_hash,
+                self.order_id,
+            ),
+        }
     }
 }
 
@@ -1824,7 +1830,7 @@ impl DeepXTransactionRecord {
                             if self.lifecycle.backend_order().is_some_and(|e| {
                                 e.order_id == value
                                     && Some(e.extrinsic_hash) == self.lifecycle.extrinsic_hash()
-                                    && e.observed_block_number > 0
+                                    && e.observed_block_number != Some(0)
                             })
                     )
             }
@@ -2516,6 +2522,53 @@ mod tests {
         assert!(!String::from_utf8_lossy(&encoded).contains("backend_order"));
         let restored = DeepXTransactionRecord::decode(&encoded).unwrap();
         assert_eq!(restored.lifecycle().backend_order(), None);
+        assert_eq!(restored.encode().unwrap(), encoded);
+    }
+
+    #[rstest]
+    fn rest_transaction_status_evidence_round_trips_without_block_height() {
+        let mut record = framework_record();
+        let runtime = record.identity().runtime();
+        let bytes = vec![1, 2, 3];
+        let signed = SignedPalletExtrinsic {
+            extrinsic_hash: BlakeTwo256.hash(&bytes).0,
+            bytes,
+            signer: record.identity().signer(),
+            nonce: 42,
+            runtime: ApprovedRuntimeIdentity {
+                environment: DeepXEnvironment::Testnet,
+                genesis_hash: runtime.genesis_hash,
+                metadata_sha256: runtime.metadata_sha256,
+                spec_version: runtime.spec_version,
+                transaction_version: runtime.transaction_version,
+                signed_extensions: runtime.signed_extensions.clone(),
+            },
+        };
+        record.record_signed(&signed).unwrap();
+        record
+            .apply_observation(DeepXTransactionObservation::SubmissionStarted)
+            .unwrap();
+        let evidence = super::super::DeepXBackendOrderEvidence::from_rest_transaction_status(
+            signed.extrinsic_hash(),
+            42,
+        );
+        record
+            .apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
+            .unwrap();
+
+        let encoded = record.encode().unwrap();
+        let restored = DeepXTransactionRecord::decode(&encoded).unwrap();
+
+        assert_eq!(restored, record);
+        assert_eq!(restored.lifecycle().backend_order(), Some(evidence));
+        assert_eq!(
+            restored
+                .lifecycle()
+                .backend_order()
+                .unwrap()
+                .observed_block_number(),
+            None,
+        );
         assert_eq!(restored.encode().unwrap(), encoded);
     }
 

@@ -1069,9 +1069,13 @@ impl NautilusKernel {
     ///
     /// Must be called after data clients are connected and instrument events
     /// have been drained into the cache, so execution clients can load instruments.
-    pub async fn connect_exec_clients(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any execution client fails to connect.
+    pub async fn connect_exec_clients(&mut self) -> anyhow::Result<()> {
         log::info!("Connecting execution clients...");
-        ExecutionEngine::connect_detached(&self.exec_engine).await;
+        ExecutionEngine::connect_detached(&self.exec_engine).await
     }
 
     /// Disconnects all engine clients.

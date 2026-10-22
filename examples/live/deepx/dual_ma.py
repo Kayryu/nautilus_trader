@@ -28,7 +28,7 @@ from nautilus_trader.adapters.deepx import (
     get_deepx_wallet_account_snapshot,
 )
 from nautilus_trader.common import Environment, LogColor
-from nautilus_trader.config import StrategyConfig
+from nautilus_trader.config import LiveExecutionEngineConfig, StrategyConfig
 from nautilus_trader.indicators import SimpleMovingAverage
 from nautilus_trader.infrastructure import PostgresCacheConfig, PostgresConnectOptions
 from nautilus_trader.live import LiveNode
@@ -49,9 +49,9 @@ from nautilus_trader.trading import Strategy
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 INSTRUMENT_ID = InstrumentId.from_str("ETH-USDC-PERP.DEEPX")
 BAR_TYPE = BarType.from_str(f"{INSTRUMENT_ID}-1-MINUTE-LAST-INTERNAL")
-ORDER_QTY = Decimal("0.0100")
-FAST_PERIOD = 5
-SLOW_PERIOD = 20
+ORDER_QTY = Decimal("0.500")
+FAST_PERIOD = 1
+SLOW_PERIOD = 5
 
 
 class DualMovingAverageConfig(StrategyConfig):
@@ -168,15 +168,14 @@ class DualMovingAverage(Strategy):
             return
         side = self._pending_side
         self._pending_side = None
+        self.log.info(
+            f"Position closed; submitting pending {side} order",
+            LogColor.BLUE,
+        )
         self._submit_market_order(side)
 
     def on_stop(self) -> None:
         if self._config.trade_enabled:
-            self.cancel_all_orders(
-                self._config.instrument_id,
-                client_id=None,
-                strategy_only=True,
-            )
             self.close_all_positions(
                 self._config.instrument_id,
                 time_in_force=TimeInForce.IOC,
@@ -193,16 +192,34 @@ class DualMovingAverage(Strategy):
 
     def _handle_signal(self, side: OrderSide) -> None:
         if self._pending_side is not None:
+            self.log.info(
+                f"Deferring {side} signal while position close is pending; "
+                f"replacing pending side {self._pending_side}",
+                LogColor.BLUE,
+            )
+            self._pending_side = side
             return
         if side == OrderSide.BUY and self.portfolio.is_net_long(
             self._config.instrument_id
         ):
+            self.log.info(
+                "Skipping BUY signal because the portfolio is already net long",
+                LogColor.BLUE,
+            )
             return
         if side == OrderSide.SELL and self.portfolio.is_net_short(
             self._config.instrument_id
         ):
+            self.log.info(
+                "Skipping SELL signal because the portfolio is already net short",
+                LogColor.BLUE,
+            )
             return
         if not self.portfolio.is_net_flat(self._config.instrument_id):
+            self.log.info(
+                f"Closing the existing position before submitting {side}",
+                LogColor.BLUE,
+            )
             self._pending_side = side
             self.close_all_positions(
                 self._config.instrument_id,
@@ -220,6 +237,10 @@ class DualMovingAverage(Strategy):
             order_side=side,
             quantity=self._quantity,
             time_in_force=TimeInForce.IOC,
+        )
+        self.log.info(
+            f"Submitting {side} market order for {self._quantity}",
+            LogColor.BLUE,
         )
         self.submit_order(order)
 
@@ -285,7 +306,7 @@ def main() -> None:
         "DEEPX-DUAL-MA-001",
         TraderId.from_str("TESTER-001"),
         Environment.LIVE,
-    ).add_data_client(
+    ).with_shutdown_on_error(True).add_data_client(
         None,
         DeepXDataClientFactory(),
         DeepXDataClientConfig(perpetual_only=True),
@@ -302,7 +323,14 @@ def main() -> None:
         builder = (
             builder.with_cache_database_factory(cache_database)
             .with_timeout_connection(180)
-            .with_reconciliation(reconciliation=True)
+            .with_exec_engine_config(
+                LiveExecutionEngineConfig(
+                    reconciliation=True,
+                    open_check_interval_secs=10.0,
+                    open_check_open_only=True,
+                    position_check_interval_secs=20.0,
+                ),
+            )
             .add_exec_client(
                 None,
                 DeepXExecutionClientFactory(),

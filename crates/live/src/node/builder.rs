@@ -227,6 +227,13 @@ impl LiveNodeBuilder {
         self
     }
 
+    /// Configure whether an error log requests system shutdown.
+    #[must_use]
+    pub const fn with_shutdown_on_error(mut self, shutdown_on_error: bool) -> Self {
+        self.config.shutdown_on_error = shutdown_on_error;
+        self
+    }
+
     /// Set the importable controller configuration for the node.
     ///
     /// The controller is instantiated and registered with the trader during
@@ -795,6 +802,15 @@ mod tests {
     use rstest::rstest;
 
     use super::LiveNodeBuilder;
+
+    #[rstest]
+    fn test_with_shutdown_on_error_sets_config() {
+        let builder = LiveNodeBuilder::new(TraderId::from("TRADER-001"), Environment::Live)
+            .unwrap()
+            .with_shutdown_on_error(true);
+
+        assert!(builder.config.shutdown_on_error);
+    }
 
     #[rstest]
     fn test_with_controller_sets_config_controller() {

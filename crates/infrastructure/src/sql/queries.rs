@@ -61,19 +61,22 @@ impl DatabaseQueries {
             .map_err(|e| anyhow::anyhow!("Failed to truncate tables: {e}"))
     }
 
-    /// Inserts a raw key-value entry into the `general` table via the provided `pool`.
+    /// Inserts or updates a raw key-value entry in the `general` table via the provided `pool`.
     ///
     /// # Errors
     ///
     /// Returns an error if the INSERT operation fails.
     pub async fn add(pool: &PgPool, key: String, value: Vec<u8>) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO general (id, value) VALUES ($1, $2)")
-            .bind(key)
-            .bind(value)
-            .execute(pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Failed to insert into general table: {e}"))
+        sqlx::query(
+            "INSERT INTO general (id, value) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into general table: {e}"))
     }
 
     /// Loads all entries from the `general` table via the provided `pool`.
@@ -566,7 +569,8 @@ impl DatabaseQueries {
     /// # Errors
     ///
     /// Returns an error if the SQL INSERT or UPDATE operation fails, or if
-    /// serialization of `exec_algorithm_params` fails.
+    /// serialization of `exec_algorithm_params` fails. Non-initialization events also return an
+    /// error when the order has no persisted `OrderInitialized` event.
     #[expect(
         clippy::too_many_lines,
         reason = "order event persistence maps the full database schema in one transaction"
@@ -577,6 +581,29 @@ impl DatabaseQueries {
         client_id: Option<ClientId>,
     ) -> anyhow::Result<()> {
         let mut transaction = pool.begin().await?;
+
+        if order_event.type_name() != "OrderInitialized" {
+            let initialized_exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM "order_event"
+                    WHERE client_order_id = $1 AND kind = 'OrderInitialized'
+                )
+                "#,
+            )
+            .bind(order_event.client_order_id().to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to check order initialization: {e}"))?;
+
+            anyhow::ensure!(
+                initialized_exists,
+                "Cannot persist {} for {}: OrderInitialized is absent",
+                order_event.type_name(),
+                order_event.client_order_id(),
+            );
+        }
 
         // Insert trader if it does not exist
         // TODO remove this when node and trader initialization is implemented
@@ -712,7 +739,19 @@ impl DatabaseQueries {
         pool: &PgPool,
         client_order_id: &ClientOrderId,
     ) -> anyhow::Result<Vec<OrderEventAny>> {
-        sqlx::query_as::<_, OrderEventAnyRow>(r#"SELECT * FROM "order_event" event WHERE event.client_order_id = $1 ORDER BY created_at ASC"#)
+        sqlx::query_as::<_, OrderEventAnyRow>(
+            r#"
+            SELECT *
+            FROM "order_event" event
+            WHERE event.client_order_id = $1
+            ORDER BY
+                CASE WHEN kind = 'OrderInitialized' THEN 0 ELSE 1 END,
+                created_at ASC,
+                ts_init::NUMERIC ASC,
+                ts_event::NUMERIC ASC,
+                id ASC
+            "#,
+        )
         .bind(client_order_id.to_string())
         .fetch_all(pool)
         .await
@@ -766,9 +805,10 @@ impl DatabaseQueries {
         })
         .map_err(|e| anyhow::anyhow!("Failed to load order ids: {e}"))?;
         for id in client_order_ids {
-            let order = Self::load_order(pool, &id).await?;
-            if let Some(order) = order {
-                orders.push(order);
+            match Self::load_order(pool, &id).await {
+                Ok(Some(order)) => orders.push(order),
+                Ok(None) => {}
+                Err(e) => log::error!("Skipping corrupt order {id} during cache load: {e}"),
             }
         }
         Ok(orders)

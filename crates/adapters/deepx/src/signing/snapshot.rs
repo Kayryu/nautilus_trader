@@ -366,6 +366,9 @@ pub enum DeepXRuntimeSnapshotUpdate {
 /// Errors produced by the runtime snapshot quiescence boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXRuntimeSnapshotServiceError {
+    /// New signing is blocked while the execution account connection is unavailable.
+    #[error("DeepX execution account connection is unavailable")]
+    AccountConnectionUnavailable,
     /// New signing is blocked while a changed runtime is being validated.
     #[error("DeepX runtime snapshot refresh is in progress")]
     RefreshInProgress,
@@ -417,6 +420,8 @@ struct RuntimeSnapshotServiceState {
     active: Arc<RuntimeSnapshot>,
     pending_identity: Option<PendingRuntimeIdentity>,
     in_flight: usize,
+    connection_generation: u64,
+    account_connection_available: bool,
     evidence_inconsistent: bool,
     client_retired: bool,
 }
@@ -449,6 +454,8 @@ impl DeepXRuntimeSnapshotService {
                 active: Arc::new(snapshot),
                 pending_identity: None,
                 in_flight: 0,
+                connection_generation: 0,
+                account_connection_available: true,
                 evidence_inconsistent: false,
                 client_retired: false,
             })),
@@ -469,6 +476,9 @@ impl DeepXRuntimeSnapshotService {
         if state.client_retired {
             return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
         }
+        if !state.account_connection_available {
+            return Err(DeepXRuntimeSnapshotServiceError::AccountConnectionUnavailable);
+        }
         if state.evidence_inconsistent {
             return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
         }
@@ -483,7 +493,45 @@ impl DeepXRuntimeSnapshotService {
         Ok(DeepXRuntimeSnapshotPermit {
             service_state: Arc::clone(&self.state),
             snapshot: Arc::clone(&state.active),
+            connection_generation: state.connection_generation,
         })
+    }
+
+    /// Invalidates current permits and blocks new signing until the account stream is restored.
+    pub(crate) fn suspend_for_account_disconnect(
+        &self,
+    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        state.connection_generation = state
+            .connection_generation
+            .checked_add(1)
+            .ok_or(DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        state.account_connection_available = false;
+        Ok(())
+    }
+
+    /// Reopens signing after a replacement account stream is fully validated.
+    pub(crate) fn resume_after_account_reconnect(
+        &self,
+    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
+        if state.client_retired {
+            return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if state.evidence_inconsistent {
+            return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
+        }
+        state.account_connection_available = true;
+        Ok(())
     }
 
     /// Permanently closes new permits after contradictory finalized RPC evidence.
@@ -629,6 +677,7 @@ impl DeepXRuntimeSnapshotService {
 pub struct DeepXRuntimeSnapshotPermit {
     service_state: Arc<Mutex<RuntimeSnapshotServiceState>>,
     snapshot: Arc<RuntimeSnapshot>,
+    connection_generation: u64,
 }
 
 impl DeepXRuntimeSnapshotPermit {
@@ -650,6 +699,11 @@ impl DeepXRuntimeSnapshotPermit {
             .map_err(|_| DeepXRuntimeSnapshotServiceError::StateUnavailable)?;
         if state.client_retired {
             return Err(DeepXRuntimeSnapshotServiceError::ClientRetired);
+        }
+        if !state.account_connection_available
+            || state.connection_generation != self.connection_generation
+        {
+            return Err(DeepXRuntimeSnapshotServiceError::AccountConnectionUnavailable);
         }
         if state.evidence_inconsistent {
             return Err(DeepXRuntimeSnapshotServiceError::EvidenceInconsistent);
@@ -1982,6 +2036,31 @@ mod tests {
             service.install(snapshot),
             Err(DeepXRuntimeSnapshotServiceError::ClientRetired),
         );
+    }
+
+    #[rstest]
+    fn account_reconnect_invalidates_old_permits_and_reopens_new_signing() {
+        let service = DeepXRuntimeSnapshotService::new(test_snapshot());
+        let old_permit = service.acquire().unwrap();
+
+        service.suspend_for_account_disconnect().unwrap();
+
+        assert_eq!(
+            old_permit.ensure_active(),
+            Err(DeepXRuntimeSnapshotServiceError::AccountConnectionUnavailable),
+        );
+        assert_eq!(
+            service.acquire().unwrap_err(),
+            DeepXRuntimeSnapshotServiceError::AccountConnectionUnavailable,
+        );
+
+        service.resume_after_account_reconnect().unwrap();
+
+        assert_eq!(
+            old_permit.ensure_active(),
+            Err(DeepXRuntimeSnapshotServiceError::AccountConnectionUnavailable),
+        );
+        assert!(service.acquire().unwrap().ensure_active().is_ok());
     }
 
     #[rstest]

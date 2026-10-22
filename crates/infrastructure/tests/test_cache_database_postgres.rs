@@ -102,6 +102,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_add_general_object_adds_to_cache() {
         let mut pg_cache = get_test_pg_cache_database().await.unwrap();
+        pg_cache.flush().unwrap();
 
         let test_id_value = Bytes::from("test_value");
         pg_cache
@@ -121,6 +122,24 @@ mod serial_tests {
             vec![String::from("test_id")]
         );
         assert_eq!(result.get("test_id").unwrap().to_owned(), test_id_value);
+
+        let updated_value = Bytes::from("updated_value");
+        pg_cache
+            .add(String::from("test_id"), updated_value.clone())
+            .unwrap();
+        wait_until(
+            || {
+                pg_cache
+                    .load()
+                    .unwrap()
+                    .get("test_id")
+                    .is_some_and(|value| value == &updated_value)
+            },
+            Duration::from_secs(5),
+        );
+        let result = pg_cache.load().unwrap();
+        assert_eq!(result.keys().len(), 1);
+        assert_eq!(result.get("test_id").unwrap(), &updated_value);
 
         pg_cache.flush().unwrap();
         pg_cache.close().unwrap();
@@ -1164,6 +1183,93 @@ mod serial_tests {
             .await
             .unwrap();
         assert_entirely_equal(market_order_result.unwrap(), market_order);
+
+        pg_cache.flush().unwrap();
+        pg_cache.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_order_event_rejects_event_without_initialization() {
+        let pg_cache = get_test_pg_cache_database().await.unwrap();
+        let instrument = currency_pair_ethusdt();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-PG-ORPHAN-EVENT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, account_id());
+
+        let error = DatabaseQueries::add_order_event(&pg_cache.pool, submitted.into_boxed(), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("OrderInitialized is absent"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_orders_skips_order_without_initialization() {
+        let mut pg_cache = get_test_pg_cache_database().await.unwrap();
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_ethusdt());
+        DatabaseQueries::add_currency(&pg_cache.pool, instrument.base_currency().unwrap())
+            .await
+            .unwrap();
+        DatabaseQueries::add_currency(&pg_cache.pool, instrument.quote_currency())
+            .await
+            .unwrap();
+        DatabaseQueries::add_instrument(
+            &pg_cache.pool,
+            "CURRENCY_PAIR",
+            Box::new(instrument.clone()),
+        )
+        .await
+        .unwrap();
+
+        let good_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-PG-GOOD-ORDER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+        let corrupt_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-PG-CORRUPT-ORDER"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .submit(true)
+            .build();
+
+        for event in good_order.events() {
+            DatabaseQueries::add_order_event(&pg_cache.pool, event.clone().into_boxed(), None)
+                .await
+                .unwrap();
+        }
+        for event in corrupt_order.events() {
+            DatabaseQueries::add_order_event(&pg_cache.pool, event.clone().into_boxed(), None)
+                .await
+                .unwrap();
+        }
+
+        sqlx::query(
+            r#"DELETE FROM "order_event" WHERE client_order_id = $1 AND kind = 'OrderInitialized'"#,
+        )
+        .bind(corrupt_order.client_order_id().to_string())
+        .execute(&pg_cache.pool)
+        .await
+        .unwrap();
+
+        let orders = DatabaseQueries::load_orders(&pg_cache.pool).await.unwrap();
+
+        assert!(
+            orders
+                .iter()
+                .any(|order| order.client_order_id() == good_order.client_order_id())
+        );
+        assert!(
+            orders
+                .iter()
+                .all(|order| order.client_order_id() != corrupt_order.client_order_id())
+        );
 
         pg_cache.flush().unwrap();
         pg_cache.close().unwrap();

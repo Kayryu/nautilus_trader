@@ -510,7 +510,7 @@ impl DeepXAbsenceEvidence {
     }
 }
 
-/// A placement bound to the durable signed hash by a backend order record.
+/// A placement bound to the durable signed hash by backend evidence.
 ///
 /// This records backend confirmation, not canonical inclusion or chain finality.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -520,8 +520,10 @@ pub struct DeepXBackendOrderEvidence {
     extrinsic_hash: [u8; 32],
     /// Timestamp-derived order ID verified against the durable reservation.
     order_id: u64,
-    /// Block height reported by the backend, without a finality claim.
-    observed_block_number: u64,
+    /// Block height reported by a backend order record, without a finality claim.
+    ///
+    /// Exact hash-bound REST transaction status does not report a block height.
+    observed_block_number: Option<u64>,
 }
 
 impl DeepXBackendOrderEvidence {
@@ -533,7 +535,18 @@ impl DeepXBackendOrderEvidence {
         Self {
             extrinsic_hash,
             order_id,
-            observed_block_number,
+            observed_block_number: Some(observed_block_number),
+        }
+    }
+
+    pub(crate) const fn from_rest_transaction_status(
+        extrinsic_hash: [u8; 32],
+        order_id: u64,
+    ) -> Self {
+        Self {
+            extrinsic_hash,
+            order_id,
+            observed_block_number: None,
         }
     }
 
@@ -551,7 +564,7 @@ impl DeepXBackendOrderEvidence {
 
     /// Returns the block height reported by the backend.
     #[must_use]
-    pub const fn observed_block_number(&self) -> u64 {
+    pub const fn observed_block_number(&self) -> Option<u64> {
         self.observed_block_number
     }
 }
@@ -784,7 +797,7 @@ impl DeepXTransactionLifecycle {
                 if self.extrinsic_hash != Some(e.extrinsic_hash) {
                     return Err(DeepXTransactionError::BackendOrderHashMismatch);
                 }
-                if e.order_id == 0 || e.observed_block_number == 0 {
+                if e.order_id == 0 || e.observed_block_number == Some(0) {
                     return Err(DeepXTransactionError::IncompleteBackendOrderEvidence);
                 }
                 self.inclusion = None;
@@ -965,7 +978,7 @@ mod tests {
         let evidence = DeepXBackendOrderEvidence {
             extrinsic_hash: EXTRINSIC_HASH,
             order_id: 42,
-            observed_block_number: 100,
+            observed_block_number: Some(100),
         };
         assert!(
             lifecycle
@@ -999,7 +1012,7 @@ mod tests {
             DeepXBackendOrderEvidence {
                 extrinsic_hash: [9; 32],
                 order_id: 42,
-                observed_block_number: 100,
+                observed_block_number: Some(100),
             },
         ));
         assert_eq!(result, Err(DeepXTransactionError::BackendOrderHashMismatch));

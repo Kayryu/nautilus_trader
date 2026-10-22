@@ -126,16 +126,17 @@ use crate::{
         DeepXPoolReconciliationCommitError, DeepXPostgresSignerLease,
         DeepXPostgresTransactionStore, DeepXPreparedReservation, DeepXPreparedSignedTransaction,
         DeepXPreparedSubmission, DeepXReorganizationCommitError, DeepXReservationPreparationError,
-        DeepXRestoredTransactionRecord, DeepXSignedTransactionPreparationError, DeepXSignerLease,
-        DeepXSpotCancelCallVerifier, DeepXSpotPlaceCallVerifier,
-        DeepXSubmissionAcceptanceCommitError, DeepXSubmissionAttemptOutcome,
-        DeepXSubmissionFailure, DeepXSubmissionPreparationError, DeepXSubmissionScanCheckpoint,
-        DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator, DeepXTransactionObservation,
-        DeepXTransactionOperation, DeepXTransactionPersistenceError, DeepXTransactionRecord,
-        DeepXTransactionRecoveryAction, DeepXTransactionState, DeepXTransactionStore,
-        DeepXTransactionWatchError, commit_framework_order_event_acknowledgement,
-        commit_framework_order_event_staging, commit_initial_submission_acceptance,
-        commit_reconciliation_observation, load_verified_committed_for_signer,
+        DeepXRestTransactionConfirmation, DeepXRestoredTransactionRecord,
+        DeepXSignedTransactionPreparationError, DeepXSignerLease, DeepXSpotCancelCallVerifier,
+        DeepXSpotPlaceCallVerifier, DeepXSubmissionAcceptanceCommitError,
+        DeepXSubmissionAttemptOutcome, DeepXSubmissionFailure, DeepXSubmissionPreparationError,
+        DeepXSubmissionScanCheckpoint, DeepXSubmittedExtrinsic, DeepXTimestampNonceAllocator,
+        DeepXTransactionObservation, DeepXTransactionOperation, DeepXTransactionPersistenceError,
+        DeepXTransactionRecord, DeepXTransactionRecoveryAction, DeepXTransactionState,
+        DeepXTransactionStore, DeepXTransactionWatchError,
+        commit_framework_order_event_acknowledgement, commit_framework_order_event_staging,
+        commit_initial_submission_acceptance, commit_reconciliation_observation,
+        get_rest_transaction_status, load_verified_committed_for_signer,
         materialize_perp_framework_order_events, observe_and_commit_finality,
         observe_and_commit_reorganization,
         prepare_framework_perp_cancel_reservation as prepare_durable_framework_perp_cancel_reservation,
@@ -164,12 +165,20 @@ const POSITION_REPORT_PAGE_SIZE: u32 = 100;
 const POSITION_REPORT_MAX_PAGES: usize = 100;
 const ORDER_REPORT_PAGE_SIZE: u32 = 100;
 const ORDER_REPORT_MAX_PAGES: usize = 100;
+const STARTUP_PERP_ORDER_HISTORY_MAX_PAGES: usize = 100;
 const FILL_REPORT_PAGE_SIZE: u32 = 100;
 const FILL_REPORT_MAX_PAGES: usize = 100;
 const ORDER_EVENT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCOUNT_STREAM_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+const ACCOUNT_STREAM_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS: usize = 3;
 const MAX_ORDER_LIST_FANOUT: usize = 20;
+
+fn account_stream_reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250)
+        .saturating_mul(2_u32.saturating_pow(attempt))
+        .min(ACCOUNT_STREAM_MAX_RECONNECT_DELAY)
+}
 
 #[derive(Debug, Error)]
 #[error(
@@ -6811,6 +6820,7 @@ impl DeepXExecutionClient {
                 DeepXTransactionState::Submitting
                     | DeepXTransactionState::Accepted
                     | DeepXTransactionState::InBlockSuccess
+                    | DeepXTransactionState::InBlockFailed
                     | DeepXTransactionState::NotIncluded
             ) {
                 let instrument_id = item.record().identity().instrument_id();
@@ -6832,20 +6842,13 @@ impl DeepXExecutionClient {
                     )
                     .into());
                 }
-                let Some(order) = poll_backend_perp_order_for_durable_place(
+                let order = lookup_backend_perp_order_for_startup(
                     &self.http,
                     item.record(),
                     catalog_market_id,
                     metadata,
-                    Duration::from_secs(self.config.http_timeout_secs),
                 )
-                .await?
-                else {
-                    return Err(DeepXMassReconciliationError::UnresolvedTransaction {
-                        client_order_id,
-                        action: DeepXTransactionRecoveryAction::ReconciliationRequired,
-                    });
-                };
+                .await?;
                 let DeepXNonceReservation::TimestampOrderId { value: order_id } =
                     item.record().identity().nonce()
                 else {
@@ -6854,18 +6857,41 @@ impl DeepXExecutionClient {
                         action: DeepXTransactionRecoveryAction::OperatorActionRequired,
                     });
                 };
+                let evidence = if let Some(order) = order {
+                    DeepXBackendOrderEvidence::new(
+                        order.extrinsic_hash(),
+                        order_id,
+                        order.observed_block_number(),
+                    )
+                } else {
+                    match lookup_backend_perp_transaction_status_for_startup(
+                        &self.http,
+                        item.record(),
+                        order_id,
+                    )
+                    .await?
+                    {
+                        DeepXStartupPerpTransactionStatus::Confirmed(evidence) => evidence,
+                        DeepXStartupPerpTransactionStatus::Inconclusive => {
+                            return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                                client_order_id,
+                                action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                            });
+                        }
+                        DeepXStartupPerpTransactionStatus::Conflicting => {
+                            return Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                                client_order_id,
+                                action: DeepXTransactionRecoveryAction::OperatorActionRequired,
+                            });
+                        }
+                    }
+                };
                 commit_reconciliation_observation(
                     store,
                     lease,
                     item.committed(),
                     item.record(),
-                    DeepXTransactionObservation::BackendOrderConfirmed(
-                        DeepXBackendOrderEvidence::new(
-                            order.extrinsic_hash(),
-                            order_id,
-                            order.observed_block_number(),
-                        ),
-                    ),
+                    DeepXTransactionObservation::BackendOrderConfirmed(evidence),
                 )
                 .await?
                 .record()
@@ -7788,18 +7814,29 @@ impl DeepXExecutionClient {
             self.account_tasks.start_generation()?;
         }
         let mut connection = self.account_connection.take().expect("validated above");
+        let network = self.config.network.clone();
+        let proxy_url = self.config.proxy_url.clone();
+        let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
+        let subaccount = self
+            .config
+            .subaccount_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("DeepX account monitor has no configured subaccount"))?;
         let cancellation = self.account_tasks.cancellation_token();
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
         let live = Arc::new(AtomicBool::new(true));
         let task_live = Arc::clone(&live);
+        let reconnect_live = Arc::clone(&live);
         let epoch = Arc::clone(&self.query_epoch);
         self.account_tasks.spawn(async move {
             let _guard = DeepXAccountMonitorGuard {
                 live: task_live,
-                epoch,
-                snapshot_service,
+                epoch: Arc::clone(&epoch),
+                snapshot_service: snapshot_service.clone(),
             };
+            let mut subscription = subscription;
+            let mut reconnect_attempt = 0_u32;
             let close_result = loop {
                 tokio::select! {
                     () = cancellation.cancelled() => {
@@ -7814,8 +7851,92 @@ impl DeepXExecutionClient {
                             Some(crate::websocket::DeepXWsError::ReceiveTimeout)
                         ) => {}
                         Err(e) => {
-                            log::error!("DeepX account stream became terminal: {e:#}");
-                            break Ok(());
+                            reconnect_live.store(false, Ordering::Release);
+                            match epoch.lock() {
+                                Ok(mut active) => *active = false,
+                                Err(_) => {
+                                    log::error!("DeepX account monitor query epoch lock is poisoned");
+                                    break Ok(());
+                                }
+                            }
+                            if let Err(suspend_error) =
+                                snapshot_service.suspend_for_account_disconnect()
+                            {
+                                log::error!(
+                                    "DeepX account stream could not suspend signing after disconnect: {suspend_error}"
+                                );
+                                break Ok(());
+                            }
+                            log::warn!(
+                                "DeepX account stream interrupted; reconnecting after validated subscription: {e:#}"
+                            );
+
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    () = cancellation.cancelled() => break,
+                                    () = tokio::time::sleep(account_stream_reconnect_delay(reconnect_attempt)) => {},
+                                }
+                                let reconnect = tokio::select! {
+                                    biased;
+                                    () = cancellation.cancelled() => break,
+                                    result = async {
+                                        let mut replacement = DeepXWsAccountConnection::connect(
+                                            &network,
+                                            proxy_url.as_deref(),
+                                            timeout,
+                                            ACCOUNT_STREAM_BUFFER_CAPACITY,
+                                        )
+                                        .await?;
+                                        let replacement_subscription = replacement
+                                            .subscribe_user_balances(&subaccount)
+                                            .await?;
+                                        let first = replacement
+                                            .next_balances(replacement_subscription)
+                                            .await?;
+                                        Ok::<_, anyhow::Error>((
+                                            replacement,
+                                            replacement_subscription,
+                                            first,
+                                        ))
+                                    } => result,
+                                };
+                                match reconnect {
+                                    Ok((replacement, replacement_subscription, first)) => {
+                                        if let Err(resume_error) =
+                                            snapshot_service.resume_after_account_reconnect()
+                                        {
+                                            log::error!(
+                                                "DeepX account stream could not resume signing after reconnect: {resume_error}"
+                                            );
+                                            break;
+                                        }
+                                        match epoch.lock() {
+                                            Ok(mut active) => *active = true,
+                                            Err(_) => {
+                                                log::error!(
+                                                    "DeepX account monitor query epoch lock is poisoned"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        connection = replacement;
+                                        subscription = replacement_subscription;
+                                        sender.send_replace(Some(first));
+                                        reconnect_live.store(true, Ordering::Release);
+                                        reconnect_attempt = 0;
+                                        log::info!("DeepX account stream reconnected");
+                                        break;
+                                    }
+                                    Err(reconnect_error) => {
+                                        log::warn!(
+                                            "DeepX account stream reconnect attempt {} failed: {reconnect_error:#}",
+                                            reconnect_attempt.saturating_add(1),
+                                        );
+                                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -8642,6 +8763,276 @@ async fn poll_backend_perp_order_for_durable_place(
     match tokio::time::timeout(timeout, lookup).await {
         Ok(result) => result,
         Err(_) => Ok(None),
+    }
+}
+
+async fn lookup_backend_perp_order_for_startup(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    catalog_market_id: u64,
+    metadata: &DeepXPerpetualReportMetadata,
+) -> Result<Option<DeepXPerpOrderEvidence>, DeepXBackendPerpOrderObservationError> {
+    if let Some(order) = lookup_backend_perp_order_by_id_for_durable_place(
+        http,
+        transaction,
+        catalog_market_id,
+        metadata,
+    )
+    .await?
+    {
+        return Ok(Some(order));
+    }
+    let signed = transaction
+        .signed_extrinsic()
+        .ok_or(DeepXPerpOrderEvidenceError::MissingSignedExtrinsic)?;
+    if transaction.lifecycle().extrinsic_hash() != Some(signed.extrinsic_hash()) {
+        return Err(DeepXPerpOrderEvidenceError::DurableHashMismatch.into());
+    }
+    let hash = format!("0x{}", nautilus_core::hex::encode(signed.extrinsic_hash()));
+    match http.get_perp_order_by_tx(&hash).await {
+        Ok(record) => DeepXExecutionClient::verify_perp_order_record_with_catalog(
+            &record,
+            transaction,
+            catalog_market_id,
+            metadata,
+        )
+        .map(Some)
+        .map_err(DeepXBackendPerpOrderObservationError::from),
+        Err(DeepXHttpError::Api {
+            code: crate::http::models::DeepXResponseCode::Api(10008 | 10020),
+            ..
+        }) => {
+            if let Some(order) = lookup_backend_perp_open_order_for_startup(
+                http,
+                transaction,
+                catalog_market_id,
+                metadata,
+            )
+            .await?
+            {
+                return Ok(Some(order));
+            }
+            lookup_backend_perp_order_history_for_startup(
+                http,
+                transaction,
+                catalog_market_id,
+                metadata,
+            )
+            .await
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn lookup_backend_perp_open_order_for_startup(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    catalog_market_id: u64,
+    metadata: &DeepXPerpetualReportMetadata,
+) -> Result<Option<DeepXPerpOrderEvidence>, DeepXBackendPerpOrderObservationError> {
+    let Some(DeepXTransactionOperation::PerpPlace { subaccount, .. }) =
+        transaction.identity().operation()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::OperationMismatch.into());
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: order_id } =
+        transaction.identity().nonce()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::NonceDomainMismatch.into());
+    };
+    let mut request = DeepXPerpOpenOrdersRequest {
+        subaccount: format!("0x{}", nautilus_core::hex::encode(subaccount)),
+        market_id: Some(catalog_market_id),
+        is_long: None,
+        cursor: None,
+        page_size: Some(ORDER_REPORT_PAGE_SIZE),
+        sort: DeepXAccountSortOrder::Descending,
+    };
+    let order_id = order_id.to_string();
+    let mut observed_cursors = HashSet::new();
+    for _ in 0..STARTUP_PERP_ORDER_HISTORY_MAX_PAGES {
+        let page = http.get_perp_open_orders(&request).await?;
+        if let Some(record) = page.items.iter().find(|record| record.order_id == order_id) {
+            return DeepXExecutionClient::verify_perp_order_record_with_catalog(
+                record,
+                transaction,
+                catalog_market_id,
+                metadata,
+            )
+            .map(Some)
+            .map_err(DeepXBackendPerpOrderObservationError::from);
+        }
+        if !page.has_next {
+            return Ok(None);
+        }
+        if page.items.is_empty() {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp open orders returned an empty continuation page".to_string(),
+            )
+            .into());
+        }
+        let cursor = page.next_cursor.ok_or_else(|| {
+            DeepXHttpError::InvalidRequest(
+                "perp open orders omitted its continuation cursor".to_string(),
+            )
+        })?;
+        if !observed_cursors.insert(cursor.clone()) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp open orders repeated its continuation cursor".to_string(),
+            )
+            .into());
+        }
+        request.cursor = Some(cursor);
+    }
+    Err(DeepXHttpError::InvalidRequest(format!(
+        "perp open orders exceeded the {STARTUP_PERP_ORDER_HISTORY_MAX_PAGES} page startup recovery limit"
+    ))
+    .into())
+}
+
+async fn lookup_backend_perp_order_history_for_startup(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    catalog_market_id: u64,
+    metadata: &DeepXPerpetualReportMetadata,
+) -> Result<Option<DeepXPerpOrderEvidence>, DeepXBackendPerpOrderObservationError> {
+    let Some(DeepXTransactionOperation::PerpPlace { subaccount, .. }) =
+        transaction.identity().operation()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::OperationMismatch.into());
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: order_id } =
+        transaction.identity().nonce()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::NonceDomainMismatch.into());
+    };
+    let subaccount = format!("0x{}", nautilus_core::hex::encode(subaccount));
+    let order_id = order_id.to_string();
+    let mut request = DeepXPerpHistoryOrdersRequest {
+        subaccount,
+        market_id: Some(catalog_market_id),
+        cursor: None,
+        page_size: Some(ORDER_REPORT_PAGE_SIZE),
+        sort: DeepXAccountSortOrder::Descending,
+    };
+    let mut observed_cursors = HashSet::new();
+    for _ in 0..STARTUP_PERP_ORDER_HISTORY_MAX_PAGES {
+        let page = http.get_perp_history_orders(&request).await?;
+        if let Some(record) = page.items.iter().find(|record| record.order_id == order_id) {
+            return DeepXExecutionClient::verify_perp_order_record_with_catalog(
+                record,
+                transaction,
+                catalog_market_id,
+                metadata,
+            )
+            .map(Some)
+            .map_err(DeepXBackendPerpOrderObservationError::from);
+        }
+        if !page.has_next {
+            return Ok(None);
+        }
+        if page.items.is_empty() {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp history orders returned an empty continuation page".to_string(),
+            )
+            .into());
+        }
+        let cursor = page.next_cursor.ok_or_else(|| {
+            DeepXHttpError::InvalidRequest(
+                "perp history orders omitted its continuation cursor".to_string(),
+            )
+        })?;
+        if !observed_cursors.insert(cursor.clone()) {
+            return Err(DeepXHttpError::InvalidRequest(
+                "perp history orders repeated its continuation cursor".to_string(),
+            )
+            .into());
+        }
+        request.cursor = Some(cursor);
+    }
+    Err(DeepXHttpError::InvalidRequest(format!(
+        "perp history orders exceeded the {STARTUP_PERP_ORDER_HISTORY_MAX_PAGES} page startup recovery limit"
+    ))
+    .into())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeepXStartupPerpTransactionStatus {
+    Confirmed(DeepXBackendOrderEvidence),
+    Inconclusive,
+    Conflicting,
+}
+
+async fn lookup_backend_perp_transaction_status_for_startup(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    order_id: u64,
+) -> Result<DeepXStartupPerpTransactionStatus, DeepXBackendPerpOrderObservationError> {
+    let Some(signed) = transaction.signed_extrinsic() else {
+        return Ok(DeepXStartupPerpTransactionStatus::Conflicting);
+    };
+    let extrinsic_hash = signed.extrinsic_hash();
+    if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash) {
+        return Ok(DeepXStartupPerpTransactionStatus::Conflicting);
+    }
+    let status = match get_rest_transaction_status(http, extrinsic_hash).await {
+        Ok(status) => status,
+        Err(DeepXHttpError::Api {
+            code: crate::http::models::DeepXResponseCode::Api(10008 | 10020),
+            ..
+        }) => return Ok(DeepXStartupPerpTransactionStatus::Inconclusive),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(match status.confirmation() {
+        DeepXRestTransactionConfirmation::Pending => {
+            DeepXStartupPerpTransactionStatus::Inconclusive
+        }
+        DeepXRestTransactionConfirmation::Best if status.order_id() == Some(order_id) => {
+            DeepXStartupPerpTransactionStatus::Confirmed(
+                DeepXBackendOrderEvidence::from_rest_transaction_status(extrinsic_hash, order_id),
+            )
+        }
+        DeepXRestTransactionConfirmation::Best | DeepXRestTransactionConfirmation::DecodeFailed => {
+            DeepXStartupPerpTransactionStatus::Conflicting
+        }
+    })
+}
+
+async fn lookup_backend_perp_order_by_id_for_durable_place(
+    http: &DeepXHttpClient,
+    transaction: &DeepXTransactionRecord,
+    catalog_market_id: u64,
+    metadata: &DeepXPerpetualReportMetadata,
+) -> Result<Option<DeepXPerpOrderEvidence>, DeepXBackendPerpOrderObservationError> {
+    let Some(DeepXTransactionOperation::PerpPlace { subaccount, .. }) =
+        transaction.identity().operation()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::OperationMismatch.into());
+    };
+    let DeepXNonceReservation::TimestampOrderId { value: order_id } =
+        transaction.identity().nonce()
+    else {
+        return Err(DeepXPerpOrderEvidenceError::NonceDomainMismatch.into());
+    };
+    let subaccount = format!("0x{}", nautilus_core::hex::encode(subaccount));
+    let order_id = order_id.to_string();
+    match http
+        .get_perp_order_by_id(&subaccount, catalog_market_id, &order_id)
+        .await
+    {
+        Ok(record) => DeepXExecutionClient::verify_perp_order_record_with_catalog(
+            &record,
+            transaction,
+            catalog_market_id,
+            metadata,
+        )
+        .map(Some)
+        .map_err(DeepXBackendPerpOrderObservationError::from),
+        Err(DeepXHttpError::Api {
+            code: crate::http::models::DeepXResponseCode::Api(10008 | 10020),
+            ..
+        }) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -10540,6 +10931,7 @@ impl ExecutionClient for DeepXExecutionClient {
         let query = self.prepare_tracked_order_query(&cmd)?;
         let http = self.http.clone();
         let account_id = query.account_id;
+        let query_timeout = Duration::from_secs(self.config.http_timeout_secs);
         let emitter = self.emitter.clone();
         let epoch = Arc::clone(&self.query_epoch);
         self.query_tasks.spawn(async move {
@@ -10550,21 +10942,36 @@ impl ExecutionClient for DeepXExecutionClient {
                     } else {
                         DeepXSpotOrderSide::Sell
                     };
-                    let record = http
-                        .get_spot_order_by_id(&DeepXSpotOrderByIdRequest {
-                            subaccount: query.subaccount.clone(),
-                            name: Some(market.name.clone()),
-                            pair: None,
-                            order_id: query.venue_order_id.as_str().to_string(),
-                            order_side: side,
-                        })
-                        .await?;
+                    let request = DeepXSpotOrderByIdRequest {
+                        subaccount: query.subaccount.clone(),
+                        name: Some(market.name.clone()),
+                        pair: None,
+                        order_id: query.venue_order_id.as_str().to_string(),
+                        order_side: side,
+                    };
+                    let lookup = async {
+                        loop {
+                            match http.get_spot_order_by_id(&request).await {
+                                Ok(record) => return Ok(record),
+                                Err(DeepXHttpError::Api {
+                                    code: crate::http::models::DeepXResponseCode::Api(
+                                        10008 | 10020,
+                                    ),
+                                    ..
+                                }) => tokio::time::sleep(Duration::from_millis(500)).await,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    };
+                    let Ok(record) = tokio::time::timeout(query_timeout, lookup).await else {
+                        return Ok(None);
+                    };
                     Self::build_tracked_spot_order_status_report(
                         &http,
                         account_id,
                         &query.subaccount,
                         DeepXTrackedSpotReportInput {
-                            record: &record,
+                            record: &record?,
                             market,
                             venue_order_id: query.venue_order_id,
                             context: query.context,
@@ -10573,19 +10980,37 @@ impl ExecutionClient for DeepXExecutionClient {
                         },
                     )
                     .await
+                    .map(Some)
                 } else {
                     let market_id = query.market_id.ok_or_else(|| {
                         anyhow::anyhow!("DeepX order query has no market identity")
                     })?;
-                    let record = http
-                        .get_perp_order_by_id(
-                            &query.subaccount,
-                            market_id,
-                            query.venue_order_id.as_str(),
-                        )
-                        .await?;
+                    let lookup = async {
+                        loop {
+                            match http
+                                .get_perp_order_by_id(
+                                    &query.subaccount,
+                                    market_id,
+                                    query.venue_order_id.as_str(),
+                                )
+                                .await
+                            {
+                                Ok(record) => return Ok(record),
+                                Err(DeepXHttpError::Api {
+                                    code: crate::http::models::DeepXResponseCode::Api(
+                                        10008 | 10020,
+                                    ),
+                                    ..
+                                }) => tokio::time::sleep(Duration::from_millis(500)).await,
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    };
+                    let Ok(record) = tokio::time::timeout(query_timeout, lookup).await else {
+                        return Ok(None);
+                    };
                     Self::build_tracked_order_status_report_from_context(
-                        &record,
+                        &record?,
                         market_id,
                         query.venue_order_id,
                         query.ts_init,
@@ -10593,16 +11018,21 @@ impl ExecutionClient for DeepXExecutionClient {
                         &query.subaccount,
                         query.context,
                     )
+                    .map(Some)
                     .map_err(anyhow::Error::from)
                 }
             }
             .await;
             match result {
-                Ok(report) => match epoch.lock() {
+                Ok(Some(report)) => match epoch.lock() {
                     Ok(active) if *active => emitter.send_order_status_report(report),
                     Ok(_) => {}
                     Err(_) => log::error!("DeepX order query epoch lock is poisoned"),
                 },
+                Ok(None) => log::warn!(
+                    "DeepX order query for {} remains pending backend indexing",
+                    query.venue_order_id,
+                ),
                 Err(e) => log::error!("DeepX order query failed: {e}"),
             }
         })?;
@@ -10826,6 +11256,17 @@ impl ExecutionClient for DeepXExecutionClient {
                         "DeepX Perpetual history response duplicated order {}",
                         record.order_id,
                     );
+                    let updated_time = record
+                        .updated_time
+                        .as_deref()
+                        .ok_or(DeepXTrackedOrderReportError::MissingUpdatedTime)?;
+                    let ts_last =
+                        parse_tracked_order_report_timestamp("updatedTime", updated_time)?;
+                    if cmd.start.is_some_and(|start| ts_last < start)
+                        || cmd.end.is_some_and(|end| ts_last > end)
+                    {
+                        continue;
+                    }
                     let venue_order_id = VenueOrderId::new(record.order_id.as_str());
                     reports.push(self.build_tracked_order_status_report(
                         &record,
@@ -13017,6 +13458,21 @@ mod tests {
         record
     }
 
+    fn submitting_framework_record(client: &DeepXExecutionClient) -> DeepXTransactionRecord {
+        let mut record = finalized_framework_record(client);
+        let mut encoded: Value = serde_json::from_slice(&record.encode().unwrap()).unwrap();
+        let mut checkpoint_hash = [0; 32];
+        checkpoint_hash[24..].copy_from_slice(&73_u64.to_be_bytes());
+        encoded["submission_scan_checkpoint"]["finalized_block_number"] = json!(73);
+        encoded["submission_scan_checkpoint"]["finalized_block_hash"] = json!(checkpoint_hash);
+        encoded["lifecycle"] = json!({
+            "state": DeepXTransactionState::Submitting,
+            "extrinsic_hash": record.signed_extrinsic().unwrap().extrinsic_hash(),
+        });
+        record = DeepXTransactionRecord::decode(&serde_json::to_vec(&encoded).unwrap()).unwrap();
+        record
+    }
+
     fn not_included_record(
         client: &DeepXExecutionClient,
         snapshot: &RuntimeSnapshot,
@@ -14524,7 +14980,7 @@ mod tests {
         let evidence =
             verify_backend_spot_order_for_durable_place(&record, &transaction, &market).unwrap();
         assert_eq!(evidence.order_id(), record.order_id.parse::<u64>().unwrap());
-        assert_eq!(evidence.observed_block_number(), record.block_number);
+        assert_eq!(evidence.observed_block_number(), Some(record.block_number));
         transaction
             .apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
             .unwrap();
@@ -14602,7 +15058,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(evidence.observed_block_number(), record.block_number);
+        assert_eq!(evidence.observed_block_number(), Some(record.block_number));
         assert_eq!(gets.load(Ordering::Relaxed), 2);
     }
 
@@ -14723,6 +15179,341 @@ mod tests {
             transaction.lifecycle().state(),
             DeepXTransactionState::Signed
         );
+    }
+
+    #[tokio::test]
+    async fn startup_backend_order_lookup_uses_durable_order_id() {
+        let client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let order_requests = Arc::new(AtomicUsize::new(0));
+        let transaction_requests = Arc::new(AtomicUsize::new(0));
+        let mut fixture: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = fixture["data"]["items"][2].take();
+        order["owner"] = json!(rest_order.owner);
+        order["txHash"] = json!(rest_order.tx_hash);
+        let response = json!({ "code": 200, "msg": "success", "fail": false, "data": order });
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/perp/order-by-id",
+                get({
+                    let order_requests = Arc::clone(&order_requests);
+                    move || {
+                        let order_requests = Arc::clone(&order_requests);
+                        let response = response.clone();
+                        async move {
+                            order_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(response)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/order-by-tx",
+                get({
+                    let transaction_requests = Arc::clone(&transaction_requests);
+                    move || {
+                        let transaction_requests = Arc::clone(&transaction_requests);
+                        async move {
+                            transaction_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10008,
+                                "fail": true,
+                                "msg": "Order 'order' not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = transaction.identity().instrument_id();
+
+        let evidence = lookup_backend_perp_order_for_startup(
+            &http,
+            &transaction,
+            client.perpetual_market_ids[&instrument_id],
+            &client.perpetual_report_metadata[&instrument_id],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(evidence.venue_order_id().as_str(), "1789445053841");
+        assert_eq!(order_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(transaction_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_backend_order_lookup_uses_open_orders_after_direct_misses() {
+        let client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let history_requests = Arc::new(AtomicUsize::new(0));
+        let mut fixture: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = fixture["data"]["items"][2].take();
+        order["owner"] = json!(rest_order.owner);
+        order["txHash"] = json!(rest_order.tx_hash);
+        order["status"] = json!("Open");
+        order["sizeFilled"] = json!(0);
+        order["sizeRemain"] = order["size"].clone();
+        order["avgFillPrice"] = Value::Null;
+        let open_response = json!({
+            "code": 200,
+            "msg": "success",
+            "fail": false,
+            "data": {
+                "items": [order],
+                "nextCursor": null,
+                "hasNext": false,
+            },
+        });
+        let direct_miss = || async {
+            Json(json!({
+                "code": 10008,
+                "fail": true,
+                "msg": "Order not found.",
+                "data": null,
+            }))
+        };
+        let router = Router::new()
+            .route("/internal/v1/account/perp/order-by-id", get(direct_miss))
+            .route("/internal/v1/account/perp/order-by-tx", get(direct_miss))
+            .route(
+                "/internal/v1/account/perp/open-orders",
+                get(move || {
+                    let response = open_response.clone();
+                    async move { Json(response) }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/history-orders",
+                get({
+                    let history_requests = Arc::clone(&history_requests);
+                    move || {
+                        let history_requests = Arc::clone(&history_requests);
+                        async move {
+                            history_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 200,
+                                "msg": "success",
+                                "fail": false,
+                                "data": { "items": [], "nextCursor": null, "hasNext": false },
+                            }))
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = transaction.identity().instrument_id();
+
+        let evidence = lookup_backend_perp_order_for_startup(
+            &http,
+            &transaction,
+            client.perpetual_market_ids[&instrument_id],
+            &client.perpetual_report_metadata[&instrument_id],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(evidence.venue_order_id().as_str(), "1789445053841");
+        assert_eq!(history_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_backend_order_lookup_uses_rest_history_after_direct_misses() {
+        let client = perp_order_mapping_test_client().await;
+        let mut rest_order = tracked_limit_order_record();
+        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let rest_requests = Arc::new(AtomicUsize::new(0));
+        let mut fixture: Value =
+            serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut order = fixture["data"]["items"][2].take();
+        order["owner"] = json!(rest_order.owner);
+        order["txHash"] = json!(rest_order.tx_hash);
+        let history_response = json!({
+            "code": 200,
+            "msg": "success",
+            "fail": false,
+            "data": {
+                "items": [order],
+                "nextCursor": null,
+                "hasNext": false,
+            },
+        });
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/perp/order-by-id",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10008,
+                                "fail": true,
+                                "msg": "Order not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/order-by-tx",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10020,
+                                "fail": true,
+                                "msg": "Transaction not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/open-orders",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 200,
+                                "msg": "success",
+                                "fail": false,
+                                "data": { "items": [], "nextCursor": null, "hasNext": false },
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/history-orders",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        let response = history_response.clone();
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(response)
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let instrument_id = transaction.identity().instrument_id();
+
+        let evidence = lookup_backend_perp_order_for_startup(
+            &http,
+            &transaction,
+            client.perpetual_market_ids[&instrument_id],
+            &client.perpetual_report_metadata[&instrument_id],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(evidence.venue_order_id().as_str(), "1789445053841");
+        assert_eq!(rest_requests.load(Ordering::Relaxed), 4);
+    }
+
+    #[rstest]
+    #[case("best", "1789445053841", "confirmed")]
+    #[case("best", "1789445053842", "conflicting")]
+    #[case("best", "", "conflicting")]
+    #[case("pending", "", "inconclusive")]
+    #[case("decode_failed", "", "conflicting")]
+    #[tokio::test]
+    async fn startup_transaction_status_classifies_hash_bound_rest_evidence(
+        #[case] confirmation: &str,
+        #[case] order_id: &str,
+        #[case] expected: &str,
+    ) {
+        let mut rest_order = tracked_limit_order_record();
+        let transaction = durable_record_for_rest_order(
+            &mut rest_order,
+            fixture_perp_place_params(),
+            OrderSide::Buy,
+        );
+        let extrinsic_hash = transaction.signed_extrinsic().unwrap().extrinsic_hash();
+        let response = json!({
+            "code": 200,
+            "msg": "success",
+            "fail": false,
+            "data": {
+                "tx_hash": format!("0x{}", nautilus_core::hex::encode(extrinsic_hash)),
+                "confirmation": confirmation,
+                "order_id": order_id,
+                "status": "included",
+            },
+        });
+        let router = Router::new().route(
+            "/internal/v1/chain/tx/status",
+            get(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+
+        let status = lookup_backend_perp_transaction_status_for_startup(
+            &http,
+            &transaction,
+            1_789_445_053_841,
+        )
+        .await
+        .unwrap();
+
+        match (expected, status) {
+            ("confirmed", DeepXStartupPerpTransactionStatus::Confirmed(evidence)) => {
+                assert_eq!(evidence.extrinsic_hash(), extrinsic_hash);
+                assert_eq!(evidence.order_id(), 1_789_445_053_841);
+                assert_eq!(evidence.observed_block_number(), None);
+            }
+            ("inconclusive", DeepXStartupPerpTransactionStatus::Inconclusive)
+            | ("conflicting", DeepXStartupPerpTransactionStatus::Conflicting) => {}
+            _ => panic!("unexpected startup transaction status: {status:?}"),
+        }
     }
 
     #[tokio::test]
@@ -16534,6 +17325,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mass_reconciliation_requires_rest_evidence_after_perp_backend_miss() {
+        let mut client = test_client();
+        let catalog_client = perp_order_mapping_test_client().await;
+        client.perpetual_market_ids = catalog_client.perpetual_market_ids;
+        client.perpetual_instrument_ids = catalog_client.perpetual_instrument_ids;
+        client.perpetual_report_metadata = catalog_client.perpetual_report_metadata;
+        let record = submitting_framework_record(&client);
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        let rest_requests = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/perp/order-by-id",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10008,
+                                "fail": true,
+                                "msg": "Order not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/order-by-tx",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10020,
+                                "fail": true,
+                                "msg": "Transaction not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/open-orders",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 200,
+                                "fail": false,
+                                "msg": "success",
+                                "data": {
+                                    "items": [],
+                                    "nextCursor": null,
+                                    "hasNext": false,
+                                },
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/account/perp/history-orders",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 200,
+                                "fail": false,
+                                "msg": "success",
+                                "data": {
+                                    "items": [],
+                                    "nextCursor": null,
+                                    "hasNext": false,
+                                },
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/internal/v1/chain/tx/status",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 10020,
+                                "fail": true,
+                                "msg": "Transaction not found.",
+                                "data": null,
+                            }))
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let (protocol, session) =
+            advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        let result = record_mass_reconciliation_completed_with_store(
+            &mut client,
+            &protocol,
+            session,
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(DeepXMassReconciliationError::UnresolvedTransaction {
+                    action: DeepXTransactionRecoveryAction::ReconciliationRequired,
+                    ..
+                }),
+            ),
+            "unexpected reconciliation result: {result:?}"
+        );
+        assert_eq!(rest_requests.load(Ordering::Relaxed), 5);
+        assert_eq!(store.current_revision(), 4);
+        assert_eq!(
+            store.persisted_record().lifecycle().state(),
+            DeepXTransactionState::Submitting,
+        );
+    }
+
+    #[tokio::test]
+    async fn mass_reconciliation_accepts_matching_rest_transaction_status() {
+        let mut client = test_client();
+        let catalog_client = perp_order_mapping_test_client().await;
+        client.perpetual_market_ids = catalog_client.perpetual_market_ids;
+        client.perpetual_instrument_ids = catalog_client.perpetual_instrument_ids;
+        client.perpetual_report_metadata = catalog_client.perpetual_report_metadata;
+        let record = submitting_framework_record(&client);
+        let extrinsic_hash = record.signed_extrinsic().unwrap().extrinsic_hash();
+        let DeepXNonceReservation::TimestampOrderId { value: order_id } = record.identity().nonce()
+        else {
+            panic!("expected timestamp order ID");
+        };
+        let (rpc_url, endpoints, capabilities) = recovery_evidence(&[]).await;
+        configure_rpc_url(&mut client, rpc_url);
+        let rest_requests = Arc::new(AtomicUsize::new(0));
+        let direct_miss = {
+            let rest_requests = Arc::clone(&rest_requests);
+            move || {
+                let rest_requests = Arc::clone(&rest_requests);
+                async move {
+                    rest_requests.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({
+                        "code": 10008,
+                        "fail": true,
+                        "msg": "Order not found.",
+                        "data": null,
+                    }))
+                }
+            }
+        };
+        let empty_orders = {
+            let rest_requests = Arc::clone(&rest_requests);
+            move || {
+                let rest_requests = Arc::clone(&rest_requests);
+                async move {
+                    rest_requests.fetch_add(1, Ordering::Relaxed);
+                    Json(json!({
+                        "code": 200,
+                        "fail": false,
+                        "msg": "success",
+                        "data": { "items": [], "nextCursor": null, "hasNext": false },
+                    }))
+                }
+            }
+        };
+        let router = Router::new()
+            .route(
+                "/internal/v1/account/perp/order-by-id",
+                get(direct_miss.clone()),
+            )
+            .route("/internal/v1/account/perp/order-by-tx", get(direct_miss))
+            .route(
+                "/internal/v1/account/perp/open-orders",
+                get(empty_orders.clone()),
+            )
+            .route(
+                "/internal/v1/account/perp/history-orders",
+                get(empty_orders),
+            )
+            .route(
+                "/internal/v1/chain/tx/status",
+                get({
+                    let rest_requests = Arc::clone(&rest_requests);
+                    move || {
+                        let rest_requests = Arc::clone(&rest_requests);
+                        async move {
+                            rest_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({
+                                "code": 200,
+                                "fail": false,
+                                "msg": "success",
+                                "data": {
+                                    "tx_hash": format!(
+                                        "0x{}",
+                                        nautilus_core::hex::encode(extrinsic_hash),
+                                    ),
+                                    "confirmation": "best",
+                                    "order_id": order_id.to_string(),
+                                    "status": "included",
+                                },
+                            }))
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        client.http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
+        let (protocol, session) =
+            advance_to_mass_reconciliation(&mut client, &endpoints, &capabilities).await;
+        let store = FinalityTestStore::new(4, &record);
+        let lease = store
+            .acquire_signer_lease(record.identity().signer())
+            .await
+            .unwrap();
+
+        let result = record_mass_reconciliation_completed_with_store(
+            &mut client,
+            &protocol,
+            session,
+            &endpoints,
+            &capabilities,
+            &store,
+            &lease,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(DeepXMassReconciliationError::FrameworkEventDispatch { .. }),
+        ));
+        assert_eq!(rest_requests.load(Ordering::Relaxed), 5);
+        let persisted = store.persisted_record();
+        assert_eq!(
+            persisted.lifecycle().state(),
+            DeepXTransactionState::BackendConfirmed
+        );
+        assert_eq!(
+            persisted.lifecycle().backend_order(),
+            Some(DeepXBackendOrderEvidence::from_rest_transaction_status(
+                extrinsic_hash,
+                order_id,
+            )),
+        );
+    }
+
+    #[tokio::test]
     async fn mass_reconciliation_finalizes_restored_in_block_transaction() {
         let mut client = test_client();
         let record = in_block_record(&client);
@@ -17139,6 +18208,7 @@ mod tests {
         DeepXWsConfirmedAccountSubscription,
         DeepXWsConfirmedBalancesFrame,
         tokio::sync::watch::Sender<u8>,
+        crate::config::DeepXNetworkConfig,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -17215,7 +18285,7 @@ mod tests {
             .await
             .unwrap();
         let first = connection.next_balances(subscription).await.unwrap();
-        (connection, subscription, first, control)
+        (connection, subscription, first, control, network)
     }
 
     fn reconciliation_fill_report(trade_id: &str, ts_event: u64) -> FillReport {
@@ -17876,6 +18946,7 @@ mod tests {
             "data": order,
             "fail": false,
         });
+        let order_requests = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -17887,9 +18958,24 @@ mod tests {
             )
             .route(
                 "/internal/v1/account/perp/order-by-id",
-                get(move || {
-                    let response = order_response.clone();
-                    async move { Json(response) }
+                get({
+                    let order_requests = Arc::clone(&order_requests);
+                    move || {
+                        let order_requests = Arc::clone(&order_requests);
+                        let response = order_response.clone();
+                        async move {
+                            if order_requests.fetch_add(1, Ordering::Relaxed) == 3 {
+                                Json(json!({
+                                    "code": 10008,
+                                    "fail": true,
+                                    "msg": "Order 'order' not found.",
+                                    "data": null,
+                                }))
+                            } else {
+                                Json(response)
+                            }
+                        }
+                    }
                 }),
             );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -17987,6 +19073,7 @@ mod tests {
         assert_eq!(report.venue_order_id, venue_order_id);
         assert_eq!(report.order_status, OrderStatus::Filled);
         assert_eq!(report.ts_init, UnixNanos::from(123_456_789));
+        assert_eq!(order_requests.load(Ordering::Relaxed), 5);
         client.reset_startup();
         client
             .query_tasks
@@ -18843,6 +19930,83 @@ mod tests {
             Some(ClientOrderId::from("O-DEEPX-ACTIVE-REPORT")),
         );
         assert!(reports[0].order_status.is_open());
+    }
+
+    #[tokio::test]
+    async fn order_report_generation_ignores_untracked_history_before_start() {
+        let fixture: Value = serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let mut untracked_order = fixture["data"]["items"][2].clone();
+        untracked_order["orderId"] = "1789445000000".into();
+        untracked_order["createTime"] = "2026-09-15T03:00:00.000Z".into();
+        untracked_order["updatedTime"] = "2026-09-15T03:00:00.000Z".into();
+        let tracked_order = fixture["data"]["items"][2].clone();
+        let mut open_response = fixture.clone();
+        open_response["data"]["items"] = json!([]);
+        let mut history_response = fixture;
+        history_response["data"]["items"] = json!([untracked_order, tracked_order]);
+        let client = order_reports_test_client(open_response, history_response).await;
+        let tracked = tracked_limit_order();
+        client.register_order(&tracked).unwrap();
+        client
+            .bind_tracked_venue_order_id(
+                tracked.client_order_id(),
+                VenueOrderId::from("1789445053841"),
+            )
+            .unwrap();
+        let start = parse_tracked_order_report_timestamp("updatedTime", "2026-09-15T04:00:00.000Z")
+            .unwrap();
+        let command = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            Some(tracked.instrument_id()),
+            Some(start),
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_order_status_reports(&client, &command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].venue_order_id,
+            VenueOrderId::from("1789445053841"),
+        );
+    }
+
+    #[tokio::test]
+    async fn order_report_generation_rejects_untracked_history_after_start() {
+        let fixture: Value = serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
+        let history_order = fixture["data"]["items"][2].clone();
+        let mut open_response = fixture.clone();
+        open_response["data"]["items"] = json!([]);
+        let mut history_response = fixture;
+        history_response["data"]["items"] = json!([history_order]);
+        let client = order_reports_test_client(open_response, history_response).await;
+        let start = parse_tracked_order_report_timestamp("updatedTime", "2026-09-15T04:00:00.000Z")
+            .unwrap();
+        let command = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            false,
+            Some(InstrumentId::from("ETH-USDC-PERP.DEEPX")),
+            Some(start),
+            None,
+            None,
+            None,
+        );
+
+        let error = ExecutionClient::generate_order_status_reports(&client, &command)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "DeepX external order context is invalid: DeepX venue order ID 1789445053841 has no registered order context",
+        );
     }
 
     #[rstest]
@@ -22067,7 +23231,9 @@ mod tests {
             .unwrap();
         client.runtime_snapshot = Some(test_runtime_snapshot());
         record_account_ownership(&mut client);
-        let (connection, subscription, first, control) = controllable_account_stream().await;
+        let (connection, subscription, first, control, network) =
+            controllable_account_stream().await;
+        client.config.network = network;
         client
             .record_account_stream_confirmed(&connection, subscription)
             .unwrap();
@@ -22115,6 +23281,36 @@ mod tests {
         client.close_account_connection().await.unwrap();
         assert!(client.account_monitor_frames.is_none());
         assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn account_monitor_reconnects_after_remote_close() {
+        let (mut client, control, snapshot_service) = monitored_ready_client().await;
+        let old_permit = snapshot_service.acquire().unwrap();
+
+        control.send(2).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while old_permit.ensure_active().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        control.send(0).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client.is_connected() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(*client.query_epoch.lock().unwrap());
+        assert!(snapshot_service.acquire().is_ok());
+        assert!(old_permit.ensure_active().is_err());
+        assert_eq!(client.next_account_balances().await.unwrap().timestamp(), 1);
+        client.close_account_connection().await.unwrap();
     }
 
     #[tokio::test]

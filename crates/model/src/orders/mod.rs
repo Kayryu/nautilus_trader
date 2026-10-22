@@ -288,6 +288,7 @@ impl OrderStatus {
             (Self::PartiallyFilled, OrderEventAny::Accepted(_)) => Self::Accepted,
             (Self::PartiallyFilled, OrderEventAny::Updated(_)) => Self::PartiallyFilled,
             (Self::PartiallyFilled, OrderEventAny::FillVoided(_)) => Self::PartiallyFilled,
+            (Self::Filled, OrderEventAny::Accepted(_)) => Self::Filled,
             (Self::Filled, OrderEventAny::FillVoided(_)) => Self::Voided,
             (Self::Filled, OrderEventAny::Updated(_)) => Self::Filled,
             (Self::Expired, OrderEventAny::FillVoided(_)) => Self::Expired,
@@ -1644,6 +1645,36 @@ mod tests {
         assert!(order.is_closed());
         assert_eq!(order.commission(&Currency::USD()), None);
         assert_eq!(order.commissions(), &IndexMap::new());
+    }
+
+    #[rstest]
+    fn test_filled_order_accepts_delayed_accepted_without_regressing_status() {
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let filled = OrderFilledSpec::builder().build();
+        let delayed_accepted = OrderAcceptedSpec::builder()
+            .account_id(AccountId::from("SIM-002"))
+            .venue_order_id(VenueOrderId::from("V-002"))
+            .ts_event(UnixNanos::from(3_000))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(filled)).unwrap();
+        order
+            .apply(OrderEventAny::Accepted(delayed_accepted.clone()))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.account_id(), Some(AccountId::from("SIM-002")));
+        assert_eq!(order.venue_order_id(), Some(VenueOrderId::from("V-002")));
+        assert_eq!(order.ts_accepted(), Some(UnixNanos::from(3_000)));
+        assert_eq!(
+            order.last_event(),
+            &OrderEventAny::Accepted(delayed_accepted)
+        );
     }
 
     #[rstest]

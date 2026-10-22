@@ -726,7 +726,10 @@ impl ExecutionEngine {
     /// Clients are restored to the engine if this future completes, is canceled, or is dropped.
     /// This permits startup order-event receipts to be processed by the engine while a client is
     /// still completing its connection workflow.
-    pub async fn connect_detached(engine: &Rc<RefCell<Self>>) {
+    /// # Errors
+    ///
+    /// Returns an error if any execution client fails to connect.
+    pub async fn connect_detached(engine: &Rc<RefCell<Self>>) -> anyhow::Result<()> {
         let clients = std::mem::take(&mut engine.borrow_mut().clients);
         let mut detached = DetachedExecutionClients {
             engine,
@@ -740,11 +743,18 @@ impl ExecutionEngine {
             .map(ExecutionClientAdapter::connect)
             .collect();
         let results = join_all(futures).await;
-
-        for error in results.into_iter().filter_map(Result::err) {
-            log::error!("Failed to connect execution client: {error:#}");
-        }
+        let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
         detached.restore();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let error_messages: Vec<_> = errors.iter().map(|e| format!("{e:#}")).collect();
+            anyhow::bail!(
+                "Failed to connect execution clients: {}",
+                error_messages.join("; ")
+            )
+        }
     }
 
     /// Disconnects all registered execution clients concurrently.

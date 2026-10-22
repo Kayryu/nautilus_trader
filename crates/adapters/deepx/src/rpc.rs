@@ -2049,7 +2049,7 @@ pub async fn observe_rpc_endpoint_identity(
 ) -> Result<DeepXObservedRpcEndpoint, DeepXRpcIdentityError> {
     let url = config.rpc_url_for(role)?;
     let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
-    let encoded_hash: String = execute_rpc_probe_with_retry(
+    let encoded_hash: String = execute_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -2125,7 +2125,7 @@ pub async fn observe_rpc_method_capabilities(
         return Err(DeepXRpcMethodCapabilityError::EmptyRequirements(role));
     }
     let client = BlockchainHttpRpcClient::new(endpoints.url_for(role).to_string(), None, None);
-    let observed: ObservedRpcMethods = execute_rpc_probe_with_retry(
+    let observed: ObservedRpcMethods = execute_rpc_read_with_retry(
         &client,
         json!({
             "jsonrpc": "2.0",
@@ -2152,7 +2152,7 @@ pub async fn observe_rpc_method_capabilities(
     })
 }
 
-async fn execute_rpc_probe_with_retry<T: DeserializeOwned>(
+async fn execute_rpc_read_with_retry<T: DeserializeOwned>(
     client: &BlockchainHttpRpcClient,
     request: serde_json::Value,
 ) -> anyhow::Result<T> {
@@ -2163,6 +2163,19 @@ async fn execute_rpc_probe_with_retry<T: DeserializeOwned>(
         }
     }
     client.execute_rpc_call(request).await
+}
+
+async fn execute_rpc_response_with_retry<T: DeserializeOwned>(
+    client: &BlockchainHttpRpcClient,
+    request: serde_json::Value,
+) -> anyhow::Result<RpcNodeHttpResponse<T>> {
+    for delay_ms in [250, 500] {
+        match client.execute_rpc_response(request.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(_) => dst::time::sleep(Duration::from_millis(delay_ms)).await,
+        }
+    }
+    client.execute_rpc_response(request).await
 }
 
 /// Collects the minimum RPC method capabilities required for all endpoint roles.
@@ -2330,39 +2343,45 @@ async fn observe_current_runtime_snapshot_with_checkpoint(
         None,
         None,
     );
-    let encoded_hash: String = client
-        .execute_rpc_call(json!({
+    let encoded_hash: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "chain_getBlockHash", "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "chain_getBlockHash",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "chain_getBlockHash",
+        source,
+    })?;
     let block_hash = decode_prefixed_hash(&encoded_hash, "current block hash")?;
-    let header: ObservedBlockHeader = client
-        .execute_rpc_call(json!({
+    let header: ObservedBlockHeader = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "chain_getHeader", "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "chain_getHeader",
+        source,
+    })?;
     let block_number = decode_block_number(&header.number)?;
-    let rejection: RpcNodeHttpResponse<ObservedRuntimeVersion> = client
-        .execute_rpc_response(json!({
+    let rejection: RpcNodeHttpResponse<ObservedRuntimeVersion> = execute_rpc_response_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "state_getRuntimeVersion",
             "params": [format!("0x{}", "00".repeat(32))],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "state_getRuntimeVersion",
+        source,
+    })?;
     if rejection.jsonrpc.as_deref() != Some("2.0")
         || rejection.id != Some(1)
         || rejection.result.is_some()
@@ -2378,16 +2397,18 @@ async fn observe_current_runtime_snapshot_with_checkpoint(
         version.transaction_version,
         &metadata,
     )?;
-    let canonical_hash: String = client
-        .execute_rpc_call(json!({
+    let canonical_hash: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "chain_getBlockHash", "params": [block_number],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "chain_getBlockHash",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "chain_getBlockHash",
+        source,
+    })?;
     if decode_prefixed_hash(&canonical_hash, "canonical runtime block hash")? != block_hash {
         return Err(DeepXRuntimeSnapshotObservationError::InvalidCheckpoint);
     }
@@ -2426,13 +2447,15 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
     service.apply_validated(&snapshot)?;
     let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
     let encoded_hash = format!("0x{}", hex::encode(block_hash));
-    let rejected: RpcNodeHttpResponse<String> = client
-        .execute_rpc_response(json!({
+    let rejected: RpcNodeHttpResponse<String> = execute_rpc_response_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "state_getStorage",
             "params": [timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))],
-        }))
-        .await?;
+        }),
+    )
+    .await?;
     if rejected.jsonrpc.as_deref() != Some("2.0")
         || rejected.id != Some(1)
         || rejected.result.is_some()
@@ -2441,13 +2464,15 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
         service.halt_for_inconsistent_evidence()?;
         anyhow::bail!("DeepX Watch RPC ignored an invalid timestamp block hash");
     }
-    let encoded_time: String = client
-        .execute_rpc_call(json!({
+    let encoded_time: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "state_getStorage",
             "params": [timestamp_now_storage_key(), encoded_hash],
-        }))
-        .await?;
+        }),
+    )
+    .await?;
     let observed_timestamp_ms = match decode_timestamp_now(&encoded_time) {
         Ok(timestamp_ms) => timestamp_ms,
         Err(e) => {
@@ -2455,13 +2480,15 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
             return Err(e.into());
         }
     };
-    let block: ObservedTimestampBlockResponse = client
-        .execute_rpc_call(json!({
+    let block: ObservedTimestampBlockResponse = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "chain_getBlock",
             "params": [encoded_hash],
-        }))
-        .await?;
+        }),
+    )
+    .await?;
     let block_number_matches = decode_block_number(&block.block.header.number)
         .is_ok_and(|received| received == block_number);
     let inherent_time = decode_timestamp_set_inherent(&block.block.extrinsics);
@@ -2471,12 +2498,14 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
         service.halt_for_inconsistent_evidence()?;
         anyhow::bail!("DeepX current timestamp storage and block inherent differ");
     }
-    let canonical_hash: String = client
-        .execute_rpc_call(json!({
+    let canonical_hash: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "chain_getBlockHash", "params": [block_number],
-        }))
-        .await?;
+        }),
+    )
+    .await?;
     anyhow::ensure!(
         decode_prefixed_hash(&canonical_hash, "canonical submission block hash")? == block_hash,
         "DeepX current submission clock block is no longer canonical",
@@ -5356,30 +5385,34 @@ async fn observe_runtime_metadata_at(
     block_hash: [u8; 32],
 ) -> Result<(ObservedRuntimeVersion, Vec<u8>), DeepXRuntimeSnapshotObservationError> {
     let block_hash = format!("0x{}", hex::encode(block_hash));
-    let version = client
-        .execute_rpc_call(json!({
+    let version = execute_rpc_read_with_retry(
+        client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "state_getRuntimeVersion",
             "params": [block_hash],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "state_getRuntimeVersion",
-            source,
-        })?;
-    let encoded_metadata: String = client
-        .execute_rpc_call(json!({
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "state_getRuntimeVersion",
+        source,
+    })?;
+    let encoded_metadata: String = execute_rpc_read_with_retry(
+        client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "state_getMetadata",
             "params": [block_hash],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "state_getMetadata",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "state_getMetadata",
+        source,
+    })?;
     let metadata = encoded_metadata
         .strip_prefix("0x")
         .filter(|value| !value.is_empty())
@@ -5392,31 +5425,35 @@ async fn observe_finalized_checkpoint_at(
     url: String,
 ) -> Result<DeepXFinalizedCheckpoint, DeepXRuntimeSnapshotObservationError> {
     let client = BlockchainHttpRpcClient::new(url, None, None);
-    let encoded_finalized_hash: String = client
-        .execute_rpc_call(json!({
+    let encoded_finalized_hash: String = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getFinalizedHead",
             "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "chain_getFinalizedHead",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "chain_getFinalizedHead",
+        source,
+    })?;
     let finalized_hash = decode_prefixed_hash(&encoded_finalized_hash, "finalized hash")?;
-    let finalized_header: ObservedBlockHeader = client
-        .execute_rpc_call(json!({
+    let finalized_header: ObservedBlockHeader = execute_rpc_read_with_retry(
+        &client,
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "chain_getHeader",
             "params": [encoded_finalized_hash],
-        }))
-        .await
-        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+        }),
+    )
+    .await
+    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+        method: "chain_getHeader",
+        source,
+    })?;
     Ok(DeepXFinalizedCheckpoint {
         block_hash: finalized_hash,
         block_number: decode_block_number(&finalized_header.number)?,
@@ -5454,7 +5491,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, http::StatusCode, routing::post};
     use nautilus_core::UnixNanos;
     use nautilus_model::{enums::AccountType, identifiers::AccountId, types::Money};
     use parity_scale_codec::DecodeAll;
@@ -8934,6 +8971,65 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::Relaxed), 5);
         assert_eq!(observation.snapshot().identity().spec_version, 367);
+    }
+
+    #[tokio::test]
+    async fn rpc_read_retries_transient_transport_failures() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                            return Err(StatusCode::SERVICE_UNAVAILABLE);
+                        }
+                        Ok(Json(json!({ "jsonrpc": "2.0", "id": 1, "result": 42 })))
+                    }
+                }
+            }),
+        );
+        let client = BlockchainHttpRpcClient::new(spawn_server(router).await, None, None);
+
+        let value: u64 = execute_rpc_read_with_retry(
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "test", "params": [] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn rpc_read_returns_error_after_retry_exhaustion() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let client = BlockchainHttpRpcClient::new(spawn_server(router).await, None, None);
+
+        let result = execute_rpc_read_with_retry::<u64>(
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "test", "params": [] }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

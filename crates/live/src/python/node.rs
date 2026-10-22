@@ -1970,6 +1970,11 @@ impl PyLiveNodeBuilder {
         self.update_builder(|builder| builder.with_save_state(save_state))
     }
 
+    #[pyo3(name = "with_shutdown_on_error")]
+    fn py_with_shutdown_on_error(&self, shutdown_on_error: bool) -> PyResult<Self> {
+        self.update_builder(|builder| builder.with_shutdown_on_error(shutdown_on_error))
+    }
+
     #[pyo3(name = "with_timeout_connection")]
     fn py_with_timeout_connection(&self, timeout_secs: u64) -> PyResult<Self> {
         self.update_builder(|builder| builder.with_timeout_connection(timeout_secs))

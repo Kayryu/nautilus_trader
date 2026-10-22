@@ -923,7 +923,7 @@ mod tests {
         let evidence = super::super::DeepXBackendOrderEvidence {
             extrinsic_hash: record.lifecycle().extrinsic_hash().unwrap(),
             order_id: ORDER_ID,
-            observed_block_number: 101,
+            observed_block_number: Some(101),
         };
         record
             .apply_observation(DeepXTransactionObservation::BackendOrderConfirmed(evidence))
@@ -965,7 +965,7 @@ mod tests {
             super::super::DeepXBackendOrderEvidence {
                 extrinsic_hash: record.lifecycle().extrinsic_hash().unwrap(),
                 order_id: ORDER_ID + 1,
-                observed_block_number: 101,
+                observed_block_number: Some(101),
             },
         ));
         assert!(matches!(

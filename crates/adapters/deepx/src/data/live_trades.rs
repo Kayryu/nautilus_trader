@@ -40,6 +40,14 @@ use crate::{
     },
 };
 
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250)
+        .saturating_mul(2_u32.saturating_pow(attempt))
+        .min(MAX_RECONNECT_DELAY)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct TradeSubscription {
     active: Arc<Mutex<bool>>,
@@ -169,7 +177,8 @@ impl TradeTask {
                 )
             });
         let resuming = stream.is_initialized();
-        for attempt in 0..=5 {
+        let mut attempt = 0;
+        loop {
             let mut retry_transport = false;
             let Err(e) = self
                 .run_inner(&mut stream, attempt > 0 || resuming, &mut retry_transport)
@@ -180,7 +189,7 @@ impl TradeTask {
             if self.subscription.cancellation.is_cancelled() || self.sender.is_closed() {
                 return;
             }
-            if (!self.kind.is_book() && !retry_transport) || attempt == 5 {
+            if !retry_transport && (!self.kind.is_book() || attempt >= 5) {
                 log::error!("DeepX public subscription stopped; explicit recovery required: {e}");
                 return;
             }
@@ -191,8 +200,9 @@ impl TradeTask {
                 biased;
                 () = self.subscription.cancellation.cancelled() => return,
                 () = self.sender.closed() => return,
-                () = tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))) => {},
+                () = tokio::time::sleep(reconnect_delay(attempt)) => {},
             }
+            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -343,5 +353,23 @@ impl TradeTask {
             )))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(0, Duration::from_millis(250))]
+    #[case(1, Duration::from_millis(500))]
+    #[case(5, Duration::from_secs(8))]
+    #[case(6, Duration::from_secs(16))]
+    #[case(7, MAX_RECONNECT_DELAY)]
+    #[case(u32::MAX, MAX_RECONNECT_DELAY)]
+    fn reconnect_delay_is_exponential_and_capped(#[case] attempt: u32, #[case] expected: Duration) {
+        assert_eq!(reconnect_delay(attempt), expected);
     }
 }

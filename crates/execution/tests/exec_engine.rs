@@ -1135,6 +1135,62 @@ fn test_order_event_receipt_rejects_event_id_conflict(mut execution_engine: Exec
 }
 
 #[rstest]
+fn test_order_event_receipt_applies_accepted_after_fill(mut execution_engine: ExecutionEngine) {
+    let instrument = audusd_sim();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .build();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+        .unwrap();
+    let account_id = AccountId::test_default();
+    let venue_order_id = VenueOrderId::from("V-001");
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
+    assert_eq!(
+        execution_engine
+            .process_with_receipt(&submitted)
+            .receipt
+            .application,
+        OrderEventApplicationStatus::Applied
+    );
+    let filled = TestOrderEventStubs::filled(
+        &order,
+        &instrument.into_any(),
+        Some(TradeId::from("T-001")),
+        None,
+        None,
+        Some(Quantity::from(1)),
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    execution_engine.process(&filled);
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, venue_order_id);
+
+    let result = execution_engine.process_with_receipt(&accepted);
+
+    assert_eq!(result.receipt.event_id, accepted.id());
+    assert_eq!(
+        result.receipt.application,
+        OrderEventApplicationStatus::Applied
+    );
+    assert_eq!(
+        execution_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Filled
+    );
+}
+
+#[rstest]
 fn test_order_event_receipt_never_confirms_async_cache_backing() {
     let clock = Rc::new(RefCell::new(TestClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
