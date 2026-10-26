@@ -999,9 +999,11 @@ limit caps the total result; an unlimited request
 uses at most 100 pages of 5000 rows and fails without partial data if that budget is exhausted.
 Each continuation starts one millisecond after the previous page's last candle, and the echoed
 market identity must remain stable across pages. OHLCV conversion proceeds only when every value is
-exactly representable at instrument precision. Spot uses
-the verified `CurrencyPair` precision; live testnet candle volumes currently contain excess
-decimal places, so those responses fail closed instead of being quantized. The request limit is
+representable at instrument precision, except that OHLC values within `1e-12` of that precision
+are normalized to absorb observed backend floating-point artifacts. The normalized prices must
+still be exact multiples of the instrument tick. Spot uses the verified `CurrencyPair` precision;
+live testnet candle volumes currently contain excess decimal places, so those responses fail closed
+instead of being quantized. The request limit is
 5000. Framework streaming bars are limited to one-minute perpetual candles. The documented public
 WebSocket has a `candles` channel. A testnet `1m` subscription on 2026-10-08 acknowledged the time
 frame, then sent repeated updates for the current bucket before a later bucket arrived. The raw
@@ -1014,8 +1016,8 @@ bucket at `1791478800000` with exact volume `56.768` and no gap before its succe
 WebSocket-to-REST comparison found different volume, close, and high values for the same bucket;
 after another read, REST volume and close converged but its high remained the float artifact
 `2418.1899999999996` against WebSocket `2418.19`. The WebSocket observation is not a guaranteed
-final OHLCV value, and historical conversion still rejects unrepresentable prices. The raw observer
-does not publish framework bars. Historical OHLC values and
+final OHLCV value, and historical conversion only normalizes price artifacts within `1e-12`. The
+raw observer does not publish framework bars. Historical OHLC values and
 volume must also be exact multiples of the finalized tick and step sizes.
 The read-only `deepx-verify-ws-candles` command polls the same REST bucket for up to 90 seconds
 after the WebSocket successor, requiring exact OHLCV equality. A 2026-10-09 observation initially

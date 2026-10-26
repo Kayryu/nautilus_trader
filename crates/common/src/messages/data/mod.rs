@@ -571,12 +571,13 @@ impl DataResponse {
         }
     }
 
-    /// Trims vector payloads to the inclusive `[start, end]` window on `ts_init`.
+    /// Trims vector payloads to the inclusive `[start, end]` window.
     ///
     /// Applies to variants whose payload elements implement `HasTsInit`
     /// (`BookDeltas`, `BookDepth`, `Quotes`, `Trades`, `FundingRates`,
-    /// `Bars`, `Instruments`). Other variants are untouched: singular payloads
-    /// (`Instrument`, `Book`),
+    /// `Instruments`). Bars are trimmed on `ts_event`, because their `ts_init`
+    /// records when the historical response was created. Other variants are
+    /// untouched: singular payloads (`Instrument`, `Book`),
     /// `ForwardPrices` (no per-item `ts_init`), and the opaque custom
     /// `Data` variant.
     pub fn trim_to_bounds(&mut self) {
@@ -584,12 +585,46 @@ impl DataResponse {
             Self::Quotes(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::Trades(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::FundingRates(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
-            Self::Bars(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
+            Self::Bars(r) => {
+                response::trim_data_to_bounds_by(&mut r.data, r.start, r.end, |bar| bar.ts_event)
+            }
             Self::Instruments(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::BookDeltas(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::BookDepth(r) => response::trim_data_to_bounds(&mut r.data, r.start, r.end),
             Self::Data(_) | Self::Instrument(_) | Self::Book(_) | Self::ForwardPrices(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::data::Bar;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_trim_bar_response_to_event_time_bounds() {
+        let bar = Bar {
+            ts_event: UnixNanos::from(200),
+            ts_init: UnixNanos::from(1_000),
+            ..Bar::default()
+        };
+        let response = BarsResponse::new(
+            UUID4::new(),
+            ClientId::new("TEST"),
+            bar.bar_type,
+            vec![bar],
+            Some(UnixNanos::from(150)),
+            Some(UnixNanos::from(250)),
+            UnixNanos::from(1_000),
+            None,
+        );
+        let mut response = DataResponse::Bars(response);
+
+        response.trim_to_bounds();
+
+        assert_eq!(response.record_count(), Some(1));
     }
 }
 

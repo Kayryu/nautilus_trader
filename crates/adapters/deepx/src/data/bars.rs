@@ -167,7 +167,7 @@ fn exact_price(value: Decimal, precision: u8, field: &str) -> Result<Price> {
     let price = Price::from_decimal_dp(value, precision)
         .with_context(|| format!("DeepX candle {field} cannot be represented"))?;
     ensure!(
-        price.as_decimal() == value,
+        (price.as_decimal() - value).abs() <= Decimal::new(1, 12),
         "DeepX candle {field} would lose precision"
     );
     Ok(price)
@@ -350,5 +350,26 @@ mod tests {
             .unwrap_err();
 
         assert!(format!("{error:#}").contains("not a multiple of the instrument tick"));
+    }
+
+    #[rstest::rstest]
+    fn normalizes_candle_price_float_artifact() {
+        let value = Decimal::from_str_exact("2481.3799999999997").unwrap();
+
+        let price = exact_price(value, 2, "close").unwrap();
+
+        assert_eq!(
+            price.as_decimal(),
+            Decimal::from_str_exact("2481.38").unwrap()
+        );
+    }
+
+    #[rstest::rstest]
+    fn rejects_candle_price_beyond_float_artifact_tolerance() {
+        let value = Decimal::from_str_exact("2481.379999999").unwrap();
+
+        let error = exact_price(value, 2, "close").unwrap_err();
+
+        assert!(format!("{error:#}").contains("close would lose precision"));
     }
 }

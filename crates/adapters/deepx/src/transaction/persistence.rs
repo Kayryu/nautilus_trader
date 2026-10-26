@@ -394,6 +394,17 @@ pub enum DeepXReservationPreparationError {
     Persistence(#[from] DeepXTransactionPersistenceError),
 }
 
+impl DeepXReservationPreparationError {
+    /// Returns whether the failure proves that no durable reservation was created.
+    #[must_use]
+    pub const fn is_proven_not_created(&self) -> bool {
+        match self {
+            Self::Record(_) | Self::TimestampNonce(_) => true,
+            Self::Persistence(e) => e.is_proven_not_committed(),
+        }
+    }
+}
+
 /// A created transaction record released only after its reservation commits durably.
 #[derive(Debug)]
 pub struct DeepXPreparedReservation {

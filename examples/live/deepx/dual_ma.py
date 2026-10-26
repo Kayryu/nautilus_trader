@@ -17,6 +17,7 @@
 
 import argparse
 import os
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any, Self
 
@@ -29,6 +30,7 @@ from nautilus_trader.adapters.deepx import (
 )
 from nautilus_trader.common import Environment, LogColor
 from nautilus_trader.config import LiveExecutionEngineConfig, StrategyConfig
+from nautilus_trader.core import NANOSECONDS_IN_SECOND, unix_nanos_to_dt
 from nautilus_trader.indicators import SimpleMovingAverage
 from nautilus_trader.infrastructure import PostgresCacheConfig, PostgresConnectOptions
 from nautilus_trader.live import LiveNode
@@ -48,10 +50,16 @@ from nautilus_trader.trading import Strategy
 
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 INSTRUMENT_ID = InstrumentId.from_str("ETH-USDC-PERP.DEEPX")
-BAR_TYPE = BarType.from_str(f"{INSTRUMENT_ID}-1-MINUTE-LAST-INTERNAL")
+BAR_TYPE = BarType.from_str(f"{INSTRUMENT_ID}-1-MINUTE-LAST-EXTERNAL")
 ORDER_QTY = Decimal("0.500")
-FAST_PERIOD = 1
-SLOW_PERIOD = 5
+FAST_PERIOD = 5
+SLOW_PERIOD = 20
+DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS = 10_000
+NANOSECONDS_IN_MINUTE = 60 * NANOSECONDS_IN_SECOND
+WARMUP_LOOKBACK_MINUTES = 60
+WARMUP_RETRY_DELAY_SECONDS = 2
+WARMUP_MAX_ATTEMPTS = 3
+WARMUP_RETRY_TIMER = "deepx-warmup-retry"
 
 
 class DualMovingAverageConfig(StrategyConfig):
@@ -108,6 +116,9 @@ class DualMovingAverage(Strategy):
         self._quantity: Quantity | None = None
         self._previous_fast_above: bool | None = None
         self._pending_side: OrderSide | None = None
+        self._warmup_complete = False
+        self._subscribed = False
+        self._warmup_attempts = 0
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(self._config.instrument_id)
@@ -132,14 +143,31 @@ class DualMovingAverage(Strategy):
 
         self.register_indicator_for_bars(self._config.bar_type, self._fast)
         self.register_indicator_for_bars(self._config.bar_type, self._slow)
-        self.subscribe_bars(self._config.bar_type)
         mode = "trading" if self._config.trade_enabled else "signal-only"
         self.log.info(
-            f"Started dual moving-average strategy in {mode} mode", LogColor.BLUE
+            f"Starting dual moving-average strategy in {mode} mode; "
+            f"requesting up to {WARMUP_LOOKBACK_MINUTES} historical bars",
+            LogColor.BLUE,
+        )
+        self._request_warmup_bars()
+
+    def _request_warmup_bars(self) -> None:
+        self._warmup_attempts += 1
+        current_minute_start = (
+            self.clock.timestamp_ns() // NANOSECONDS_IN_MINUTE
+        ) * NANOSECONDS_IN_MINUTE
+        history_start = (
+            current_minute_start - WARMUP_LOOKBACK_MINUTES * NANOSECONDS_IN_MINUTE
+        )
+        self.request_bars(
+            self._config.bar_type,
+            start=unix_nanos_to_dt(history_start),
+            end=unix_nanos_to_dt(current_minute_start - 1),
+            limit=WARMUP_LOOKBACK_MINUTES,
         )
 
     def on_bar(self, bar: Bar) -> None:
-        if not self.indicators_initialized():
+        if not self._warmup_complete:
             return
 
         fast_above = self._fast.value > self._slow.value
@@ -159,6 +187,38 @@ class DualMovingAverage(Strategy):
         self.log.info(f"Moving-average crossover signal: {side}", LogColor.BLUE)
         if self._config.trade_enabled:
             self._handle_signal(side)
+
+    def on_historical_bars(self, bars: Sequence[Bar]) -> None:
+        if self._warmup_complete:
+            return
+        if len(bars) == 0 and self._warmup_attempts < WARMUP_MAX_ATTEMPTS:
+            self.log.warning(
+                f"Historical warmup returned no bars on attempt "
+                f"{self._warmup_attempts}/{WARMUP_MAX_ATTEMPTS}; retrying in "
+                f"{WARMUP_RETRY_DELAY_SECONDS} seconds",
+            )
+            self.clock.set_time_alert_ns(
+                WARMUP_RETRY_TIMER,
+                self.clock.timestamp_ns()
+                + WARMUP_RETRY_DELAY_SECONDS * NANOSECONDS_IN_SECOND,
+                lambda _event: self._request_warmup_bars(),
+            )
+            return
+        if len(bars) < self._config.slow_period or not self.indicators_initialized():
+            self.log.error(
+                f"Historical warmup requires {self._config.slow_period} bars, "
+                f"received {len(bars)}",
+            )
+            return
+
+        self._previous_fast_above = self._fast.value > self._slow.value
+        self._warmup_complete = True
+        self.subscribe_bars(self._config.bar_type)
+        self._subscribed = True
+        self.log.info(
+            f"Historical warmup complete with {len(bars)} bars; subscribed to live bars",
+            LogColor.BLUE,
+        )
 
     def on_position_closed(self, event: PositionClosed) -> None:
         if (
@@ -181,12 +241,16 @@ class DualMovingAverage(Strategy):
                 time_in_force=TimeInForce.IOC,
                 reduce_only=True,
             )
-        self.unsubscribe_bars(self._config.bar_type)
+        if self._subscribed:
+            self.unsubscribe_bars(self._config.bar_type)
 
     def on_reset(self) -> None:
         self._quantity = None
         self._previous_fast_above = None
         self._pending_side = None
+        self._warmup_complete = False
+        self._subscribed = False
+        self._warmup_attempts = 0
         self._fast.reset()
         self._slow.reset()
 
@@ -261,6 +325,14 @@ def select_subaccount(requested: str | None, addresses: list[str]) -> str:
     return addresses[0]
 
 
+def positive_int(value: str) -> int:
+    """Parse a positive integer command-line argument."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
+
+
 def postgres_options() -> tuple[PostgresConnectOptions, PostgresCacheConfig]:
     """Read durable transaction store settings from the environment."""
     required = ("POSTGRES_USERNAME", "POSTGRES_PASSWORD", "POSTGRES_DATABASE")
@@ -300,16 +372,26 @@ def main() -> None:
         action="store_true",
         help="enable testnet order submission; otherwise only log crossover signals",
     )
+    parser.add_argument(
+        "--timestamp-nonce-max-clock-drift-ms",
+        type=positive_int,
+        default=DEFAULT_TIMESTAMP_NONCE_MAX_CLOCK_DRIFT_MS,
+        help="maximum local-to-chain clock drift for testnet order nonces",
+    )
     args = parser.parse_args()
 
-    builder = LiveNode.builder(
-        "DEEPX-DUAL-MA-001",
-        TraderId.from_str("TESTER-001"),
-        Environment.LIVE,
-    ).with_shutdown_on_error(True).add_data_client(
-        None,
-        DeepXDataClientFactory(),
-        DeepXDataClientConfig(perpetual_only=True),
+    builder = (
+        LiveNode.builder(
+            "DEEPX-DUAL-MA-001",
+            TraderId.from_str("TESTER-001"),
+            Environment.LIVE,
+        )
+        .with_shutdown_on_error(True)
+        .add_data_client(
+            None,
+            DeepXDataClientFactory(),
+            DeepXDataClientConfig(perpetual_only=True),
+        )
     )
 
     if args.trade:
@@ -328,7 +410,6 @@ def main() -> None:
                     reconciliation=True,
                     open_check_interval_secs=10.0,
                     open_check_open_only=True,
-                    position_check_interval_secs=20.0,
                 ),
             )
             .add_exec_client(
@@ -337,6 +418,9 @@ def main() -> None:
                 DeepXExecutionClientConfig(
                     account_id=AccountId.from_str("DEEPX-001"),
                     subaccount_id=subaccount,
+                    timestamp_nonce_max_clock_drift_ms=(
+                        args.timestamp_nonce_max_clock_drift_ms
+                    ),
                     postgres_cache_database_config=database,
                 ),
             )
