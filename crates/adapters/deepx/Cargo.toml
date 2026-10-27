@@ -43,6 +43,7 @@ python = [
 ]
 
 [dependencies]
+deepx-rust-sdk = { workspace = true }
 nautilus-blockchain = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
@@ -111,6 +112,12 @@ doc = false
 name = "deepx-verify-delegate-ownership"
 path = "bin/verify_delegate_ownership.rs"
 doc = false
+
+[[bin]]
+name = "deepx-verify-delegate-order"
+path = "bin/verify_delegate_order.rs"
+doc = false
+test = false
 
 [[bin]]
 name = "deepx-verify-spot-instruments"

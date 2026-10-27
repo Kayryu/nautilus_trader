@@ -23,18 +23,44 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy::{
-    primitives::{Address, Bytes},
-    sol,
-    sol_types::{SolCall, SolValue},
+#[cfg(test)]
+use alloy::{primitives::Bytes, sol_types::SolValue};
+#[cfg(test)]
+use deepx_rust_sdk::rpc::execute_rpc_read_with_retry;
+#[cfg(test)]
+use deepx_rust_sdk::rpc::precompile::{DeepXPerpMarketAbi, DeepXPerpOrderSpecAbi};
+use deepx_rust_sdk::rpc::{
+    DEEPX_LENDING_BORROW_RUNTIME_API_METHOD, DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD,
+    DEEPX_LENDING_POOL_RUNTIME_API_METHOD, DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD,
+    DEEPX_MARGIN_RUNTIME_API_METHOD, DeepXRawMarginRequirement,
+    DeepXRpcBlockHeader as ObservedBlockHeader,
+    DeepXRpcBlockResponse as ObservedTimestampBlockResponse, DeepXRpcClient,
+    DeepXRpcResponse as RpcNodeHttpResponse, DeepXRpcRuntimeVersion as ObservedRuntimeVersion,
+    DeepXRpcStorageChangeSet as ObservedStorageChangeSet, get_finalized_head,
+    get_genesis_block_hash, get_header, get_metadata, get_rpc_methods, get_runtime_version,
+    lending_positions::DeepXRawLendingPosition,
+    precompile::{
+        DEEPX_LENDING_PRECOMPILE_ADDRESS, DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS,
+        decode_max_withdraw_return, decode_perp_market_return, encode_max_withdraw_call,
+        encode_perp_market_call,
+    },
+    storage::{
+        DeepXActivePerpOrderIndexEntry, DeepXLendingPoolStorage, DeepXPerpOrderStorage,
+        DeepXPerpPositionStorage, DeepXSpotOrderStorage, DeepXStoredOrderSide,
+    },
+    timestamp::{DeepXTimestampReadError, get_timestamp_now, timestamp_now_storage_key},
+};
+pub use deepx_rust_sdk::rpc::{
+    DeepXMarginDirection,
+    storage::{
+        DeepXLendingPoolStatus, DeepXStoredOrderStatus, DeepXStoredPerpOrderType,
+        DeepXStoredPostOnlyParam, DeepXStoredSpotOrderType, DeepXStoredTimeInForce,
+    },
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
-use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
-use nautilus_common::live::dst;
 use nautilus_core::hex;
-use nautilus_model::defi::rpc::RpcNodeHttpResponse;
 use parity_scale_codec::{Compact, Decode, Encode};
-use serde::{Deserialize, de::DeserializeOwned};
+#[cfg(test)]
 use serde_json::json;
 pub use spot_margin::{
     DeepXFinalizedSpotMarginError, DeepXFinalizedSpotMarginEvidence,
@@ -72,73 +98,14 @@ pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
     "state_call",
 ];
 
-const DEEPX_MARGIN_RUNTIME_API_METHOD: &str =
-    "PerpRuntimeRpcApi_total_collateral_and_margin_required_for";
-const DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_batch_position_for";
-const DEEPX_LENDING_POOL_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_pool_accounting_v2";
-const DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_deposit_v2";
-const DEEPX_LENDING_BORROW_RUNTIME_API_METHOD: &str = "LendingRuntimeRpcApi_effective_borrow_v2";
 const DEEPX_ETH_CALL_PROBE_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
-const DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
 const DEEPX_MAX_PERP_MARKET_STORAGE_BYTES: usize = 16_384;
 const DEEPX_MAX_SPOT_MARKET_STORAGE_BYTES: usize = 16_384;
-const DEEPX_MAX_LENDING_POSITION_ASSETS: usize = 64;
 const DEEPX_LENDING_ASSET_QUERY_CONCURRENCY: usize = 8;
 const DEEPX_DEFAULT_MAX_PERP_POSITIONS: u32 = 8;
 const DEEPX_ABSOLUTE_MAX_PERP_POSITIONS: u32 = 256;
 const DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS: u32 = 256;
 const DEEPX_ABSOLUTE_MAX_PERP_ORDERS: u32 = 4_096;
-const DEEPX_LENDING_PRECOMPILE_ADDRESS: Address = Address::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x50,
-]);
-
-sol! {
-    function maxWithdrawAmountFor(
-        address subaccount,
-        uint8 lendingMarket,
-        bytes asset
-    ) external view returns (uint128);
-
-    struct DeepXPerpOrderSpecAbi {
-        uint128 min_order_size;
-        uint128 tick_size;
-        uint128 step_size;
-    }
-
-    struct DeepXPerpMarketAbi {
-        uint16 id;
-        bytes name;
-        bytes base_symbol;
-        int32 base_decimal;
-        uint16 quote_market_id;
-        bytes network;
-        uint64 height;
-        int128 funding_rate;
-        uint64 last_cacl_funding_rate_time;
-        uint128 oracle_price;
-        uint128 mark_price;
-        uint64 max_deviation_bps;
-        uint128 maintenance_margin_ratio;
-        uint32 taker_fee_rate;
-        int32 maker_fee_rate;
-        DeepXPerpOrderSpecAbi order_spec;
-        uint128 open_interest;
-        uint128 long_open_pos_num;
-        uint128 short_open_pos_num;
-        int128 base_interest_rate;
-        uint128 impact_margin_value;
-        int128 funding_rate_change_cap;
-        int128 funding_rate_change_floor;
-        int128 cumulative_funding_index;
-    }
-
-    function perpMarkets(uint16 market_id) external view returns (DeepXPerpMarketAbi);
-}
-
-const DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS: Address = Address::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x4e,
-]);
-
 /// RPC methods required from the transaction recovery endpoint.
 pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
     "chain_getBlock",
@@ -147,40 +114,6 @@ pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
     "chain_getHeader",
     "state_getStorage",
 ];
-
-#[derive(Debug, Deserialize)]
-struct ObservedBlockHeader {
-    number: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObservedRuntimeVersion {
-    spec_version: u32,
-    transaction_version: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObservedTimestampBlockResponse {
-    block: ObservedTimestampBlock,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObservedTimestampBlock {
-    header: ObservedBlockHeader,
-    extrinsics: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObservedStorageChangeSet {
-    block: String,
-    changes: Vec<(String, Option<String>)>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObservedRpcMethods {
-    methods: BTreeSet<String>,
-}
 
 /// Evidence that one identity-validated endpoint advertised every requested RPC method.
 #[derive(Clone, PartialEq, Eq)]
@@ -543,30 +476,9 @@ impl DeepXFinalizedPerpOrderSpecEvidence {
     }
 }
 
-/// Margin weighting used by the DeepX runtime calculation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepXMarginDirection {
-    /// Initial collateral weights and order/position requirements.
-    Initial,
-    /// Maintenance collateral weights, requirements, unrealized PnL, and unsettled funding.
-    Maintenance,
-}
-
-impl DeepXMarginDirection {
-    const fn as_runtime_u8(self) -> u8 {
-        match self {
-            Self::Initial => 0,
-            Self::Maintenance => 1,
-        }
-    }
-}
-
 /// One direction-specific aggregate returned by the DeepX perpetual runtime API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXMarginRequirement {
-    total_collateral: u128,
-    total_margin_required: u128,
-}
+pub struct DeepXMarginRequirement(DeepXRawMarginRequirement);
 
 /// Initial and maintenance margin observed at one current canonical Watch block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,13 +526,13 @@ impl DeepXMarginRequirement {
     /// Returns aggregate weighted collateral in the runtime quote precision.
     #[must_use]
     pub const fn total_collateral(&self) -> u128 {
-        self.total_collateral
+        self.0.total_collateral
     }
 
     /// Returns aggregate required margin in the runtime quote precision.
     #[must_use]
     pub const fn total_margin_required(&self) -> u128 {
-        self.total_margin_required
+        self.0.total_margin_required
     }
 }
 
@@ -666,72 +578,39 @@ impl DeepXFinalizedMarginEvidence {
     }
 }
 
-/// Runtime status of one DeepX V2 lending pool.
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXLendingPoolStatus {
-    /// New lending activity is paused.
-    Paused,
-    /// The pool is undergoing a storage migration and is not readable as V2 state.
-    Migrating,
-    /// The pool is active.
-    Active,
-    /// The pool is frozen.
-    Frozen,
-}
-
 /// Raw accounting evidence for one DeepX V2 lending pool.
 #[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-pub struct DeepXLendingPoolEvidence {
-    market_id: u8,
-    asset: Vec<u8>,
-    decimal: u32,
-    cash_balance: u128,
-    locked_liquidity: u128,
-    available_liquidity: u128,
-    total_scaled_deposits: u128,
-    total_scaled_borrows: u128,
-    total_effective_deposits: u128,
-    total_effective_borrows: u128,
-    deposit_index: u128,
-    borrow_index: u128,
-    protocol_reserve: u128,
-    bad_debt: u128,
-    accounting_dust: i128,
-    internal_transfer_dust: i128,
-    status: DeepXLendingPoolStatus,
-    apr_borrow: u128,
-    apr_lend: u128,
-}
+pub struct DeepXLendingPoolEvidence(DeepXLendingPoolStorage);
 
 impl DeepXLendingPoolEvidence {
     /// Returns the lending market ID.
     #[must_use]
     pub const fn market_id(&self) -> u8 {
-        self.market_id
+        self.0.market_id
     }
 
     /// Returns the exact runtime asset symbol bytes.
     #[must_use]
     pub fn asset(&self) -> &[u8] {
-        &self.asset
+        &self.0.asset
     }
 
     /// Returns the token decimal precision reported by the pool.
     #[must_use]
     pub const fn decimal(&self) -> u32 {
-        self.decimal
+        self.0.decimal
     }
 
     /// Returns the raw V2 cumulative deposit index.
     #[must_use]
     pub const fn deposit_index(&self) -> u128 {
-        self.deposit_index
+        self.0.deposit_index
     }
 
     /// Returns the raw V2 cumulative borrow index.
     #[must_use]
     pub const fn borrow_index(&self) -> u128 {
-        self.borrow_index
+        self.0.borrow_index
     }
 
     /// Returns the pool-level locked liquidity.
@@ -739,13 +618,13 @@ impl DeepXLendingPoolEvidence {
     /// This value is not a user balance and must not be mapped to Nautilus locked funds.
     #[must_use]
     pub const fn locked_liquidity(&self) -> u128 {
-        self.locked_liquidity
+        self.0.locked_liquidity
     }
 
     /// Returns the runtime pool status.
     #[must_use]
     pub const fn status(&self) -> DeepXLendingPoolStatus {
-        self.status
+        self.0.status
     }
 }
 
@@ -826,99 +705,85 @@ pub struct DeepXFinalizedLendingEvidence {
 
 /// One raw perpetual position decoded directly from finalized runtime storage.
 #[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-pub struct DeepXPerpPositionStorageEvidence {
-    market_id: u16,
-    is_long: bool,
-    base_asset_amount: u128,
-    entry_price: u128,
-    leverage: u64,
-    last_funding_rate: i128,
-    version: u64,
-    realized_pnl: i128,
-    funding_payment: i128,
-    owner: [u8; 20],
-    take_profit: Option<u128>,
-    stop_loss: Option<u128>,
-    last_settle_price: u128,
-}
+pub struct DeepXPerpPositionStorageEvidence(DeepXPerpPositionStorage);
 
 impl DeepXPerpPositionStorageEvidence {
     /// Returns the deployment-provided perpetual market ID.
     #[must_use]
     pub const fn market_id(&self) -> u16 {
-        self.market_id
+        self.0.market_id
     }
 
     /// Returns whether the position is long.
     #[must_use]
     pub const fn is_long(&self) -> bool {
-        self.is_long
+        self.0.is_long
     }
 
     /// Returns the raw base-asset position amount.
     #[must_use]
     pub const fn base_asset_amount(&self) -> u128 {
-        self.base_asset_amount
+        self.0.base_asset_amount
     }
 
     /// Returns the raw entry price.
     #[must_use]
     pub const fn entry_price(&self) -> u128 {
-        self.entry_price
+        self.0.entry_price
     }
 
     /// Returns effective leverage in runtime leverage precision.
     #[must_use]
     pub const fn leverage(&self) -> u64 {
-        self.leverage
+        self.0.leverage
     }
 
     /// Returns the cumulative-funding-index snapshot at the last settlement.
     #[must_use]
     pub const fn last_funding_rate(&self) -> i128 {
-        self.last_funding_rate
+        self.0.last_funding_rate
     }
 
     /// Returns the runtime position version.
     #[must_use]
     pub const fn version(&self) -> u64 {
-        self.version
+        self.0.version
     }
 
     /// Returns raw realized PnL.
     #[must_use]
     pub const fn realized_pnl(&self) -> i128 {
-        self.realized_pnl
+        self.0.realized_pnl
     }
 
     /// Returns raw settled funding payment.
     #[must_use]
     pub const fn funding_payment(&self) -> i128 {
-        self.funding_payment
+        self.0.funding_payment
     }
 
     /// Returns the exact owner encoded inside the position.
     #[must_use]
     pub const fn owner(&self) -> [u8; 20] {
-        self.owner
+        self.0.owner
     }
 
     /// Returns the optional raw take-profit point.
     #[must_use]
     pub const fn take_profit(&self) -> Option<u128> {
-        self.take_profit
+        self.0.take_profit
     }
 
     /// Returns the optional raw stop-loss point.
     #[must_use]
     pub const fn stop_loss(&self) -> Option<u128> {
-        self.stop_loss
+        self.0.stop_loss
     }
 
     /// Returns the raw last settlement price.
     #[must_use]
     pub const fn last_settle_price(&self) -> u128 {
-        self.last_settle_price
+        self.0.last_settle_price
     }
 }
 
@@ -932,197 +797,105 @@ pub struct DeepXFinalizedPerpPositionsEvidence {
     positions: Vec<DeepXPerpPositionStorageEvidence>,
 }
 
-/// Time-in-force encoded in finalized perpetual-order storage.
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXStoredTimeInForce {
-    /// Good until canceled.
-    Gtc,
-    /// Immediate or cancel.
-    Ioc,
-    /// Fill or kill.
-    Fok,
-}
-
-/// Order type encoded in finalized perpetual-order storage.
-#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXStoredPerpOrderType {
-    /// Limit order with its exact runtime time-in-force value.
-    Limit(DeepXStoredTimeInForce),
-    /// Market order with an optional raw slippage limit.
-    Market(Option<u64>),
-    /// System stop order.
-    Stop,
-}
-
-/// Lifecycle state encoded in finalized perpetual-order storage.
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXStoredOrderStatus {
-    /// Active on the order book.
-    Open,
-    /// Partially filled with a remainder still active.
-    PartiallyFilled,
-    /// Fully filled.
-    Filled,
-    /// Canceled by a user or the protocol.
-    Canceled,
-    /// Reverted or failed on-chain.
-    Rejected,
-    /// Canceled according to order-type rules or by the exchange.
-    Expired,
-}
-
-impl DeepXStoredOrderStatus {
-    const fn is_active(self) -> bool {
-        matches!(self, Self::Open | Self::PartiallyFilled)
-    }
-}
-
-/// Post-only behavior encoded in finalized perpetual-order storage.
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXStoredPostOnlyParam {
-    /// No post-only constraint.
-    None,
-    /// The order must rest without immediately matching.
-    MustPostOnly,
-    /// The runtime may adapt the price to post the order.
-    Adaptive,
-}
-
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-enum DeepXStoredOrderSide {
-    #[codec(index = 1)]
-    Buy,
-    #[codec(index = 0)]
-    Sell,
-}
-
-#[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-struct DeepXActivePerpOrderIndexEntry {
-    address: [u8; 20],
-    market_id: u16,
-    order_side: DeepXStoredOrderSide,
-    order_type: DeepXStoredPerpOrderType,
-    order_id: u64,
-    price: u128,
-    created_at: u64,
-}
-
 /// One complete active perpetual order decoded from finalized runtime storage.
 #[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-pub struct DeepXPerpOrderStorageEvidence {
-    order_id: u64,
-    owner: [u8; 20],
-    market_id: u16,
-    is_long: bool,
-    size: u128,
-    price: u128,
-    order_type: DeepXStoredPerpOrderType,
-    create_time: u64,
-    leverage: u64,
-    status: DeepXStoredOrderStatus,
-    size_filled: u128,
-    size_remain: u128,
-    take_profit: Option<u128>,
-    stop_loss: Option<u128>,
-    reduce_only: bool,
-    post_only: DeepXStoredPostOnlyParam,
-}
+pub struct DeepXPerpOrderStorageEvidence(DeepXPerpOrderStorage);
 
 impl DeepXPerpOrderStorageEvidence {
     /// Returns the runtime order ID.
     #[must_use]
     pub const fn order_id(&self) -> u64 {
-        self.order_id
+        self.0.order_id
     }
 
     /// Returns the exact owner encoded in `OrderInfo`.
     #[must_use]
     pub const fn owner(&self) -> [u8; 20] {
-        self.owner
+        self.0.owner
     }
 
     /// Returns the runtime perpetual market ID.
     #[must_use]
     pub const fn market_id(&self) -> u16 {
-        self.market_id
+        self.0.market_id
     }
 
     /// Returns whether the order increases or reduces the long side.
     #[must_use]
     pub const fn is_long(&self) -> bool {
-        self.is_long
+        self.0.is_long
     }
 
     /// Returns the raw total order size.
     #[must_use]
     pub const fn size(&self) -> u128 {
-        self.size
+        self.0.size
     }
 
     /// Returns the raw order price.
     #[must_use]
     pub const fn price(&self) -> u128 {
-        self.price
+        self.0.price
     }
 
     /// Returns the exact stored order type.
     #[must_use]
     pub const fn order_type(&self) -> &DeepXStoredPerpOrderType {
-        &self.order_type
+        &self.0.order_type
     }
 
     /// Returns the raw runtime creation timestamp.
     #[must_use]
     pub const fn create_time(&self) -> u64 {
-        self.create_time
+        self.0.create_time
     }
 
     /// Returns the raw effective leverage cap.
     #[must_use]
     pub const fn leverage(&self) -> u64 {
-        self.leverage
+        self.0.leverage
     }
 
     /// Returns the active stored lifecycle state.
     #[must_use]
     pub const fn status(&self) -> DeepXStoredOrderStatus {
-        self.status
+        self.0.status
     }
 
     /// Returns the raw filled size.
     #[must_use]
     pub const fn size_filled(&self) -> u128 {
-        self.size_filled
+        self.0.size_filled
     }
 
     /// Returns the raw remaining size.
     #[must_use]
     pub const fn size_remain(&self) -> u128 {
-        self.size_remain
+        self.0.size_remain
     }
 
     /// Returns the optional raw take-profit point.
     #[must_use]
     pub const fn take_profit(&self) -> Option<u128> {
-        self.take_profit
+        self.0.take_profit
     }
 
     /// Returns the optional raw stop-loss point.
     #[must_use]
     pub const fn stop_loss(&self) -> Option<u128> {
-        self.stop_loss
+        self.0.stop_loss
     }
 
     /// Returns whether the order is reduce-only.
     #[must_use]
     pub const fn reduce_only(&self) -> bool {
-        self.reduce_only
+        self.0.reduce_only
     }
 
     /// Returns the exact stored post-only behavior.
     #[must_use]
     pub const fn post_only(&self) -> DeepXStoredPostOnlyParam {
-        self.post_only
+        self.0.post_only
     }
 }
 
@@ -1172,101 +945,80 @@ pub struct DeepXFinalizedPerpOrderStorageBatchEvidence {
 
 /// One complete Spot order decoded from finalized runtime storage.
 #[derive(Clone, Debug, Decode, Encode, PartialEq, Eq)]
-pub struct DeepXSpotOrderStorageEvidence {
-    order_id: u64,
-    owner: [u8; 20],
-    pair: [u8; 32],
-    price: Option<[u8; 32]>,
-    quote_amount: [u8; 32],
-    base_amount: [u8; 32],
-    create_time: u64,
-    status: DeepXStoredOrderStatus,
-    order_type: DeepXStoredSpotOrderType,
-    post_only: DeepXStoredPostOnlyParam,
-    reduce_only: bool,
-    is_buy: bool,
-}
+pub struct DeepXSpotOrderStorageEvidence(DeepXSpotOrderStorage);
 
 impl DeepXSpotOrderStorageEvidence {
     /// Returns the runtime order ID.
     #[must_use]
     pub const fn order_id(&self) -> u64 {
-        self.order_id
+        self.0.order_id
     }
 
     /// Returns the exact owner encoded in `OrderInfo`.
     #[must_use]
     pub const fn owner(&self) -> [u8; 20] {
-        self.owner
+        self.0.owner
     }
 
     /// Returns the deployment-provided Spot pair identity.
     #[must_use]
     pub const fn pair(&self) -> [u8; 32] {
-        self.pair
+        self.0.pair
     }
 
     /// Returns the order creation block number retained by the runtime.
     #[must_use]
     pub const fn create_time(&self) -> u64 {
-        self.create_time
+        self.0.create_time
     }
 
     /// Returns the raw optional runtime price as little-endian U256 bytes.
     #[must_use]
     pub const fn price(&self) -> Option<[u8; 32]> {
-        self.price
+        self.0.price
     }
 
     /// Returns the raw quote amount as little-endian U256 bytes.
     #[must_use]
     pub const fn quote_amount(&self) -> [u8; 32] {
-        self.quote_amount
+        self.0.quote_amount
     }
 
     /// Returns the raw base amount as little-endian U256 bytes.
     #[must_use]
     pub const fn base_amount(&self) -> [u8; 32] {
-        self.base_amount
+        self.0.base_amount
     }
 
     /// Returns the runtime order status.
     #[must_use]
     pub const fn status(&self) -> DeepXStoredOrderStatus {
-        self.status
+        self.0.status
     }
 
     /// Returns the runtime Spot order type.
     #[must_use]
     pub const fn order_type(&self) -> DeepXStoredSpotOrderType {
-        self.order_type
+        self.0.order_type
     }
 
     /// Returns the runtime post-only parameter.
     #[must_use]
     pub const fn post_only(&self) -> DeepXStoredPostOnlyParam {
-        self.post_only
+        self.0.post_only
     }
 
     /// Returns the runtime reduce-only flag.
     #[must_use]
     pub const fn reduce_only(&self) -> bool {
-        self.reduce_only
+        self.0.reduce_only
     }
 
     /// Returns whether the order is a buy.
     #[must_use]
     pub const fn is_buy(&self) -> bool {
-        self.is_buy
+        self.0.is_buy
     }
-}
-
-/// Spot order type stored by the runtime.
-#[derive(Clone, Copy, Debug, Decode, Encode, PartialEq, Eq)]
-pub enum DeepXStoredSpotOrderType {
-    Limit(DeepXStoredTimeInForce),
-    Market(Option<u64>),
-    Stop,
 }
 
 /// Batch Spot order evidence observed at one finalized checkpoint.
@@ -2048,18 +1800,9 @@ pub async fn observe_rpc_endpoint_identity(
     role: DeepXRpcRole,
 ) -> Result<DeepXObservedRpcEndpoint, DeepXRpcIdentityError> {
     let url = config.rpc_url_for(role)?;
-    let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
-    let encoded_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlockHash",
-            "params": [0],
-        }),
-    )
-    .await
-    .map_err(DeepXRpcIdentityError::Rpc)?;
+    let encoded_hash = get_genesis_block_hash(&url)
+        .await
+        .map_err(DeepXRpcIdentityError::Rpc)?;
     let hash = encoded_hash
         .strip_prefix("0x")
         .ok_or(DeepXRpcIdentityError::InvalidGenesisHash)
@@ -2124,20 +1867,11 @@ pub async fn observe_rpc_method_capabilities(
     if required_methods.is_empty() {
         return Err(DeepXRpcMethodCapabilityError::EmptyRequirements(role));
     }
-    let client = BlockchainHttpRpcClient::new(endpoints.url_for(role).to_string(), None, None);
-    let observed: ObservedRpcMethods = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "rpc_methods",
-            "params": [],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRpcMethodCapabilityError::Rpc { role, source })?;
+    let observed = get_rpc_methods(endpoints.url_for(role))
+        .await
+        .map_err(|source| DeepXRpcMethodCapabilityError::Rpc { role, source })?;
     for method in &required_methods {
-        if !observed.methods.contains(method) {
+        if !observed.contains(method) {
             return Err(DeepXRpcMethodCapabilityError::MissingMethod {
                 role,
                 method: method.clone(),
@@ -2150,32 +1884,6 @@ pub async fn observe_rpc_method_capabilities(
         endpoint_url: endpoints.url_for(role).to_string(),
         methods: required_methods,
     })
-}
-
-async fn execute_rpc_read_with_retry<T: DeserializeOwned>(
-    client: &BlockchainHttpRpcClient,
-    request: serde_json::Value,
-) -> anyhow::Result<T> {
-    for delay_ms in [250, 500] {
-        match client.execute_rpc_call(request.clone()).await {
-            Ok(value) => return Ok(value),
-            Err(_) => dst::time::sleep(Duration::from_millis(delay_ms)).await,
-        }
-    }
-    client.execute_rpc_call(request).await
-}
-
-async fn execute_rpc_response_with_retry<T: DeserializeOwned>(
-    client: &BlockchainHttpRpcClient,
-    request: serde_json::Value,
-) -> anyhow::Result<RpcNodeHttpResponse<T>> {
-    for delay_ms in [250, 500] {
-        match client.execute_rpc_response(request.clone()).await {
-            Ok(value) => return Ok(value),
-            Err(_) => dst::time::sleep(Duration::from_millis(delay_ms)).await,
-        }
-    }
-    client.execute_rpc_response(request).await
 }
 
 /// Collects the minimum RPC method capabilities required for all endpoint roles.
@@ -2241,18 +1949,17 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     config: &DeepXNetworkConfig,
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
     let url = config.rpc_url()?;
-    let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
-    let encoded_genesis: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlockHash",
-            "params": [0],
-        }))
+    let client = DeepXRpcClient::new(url.clone());
+    let encoded_genesis = client
+        .get_block_hash(0)
         .await
         .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
             method: "chain_getBlockHash",
             source,
+        })?
+        .ok_or_else(|| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source: anyhow::anyhow!("genesis block hash is unavailable"),
         })?;
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
@@ -2303,7 +2010,7 @@ pub(crate) async fn observe_approved_finalized_runtime_snapshot_for_endpoints(
 ) -> Result<DeepXObservedRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
     let url = endpoints.url_for(DeepXRpcRole::Watch).to_string();
     let checkpoint = observe_finalized_checkpoint_at(url.clone()).await?;
-    let client = BlockchainHttpRpcClient::new(url, None, None);
+    let client = DeepXRpcClient::new(url);
     let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
     let snapshot = RuntimeSnapshot::observed_testnet(
         environment,
@@ -2338,50 +2045,30 @@ async fn observe_current_runtime_snapshot_with_checkpoint(
     environment: &DeepXEnvironment,
     endpoints: &DeepXValidatedRpcEndpoints,
 ) -> Result<(RuntimeSnapshot, [u8; 32], u32), DeepXRuntimeSnapshotObservationError> {
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
-    let encoded_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "chain_getBlockHash",
-        source,
-    })?;
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
+    let encoded_hash = client
+        .get_best_block_hash_with_retry()
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
     let block_hash = decode_prefixed_hash(&encoded_hash, "current block hash")?;
-    let header: ObservedBlockHeader = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getHeader", "params": [encoded_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "chain_getHeader",
-        source,
-    })?;
+    let header: ObservedBlockHeader =
+        get_header(&client, &encoded_hash).await.map_err(|source| {
+            DeepXRuntimeSnapshotObservationError::Rpc {
+                method: "chain_getHeader",
+                source,
+            }
+        })?;
     let block_number = decode_block_number(&header.number)?;
-    let rejection: RpcNodeHttpResponse<ObservedRuntimeVersion> = execute_rpc_response_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getRuntimeVersion",
-            "params": [format!("0x{}", "00".repeat(32))],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "state_getRuntimeVersion",
-        source,
-    })?;
+    let rejection: RpcNodeHttpResponse<ObservedRuntimeVersion> = client
+        .get_runtime_version_response_with_retry(&format!("0x{}", "00".repeat(32)))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
     if rejection.jsonrpc.as_deref() != Some("2.0")
         || rejection.id != Some(1)
         || rejection.result.is_some()
@@ -2397,18 +2084,13 @@ async fn observe_current_runtime_snapshot_with_checkpoint(
         version.transaction_version,
         &metadata,
     )?;
-    let canonical_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [block_number],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "chain_getBlockHash",
-        source,
-    })?;
+    let canonical_hash = client
+        .get_block_hash_required_with_retry(u64::from(block_number))
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
     if decode_prefixed_hash(&canonical_hash, "canonical runtime block hash")? != block_hash {
         return Err(DeepXRuntimeSnapshotObservationError::InvalidCheckpoint);
     }
@@ -2445,17 +2127,14 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
     let (snapshot, block_hash, block_number) =
         observe_current_runtime_snapshot_with_checkpoint(environment, endpoints).await?;
     service.apply_validated(&snapshot)?;
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let encoded_hash = format!("0x{}", hex::encode(block_hash));
-    let rejected: RpcNodeHttpResponse<String> = execute_rpc_response_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getStorage",
-            "params": [timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))],
-        }),
-    )
-    .await?;
+    let rejected: RpcNodeHttpResponse<String> = client
+        .get_storage_response_with_retry(
+            &timestamp_now_storage_key(),
+            &format!("0x{}", "00".repeat(32)),
+        )
+        .await?;
     if rejected.jsonrpc.as_deref() != Some("2.0")
         || rejected.id != Some(1)
         || rejected.result.is_some()
@@ -2464,15 +2143,9 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
         service.halt_for_inconsistent_evidence()?;
         anyhow::bail!("DeepX Watch RPC ignored an invalid timestamp block hash");
     }
-    let encoded_time: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getStorage",
-            "params": [timestamp_now_storage_key(), encoded_hash],
-        }),
-    )
-    .await?;
+    let encoded_time = client
+        .get_storage_required_with_retry(&timestamp_now_storage_key(), &encoded_hash)
+        .await?;
     let observed_timestamp_ms = match decode_timestamp_now(&encoded_time) {
         Ok(timestamp_ms) => timestamp_ms,
         Err(e) => {
@@ -2480,15 +2153,7 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
             return Err(e.into());
         }
     };
-    let block: ObservedTimestampBlockResponse = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlock",
-            "params": [encoded_hash],
-        }),
-    )
-    .await?;
+    let block: ObservedTimestampBlockResponse = client.get_block_with_retry(&encoded_hash).await?;
     let block_number_matches = decode_block_number(&block.block.header.number)
         .is_ok_and(|received| received == block_number);
     let inherent_time = decode_timestamp_set_inherent(&block.block.extrinsics);
@@ -2498,14 +2163,9 @@ pub(crate) async fn observe_and_apply_current_submission_clock(
         service.halt_for_inconsistent_evidence()?;
         anyhow::bail!("DeepX current timestamp storage and block inherent differ");
     }
-    let canonical_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [block_number],
-        }),
-    )
-    .await?;
+    let canonical_hash = client
+        .get_block_hash_required_with_retry(u64::from(block_number))
+        .await?;
     anyhow::ensure!(
         decode_prefixed_hash(&canonical_hash, "canonical submission block hash")? == block_hash,
         "DeepX current submission clock block is no longer canonical",
@@ -2577,11 +2237,7 @@ pub async fn observe_and_apply_finalized_chain_time(
     let applied =
         observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
             .await?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let checkpoint = applied.checkpoint();
     let timestamp_ms = observe_finalized_chain_time_with_client(&client, checkpoint).await?;
     if let Err(e) = validate_block_timestamp_inherent(&client, checkpoint, timestamp_ms).await {
@@ -2637,11 +2293,7 @@ pub(crate) async fn observe_finalized_block_timestamp(
         return Err(DeepXFinalizedBlockTimeError::RpcCapabilitiesMismatch);
     }
 
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let finalized_hash: String = client
         .execute_rpc_call(json!({
             "jsonrpc": "2.0",
@@ -2824,20 +2476,10 @@ pub async fn observe_current_margin_evidence(
                 .all(|method| watch.methods().contains(method)),
         "DeepX Watch RPC capabilities do not authorize current margin reads",
     );
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    let encoded_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [],
-        }))
-        .await?;
+    let client = DeepXRpcClient::new(watch_url.to_string());
+    let encoded_hash = client.get_best_block_hash_once().await?;
     let block_hash = decode_prefixed_hash(&encoded_hash, "current margin block hash")?;
-    let header: ObservedBlockHeader = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getHeader", "params": [encoded_hash],
-        }))
-        .await?;
+    let header: ObservedBlockHeader = client.get_header_once(&encoded_hash).await?;
     let block_number = decode_block_number(&header.number)?;
     let input = (
         vec![subaccount],
@@ -2845,15 +2487,11 @@ pub async fn observe_current_margin_evidence(
     )
         .encode();
     let rejection: RpcNodeHttpResponse<String> = client
-        .execute_rpc_response(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_call",
-            "params": [
-                DEEPX_MARGIN_RUNTIME_API_METHOD,
-                format!("0x{}", hex::encode(input)),
-                format!("0x{}", "00".repeat(32)),
-            ],
-        }))
+        .state_call_response(
+            DEEPX_MARGIN_RUNTIME_API_METHOD,
+            input,
+            &format!("0x{}", "00".repeat(32)),
+        )
         .await?;
     anyhow::ensure!(
         rejection.jsonrpc.as_deref() == Some("2.0")
@@ -2868,11 +2506,8 @@ pub async fn observe_current_margin_evidence(
         first == second,
         "DeepX margin changed at a fixed block hash"
     );
-    let canonical_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [block_number],
-        }))
+    let canonical_hash = client
+        .get_block_hash_required_once(u64::from(block_number))
         .await?;
     anyhow::ensure!(
         decode_prefixed_hash(&canonical_hash, "canonical margin block hash")? == block_hash,
@@ -2920,11 +2555,7 @@ pub async fn observe_finalized_spot_market_spec_evidence(
     )
     .await
     .map_err(DeepXFinalizedSpotMarketSpecError::RuntimeObservation)?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let timestamp_ms =
         validate_finalized_storage_read_checkpoint(&client, observation.checkpoint())
             .await
@@ -2983,11 +2614,7 @@ pub async fn observe_finalized_spot_market_spec_batch(
     )
     .await
     .map_err(DeepXFinalizedSpotMarketSpecError::RuntimeObservation)?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let timestamp_ms =
         validate_finalized_storage_read_checkpoint(&client, observation.checkpoint())
             .await
@@ -3035,20 +2662,10 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
         pairs.iter().all(|pair| unique.insert(*pair)),
         "duplicate DeepX Spot market pair",
     );
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
-    let encoded_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [],
-        }))
-        .await?;
+    let client = DeepXRpcClient::new(watch_url.to_string());
+    let encoded_hash = client.get_best_block_hash_once().await?;
     let block_hash = decode_prefixed_hash(&encoded_hash, "current block hash")?;
-    let header: ObservedBlockHeader = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getHeader", "params": [encoded_hash],
-        }))
-        .await?;
+    let header: ObservedBlockHeader = client.get_header_once(&encoded_hash).await?;
     let block_number = decode_block_number(&header.number)?;
     let (version, metadata) = observe_runtime_metadata_at(&client, block_hash).await?;
     let snapshot = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
@@ -3059,11 +2676,10 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
         &metadata,
     )?;
     let rejection: RpcNodeHttpResponse<String> = client
-        .execute_rpc_response(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getStorage",
-            "params": [spot_market_storage_key(pairs[0]), format!("0x{}", "00".repeat(32))],
-        }))
+        .get_storage_response(
+            &spot_market_storage_key(pairs[0]),
+            &format!("0x{}", "00".repeat(32)),
+        )
         .await?;
     anyhow::ensure!(
         rejection.jsonrpc.as_deref() == Some("2.0")
@@ -3077,10 +2693,7 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
         let key = spot_market_storage_key(*pair);
         let read = || async {
             client
-                .execute_rpc_call::<Option<String>>(json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "state_getStorage", "params": [key, encoded_hash],
-                }))
+                .get_storage_result::<Option<String>>(&key, &encoded_hash)
                 .await
         };
         let first = read().await?;
@@ -3107,11 +2720,8 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
             step_size,
         });
     }
-    let canonical_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "chain_getBlockHash", "params": [block_number],
-        }))
+    let canonical_hash = client
+        .get_block_hash_required_once(u64::from(block_number))
         .await?;
     anyhow::ensure!(
         decode_prefixed_hash(&canonical_hash, "canonical Spot market block hash")? == block_hash,
@@ -3121,7 +2731,7 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
 }
 
 async fn observe_spot_market_spec_at(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     pair: [u8; 32],
     observation: &DeepXObservedReadOnlyRuntimeSnapshot,
     metadata: &subxt_core::Metadata,
@@ -3130,12 +2740,7 @@ async fn observe_spot_market_spec_at(
     let key = spot_market_storage_key(pair);
     let checkpoint_hash = format!("0x{}", hex::encode(observation.checkpoint().block_hash()));
     let stored: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [key, checkpoint_hash],
-        }))
+        .get_storage_result(&key, &checkpoint_hash)
         .await
         .map_err(|source| DeepXFinalizedSpotMarketSpecError::Rpc {
             pair: pair_hex.clone(),
@@ -3146,12 +2751,7 @@ async fn observe_spot_market_spec_at(
         .and_then(|encoded| decode_finalized_spot_market_storage(encoded, metadata, pair))
         .ok_or_else(|| DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex.clone()))?;
     let repeated: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [key, checkpoint_hash],
-        }))
+        .get_storage_result(&key, &checkpoint_hash)
         .await
         .map_err(|source| DeepXFinalizedSpotMarketSpecError::Rpc {
             pair: pair_hex.clone(),
@@ -3256,43 +2856,26 @@ pub async fn observe_finalized_perp_order_spec_evidence(
     )
     .await
     .map_err(DeepXFinalizedPerpOrderSpecError::RuntimeObservation)?;
-    let call_data = perpMarketsCall { market_id }.abi_encode();
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let call_data = encode_perp_market_call(market_id);
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let timestamp_ms = validate_finalized_market_read_checkpoint(&client, observation.checkpoint())
         .await
         .map_err(|e| DeepXFinalizedPerpOrderSpecError::Checkpoint(Box::new(e)))?;
     let encoded: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS.to_string(),
-                    "data": format!("0x{}", hex::encode(call_data)),
-                },
-                format!("0x{:x}", observation.checkpoint().block_number()),
-            ],
-        }))
+        .eth_call(
+            &DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS.to_string(),
+            &call_data,
+            &format!("0x{:x}", observation.checkpoint().block_number()),
+        )
         .await
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::Rpc { market_id, source })?;
     let (min_order_size, tick_size, step_size) =
         decode_finalized_perp_order_spec(&encoded, market_id)
             .ok_or(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id))?;
+    let storage_key = perp_market_storage_key(market_id);
+    let checkpoint_hash = format!("0x{}", hex::encode(observation.checkpoint().block_hash()));
     let stored: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [
-                perp_market_storage_key(market_id),
-                format!("0x{}", hex::encode(observation.checkpoint().block_hash())),
-            ],
-        }))
+        .get_storage_result(&storage_key, &checkpoint_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::StorageRpc { market_id, source })?;
     let (stored_min_size, stored_tick, stored_step, min_notional) = stored
@@ -3309,15 +2892,7 @@ pub async fn observe_finalized_perp_order_spec_evidence(
         return Err(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id));
     }
     let repeated: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [
-                perp_market_storage_key(market_id),
-                format!("0x{}", hex::encode(observation.checkpoint().block_hash())),
-            ],
-        }))
+        .get_storage_result(&storage_key, &checkpoint_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::StorageRpc { market_id, source })?;
     if repeated != stored {
@@ -3342,10 +2917,7 @@ fn decode_finalized_perp_order_spec(encoded: &str, market_id: u16) -> Option<(u1
     let bytes = encoded
         .strip_prefix("0x")
         .and_then(|value| hex::decode(value).ok())?;
-    let market = perpMarketsCall::abi_decode_returns(&bytes).ok()?;
-    if market.abi_encode() != bytes {
-        return None;
-    }
+    let market = decode_perp_market_return(&bytes)?;
     let spec = market.order_spec;
     (market.id == market_id && spec.min_order_size > 0 && spec.tick_size > 0 && spec.step_size > 0)
         .then_some((spec.min_order_size, spec.tick_size, spec.step_size))
@@ -3692,24 +3264,19 @@ async fn observe_finalized_perp_orders_at(
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXPerpOrderStorageEvidence>, DeepXFinalizedPerpOrdersError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     observe_finalized_perp_orders_with_client(&client, checkpoint, subaccount).await
 }
 
 async fn observe_finalized_perp_orders_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXPerpOrderStorageEvidence>, DeepXFinalizedPerpOrdersError> {
     let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
     let index_key = active_perp_orders_storage_key(subaccount);
     let mut index_change_sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [[index_key.clone()], block_hash.clone()],
-        }))
+        .query_storage_at(std::slice::from_ref(&index_key), &block_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
             storage: "PerpMarket.ActivePerpOrdersFor",
@@ -3746,12 +3313,7 @@ async fn observe_finalized_perp_orders_with_client(
     }
     let keys = expected.keys().cloned().collect::<Vec<_>>();
     let mut order_change_sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [keys, block_hash.clone()],
-        }))
+        .query_storage_at(&keys, &block_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
             storage: "PerpMarket.OrderInfo",
@@ -3785,7 +3347,7 @@ async fn observe_finalized_perp_orders_with_client(
         }
         orders.push(order);
     }
-    orders.sort_unstable_by_key(|order| (order.market_id, order.order_id));
+    orders.sort_unstable_by_key(|order| (order.0.market_id, order.0.order_id));
     Ok(orders)
 }
 
@@ -3818,7 +3380,7 @@ async fn observe_finalized_perp_orders_by_id_at(
     if expected_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
     let index_key = active_perp_orders_storage_key(subaccount);
     let order_keys = expected_ids
@@ -3833,12 +3395,7 @@ async fn observe_finalized_perp_orders_by_id_at(
     let mut keys = vec![index_key.clone()];
     keys.extend(order_keys.values().cloned());
     let mut changesets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [keys, block_hash.clone()],
-        }))
+        .query_storage_at(&keys, &block_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrdersError::Rpc {
             storage: "PerpMarket.OrderInfo",
@@ -3882,26 +3439,26 @@ async fn observe_finalized_perp_orders_by_id_at(
             .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
         let active_entry = active_by_id.get(&order_id);
         if !input.is_empty()
-            || order.order_id != order_id
-            || order.owner != subaccount
-            || order.create_time == 0
-            || order.size == 0
-            || order.size_filled.checked_add(order.size_remain) != Some(order.size)
-            || order.status.is_active() != active_entry.is_some()
+            || order.0.order_id != order_id
+            || order.0.owner != subaccount
+            || order.0.create_time == 0
+            || order.0.size == 0
+            || order.0.size_filled.checked_add(order.0.size_remain) != Some(order.0.size)
+            || order.0.status.is_active() != active_entry.is_some()
             || active_entry
                 .is_some_and(|entry| !perp_order_matches_index(&order, entry, subaccount))
         {
             return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
         }
-        let status_quantities_match = match order.status {
+        let status_quantities_match = match order.0.status {
             DeepXStoredOrderStatus::Open => {
-                order.size_filled == 0 && order.size_remain == order.size
+                order.0.size_filled == 0 && order.0.size_remain == order.0.size
             }
             DeepXStoredOrderStatus::PartiallyFilled => {
-                order.size_filled > 0 && order.size_remain > 0
+                order.0.size_filled > 0 && order.0.size_remain > 0
             }
             DeepXStoredOrderStatus::Filled => {
-                order.size_filled == order.size && order.size_remain == 0
+                order.0.size_filled == order.0.size && order.0.size_remain == 0
             }
             DeepXStoredOrderStatus::Canceled
             | DeepXStoredOrderStatus::Rejected
@@ -4004,13 +3561,13 @@ async fn observe_finalized_spot_orders_by_id_at(
     ),
     DeepXFinalizedSpotOrdersError,
 > {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     observe_finalized_spot_orders_by_id_with_client(&client, checkpoint, subaccount, order_ids)
         .await
 }
 
 async fn observe_finalized_spot_orders_by_id_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
     order_ids: &[u64],
@@ -4038,12 +3595,7 @@ async fn observe_finalized_spot_orders_by_id_with_client(
     keys.extend(order_keys.values().cloned());
     let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
     let mut sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [keys, block_hash.clone()],
-        }))
+        .query_storage_at(&keys, &block_hash)
         .await
         .map_err(|source| DeepXFinalizedSpotOrdersError::Rpc {
             storage: "SpotMarket.OrderInfo",
@@ -4125,15 +3677,16 @@ async fn observe_finalized_spot_orders_by_id_with_client(
         let order = DeepXSpotOrderStorageEvidence::decode(&mut input)
             .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
         if !input.is_empty()
-            || order.order_id != id
-            || order.owner != subaccount
-            || order.create_time == 0
+            || order.0.order_id != id
+            || order.0.owner != subaccount
+            || order.0.create_time == 0
         {
             return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
         }
         let indexed = active_by_id.get(&id);
-        if order.status.is_active() != indexed.is_some()
-            || indexed.is_some_and(|(pair, is_buy)| *pair != order.pair || *is_buy != order.is_buy)
+        if order.0.status.is_active() != indexed.is_some()
+            || indexed
+                .is_some_and(|(pair, is_buy)| *pair != order.0.pair || *is_buy != order.0.is_buy)
         {
             return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
         }
@@ -4201,20 +3754,20 @@ fn perp_order_matches_index(
     subaccount: [u8; 20],
 ) -> bool {
     let expected_long = matches!(index.order_side, DeepXStoredOrderSide::Buy);
-    order.order_id == index.order_id
-        && order.owner == subaccount
-        && order.market_id == index.market_id
-        && order.is_long == expected_long
-        && order.order_type == index.order_type
-        && order.price == index.price
-        && order.create_time == index.created_at
-        && order.create_time != 0
-        && order.leverage != 0
-        && order.status.is_active()
-        && order.size != 0
-        && order.size_remain != 0
-        && order.size_filled.checked_add(order.size_remain) == Some(order.size)
-        && (!matches!(order.order_type, DeepXStoredPerpOrderType::Limit(_)) || order.price != 0)
+    order.0.order_id == index.order_id
+        && order.0.owner == subaccount
+        && order.0.market_id == index.market_id
+        && order.0.is_long == expected_long
+        && order.0.order_type == index.order_type
+        && order.0.price == index.price
+        && order.0.create_time == index.created_at
+        && order.0.create_time != 0
+        && order.0.leverage != 0
+        && order.0.status.is_active()
+        && order.0.size != 0
+        && order.0.size_remain != 0
+        && order.0.size_filled.checked_add(order.0.size_remain) == Some(order.0.size)
+        && (!matches!(order.0.order_type, DeepXStoredPerpOrderType::Limit(_)) || order.0.price != 0)
 }
 
 /// Observes finalized perpetual positions and applies the runtime to a signing snapshot service.
@@ -4316,11 +3869,7 @@ pub async fn observe_and_apply_finalized_account_evidence(
     let applied =
         observe_and_apply_approved_finalized_runtime_snapshot(environment, endpoints, service)
             .await?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let evidence = collect_finalized_account_evidence(
         &client,
         applied.checkpoint(),
@@ -4368,11 +3917,7 @@ pub async fn observe_finalized_account_evidence(
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
     .await?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     collect_finalized_account_evidence(
         &client,
         observation.checkpoint(),
@@ -4413,11 +3958,7 @@ pub async fn observe_finalized_accounts_evidence(
         endpoints.url_for(DeepXRpcRole::Watch).to_string(),
     )
     .await?;
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Watch).to_string(),
-        None,
-        None,
-    );
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Watch).to_string());
     let mut evidence = Vec::with_capacity(subaccounts.len());
     let mut shared_timestamp_ms = None;
     for subaccount in subaccounts {
@@ -4470,7 +4011,7 @@ fn validate_account_evidence_capabilities(
 }
 
 async fn collect_finalized_account_evidence(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     runtime_identity: &ApprovedRuntimeIdentity,
     subaccount: [u8; 20],
@@ -4559,7 +4100,7 @@ async fn collect_finalized_account_evidence(
 }
 
 async fn validate_finalized_market_read_checkpoint(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
 ) -> Result<u64, DeepXFinalizedAccountError> {
     let timestamp_ms = observe_finalized_chain_time_with_client(client, checkpoint).await?;
@@ -4569,16 +4110,16 @@ async fn validate_finalized_market_read_checkpoint(
 }
 
 async fn validate_finalized_storage_read_checkpoint(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
 ) -> Result<u64, DeepXFinalizedAccountError> {
     let timestamp_ms = observe_finalized_chain_time_with_client(client, checkpoint).await?;
     validate_block_timestamp_inherent(client, checkpoint, timestamp_ms).await?;
     let response: RpcNodeHttpResponse<String> = client
-        .execute_rpc_response(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getStorage",
-            "params": [timestamp_now_storage_key(), format!("0x{}", "00".repeat(32))],
-        }))
+        .get_storage_response(
+            &timestamp_now_storage_key(),
+            &format!("0x{}", "00".repeat(32)),
+        )
         .await
         .map_err(DeepXFinalizedAccountError::StorageRejectionRpc)?;
     if response.jsonrpc.as_deref() != Some("2.0")
@@ -4592,7 +4133,7 @@ async fn validate_finalized_storage_read_checkpoint(
 }
 
 async fn validate_finalized_market_timestamp_unchanged(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     timestamp_ms: u64,
 ) -> Result<(), DeepXFinalizedAccountError> {
@@ -4607,16 +4148,12 @@ async fn validate_finalized_market_timestamp_unchanged(
 }
 
 async fn validate_eth_call_block_selection(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
 ) -> Result<(), DeepXFinalizedAccountError> {
-    let call = json!({"to": DEEPX_ETH_CALL_PROBE_ADDRESS, "data": "0x"});
     let selected = format!("0x{:x}", checkpoint.block_number());
     let valid: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-            "params": [call.clone(), selected],
-        }))
+        .eth_call(DEEPX_ETH_CALL_PROBE_ADDRESS, &[], &selected)
         .await
         .map_err(DeepXFinalizedAccountError::EthCallProbeRpc)?;
     if valid != "0x" {
@@ -4624,10 +4161,7 @@ async fn validate_eth_call_block_selection(
     }
     let impossible = "0xffffffff";
     let response: RpcNodeHttpResponse<String> = client
-        .execute_rpc_response(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-            "params": [call, impossible],
-        }))
+        .eth_call_response(DEEPX_ETH_CALL_PROBE_ADDRESS, &[], impossible)
         .await
         .map_err(DeepXFinalizedAccountError::EthCallRejectionRpc)?;
     if response.jsonrpc.as_deref() != Some("2.0")
@@ -4641,17 +4175,13 @@ async fn validate_eth_call_block_selection(
 }
 
 async fn validate_block_timestamp_inherent(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     storage_ms: u64,
 ) -> Result<(), DeepXFinalizedAccountError> {
+    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
     let block: ObservedTimestampBlockResponse = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlock",
-            "params": [format!("0x{}", hex::encode(checkpoint.block_hash()))],
-        }))
+        .get_block(&block_hash)
         .await
         .map_err(DeepXFinalizedAccountError::BlockRpc)?;
     if decode_block_number(&block.block.header.number)
@@ -4667,15 +4197,9 @@ async fn validate_block_timestamp_inherent(
             storage_ms,
         });
     }
-    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
     let timestamp_key = timestamp_now_storage_key();
     let mut sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [[timestamp_key.clone()], block_hash.clone()],
-        }))
+        .query_storage_at(std::slice::from_ref(&timestamp_key), &block_hash)
         .await
         .map_err(DeepXFinalizedAccountError::StorageQueryRpc)?;
     if sets.len() != 1 || sets[0].block != block_hash {
@@ -4702,33 +4226,8 @@ async fn validate_block_timestamp_inherent(
 }
 
 fn decode_timestamp_set_inherent(extrinsics: &[String]) -> Result<u64, DeepXFinalizedAccountError> {
-    let mut block_ms = None;
-    for encoded in extrinsics {
-        let bytes = hex::decode(
-            encoded
-                .strip_prefix("0x")
-                .ok_or(DeepXFinalizedAccountError::InvalidBlockTimestamp)?,
-        )
-        .map_err(|_| DeepXFinalizedAccountError::InvalidBlockTimestamp)?;
-        let mut input = bytes.as_slice();
-        let length = Compact::<u32>::decode(&mut input)
-            .map_err(|_| DeepXFinalizedAccountError::InvalidBlockTimestamp)?;
-        if input.len() != length.0 as usize {
-            return Err(DeepXFinalizedAccountError::InvalidBlockTimestamp);
-        }
-        if input.starts_with(&[4, 2, 0]) {
-            let mut timestamp_input = &input[3..];
-            let timestamp = Compact::<u64>::decode(&mut timestamp_input)
-                .map_err(|_| DeepXFinalizedAccountError::InvalidBlockTimestamp)?;
-            if timestamp.0 == 0
-                || !timestamp_input.is_empty()
-                || block_ms.replace(timestamp.0).is_some()
-            {
-                return Err(DeepXFinalizedAccountError::InvalidBlockTimestamp);
-            }
-        }
-    }
-    block_ms.ok_or(DeepXFinalizedAccountError::InvalidBlockTimestamp)
+    deepx_rust_sdk::rpc::timestamp::decode_timestamp_set_inherent(extrinsics)
+        .ok_or(DeepXFinalizedAccountError::InvalidBlockTimestamp)
 }
 
 fn validate_perp_position_capabilities(
@@ -4752,12 +4251,12 @@ async fn observe_finalized_perp_positions_at(
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<(u32, Vec<DeepXPerpPositionStorageEvidence>), DeepXFinalizedPerpPositionsError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     observe_finalized_perp_positions_with_client(&client, checkpoint, subaccount).await
 }
 
 async fn observe_finalized_perp_positions_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<(u32, Vec<DeepXPerpPositionStorageEvidence>), DeepXFinalizedPerpPositionsError> {
@@ -4765,12 +4264,7 @@ async fn observe_finalized_perp_positions_with_client(
     let maximum_key = subaccount_max_perp_positions_storage_key();
     let positions_key = user_perp_positions_storage_key(subaccount);
     let mut change_sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_queryStorageAt",
-            "params": [[maximum_key.clone(), positions_key.clone()], block_hash.clone()],
-        }))
+        .query_storage_at(&[maximum_key.clone(), positions_key.clone()], &block_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpPositionsError::Rpc {
             storage: "Subaccount.MaxPerpPositions and PerpMarket.UserPerpPositions",
@@ -4842,12 +4336,12 @@ fn decode_perp_positions(
     for _ in 0..length {
         let position = DeepXPerpPositionStorageEvidence::decode(&mut input)
             .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
-        if position.owner != subaccount
-            || position.base_asset_amount == 0
-            || position.entry_price == 0
-            || position.leverage == 0
-            || position.last_settle_price == 0
-            || !market_ids.insert(position.market_id)
+        if position.0.owner != subaccount
+            || position.0.base_asset_amount == 0
+            || position.0.entry_price == 0
+            || position.0.leverage == 0
+            || position.0.last_settle_price == 0
+            || !market_ids.insert(position.0.market_id)
         {
             return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
         }
@@ -4929,12 +4423,12 @@ async fn observe_finalized_lending_at(
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXLendingPositionEvidence>, DeepXFinalizedLendingError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     observe_finalized_lending_with_client(&client, checkpoint, subaccount).await
 }
 
 async fn observe_finalized_lending_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXLendingPositionEvidence>, DeepXFinalizedLendingError> {
@@ -4943,16 +4437,11 @@ async fn observe_finalized_lending_with_client(
     let market_ids = (u8::MIN..=u8::MAX).collect::<Vec<_>>();
     let input = (vec![subaccount], market_ids).encode();
     let encoded: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_call",
-            "params": [
-                DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD,
-                format!("0x{}", hex::encode(input)),
-                block_hash.clone(),
-            ],
-        }))
+        .state_call(
+            DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD,
+            input,
+            &block_hash,
+        )
         .await
         .map_err(DeepXFinalizedLendingError::PositionsRpc)?;
     let raw_positions = decode_lending_positions(&encoded, subaccount)?;
@@ -4964,16 +4453,8 @@ async fn observe_finalized_lending_with_client(
     .await
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct DeepXRawLendingPosition {
-    market_id: u8,
-    asset: Vec<u8>,
-    scaled_deposit: u128,
-    scaled_borrow: u128,
-}
-
 async fn observe_finalized_lending_asset(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     block_hash: &str,
     block_number: &str,
     subaccount: [u8; 20],
@@ -4984,16 +4465,7 @@ async fn observe_finalized_lending_asset(
     let balance_input = (subaccount, market_id, raw.asset.clone()).encode();
     let call = |method: &'static str, input: Vec<u8>| async move {
         client
-            .execute_rpc_call::<String>(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "state_call",
-                "params": [
-                    method,
-                    format!("0x{}", hex::encode(input)),
-                    block_hash,
-                ],
-            }))
+            .state_call(method, input, block_hash)
             .await
             .map_err(|source| DeepXFinalizedLendingError::AssetRpc {
                 method,
@@ -5044,47 +4516,32 @@ async fn observe_finalized_lending_asset(
 }
 
 async fn observe_finalized_max_withdrawal(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     block_number: &str,
     subaccount: [u8; 20],
     market_id: u8,
     asset: &[u8],
 ) -> Result<u128, DeepXFinalizedLendingError> {
-    let call_data = maxWithdrawAmountForCall {
-        subaccount: Address::from(subaccount),
-        lendingMarket: market_id,
-        asset: Bytes::copy_from_slice(asset),
-    }
-    .abi_encode();
+    let call_data = encode_max_withdraw_call(subaccount, market_id, asset);
     let encoded: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [
-                {
-                    "to": DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string(),
-                    "data": format!("0x{}", hex::encode(call_data)),
-                },
-                block_number,
-            ],
-        }))
+        .eth_call(
+            &DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string(),
+            &call_data,
+            block_number,
+        )
         .await
         .map_err(|source| DeepXFinalizedLendingError::WithdrawalRpc { market_id, source })?;
     decode_max_withdrawal(&encoded, market_id)
 }
 
 fn decode_max_withdrawal(encoded: &str, market_id: u8) -> Result<u128, DeepXFinalizedLendingError> {
-    let bytes = encoded
+    encoded
         .strip_prefix("0x")
         .and_then(|value| hex::decode(value).ok())
-        .filter(|value| value.len() == 32 && value[..16].iter().all(|byte| *byte == 0))
+        .and_then(|bytes| decode_max_withdraw_return(&bytes))
         .ok_or(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(
             market_id,
-        ))?;
-    let raw = <[u8; 16]>::try_from(&bytes[16..])
-        .map_err(|_| DeepXFinalizedLendingError::InvalidWithdrawalEvidence(market_id))?;
-    Ok(u128::from_be_bytes(raw))
+        ))
 }
 
 fn validate_lending_asset_evidence(
@@ -5095,13 +4552,13 @@ fn validate_lending_asset_evidence(
     max_withdraw_amount: Option<u128>,
 ) -> Result<DeepXLendingPositionEvidence, DeepXFinalizedLendingError> {
     let market_id = raw.market_id;
-    if pool.market_id != market_id
-        || pool.asset != raw.asset
+    if pool.0.market_id != market_id
+        || pool.0.asset != raw.asset
         || (raw.scaled_deposit == 0) != effective_deposit.is_none()
         || (raw.scaled_borrow == 0) != effective_borrow.is_none()
         || (raw.scaled_deposit == 0) != max_withdraw_amount.is_none()
         || max_withdraw_amount.is_some_and(|amount| {
-            amount > effective_deposit.unwrap_or_default() || amount > pool.available_liquidity
+            amount > effective_deposit.unwrap_or_default() || amount > pool.0.available_liquidity
         })
     {
         return Err(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id));
@@ -5123,88 +4580,8 @@ fn decode_lending_positions(
     encoded: &str,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXRawLendingPosition>, DeepXFinalizedLendingError> {
-    let bytes = encoded
-        .strip_prefix("0x")
+    deepx_rust_sdk::rpc::lending_positions::decode_lending_positions(encoded, subaccount)
         .ok_or(DeepXFinalizedLendingError::InvalidPositions)
-        .and_then(|value| {
-            hex::decode(value).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)
-        })?;
-    let mut input = bytes.as_slice();
-    let account_count = decode_bounded_compact_len(&mut input, 1)
-        .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
-    if account_count == 0 {
-        if input.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Err(DeepXFinalizedLendingError::InvalidPositions);
-    }
-    let account =
-        <[u8; 20]>::decode(&mut input).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
-    if account != subaccount {
-        return Err(DeepXFinalizedLendingError::InvalidPositions);
-    }
-    let market_count = decode_bounded_compact_len(&mut input, usize::from(u8::MAX) + 1)
-        .filter(|count| *count > 0)
-        .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
-    let mut positions = Vec::new();
-    let mut previous_market = None;
-    for _ in 0..market_count {
-        let market_id =
-            u8::decode(&mut input).map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
-        if previous_market.is_some_and(|previous| market_id <= previous) {
-            return Err(DeepXFinalizedLendingError::InvalidPositions);
-        }
-        previous_market = Some(market_id);
-        let asset_count = decode_bounded_compact_len(&mut input, DEEPX_MAX_LENDING_POSITION_ASSETS)
-            .filter(|count| *count > 0)
-            .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
-        let mut previous_asset: Option<Vec<u8>> = None;
-        for _ in 0..asset_count {
-            let asset = decode_bounded_bytes(&mut input, DEEPX_MAX_LENDING_ASSET_SYMBOL_BYTES)
-                .filter(|value| !value.is_empty())
-                .ok_or(DeepXFinalizedLendingError::InvalidPositions)?;
-            if previous_asset
-                .as_ref()
-                .is_some_and(|previous| asset <= *previous)
-            {
-                return Err(DeepXFinalizedLendingError::InvalidPositions);
-            }
-            previous_asset = Some(asset.clone());
-            let scaled_deposit = u128::decode(&mut input)
-                .map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
-            let scaled_borrow = u128::decode(&mut input)
-                .map_err(|_| DeepXFinalizedLendingError::InvalidPositions)?;
-            if scaled_deposit == 0 && scaled_borrow == 0 {
-                return Err(DeepXFinalizedLendingError::InvalidPositions);
-            }
-            positions.push(DeepXRawLendingPosition {
-                market_id,
-                asset,
-                scaled_deposit,
-                scaled_borrow,
-            });
-        }
-    }
-    if !input.is_empty() {
-        return Err(DeepXFinalizedLendingError::InvalidPositions);
-    }
-    Ok(positions)
-}
-
-fn decode_bounded_compact_len(input: &mut &[u8], maximum: usize) -> Option<usize> {
-    let Compact(value) = Compact::<u32>::decode(input).ok()?;
-    let value = usize::try_from(value).ok()?;
-    (value <= maximum).then_some(value)
-}
-
-fn decode_bounded_bytes(input: &mut &[u8], maximum: usize) -> Option<Vec<u8>> {
-    let len = decode_bounded_compact_len(input, maximum)?;
-    if input.len() < len {
-        return None;
-    }
-    let (value, remaining) = input.split_at(len);
-    *input = remaining;
-    Some(value.to_vec())
 }
 
 fn decode_lending_asset_response<T: Decode>(
@@ -5229,12 +4606,12 @@ async fn observe_finalized_margin_requirements_at(
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     observe_finalized_margin_requirements_with_client(&client, checkpoint, subaccount).await
 }
 
 async fn observe_finalized_margin_requirements_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     subaccount: [u8; 20],
 ) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
@@ -5242,23 +4619,14 @@ async fn observe_finalized_margin_requirements_with_client(
 }
 
 async fn observe_margin_requirements_at_hash(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     block_hash: [u8; 32],
     subaccount: [u8; 20],
 ) -> Result<(DeepXMarginRequirement, DeepXMarginRequirement), DeepXFinalizedMarginError> {
     let block_hash = format!("0x{}", hex::encode(block_hash));
     let observe = |direction: DeepXMarginDirection| {
         let input = (vec![subaccount], direction.as_runtime_u8()).encode();
-        client.execute_rpc_call::<String>(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_call",
-            "params": [
-                DEEPX_MARGIN_RUNTIME_API_METHOD,
-                format!("0x{}", hex::encode(input)),
-                block_hash,
-            ],
-        }))
+        client.state_call(DEEPX_MARGIN_RUNTIME_API_METHOD, input, &block_hash)
     };
     let (initial, maintenance) = tokio::join!(
         observe(DeepXMarginDirection::Initial),
@@ -5299,70 +4667,44 @@ fn decode_margin_requirement(
         .get(&subaccount)
         .copied()
         .ok_or(DeepXFinalizedMarginError::InvalidEvidence(direction))?;
-    Ok(DeepXMarginRequirement {
+    Ok(DeepXMarginRequirement(DeepXRawMarginRequirement {
         total_collateral,
         total_margin_required,
-    })
-}
-
-fn timestamp_now_storage_key() -> String {
-    let mut encoded = Vec::with_capacity(32);
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Timestamp"));
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(b"Now"));
-    format!("0x{}", hex::encode(encoded))
+    }))
 }
 
 async fn observe_finalized_chain_time_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
 ) -> Result<u64, DeepXFinalizedChainTimeError> {
-    let encoded: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [
-                timestamp_now_storage_key(),
-                format!("0x{}", hex::encode(checkpoint.block_hash())),
-            ],
-        }))
+    get_timestamp_now(client, checkpoint.block_hash())
         .await
-        .map_err(DeepXFinalizedChainTimeError::Rpc)?;
-    decode_timestamp_now(&encoded)
+        .map_err(|e| match e {
+            DeepXTimestampReadError::Rpc(source) => DeepXFinalizedChainTimeError::Rpc(source),
+            DeepXTimestampReadError::InvalidStorage => DeepXFinalizedChainTimeError::InvalidStorage,
+        })
 }
 
 fn decode_timestamp_now(encoded: &str) -> Result<u64, DeepXFinalizedChainTimeError> {
-    let bytes = encoded
-        .strip_prefix("0x")
+    deepx_rust_sdk::rpc::timestamp::decode_timestamp_now(encoded)
         .ok_or(DeepXFinalizedChainTimeError::InvalidStorage)
-        .and_then(|value| {
-            hex::decode(value).map_err(|_| DeepXFinalizedChainTimeError::InvalidStorage)
-        })?;
-    let mut input = bytes.as_slice();
-    let timestamp_ms =
-        u64::decode(&mut input).map_err(|_| DeepXFinalizedChainTimeError::InvalidStorage)?;
-    if timestamp_ms == 0 || !input.is_empty() {
-        return Err(DeepXFinalizedChainTimeError::InvalidStorage);
-    }
-    Ok(timestamp_ms)
 }
 
 async fn observe_approved_finalized_read_only_runtime_snapshot_at(
     environment: &DeepXEnvironment,
     url: String,
 ) -> Result<DeepXObservedReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotObservationError> {
-    let client = BlockchainHttpRpcClient::new(url.clone(), None, None);
-    let encoded_genesis: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlockHash",
-            "params": [0],
-        }))
+    let client = DeepXRpcClient::new(url.clone());
+    let encoded_genesis = client
+        .get_block_hash(0)
         .await
         .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
             method: "chain_getBlockHash",
             source,
+        })?
+        .ok_or_else(|| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getBlockHash",
+            source: anyhow::anyhow!("genesis block hash is unavailable"),
         })?;
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
@@ -5381,37 +4723,21 @@ async fn observe_approved_finalized_read_only_runtime_snapshot_at(
 }
 
 async fn observe_runtime_metadata_at(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     block_hash: [u8; 32],
 ) -> Result<(ObservedRuntimeVersion, Vec<u8>), DeepXRuntimeSnapshotObservationError> {
     let block_hash = format!("0x{}", hex::encode(block_hash));
-    let version = execute_rpc_read_with_retry(
-        client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getRuntimeVersion",
-            "params": [block_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "state_getRuntimeVersion",
-        source,
-    })?;
-    let encoded_metadata: String = execute_rpc_read_with_retry(
-        client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getMetadata",
-            "params": [block_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "state_getMetadata",
-        source,
+    let version = get_runtime_version(client, &block_hash)
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getRuntimeVersion",
+            source,
+        })?;
+    let encoded_metadata = get_metadata(client, &block_hash).await.map_err(|source| {
+        DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "state_getMetadata",
+            source,
+        }
     })?;
     let metadata = encoded_metadata
         .strip_prefix("0x")
@@ -5424,36 +4750,20 @@ async fn observe_runtime_metadata_at(
 async fn observe_finalized_checkpoint_at(
     url: String,
 ) -> Result<DeepXFinalizedCheckpoint, DeepXRuntimeSnapshotObservationError> {
-    let client = BlockchainHttpRpcClient::new(url, None, None);
-    let encoded_finalized_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getFinalizedHead",
-            "params": [],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "chain_getFinalizedHead",
-        source,
+    let client = DeepXRpcClient::new(url);
+    let encoded_finalized_hash = get_finalized_head(&client).await.map_err(|source| {
+        DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getFinalizedHead",
+            source,
+        }
     })?;
     let finalized_hash = decode_prefixed_hash(&encoded_finalized_hash, "finalized hash")?;
-    let finalized_header: ObservedBlockHeader = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getHeader",
-            "params": [encoded_finalized_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
-        method: "chain_getHeader",
-        source,
-    })?;
+    let finalized_header: ObservedBlockHeader = get_header(&client, &encoded_finalized_hash)
+        .await
+        .map_err(|source| DeepXRuntimeSnapshotObservationError::Rpc {
+            method: "chain_getHeader",
+            source,
+        })?;
     Ok(DeepXFinalizedCheckpoint {
         block_hash: finalized_hash,
         block_number: decode_block_number(&finalized_header.number)?,
@@ -5556,7 +4866,7 @@ mod tests {
     }
 
     fn lending_pool(market_id: u8, asset: &[u8]) -> DeepXLendingPoolEvidence {
-        DeepXLendingPoolEvidence {
+        DeepXLendingPoolEvidence(DeepXLendingPoolStorage {
             market_id,
             asset: asset.to_vec(),
             decimal: 6,
@@ -5576,7 +4886,7 @@ mod tests {
             status: DeepXLendingPoolStatus::Active,
             apr_borrow: 50_000_000_000_000_000,
             apr_lend: 20_000_000_000_000_000,
-        }
+        })
     }
 
     fn flat_account_evidence() -> DeepXFinalizedAccountEvidence {
@@ -5612,14 +4922,14 @@ mod tests {
                 checkpoint,
                 runtime_identity: runtime_identity.clone(),
                 subaccount,
-                initial: DeepXMarginRequirement {
+                initial: DeepXMarginRequirement(DeepXRawMarginRequirement {
                     total_collateral: 1_234_567,
                     total_margin_required: 0,
-                },
-                maintenance: DeepXMarginRequirement {
+                }),
+                maintenance: DeepXMarginRequirement(DeepXRawMarginRequirement {
                     total_collateral: 1_234_567,
                     total_margin_required: 0,
-                },
+                }),
             },
             lending: DeepXFinalizedLendingEvidence {
                 checkpoint,
@@ -5692,7 +5002,7 @@ mod tests {
     #[test]
     fn finalized_flat_account_rejects_exposure_liability_and_restrictions() {
         let mut evidence = flat_account_evidence();
-        evidence.margin.initial.total_margin_required = 1;
+        evidence.margin.initial.0.total_margin_required = 1;
         assert!(matches!(
             map_finalized_flat_account_balances(&evidence),
             Err(DeepXFlatAccountBalanceError::MarginRequired),
@@ -5764,7 +5074,7 @@ mod tests {
         let mut evidence = flat_account_evidence();
         evidence.lending.positions[0].effective_deposit = Some(1);
         evidence.lending.positions[0].max_withdraw_amount = Some(1);
-        evidence.lending.positions[0].pool.decimal = 18;
+        evidence.lending.positions[0].pool.0.decimal = 18;
         assert!(matches!(
             map_finalized_flat_account_balances(&evidence),
             Err(DeepXFlatAccountBalanceError::InexactAmount { .. }),
@@ -5784,7 +5094,7 @@ mod tests {
     }
 
     fn perp_position(subaccount: [u8; 20], market_id: u16) -> DeepXPerpPositionStorageEvidence {
-        DeepXPerpPositionStorageEvidence {
+        DeepXPerpPositionStorageEvidence(DeepXPerpPositionStorage {
             market_id,
             is_long: true,
             base_asset_amount: 250_000_000_000_000_000,
@@ -5798,7 +5108,7 @@ mod tests {
             take_profit: Some(3_000_000_000_000_000_000),
             stop_loss: None,
             last_settle_price: 2_550_000_000_000_000_000,
-        }
+        })
     }
 
     fn perp_order(
@@ -5806,7 +5116,7 @@ mod tests {
         market_id: u16,
         order_id: u64,
     ) -> DeepXPerpOrderStorageEvidence {
-        DeepXPerpOrderStorageEvidence {
+        DeepXPerpOrderStorageEvidence(DeepXPerpOrderStorage {
             order_id,
             owner: subaccount,
             market_id,
@@ -5823,7 +5133,7 @@ mod tests {
             stop_loss: None,
             reduce_only: false,
             post_only: DeepXStoredPostOnlyParam::MustPostOnly,
-        }
+        })
     }
 
     fn spot_order(
@@ -5831,7 +5141,7 @@ mod tests {
         pair: [u8; 32],
         order_id: u64,
     ) -> DeepXSpotOrderStorageEvidence {
-        DeepXSpotOrderStorageEvidence {
+        DeepXSpotOrderStorageEvidence(DeepXSpotOrderStorage {
             order_id,
             owner: subaccount,
             pair,
@@ -5844,24 +5154,24 @@ mod tests {
             post_only: DeepXStoredPostOnlyParam::None,
             reduce_only: false,
             is_buy: true,
-        }
+        })
     }
 
     fn active_perp_order_index_entry(
         order: &DeepXPerpOrderStorageEvidence,
     ) -> DeepXActivePerpOrderIndexEntry {
         DeepXActivePerpOrderIndexEntry {
-            address: order.owner,
-            market_id: order.market_id,
-            order_side: if order.is_long {
+            address: order.0.owner,
+            market_id: order.0.market_id,
+            order_side: if order.0.is_long {
                 DeepXStoredOrderSide::Buy
             } else {
                 DeepXStoredOrderSide::Sell
             },
-            order_type: order.order_type.clone(),
-            order_id: order.order_id,
-            price: order.price,
-            created_at: order.create_time,
+            order_type: order.0.order_type.clone(),
+            order_id: order.0.order_id,
+            price: order.0.price,
+            created_at: order.0.create_time,
         }
     }
 
@@ -5947,13 +5257,13 @@ mod tests {
 
         let index = active_perp_order_index_entry(&order);
         let mut invalid = order.clone();
-        invalid.status = DeepXStoredOrderStatus::Filled;
+        invalid.0.status = DeepXStoredOrderStatus::Filled;
         assert!(!perp_order_matches_index(&invalid, &index, subaccount));
         invalid = order.clone();
-        invalid.size_remain -= 1;
+        invalid.0.size_remain -= 1;
         assert!(!perp_order_matches_index(&invalid, &index, subaccount));
         invalid = order;
-        invalid.owner = [0x22; 20];
+        invalid.0.owner = [0x22; 20];
         assert!(!perp_order_matches_index(&invalid, &index, subaccount));
     }
 
@@ -5998,9 +5308,9 @@ mod tests {
         let subaccount = [0x11; 20];
         let valid = perp_position(subaccount, 2);
         let mut foreign = valid.clone();
-        foreign.owner = [0x22; 20];
+        foreign.0.owner = [0x22; 20];
         let mut zero_amount = valid.clone();
-        zero_amount.base_asset_amount = 0;
+        zero_amount.0.base_asset_amount = 0;
 
         for positions in [vec![valid.clone(), valid], vec![foreign], vec![zero_amount]] {
             assert!(matches!(
@@ -6181,10 +5491,7 @@ mod tests {
                         );
                         let encoded = request["params"][0]["data"].as_str().unwrap();
                         let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
-                        let call = maxWithdrawAmountForCall::abi_decode(&bytes).unwrap();
-                        assert_eq!(call.subaccount, Address::from(subaccount));
-                        assert_eq!(call.lendingMarket, 1);
-                        assert_eq!(call.asset.as_ref(), asset.as_slice());
+                        assert_eq!(bytes, encode_max_withdraw_call(subaccount, 1, &asset));
                         return Json(json!({
                             "jsonrpc": "2.0",
                             "id": 1,
@@ -7602,10 +6909,7 @@ mod tests {
                                     .trim_start_matches("0x"),
                             )
                             .unwrap();
-                            assert_eq!(
-                                perpMarketsCall::abi_decode(&calldata).unwrap().market_id,
-                                3
-                            );
+                            assert_eq!(calldata, encode_perp_market_call(3));
                             json!({
                                 "jsonrpc": "2.0",
                                 "id": 1,
@@ -7901,12 +7205,15 @@ mod tests {
         let subaccount = [0x11; 20];
         let order = perp_order(subaccount, 3, 42);
         let index_key = active_perp_orders_storage_key(subaccount);
-        let order_key = perp_order_info_storage_key(subaccount, order.order_id);
+        let order_key = perp_order_info_storage_key(subaccount, order.0.order_id);
         let encoded_index = format!(
             "0x{}",
             hex::encode(
-                BTreeMap::from([(order.market_id, vec![active_perp_order_index_entry(&order)],)])
-                    .encode(),
+                BTreeMap::from([(
+                    order.0.market_id,
+                    vec![active_perp_order_index_entry(&order)],
+                )])
+                .encode(),
             ),
         );
         let encoded_order = format!("0x{}", hex::encode(order.encode()));
@@ -7991,10 +7298,12 @@ mod tests {
         let pair = [0x22; 32];
         let order = spot_order(subaccount, pair, 42);
         let index_key = active_spot_orders_storage_key(subaccount);
-        let order_key = spot_order_info_storage_key(subaccount, order.order_id);
+        let order_key = spot_order_info_storage_key(subaccount, order.0.order_id);
         let encoded_index = format!(
             "0x{}",
-            hex::encode(BTreeMap::from([(pair, vec![(order.order_id, order.is_buy)])]).encode()),
+            hex::encode(
+                BTreeMap::from([(pair, vec![(order.0.order_id, order.0.is_buy)])]).encode()
+            ),
         );
         let encoded_order = format!("0x{}", hex::encode(order.encode()));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -8091,13 +7400,13 @@ mod tests {
         let orders_key = active_perp_orders_storage_key(subaccount);
         let spot_orders_key = active_spot_orders_storage_key(subaccount);
         let spot_active_order = spot_order(subaccount, [0x22; 32], 77);
-        let spot_order_key = spot_order_info_storage_key(subaccount, spot_active_order.order_id);
+        let spot_order_key = spot_order_info_storage_key(subaccount, spot_active_order.0.order_id);
         let spot_order_index = format!(
             "0x{}",
             hex::encode(
                 BTreeMap::from([(
-                    spot_active_order.pair,
-                    vec![(spot_active_order.order_id, spot_active_order.is_buy)],
+                    spot_active_order.0.pair,
+                    vec![(spot_active_order.0.order_id, spot_active_order.0.is_buy)],
                 )])
                 .encode(),
             ),
@@ -8991,7 +8300,7 @@ mod tests {
                 }
             }),
         );
-        let client = BlockchainHttpRpcClient::new(spawn_server(router).await, None, None);
+        let client = DeepXRpcClient::new(spawn_server(router).await);
 
         let value: u64 = execute_rpc_read_with_retry(
             &client,
@@ -9020,7 +8329,7 @@ mod tests {
                 }
             }),
         );
-        let client = BlockchainHttpRpcClient::new(spawn_server(router).await, None, None);
+        let client = DeepXRpcClient::new(spawn_server(router).await);
 
         let result = execute_rpc_read_with_retry::<u64>(
             &client,
@@ -9594,50 +8903,49 @@ mod tests {
     fn current_flat_usdc_balance_requires_backend_exact_collateral_and_chain_coverage() {
         use crate::{
             account::map_current_flat_usdc_balance,
-            http::{
-                DeepXSubaccountBalanceAsset, DeepXSubaccountBalances, DeepXSubaccountMarginRatio,
-                models::DeepXExactMargin,
-            },
+            http::{DeepXSubaccountBalances, DeepXSubaccountMarginRatio, models::DeepXExactMargin},
         };
 
         let amount = rust_decimal::Decimal::new(10_000_000, 6);
         let zero = rust_decimal::Decimal::ZERO;
-        let mut balances = DeepXSubaccountBalances {
-            address: format!("0x{}", hex::encode([0x11; 20])),
-            assets: vec![DeepXSubaccountBalanceAsset {
-                symbol: "USDC".to_string(),
-                decimals: 6,
-                price: rust_decimal::Decimal::ONE,
-                balance: amount,
-                balance_usd: amount,
-                balance_borrowed: zero,
-                balance_borrowed_usd: zero,
-                borrow_interest: zero,
-                borrow_interest_usd: zero,
-            }],
-        };
-        let mut margin = DeepXSubaccountMarginRatio {
-            collateral: amount,
-            margin_required: zero,
-            margin_ratio: None,
-            exact_margin: Some(DeepXExactMargin {
-                total_collateral: amount,
-                maint_margin_req: zero,
-                uni_mmr: None,
-            }),
-        };
+        let mut balances =
+            DeepXSubaccountBalances(deepx_rust_sdk::rest::models::DeepXSubaccountBalances {
+                address: format!("0x{}", hex::encode([0x11; 20])),
+                assets: vec![deepx_rust_sdk::rest::models::DeepXSubaccountBalanceAsset {
+                    symbol: "USDC".to_string(),
+                    decimals: 6,
+                    price: rust_decimal::Decimal::ONE,
+                    balance: amount,
+                    balance_usd: amount,
+                    balance_borrowed: zero,
+                    balance_borrowed_usd: zero,
+                    borrow_interest: zero,
+                    borrow_interest_usd: zero,
+                }],
+            });
+        let mut margin =
+            DeepXSubaccountMarginRatio(deepx_rust_sdk::rest::models::DeepXSubaccountMarginRatio {
+                collateral: amount,
+                margin_required: zero,
+                margin_ratio: None,
+                exact_margin: Some(DeepXExactMargin {
+                    total_collateral: amount,
+                    maint_margin_req: zero,
+                    uni_mmr: None,
+                }),
+            });
         let mut current = DeepXCurrentMarginEvidence {
             block_hash: [0x22; 32],
             block_number: 42,
             subaccount: [0x11; 20],
-            initial: DeepXMarginRequirement {
+            initial: DeepXMarginRequirement(DeepXRawMarginRequirement {
                 total_collateral: 10_000_000,
                 total_margin_required: 0,
-            },
-            maintenance: DeepXMarginRequirement {
+            }),
+            maintenance: DeepXMarginRequirement(DeepXRawMarginRequirement {
                 total_collateral: 10_000_000,
                 total_margin_required: 0,
-            },
+            }),
         };
         let mapped = map_current_flat_usdc_balance(&balances, &margin, &current).unwrap();
         balances.assets[0].price = rust_decimal::Decimal::new(2, 0);
@@ -9651,26 +8959,26 @@ mod tests {
         assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
         balances.assets[0].balance_borrowed = zero;
 
-        current.initial.total_margin_required = 1;
+        current.initial.0.total_margin_required = 1;
         assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        current.initial.total_margin_required = 0;
+        current.initial.0.total_margin_required = 0;
 
         margin.exact_margin.as_mut().unwrap().total_collateral =
             rust_decimal::Decimal::new(9_999_999, 6);
         assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
         margin.exact_margin.as_mut().unwrap().total_collateral = amount;
 
-        current.initial.total_collateral = 10_000_001;
-        current.maintenance.total_collateral = 10_000_001;
+        current.initial.0.total_collateral = 10_000_001;
+        current.maintenance.0.total_collateral = 10_000_001;
         assert_eq!(
             map_current_flat_usdc_balance(&balances, &margin, &current).unwrap(),
             mapped,
         );
-        current.initial.total_collateral = 9_999_999;
+        current.initial.0.total_collateral = 9_999_999;
         assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        current.initial.total_collateral = 10_000_000;
+        current.initial.0.total_collateral = 10_000_000;
 
-        current.maintenance.total_collateral = 9_999_999;
+        current.maintenance.0.total_collateral = 9_999_999;
         assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
     }
 }

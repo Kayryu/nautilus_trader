@@ -14,13 +14,23 @@
 
 //! Fail-closed DeepX canonical block and submission-pool observations.
 
-use std::{collections::HashSet, time::Duration};
+use std::collections::HashSet;
 
-use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
+pub use deepx_rust_sdk::rpc::events::{
+    DeepXDelegateAccountChangeKind, DeepXFinalizedDelegateAccountChange,
+    DeepXFinalizedDelegateModeChange, DeepXFinalizedPerpTrade, DeepXFinalizedSpotTrade,
+};
+#[cfg(test)]
+use deepx_rust_sdk::rpc::execute_rpc_read_with_retry;
+use deepx_rust_sdk::rpc::{
+    DeepXRpcBlockHeader as RpcBlockHeader, DeepXRpcBlockResponse as RpcBlockResponse,
+    DeepXRpcClient, DeepXRpcRuntimeVersion as HistoricalRuntimeVersion, get_metadata,
+    get_runtime_version,
+};
 use nautilus_core::hex;
 use parity_scale_codec::{Compact, Decode, Encode};
 use scale_info::{TypeDef, TypeDefPrimitive};
-use serde::Deserialize;
+#[cfg(test)]
 use serde_json::json;
 use subxt_core::{
     config::{Hasher, substrate::BlakeTwo256},
@@ -66,62 +76,21 @@ const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
     "80d41e5e16056765bc8461851072c9d7",
 );
 
-async fn execute_rpc_read_with_retry<T: for<'de> Deserialize<'de>>(
-    client: &BlockchainHttpRpcClient,
-    request: serde_json::Value,
-) -> anyhow::Result<T> {
-    for delay_ms in [250, 500] {
-        match client.execute_rpc_call(request.clone()).await {
-            Ok(value) => return Ok(value),
-            Err(_) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
-        }
-    }
-    client.execute_rpc_call(request).await
-}
-
-async fn execute_optional_rpc_read_with_retry<T: for<'de> Deserialize<'de>>(
-    client: &BlockchainHttpRpcClient,
-    request: serde_json::Value,
-) -> anyhow::Result<Option<T>> {
-    for delay_ms in [250, 500] {
-        match client.execute_optional_rpc_call(request.clone()).await {
-            Ok(Some(value)) => return Ok(Some(value)),
-            Ok(None) | Err(_) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
-        }
-    }
-    client.execute_optional_rpc_call(request).await
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoricalRuntimeVersion {
-    spec_version: u32,
-    transaction_version: u32,
-}
-
 async fn observe_historical_read_only_runtime(
     environment: &DeepXEnvironment,
     genesis_hash: [u8; 32],
     watch_url: &str,
     block_hash: [u8; 32],
 ) -> Result<DeepXReadOnlyRuntimeSnapshot, DeepXHistoricalRuntimeError> {
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let encoded_hash = format!("0x{}", hex::encode(block_hash));
-    let version: HistoricalRuntimeVersion = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getRuntimeVersion", "params": [encoded_hash],
-        }))
+    let version: HistoricalRuntimeVersion = get_runtime_version(&client, &encoded_hash)
         .await
         .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
             method: "state_getRuntimeVersion",
             source,
         })?;
-    let encoded_metadata: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "state_getMetadata", "params": [encoded_hash],
-        }))
+    let encoded_metadata = get_metadata(&client, &encoded_hash)
         .await
         .map_err(|source| DeepXHistoricalRuntimeError::Rpc {
             method: "state_getMetadata",
@@ -190,32 +159,6 @@ impl<T: RuntimeMetadataView + ?Sized> RuntimeMetadataView for &T {
     }
 }
 
-/// Wallet delegate account operation reported by the runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeepXDelegateAccountChangeKind {
-    /// A delegate was created or renewed; the event does not distinguish the two.
-    Set,
-    /// A delegate was removed.
-    Removed,
-}
-
-/// One delegate account change decoded from complete finalized runtime event storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXFinalizedDelegateAccountChange {
-    /// Finalized block identity supplied with the complete event storage value.
-    pub block_hash: [u8; 32],
-    pub block_number: u64,
-    /// Zero-based position in the complete event sequence.
-    pub event_index: u32,
-    /// Extrinsic index attached to the runtime event.
-    pub extrinsic_index: u32,
-    /// Wallet owner and delegate identities emitted by the runtime.
-    pub owner: [u8; 20],
-    pub delegate: [u8; 20],
-    /// Runtime account operation.
-    pub kind: DeepXDelegateAccountChangeKind,
-}
-
 /// Failures decoding complete delegate account event storage.
 #[derive(Debug, Error)]
 pub enum DeepXDelegateAccountEventError {
@@ -256,23 +199,6 @@ pub enum DeepXDelegateAccountVerificationError {
     ConflictingChange,
 }
 
-/// One wallet delegate mode change decoded from complete finalized runtime event storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXFinalizedDelegateModeChange {
-    /// Finalized block identity supplied with the complete event storage value.
-    pub block_hash: [u8; 32],
-    pub block_number: u64,
-    /// Zero-based position in the complete event sequence.
-    pub event_index: u32,
-    /// Extrinsic index attached to the runtime event.
-    pub extrinsic_index: u32,
-    /// Wallet owner and delegate identities emitted by the runtime.
-    pub owner: [u8; 20],
-    pub delegate: [u8; 20],
-    /// Runtime mode after the update.
-    pub mode: DeepXDelegateMode,
-}
-
 /// Failures decoding complete delegate-mode event storage.
 #[derive(Debug, Error)]
 pub enum DeepXDelegateModeEventError {
@@ -311,76 +237,6 @@ pub enum DeepXDelegateModeVerificationError {
     /// The mode-change event differs from the expected wallet, delegate, or mode.
     #[error("DeepX delegate mode change conflicts with expected terms")]
     ConflictingChange,
-}
-
-/// One perpetual execution decoded from complete finalized runtime event storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXFinalizedPerpTrade {
-    /// Finalized block hash supplied with the complete event storage value.
-    pub block_hash: [u8; 32],
-    /// Finalized block number supplied with the complete event storage value.
-    pub block_number: u64,
-    /// Zero-based position in the complete `System.Events` value.
-    pub event_index: u32,
-    /// Runtime perpetual market ID.
-    pub market_id: u16,
-    /// Buyer order ID.
-    pub buyer_order_id: u64,
-    /// Buyer account.
-    pub buyer: [u8; 20],
-    /// Seller order ID.
-    pub seller_order_id: u64,
-    /// Seller account.
-    pub seller: [u8; 20],
-    /// Raw runtime price before market-specific scale conversion.
-    pub price: u128,
-    /// Raw runtime size before market-specific scale conversion.
-    pub size: u128,
-    /// Raw buyer leverage.
-    pub buyer_leverage: u64,
-    /// Raw seller leverage.
-    pub seller_leverage: u64,
-    /// Runtime filled-direction variant.
-    pub filled_direction: String,
-    /// Runtime taker variant.
-    pub taker: String,
-    /// Raw signed taker fee in the runtime quote asset's atomic units.
-    pub taker_fee: i128,
-    /// Raw signed maker fee in the runtime quote asset's atomic units.
-    pub maker_fee: i128,
-    /// Runtime fee asset bytes; both event fee assets must agree.
-    pub fee_asset: Vec<u8>,
-}
-
-/// One Spot execution decoded from complete finalized runtime event storage.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXFinalizedSpotTrade {
-    /// Finalized block hash supplied with complete event storage.
-    pub block_hash: [u8; 32],
-    /// Finalized block number supplied with complete event storage.
-    pub block_number: u64,
-    /// Zero-based index in complete `System.Events`.
-    pub event_index: u32,
-    /// Deployment-provided Spot pair identity.
-    pub pair: [u8; 32],
-    /// Buyer account and order ID.
-    pub buyer: [u8; 20],
-    pub buy_id: u64,
-    /// Seller account and order ID.
-    pub seller: [u8; 20],
-    pub sell_id: u64,
-    /// Gross quote and base quantities in raw atomic units.
-    pub trade_amount_u: [u8; 32],
-    pub trade_amount_b: [u8; 32],
-    /// Buyer or seller taker role.
-    pub taker: String,
-    /// Signed taker and maker balance fees in their respective received assets.
-    pub taker_fee: i128,
-    pub taker_fee_asset: Vec<u8>,
-    pub maker_fee: i128,
-    pub maker_fee_asset: Vec<u8>,
-    /// Runtime price in six-decimal quote units.
-    pub price: [u8; 32],
 }
 
 /// Failures decoding complete Spot trade event storage.
@@ -1863,15 +1719,10 @@ pub async fn observe_finalized_perp_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let read_hash = || async {
         let encoded: Option<String> = client
-            .execute_rpc_call(json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "chain_getBlockHash",
-                "params": [block_number],
-            }))
+            .get_block_hash_at_height(block_number)
             .await
             .map_err(|source| DeepXTransactionWatchError::Rpc {
                 method: "chain_getBlockHash",
@@ -1881,15 +1732,14 @@ pub async fn observe_finalized_perp_trades_at(
     };
     let block_hash = read_hash().await?;
     let encoded_hash = format!("0x{}", hex::encode(block_hash));
-    let header: Option<RpcBlockHeader> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "chain_getHeader", "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+    let header: Option<RpcBlockHeader> =
+        client
+            .get_header_optional(&encoded_hash)
+            .await
+            .map_err(|source| DeepXTransactionWatchError::Rpc {
+                method: "chain_getHeader",
+                source,
+            })?;
     let header = header.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let received = decode_block_number(&header.number)?;
     if received != block_number {
@@ -1991,13 +1841,10 @@ pub async fn observe_finalized_spot_trades_at(
             finalized: finalized.block_number(),
         });
     }
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let read_hash = || async {
         let encoded: Option<String> = client
-            .execute_rpc_call(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "chain_getBlockHash",
-                "params": [block_number],
-            }))
+            .get_block_hash_at_height(block_number)
             .await
             .map_err(|source| DeepXTransactionWatchError::Rpc {
                 method: "chain_getBlockHash",
@@ -2007,15 +1854,14 @@ pub async fn observe_finalized_spot_trades_at(
     };
     let block_hash = read_hash().await?;
     let encoded_hash = format!("0x{}", hex::encode(block_hash));
-    let header: Option<RpcBlockHeader> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "chain_getHeader", "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+    let header: Option<RpcBlockHeader> =
+        client
+            .get_header_optional(&encoded_hash)
+            .await
+            .map_err(|source| DeepXTransactionWatchError::Rpc {
+                method: "chain_getHeader",
+                source,
+            })?;
     let header = header.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let received = decode_block_number(&header.number)?;
     if received != block_number {
@@ -3821,6 +3667,16 @@ pub enum DeepXTransactionWatchError {
     /// The exact finalized block returned malformed system event storage.
     #[error("DeepX system event storage at finalized block {0} was malformed")]
     InvalidEventStorage(u64),
+    /// The exact finalized extrinsic had no unique System dispatch outcome.
+    #[error(
+        "DeepX finalized extrinsic at block {block_number} index {extrinsic_index} has no unique System dispatch outcome"
+    )]
+    MissingSystemDispatch {
+        /// Finalized block containing the exact extrinsic.
+        block_number: u64,
+        /// Index of the exact extrinsic in that block.
+        extrinsic_index: u32,
+    },
     /// Runtime event evidence did not prove the durable perpetual cancellation.
     #[error(transparent)]
     EventVerification(#[from] DeepXPerpCancelEventVerificationError),
@@ -3850,22 +3706,6 @@ pub enum DeepXTransactionWatchError {
     /// Collected canonical evidence did not match the bounded scan plan.
     #[error(transparent)]
     ScanCollection(#[from] DeepXRecoveryScanCollectionError),
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcBlockResponse {
-    block: RpcBlock,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcBlock {
-    header: RpcBlockHeader,
-    extrinsics: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcBlockHeader {
-    number: String,
 }
 
 /// Exact transaction-location observation from one canonical block.
@@ -4116,6 +3956,84 @@ pub async fn observe_finalized_transaction_location(
     ))
 }
 
+/// Reads the unique System dispatch outcome of an exact finalized extrinsic.
+///
+/// The caller supplies a location already verified against a finalized canonical block. Complete
+/// event storage is required, including every thread when the runtime shards `System.Events`.
+///
+/// # Errors
+///
+/// Returns an error for missing or malformed event storage, malformed event decoding, or a missing
+/// or duplicate dispatch outcome at the exact extrinsic index.
+pub async fn observe_finalized_system_dispatch(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    snapshot: &RuntimeSnapshot,
+    location: DeepXFinalizedTransactionLocation,
+) -> Result<DeepXDispatchOutcome, DeepXTransactionWatchError> {
+    let block_number = location.block_number();
+    let event_bytes = fetch_system_events(
+        endpoints.url_for(DeepXRpcRole::Watch),
+        location.block_hash(),
+        block_number,
+    )
+    .await?;
+    decode_finalized_system_dispatch(snapshot, location, &event_bytes)
+}
+
+fn decode_finalized_system_dispatch(
+    snapshot: &RuntimeSnapshot,
+    location: DeepXFinalizedTransactionLocation,
+    event_bytes: &[u8],
+) -> Result<DeepXDispatchOutcome, DeepXTransactionWatchError> {
+    let block_number = location.block_number();
+    let mut remaining = event_bytes;
+    let declared = Compact::<u32>::decode(&mut remaining)
+        .map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?
+        .0;
+    let mut consumed = event_bytes.len() - remaining.len();
+    let mut count = 0_u32;
+    let mut dispatch = None;
+    let events = Events::<DeepXRuntimeConfig>::decode_from(
+        event_bytes.to_vec(),
+        snapshot.metadata().clone(),
+    );
+    for event in events.iter() {
+        let event =
+            event.map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?;
+        count = count
+            .checked_add(1)
+            .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
+                block_number,
+            ))?;
+        consumed += event.bytes().len();
+        if event.phase() != Phase::ApplyExtrinsic(location.extrinsic_index())
+            || event.pallet_name() != "System"
+        {
+            continue;
+        }
+        let outcome = match event.variant_name() {
+            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
+            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
+            _ => continue,
+        };
+        if dispatch.replace(outcome).is_some() {
+            return Err(DeepXTransactionWatchError::MissingSystemDispatch {
+                block_number,
+                extrinsic_index: location.extrinsic_index(),
+            });
+        }
+    }
+    if count != declared || consumed != event_bytes.len() {
+        return Err(DeepXTransactionWatchError::InvalidEventStorage(
+            block_number,
+        ));
+    }
+    dispatch.ok_or(DeepXTransactionWatchError::MissingSystemDispatch {
+        block_number,
+        extrinsic_index: location.extrinsic_index(),
+    })
+}
+
 /// Exact transaction-membership observation from the submission node pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeepXPoolObservation {
@@ -4158,32 +4076,22 @@ impl DeepXFinalizedRecoveryCheckpoint {
 async fn observe_finalized_checkpoint_at(
     endpoint_url: &str,
 ) -> Result<DeepXFinalizedRecoveryCheckpoint, DeepXTransactionWatchError> {
-    let client = BlockchainHttpRpcClient::new(endpoint_url.to_string(), None, None);
-    let encoded_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getFinalizedHead",
-            "params": [],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
+    let client = DeepXRpcClient::new(endpoint_url.to_string());
+    let encoded_hash = client.get_finalized_head_once().await.map_err(|source| {
+        DeepXTransactionWatchError::Rpc {
             method: "chain_getFinalizedHead",
             source,
-        })?;
+        }
+    })?;
     let block_hash = decode_hash(&encoded_hash)?;
-    let header: Option<RpcBlockHeader> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getHeader",
-            "params": [encoded_hash],
-        }))
-        .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "chain_getHeader",
-            source,
-        })?;
+    let header: Option<RpcBlockHeader> =
+        client
+            .get_header_optional(&encoded_hash)
+            .await
+            .map_err(|source| DeepXTransactionWatchError::Rpc {
+                method: "chain_getHeader",
+                source,
+            })?;
     let header = header.ok_or(DeepXTransactionWatchError::FinalizedHeaderUnavailable)?;
     Ok(DeepXFinalizedRecoveryCheckpoint {
         block_number: decode_block_number(&header.number)?,
@@ -4228,38 +4136,24 @@ async fn observe_canonical_block_at(
     block_number: u64,
     target_extrinsic_hash: [u8; 32],
 ) -> Result<DeepXCanonicalBlockObservation, DeepXTransactionWatchError> {
-    let client = BlockchainHttpRpcClient::new(endpoint_url.to_string(), None, None);
-    let encoded_hash: Option<String> = execute_optional_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlockHash",
-            "params": [block_number],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "chain_getBlockHash",
-        source,
-    })?;
+    let client = DeepXRpcClient::new(endpoint_url.to_string());
+    let encoded_hash = client
+        .get_block_hash_at_height_with_retry(block_number)
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
     let encoded_hash =
         encoded_hash.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let block_hash = decode_hash(&encoded_hash)?;
-    let response: Option<RpcBlockResponse> = execute_optional_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlock",
-            "params": [encoded_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "chain_getBlock",
-        source,
-    })?;
+    let response: Option<RpcBlockResponse> = client
+        .get_block_optional_with_retry(&encoded_hash)
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getBlock",
+            source,
+        })?;
     let response = response.ok_or(DeepXTransactionWatchError::BlockUnavailable(block_number))?;
     let observed_number = decode_block_number(&response.block.header.number)?;
     if observed_number != block_number {
@@ -4691,21 +4585,14 @@ async fn collect_finalized_recovery_scan_inner(
         ));
     }
 
-    let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
-    let encoded_checkpoint_hash: Option<String> = execute_optional_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getBlockHash",
-            "params": [last_scanned_block],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "chain_getBlockHash",
-        source,
-    })?;
+    let client = DeepXRpcClient::new(recovery_url.to_string());
+    let encoded_checkpoint_hash = client
+        .get_block_hash_at_height_with_retry(last_scanned_block)
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getBlockHash",
+            source,
+        })?;
     let encoded_checkpoint_hash = encoded_checkpoint_hash.ok_or(
         DeepXTransactionWatchError::BlockUnavailable(last_scanned_block),
     )?;
@@ -4717,35 +4604,20 @@ async fn collect_finalized_recovery_scan_inner(
             received: observed_checkpoint_hash,
         });
     }
-    let encoded_finalized_hash: String = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getFinalizedHead",
-            "params": [],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "chain_getFinalizedHead",
-        source,
-    })?;
+    let encoded_finalized_hash = deepx_rust_sdk::rpc::get_finalized_head(&client)
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getFinalizedHead",
+            source,
+        })?;
     let finalized_hash = decode_hash(&encoded_finalized_hash)?;
-    let finalized_header: Option<RpcBlockHeader> = execute_optional_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "chain_getHeader",
-            "params": [encoded_finalized_hash],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "chain_getHeader",
-        source,
-    })?;
+    let finalized_header: Option<RpcBlockHeader> = client
+        .get_header_optional_with_retry(&encoded_finalized_hash)
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "chain_getHeader",
+            source,
+        })?;
     let finalized_header =
         finalized_header.ok_or(DeepXTransactionWatchError::FinalizedHeaderUnavailable)?;
     let finalized_block_number = decode_block_number(&finalized_header.number)?;
@@ -4892,7 +4764,7 @@ async fn fetch_system_events(
     block_hash: [u8; 32],
     block_number: u64,
 ) -> Result<Vec<u8>, DeepXTransactionWatchError> {
-    let client = BlockchainHttpRpcClient::new(recovery_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(recovery_url.to_string());
     let block_hash = format!("0x{}", hex::encode(block_hash));
     let encoded = fetch_storage_value(&client, SYSTEM_EVENTS_STORAGE_KEY, &block_hash).await?;
     if let Some(encoded) = encoded {
@@ -4925,17 +4797,12 @@ async fn fetch_system_events(
 }
 
 async fn fetch_storage_value(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     storage_key: &str,
     block_hash: &str,
 ) -> Result<Option<String>, DeepXTransactionWatchError> {
     client
-        .execute_optional_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "state_getStorage",
-            "params": [storage_key, block_hash],
-        }))
+        .get_storage(storage_key, block_hash)
         .await
         .map_err(|source| DeepXTransactionWatchError::Rpc {
             method: "state_getStorage",
@@ -5046,25 +4913,14 @@ pub async fn observe_submission_pool(
     endpoints: &DeepXValidatedRpcEndpoints,
     target_extrinsic_hash: [u8; 32],
 ) -> Result<DeepXPoolObservation, DeepXTransactionWatchError> {
-    let client = BlockchainHttpRpcClient::new(
-        endpoints.url_for(DeepXRpcRole::Submission).to_string(),
-        None,
-        None,
-    );
-    let extrinsics: Vec<String> = execute_rpc_read_with_retry(
-        &client,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "author_pendingExtrinsics",
-            "params": [],
-        }),
-    )
-    .await
-    .map_err(|source| DeepXTransactionWatchError::Rpc {
-        method: "author_pendingExtrinsics",
-        source,
-    })?;
+    let client = DeepXRpcClient::new(endpoints.url_for(DeepXRpcRole::Submission).to_string());
+    let extrinsics = client
+        .get_pending_extrinsics_with_retry()
+        .await
+        .map_err(|source| DeepXTransactionWatchError::Rpc {
+            method: "author_pendingExtrinsics",
+            source,
+        })?;
 
     Ok(
         if find_extrinsic(&extrinsics, target_extrinsic_hash, "submission pool")?.is_some() {
@@ -5157,6 +5013,7 @@ mod tests {
     use parity_scale_codec::Encode;
     use rstest::rstest;
     use scale_info::{Field, TypeDef, TypeDefPrimitive, Variant};
+    use serde::Deserialize;
     use serde_json::Value;
     use tokio::net::TcpListener;
 
@@ -5242,7 +5099,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let client = BlockchainHttpRpcClient::new(format!("http://{address}"), None, None);
+        let client = DeepXRpcClient::new(format!("http://{address}"));
 
         let value: u64 = execute_rpc_read_with_retry(
             &client,
@@ -6714,6 +6571,49 @@ mod tests {
             bytes.extend_from_slice(record);
         }
         bytes
+    }
+
+    #[rstest]
+    fn finalized_system_dispatch_requires_one_exact_indexed_event() {
+        let snapshot = runtime_snapshot();
+        let location = DeepXFinalizedTransactionLocation {
+            extrinsic_hash: [0x11; 32],
+            block_number: 42,
+            block_hash: [0x22; 32],
+            extrinsic_index: 2,
+        };
+        let success = dispatch_event_record(&snapshot, 2, true);
+        let failed = dispatch_event_record(&snapshot, 2, false);
+        assert_eq!(
+            decode_finalized_system_dispatch(
+                &snapshot,
+                location,
+                &system_events(std::slice::from_ref(&success))
+            )
+            .unwrap(),
+            DeepXDispatchOutcome::Success,
+        );
+        assert_eq!(
+            decode_finalized_system_dispatch(&snapshot, location, &system_events(&[failed]))
+                .unwrap(),
+            DeepXDispatchOutcome::Failed,
+        );
+        for records in [
+            Vec::new(),
+            vec![dispatch_event_record(&snapshot, 1, true)],
+            vec![success.clone(), success],
+        ] {
+            assert!(matches!(
+                decode_finalized_system_dispatch(&snapshot, location, &system_events(&records)),
+                Err(DeepXTransactionWatchError::MissingSystemDispatch { .. }),
+            ));
+        }
+        let mut malformed = system_events(&[dispatch_event_record(&snapshot, 2, true)]);
+        malformed.push(0);
+        assert!(matches!(
+            decode_finalized_system_dispatch(&snapshot, location, &malformed),
+            Err(DeepXTransactionWatchError::InvalidEventStorage(42)),
+        ));
     }
 
     fn delegate_account_event_record(
@@ -9012,20 +8912,22 @@ mod tests {
             trades[0].trade_amount_b[..16],
             1_000_000_000_000_000_000_u128.to_le_bytes()
         );
-        let account_trade = DeepXSpotAccountTradeRecord {
-            id: 42_000_000,
-            order_id: buy_id.to_string(),
-            order_side: "Buy".to_string(),
-            pair: format!("0x{}", hex::encode([0x5a; 32])),
-            pair_name: "ETH/USDC".to_string(),
-            base_amount: "1".parse().unwrap(),
-            quote_amount: "50".parse().unwrap(),
-            price: "50".parse().unwrap(),
-            fee: "-0.01".parse().unwrap(),
-            fee_asset: "ETH".to_string(),
-            taker: "Buyer".to_string(),
-            created_at: "2026-06-18T15:13:14.739Z".to_string(),
-        };
+        let account_trade = DeepXSpotAccountTradeRecord(
+            deepx_rust_sdk::rest::models::DeepXSpotAccountTradeRecord {
+                id: 42_000_000,
+                order_id: buy_id.to_string(),
+                order_side: "Buy".to_string(),
+                pair: format!("0x{}", hex::encode([0x5a; 32])),
+                pair_name: "ETH/USDC".to_string(),
+                base_amount: "1".parse().unwrap(),
+                quote_amount: "50".parse().unwrap(),
+                price: "50".parse().unwrap(),
+                fee: "-0.01".parse().unwrap(),
+                fee_asset: "ETH".to_string(),
+                taker: "Buyer".to_string(),
+                created_at: "2026-06-18T15:13:14.739Z".to_string(),
+            },
+        );
         assert_eq!(
             match_finalized_spot_account_trade(
                 &trades,

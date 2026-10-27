@@ -15,16 +15,15 @@
 
 //! Finalized, read-only SubaccountInfo Spot-margin observation.
 
-use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
-use nautilus_core::hex;
-use serde_json::json;
-use subxt_core::ext::scale_value::{Composite, Value, ValueDef, scale::decode_as_type};
+use deepx_rust_sdk::rpc::{
+    DeepXRpcClient,
+    spot_margin::{DeepXSpotMarginQueryError, get_spot_margin_at_block},
+};
 use thiserror::Error;
 
 use super::{
     DeepXFinalizedCheckpoint, DeepXRpcRole, DeepXRuntimeSnapshotObservationError,
-    DeepXValidatedRpcMethodCapabilities, ObservedStorageChangeSet,
-    observe_approved_finalized_read_only_runtime_snapshot_at, storage_value_key,
+    DeepXValidatedRpcMethodCapabilities, observe_approved_finalized_read_only_runtime_snapshot_at,
 };
 use crate::{
     common::DeepXEnvironment, config::DeepXValidatedRpcEndpoints, signing::ApprovedRuntimeIdentity,
@@ -132,7 +131,7 @@ pub async fn observe_finalized_spot_margin_evidence(
         watch_url.to_string(),
     )
     .await?;
-    let client = BlockchainHttpRpcClient::new(watch_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(watch_url.to_string());
     let enabled = observe_spot_margin_with_client(
         &client,
         observation.checkpoint(),
@@ -151,125 +150,44 @@ pub async fn observe_finalized_spot_margin_evidence(
 }
 
 async fn observe_spot_margin_with_client(
-    client: &BlockchainHttpRpcClient,
+    client: &DeepXRpcClient,
     checkpoint: DeepXFinalizedCheckpoint,
     metadata: &subxt_core::Metadata,
     subaccount: [u8; 20],
     expected_authority: [u8; 20],
 ) -> Result<bool, DeepXFinalizedSpotMarginError> {
-    let block_hash = format!("0x{}", hex::encode(checkpoint.block_hash()));
-    let key = subaccount_info_storage_key(subaccount);
-    let sets: Vec<ObservedStorageChangeSet> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_queryStorageAt",
-            "params": [[key.clone()], block_hash.clone()],
-        }))
-        .await
-        .map_err(DeepXFinalizedSpotMarginError::Rpc)?;
-    let [set] =
-        <[_; 1]>::try_from(sets).map_err(|_| DeepXFinalizedSpotMarginError::InvalidStorage)?;
-    if set.block != block_hash {
-        return Err(DeepXFinalizedSpotMarginError::InvalidStorage);
-    }
-    let [(observed_key, Some(encoded))] = <[_; 1]>::try_from(set.changes)
-        .map_err(|_| DeepXFinalizedSpotMarginError::InvalidStorage)?
-    else {
-        return Err(DeepXFinalizedSpotMarginError::InvalidStorage);
-    };
-    if observed_key != key {
-        return Err(DeepXFinalizedSpotMarginError::InvalidStorage);
-    }
-    let direct: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "state_getStorage",
-            "params": [key, block_hash.clone()],
-        }))
-        .await
-        .map_err(DeepXFinalizedSpotMarginError::Rpc)?;
-    if direct.as_deref() != Some(encoded.as_str()) {
-        return Err(DeepXFinalizedSpotMarginError::InconsistentStorage);
-    }
-    let enabled = decode_spot_margin(metadata, &encoded, subaccount, expected_authority)
-        .ok_or(DeepXFinalizedSpotMarginError::InvalidStorage)?;
-    let canonical: Option<String> = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "chain_getBlockHash",
-            "params": [checkpoint.block_number()],
-        }))
-        .await
-        .map_err(DeepXFinalizedSpotMarginError::Rpc)?;
-    if canonical.as_deref() != Some(block_hash.as_str()) {
-        return Err(DeepXFinalizedSpotMarginError::CanonicalHashMismatch);
-    }
-    Ok(enabled)
-}
-
-fn subaccount_info_storage_key(subaccount: [u8; 20]) -> String {
-    let mut key = storage_value_key(b"Subaccount", b"SubaccountInfo");
-    key.extend_from_slice(&subaccount);
-    format!("0x{}", hex::encode(key))
-}
-
-fn decode_spot_margin(
-    metadata: &subxt_core::Metadata,
-    encoded: &str,
-    subaccount: [u8; 20],
-    expected_authority: [u8; 20],
-) -> Option<bool> {
-    let value_type = metadata
-        .pallet_by_name("Subaccount")?
-        .storage()?
-        .entry_by_name("SubaccountInfo")?
-        .entry_type()
-        .value_ty();
-    let bytes = hex::decode(encoded.strip_prefix("0x")?).ok()?;
-    if bytes.is_empty() || bytes.len() > 4096 {
-        return None;
-    }
-    let mut input = bytes.as_slice();
-    let info = decode_as_type(&mut input, value_type, metadata.types()).ok()?;
-    if !input.is_empty() {
-        return None;
-    }
-    let ValueDef::Composite(Composite::Named(fields)) = &info.value else {
-        return None;
-    };
-    let field = |name| {
-        fields
-            .iter()
-            .find(|(field, _)| field == name)
-            .map(|(_, value)| value)
-    };
-    if scale_account_id20(field("authority")?)? != expected_authority
-        || scale_account_id20(field("address")?)? != subaccount
-    {
-        return None;
-    }
-    field("spot_margin_trading_enabled")?.as_bool()
-}
-
-fn scale_account_id20(value: &Value<u32>) -> Option<[u8; 20]> {
-    let ValueDef::Composite(Composite::Unnamed(items)) = &value.value else {
-        return None;
-    };
-    if let [inner] = items.as_slice() {
-        return scale_account_id20(inner);
-    }
-    let bytes = items
-        .iter()
-        .map(|item| u8::try_from(item.as_u128()?).ok())
-        .collect::<Option<Vec<_>>>()?;
-    bytes.try_into().ok()
+    get_spot_margin_at_block(
+        client,
+        checkpoint.block_hash(),
+        checkpoint.block_number(),
+        metadata,
+        subaccount,
+        expected_authority,
+    )
+    .await
+    .map_err(|e| match e {
+        DeepXSpotMarginQueryError::Rpc(e) => DeepXFinalizedSpotMarginError::Rpc(e),
+        DeepXSpotMarginQueryError::InvalidStorage => DeepXFinalizedSpotMarginError::InvalidStorage,
+        DeepXSpotMarginQueryError::InconsistentStorage => {
+            DeepXFinalizedSpotMarginError::InconsistentStorage
+        }
+        DeepXSpotMarginQueryError::CanonicalHashMismatch => {
+            DeepXFinalizedSpotMarginError::CanonicalHashMismatch
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use axum::{Json, Router, routing::post};
+    use deepx_rust_sdk::rpc::spot_margin::{decode_spot_margin, subaccount_info_storage_key};
     use frame_metadata::{
         RuntimeMetadata, RuntimeMetadataPrefixed,
         v14::{StorageEntryModifier, StorageEntryType},
     };
+    use nautilus_core::hex;
     use parity_scale_codec::Decode;
+    use serde_json::json;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -406,22 +324,24 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::consistent(STORAGE, BLOCK_HASH, None)]
-    #[case::changed_storage("0x00", BLOCK_HASH, Some("storage"))]
+    #[case::consistent(Some(STORAGE), Some(BLOCK_HASH), None)]
+    #[case::changed_storage(Some("0x00"), Some(BLOCK_HASH), Some("storage"))]
+    #[case::missing_storage(None, Some(BLOCK_HASH), Some("storage"))]
+    #[case::missing_canonical_hash(Some(STORAGE), None, Some("canonical"))]
     #[case::changed_canonical_hash(
-        STORAGE,
-        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        Some(STORAGE),
+        Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
         Some("canonical")
     )]
     #[tokio::test]
     async fn finalized_spot_margin_reads_consistent_storage_at_one_hash(
-        #[case] direct_storage: &str,
-        #[case] canonical_hash: &str,
+        #[case] direct_storage: Option<&str>,
+        #[case] canonical_hash: Option<&str>,
         #[case] failure: Option<&str>,
     ) {
         let key = subaccount_info_storage_key(SUBACCOUNT);
-        let direct_storage = direct_storage.to_string();
-        let canonical_hash = canonical_hash.to_string();
+        let direct_storage = direct_storage.map(str::to_string);
+        let canonical_hash = canonical_hash.map(str::to_string);
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<serde_json::Value>| {
@@ -456,7 +376,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = BlockchainHttpRpcClient::new(format!("http://{address}"), None, None);
+        let client = DeepXRpcClient::new(format!("http://{address}"));
         let checkpoint = DeepXFinalizedCheckpoint {
             block_hash: hex::decode_array(BLOCK_HASH.strip_prefix("0x").unwrap()).unwrap(),
             block_number: BLOCK_NUMBER,

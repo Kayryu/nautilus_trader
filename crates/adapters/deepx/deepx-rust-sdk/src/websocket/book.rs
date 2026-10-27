@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use super::public::{DeepXWsPublicChannel, DeepXWsPublicFrame};
-use crate::http::models::exact_decimal;
+use crate::decimal::exact_decimal;
 
 /// A price level in the server's configured, potentially aggregated book.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

@@ -17,10 +17,10 @@
 
 use rust_decimal::Decimal;
 
-use super::error::{DeepXError, Result};
+use crate::error::{DeepXError, Result};
 
 /// Parses the unique decimal spelling of a runtime `u64` order ID, including zero.
-pub(crate) fn parse_canonical_order_id(value: &str) -> Option<u64> {
+pub fn parse_canonical_order_id(value: &str) -> Option<u64> {
     let parsed = value.parse::<u64>().ok()?;
     (parsed.to_string() == value).then_some(parsed)
 }

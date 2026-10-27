@@ -16,103 +16,13 @@
 
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 
+use deepx_rust_sdk::websocket::account::{DeepXWsAccountWireFrame, parse_subaccount_address};
+pub use deepx_rust_sdk::websocket::account::{
+    DeepXWsAllMarket, DeepXWsUserBalancesRequest, DeepXWsUserBalancesSubscription,
+};
 use nautilus_core::UUID4;
-use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 
-use crate::http::{DeepXSubaccountBalances, client::validate_subaccount_balances};
-
-/// The aggregate market identity required by portfolio channels.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeepXWsAllMarket {
-    /// Market kind; account consumers require this to equal `all`.
-    #[serde(rename = "type")]
-    pub kind: String,
-}
-
-/// One address-scoped user-balances subscription.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeepXWsUserBalancesSubscription {
-    channel: DeepXWsAccountChannel,
-    address: String,
-}
-
-impl DeepXWsUserBalancesSubscription {
-    fn new(address: &str) -> anyhow::Result<Self> {
-        validate_address(address)?;
-        Ok(Self {
-            channel: DeepXWsAccountChannel::UserBalances,
-            address: address.to_ascii_lowercase(),
-        })
-    }
-
-    /// Returns the subscribed subaccount address.
-    #[must_use]
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DeepXWsAccountChannel {
-    UserBalances,
-}
-
-/// A documented user-balances subscription request for one exact subaccount.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXWsUserBalancesRequest {
-    subscription: DeepXWsUserBalancesSubscription,
-}
-
-impl DeepXWsUserBalancesRequest {
-    /// Creates a read-only user-balances subscription for an AccountId20 subaccount.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `subaccount` is a `0x`-prefixed 20-byte hexadecimal address.
-    pub fn new(subaccount: &str) -> anyhow::Result<Self> {
-        Ok(Self {
-            subscription: DeepXWsUserBalancesSubscription::new(subaccount)?,
-        })
-    }
-
-    /// Returns the canonical lower-case subaccount address.
-    #[must_use]
-    pub fn subaccount(&self) -> &str {
-        self.subscription.address()
-    }
-
-    /// Serializes the documented aggregate-market subscription with compression disabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the validated request cannot be serialized.
-    pub fn to_text(&self) -> anyhow::Result<String> {
-        #[derive(Serialize)]
-        struct Request<'a> {
-            action: &'static str,
-            market: DeepXWsAllMarket,
-            subscriptions: [&'a DeepXWsUserBalancesSubscription; 1],
-            options: Options,
-        }
-        #[derive(Serialize)]
-        struct Options {
-            compress: bool,
-        }
-
-        Ok(serde_json::to_string(&Request {
-            action: "subscribe",
-            market: DeepXWsAllMarket {
-                kind: "all".to_string(),
-            },
-            subscriptions: [&self.subscription],
-            options: Options { compress: false },
-        })?)
-    }
-}
+use crate::http::DeepXSubaccountBalances;
 
 /// Schema-validated frames for one DeepX user-balances subscription.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,75 +101,28 @@ impl DeepXWsAccountFrame {
     ///
     /// Returns an error for malformed, unsupported, foreign-market, or invalid balance frames.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        #[derive(Deserialize)]
-        struct WireFrame {
-            #[serde(rename = "type")]
-            kind: String,
-            market: Option<DeepXWsAllMarket>,
-            subscriptions: Option<Vec<DeepXWsUserBalancesSubscription>>,
-            message: Option<String>,
-            channel: Option<DeepXWsAccountChannel>,
-            data: Option<Box<RawValue>>,
-            timestamp: Option<u64>,
-            code: Option<String>,
-        }
-
-        fn required<T>(value: Option<T>, name: &str) -> anyhow::Result<T> {
-            value.ok_or_else(|| anyhow::anyhow!("DeepX account frame missing {name}"))
-        }
-
-        let wire: WireFrame = serde_json::from_str(text)?;
-        let frame = match wire.kind.as_str() {
-            "subscribed" => {
-                let subscriptions = required(wire.subscriptions, "subscriptions")?;
-                for subscription in &subscriptions {
-                    validate_address(subscription.address())?;
-                }
-                Self::Subscribed {
-                    market: required(wire.market, "market")?,
-                    subscriptions,
-                    message: required(wire.message, "message")?,
-                }
-            }
-            "data" => {
-                anyhow::ensure!(
-                    wire.channel == Some(DeepXWsAccountChannel::UserBalances),
-                    "unsupported DeepX account data channel"
-                );
-                let raw = required(wire.data, "data")?;
-                let balances: DeepXSubaccountBalances = serde_json::from_str(raw.get())?;
-                let requested = balances.address.clone();
-                validate_address(&requested)?;
-                validate_subaccount_balances(&balances, &requested)?;
-                let timestamp = required(wire.timestamp, "timestamp")?;
-                anyhow::ensure!(
-                    timestamp > 0 && i64::try_from(timestamp).is_ok(),
-                    "invalid DeepX account frame timestamp"
-                );
-                Self::UserBalances {
-                    market: required(wire.market, "market")?,
-                    balances,
-                    timestamp,
-                }
-            }
-            "pong" => Self::Pong {
-                timestamp: required(wire.timestamp, "timestamp")?,
+        Ok(match DeepXWsAccountWireFrame::parse(text)? {
+            DeepXWsAccountWireFrame::Subscribed {
+                market,
+                subscriptions,
+                message,
+            } => Self::Subscribed {
+                market,
+                subscriptions,
+                message,
             },
-            "error" => Self::Error {
-                code: required(wire.code, "code")?,
-                message: required(wire.message, "message")?,
+            DeepXWsAccountWireFrame::UserBalances {
+                market,
+                balances,
+                timestamp,
+            } => Self::UserBalances {
+                market,
+                balances: DeepXSubaccountBalances(balances),
+                timestamp,
             },
-            _ => anyhow::bail!("unsupported DeepX account frame type"),
-        };
-        let market = match &frame {
-            Self::Subscribed { market, .. } | Self::UserBalances { market, .. } => Some(market),
-            Self::Pong { .. } | Self::Error { .. } => None,
-        };
-        anyhow::ensure!(
-            market.is_none_or(|market| market.kind == "all"),
-            "DeepX account frame is not aggregate-market scoped"
-        );
-        Ok(frame)
+            DeepXWsAccountWireFrame::Pong { timestamp } => Self::Pong { timestamp },
+            DeepXWsAccountWireFrame::Error { code, message } => Self::Error { code, message },
+        })
     }
 }
 
@@ -336,7 +199,7 @@ impl DeepXWsAccountConnection {
             Ok(Ok(())) => {
                 let subscription = DeepXWsConfirmedAccountSubscription {
                     owner_id: self.owner_id,
-                    subaccount: parse_address(&expected)?,
+                    subaccount: parse_subaccount_address(&expected)?,
                 };
                 self.confirmed_subaccount = Some(expected);
                 self.confirmed_subscription = Some(subscription);
@@ -519,25 +382,10 @@ fn validate_ack(frame: &DeepXWsAccountFrame, expected: &str) -> anyhow::Result<(
     anyhow::ensure!(
         market.kind == "all"
             && subscriptions.len() == 1
-            && subscriptions[0].channel == DeepXWsAccountChannel::UserBalances
-            && subscriptions[0].address.eq_ignore_ascii_case(expected),
+            && subscriptions[0].address().eq_ignore_ascii_case(expected),
         "DeepX account subscription acknowledgement conflicts with pending intent"
     );
     Ok(())
-}
-
-fn validate_address(address: &str) -> anyhow::Result<()> {
-    parse_address(address).map(|_| ())
-}
-
-fn parse_address(address: &str) -> anyhow::Result<[u8; 20]> {
-    anyhow::ensure!(
-        address.len() == 42
-            && address.starts_with("0x")
-            && address.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit),
-        "DeepX user-balances subscription requires a 20-byte hex subaccount address"
-    );
-    Ok(nautilus_core::hex::decode_array::<20>(&address[2..])?)
 }
 
 #[cfg(test)]

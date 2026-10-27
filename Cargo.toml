@@ -11,6 +11,7 @@ members = [
   "crates/adapters/coinbase",
   "crates/adapters/databento",
   "crates/adapters/deepx",
+  "crates/adapters/deepx/deepx-rust-sdk",
   "crates/adapters/deribit",
   "crates/adapters/derive",
   "crates/adapters/dydx",
@@ -98,6 +99,7 @@ nautilus-trading = { path = "crates/trading", version = "0.63.0" }
 #
 # Note: default-features = false keeps high-precision selection explicit
 # -----------------------------------------------------------------------------
+deepx-rust-sdk = { path = "crates/adapters/deepx/deepx-rust-sdk", version = "0.63.0" }
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.63.0" }
 nautilus-betfair = { path = "crates/adapters/betfair", version = "0.63.0", default-features = false }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.63.0", default-features = false }

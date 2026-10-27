@@ -16,9 +16,11 @@
 
 use std::{future::Future, num::NonZeroU32};
 
-use nautilus_blockchain::rpc::http::BlockchainHttpRpcClient;
+use deepx_rust_sdk::{
+    rest::{DeepXRestAction, decode_transaction_acknowledgement, encode_transaction_request},
+    rpc::{DeepXRpcClient, SUBMIT_EXTRINSIC_METHOD},
+};
 use nautilus_core::hex;
-use serde_json::json;
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 use thiserror::Error;
 
@@ -45,20 +47,18 @@ pub enum DeepXRestSubmissionError {
     ReconciliationRequired(String),
 }
 
-fn rest_action(
-    operation: &super::DeepXTransactionOperation,
-) -> Option<(&'static str, &'static str)> {
+fn rest_action(operation: &super::DeepXTransactionOperation) -> Option<DeepXRestAction> {
     use super::DeepXTransactionOperation;
     Some(match operation {
-        DeepXTransactionOperation::PerpPlace { .. } => ("Perp", "PlaceOrder"),
-        DeepXTransactionOperation::PerpCancel { .. } => ("Perp", "CancelOrder"),
+        DeepXTransactionOperation::PerpPlace { .. } => DeepXRestAction::PerpPlace,
+        DeepXTransactionOperation::PerpCancel { .. } => DeepXRestAction::PerpCancel,
         DeepXTransactionOperation::PerpModify { .. } => return None,
-        DeepXTransactionOperation::PerpClose { .. } => ("Perp", "ClosePosition"),
+        DeepXTransactionOperation::PerpClose { .. } => DeepXRestAction::PerpClose,
         DeepXTransactionOperation::PerpProfitAndLossPoint { .. } => {
-            ("Perp", "SetProfitAndLossPoint")
+            DeepXRestAction::PerpProfitAndLossPoint
         }
-        DeepXTransactionOperation::SpotPlace { .. } => ("Spot", "PlaceOrder"),
-        DeepXTransactionOperation::SpotCancel { .. } => ("Spot", "CancelOrder"),
+        DeepXTransactionOperation::SpotPlace { .. } => DeepXRestAction::SpotPlace,
+        DeepXTransactionOperation::SpotCancel { .. } => DeepXRestAction::SpotCancel,
     })
 }
 
@@ -67,23 +67,10 @@ fn verify_rest_acknowledgement(
     bytes: &[u8],
     expected_hash: [u8; 32],
 ) -> Result<DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError> {
-    use crate::http::models::DeepXApiResponse;
     let uncertain = |e: String| DeepXRestSubmissionError::ReconciliationRequired(e);
-    let response: DeepXApiResponse<serde_json::Value> =
-        serde_json::from_slice(body).map_err(|e| uncertain(e.to_string()))?;
-    if response.fail || !response.code.is_success() {
-        // Runtime failures may already be included and consume the timestamp nonce
-        return Err(uncertain(format!(
-            "backend code {}: {}",
-            response.code, response.msg
-        )));
-    }
-    let encoded = response
-        .data
-        .get("tx_hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| uncertain("missing transaction hash".to_string()))?;
-    let node_hash = decode_node_hash(encoded).map_err(|e| uncertain(e.to_string()))?;
+    let response =
+        decode_transaction_acknowledgement(body).map_err(|e| uncertain(e.to_string()))?;
+    let node_hash = decode_node_hash(&response.tx_hash).map_err(|e| uncertain(e.to_string()))?;
     verify_submission_hash(bytes, expected_hash, node_hash)
         .map_err(|e| uncertain(e.to_string()))?;
     Ok(DeepXRestSubmissionAcknowledgement {
@@ -123,7 +110,7 @@ pub async fn submit_rest_transaction_once(
     let operation = prepared.record().identity().operation().ok_or_else(|| {
         DeepXRestSubmissionError::NotSent("missing durable operation".to_string())
     })?;
-    let (market_type, action) = rest_action(operation).ok_or_else(|| {
+    let action = rest_action(operation).ok_or_else(|| {
         DeepXRestSubmissionError::NotSent(
             "perpetual modification has no documented REST transact action".to_string(),
         )
@@ -131,12 +118,8 @@ pub async fn submit_rest_transaction_once(
     let (bytes, expected_hash) = prepared.into_permit().into_payload();
     verify_submission_hash(&bytes, expected_hash, expected_hash)
         .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
-    let body = serde_json::to_vec(&json!({
-        "marketType": market_type,
-        "action": action,
-        "signedExtrinsic": format!("0x{}", hex::encode(&bytes)),
-    }))
-    .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
+    let body = encode_transaction_request(action, &bytes)
+        .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
     runtime_permit
         .ensure_active()
         .map_err(|e| DeepXRestSubmissionError::NotSent(e.to_string()))?;
@@ -152,9 +135,6 @@ pub async fn submit_rest_transaction_once(
     }
     verify_rest_acknowledgement(&response.body, &bytes, expected_hash)
 }
-
-/// JSON-RPC method used to submit a signed DeepX extrinsic exactly once.
-const SUBMIT_EXTRINSIC_METHOD: &str = "author_submitExtrinsic";
 
 /// Errors raised while submitting one signed DeepX extrinsic.
 #[derive(Debug, Error)]
@@ -509,14 +489,9 @@ async fn submit_encoded_extrinsic_hash_once(
     submission_url: &str,
     bytes: &[u8],
 ) -> Result<[u8; 32], DeepXSubmissionError> {
-    let client = BlockchainHttpRpcClient::new(submission_url.to_string(), None, None);
+    let client = DeepXRpcClient::new(submission_url.to_string());
     let encoded_hash: String = client
-        .execute_rpc_call(json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": SUBMIT_EXTRINSIC_METHOD,
-            "params": [format!("0x{}", hex::encode(bytes))],
-        }))
+        .submit_encoded_extrinsic(&format!("0x{}", hex::encode(bytes)))
         .await
         .map_err(|source| DeepXSubmissionError::Rpc {
             method: SUBMIT_EXTRINSIC_METHOD,
@@ -551,7 +526,7 @@ mod tests {
 
     use axum::{Json, Router, routing::post};
     use rstest::rstest;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
     use super::*;

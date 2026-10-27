@@ -18,11 +18,10 @@
 use std::fmt::{Debug, Formatter};
 
 use alloy::signers::{SignerSync, local::PrivateKeySigner};
-use nautilus_core::hex;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::common::DeepXPrivateKey;
+use crate::credential::DeepXPrivateKey;
 
 /// Exact signed fields for the documented quota-claim request.
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -102,10 +101,12 @@ pub fn sign_quota_claim(
     wallet: &str,
     idempotency_key: &str,
 ) -> Result<DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError> {
-    let wallet_bytes = wallet
+    let wallet = wallet
         .strip_prefix("0x")
-        .and_then(|value| hex::decode_array::<20>(value).ok())
         .ok_or(DeepXQuotaClaimSigningError::InvalidWallet)?;
+    let mut wallet_bytes = [0_u8; 20];
+    hex::decode_to_slice(wallet, &mut wallet_bytes)
+        .map_err(|_| DeepXQuotaClaimSigningError::InvalidWallet)?;
     if idempotency_key.is_empty()
         || idempotency_key.len() > 160
         || idempotency_key.chars().any(char::is_control)
@@ -136,7 +137,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::common::DeepXKeyScheme;
+    use crate::credential::DeepXKeyScheme;
 
     fn test_key() -> DeepXPrivateKey {
         DeepXPrivateKey::new(
@@ -183,7 +184,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             recovered.as_slice(),
-            hex::decode_array::<20>(&signed.wallet()[2..]).unwrap()
+            hex::decode(&signed.wallet()[2..]).unwrap()
         );
     }
 
@@ -222,7 +223,7 @@ mod tests {
         );
         assert_ne!(
             recovered.as_slice(),
-            &hex::decode_array::<20>(&signed.wallet()[2..]).unwrap()
+            hex::decode(&signed.wallet()[2..]).unwrap().as_slice()
         );
     }
 

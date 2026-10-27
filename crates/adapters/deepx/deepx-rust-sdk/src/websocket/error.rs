@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Errors for DeepX WebSocket protocol state.
+//! Errors for DeepX WebSocket frames and protocol state.
 
 use thiserror::Error;
 

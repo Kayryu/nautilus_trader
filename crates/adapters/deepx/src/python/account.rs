@@ -206,7 +206,11 @@ impl DeepXSubaccountBalances {
 
     #[getter]
     fn assets(&self) -> Vec<DeepXSubaccountBalanceAsset> {
-        self.assets.clone()
+        self.assets
+            .iter()
+            .cloned()
+            .map(DeepXSubaccountBalanceAsset)
+            .collect()
     }
 }
 

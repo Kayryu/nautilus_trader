@@ -41,7 +41,7 @@ impl DeepXWsFrame {
     /// Returns [`DeepXWsError::InvalidJsonFrame`] when `text` is not valid JSON.
     pub fn parse(text: &str) -> Result<Self, DeepXWsError> {
         let value: Value = serde_json::from_str(text)
-            .map_err(|error| DeepXWsError::InvalidJsonFrame(error.to_string()))?;
+            .map_err(|e| DeepXWsError::InvalidJsonFrame(e.to_string()))?;
         let id = value
             .as_object()
             .and_then(|object| object.get("id"))

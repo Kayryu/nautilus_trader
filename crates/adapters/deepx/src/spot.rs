@@ -17,10 +17,10 @@
 
 use std::sync::Arc;
 
-use alloy::{
-    primitives::{Address, FixedBytes},
-    sol,
-    sol_types::SolCall,
+use alloy::primitives::Address;
+pub use deepx_rust_sdk::rpc::spot_market_spec::DeepXSpotMarketSpec;
+use deepx_rust_sdk::rpc::spot_market_spec::{
+    decode_spot_market_spec_return, encode_spot_market_spec_call,
 };
 use nautilus_blockchain::{
     contracts::base::BaseContract,
@@ -28,27 +28,6 @@ use nautilus_blockchain::{
 };
 use nautilus_core::hex;
 use thiserror::Error;
-
-sol! {
-    struct SpotMarketSpec {
-        uint128 minOrderSize;
-        uint128 tickSize;
-        uint128 stepSize;
-    }
-
-    function getSpotMarketSpec(bytes32 pair) external view returns (SpotMarketSpec);
-}
-
-/// Raw integer Spot order constraints returned by the DeepX precompile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSpotMarketSpec {
-    /// Raw minimum order size.
-    pub min_order_size: u128,
-    /// Raw price tick size.
-    pub tick_size: u128,
-    /// Raw quantity step size.
-    pub step_size: u128,
-}
 
 /// Errors raised while retrieving a raw DeepX Spot market specification.
 #[derive(Debug, Error)]
@@ -90,22 +69,14 @@ impl DeepXSpotMarketSpecClient {
     ) -> Result<DeepXSpotMarketSpec, DeepXSpotMarketSpecError> {
         let pair_bytes = hex::decode_array::<32>(pair.strip_prefix("0x").unwrap_or(pair))
             .map_err(|_| DeepXSpotMarketSpecError::InvalidPair(pair.to_string()))?;
-        let call_data = getSpotMarketSpecCall {
-            pair: FixedBytes::from(pair_bytes),
-        }
-        .abi_encode();
+        let call_data = encode_spot_market_spec_call(pair_bytes);
         let response = self
             .contract
             .execute_call(&self.precompile_address, &call_data, None)
             .await?;
-        let decoded = getSpotMarketSpecCall::abi_decode_returns(&response)
+        let decoded = decode_spot_market_spec_return(&response)
             .map_err(|error| BlockchainRpcClientError::AbiDecodingError(error.to_string()))?;
-
-        Ok(DeepXSpotMarketSpec {
-            min_order_size: decoded.minOrderSize,
-            tick_size: decoded.tickSize,
-            step_size: decoded.stepSize,
-        })
+        Ok(decoded)
     }
 }
 

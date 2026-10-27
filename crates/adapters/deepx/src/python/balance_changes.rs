@@ -151,7 +151,7 @@ impl DeepXBalanceChangeRecord {
 
     #[getter]
     fn position(&self) -> Option<DeepXBalanceChangePosition> {
-        self.position.clone()
+        self.position.clone().map(DeepXBalanceChangePosition)
     }
 }
 

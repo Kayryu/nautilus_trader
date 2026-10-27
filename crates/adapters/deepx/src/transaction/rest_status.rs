@@ -17,26 +17,14 @@
 
 use std::{num::NonZeroU32, time::Duration};
 
-use nautilus_core::hex;
-use serde::Deserialize;
+pub use deepx_rust_sdk::rest::status::DeepXRestTransactionConfirmation;
+use deepx_rust_sdk::rest::status::parse_transaction_status as parse_sdk_transaction_status;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::{
     DeepXHttpClient, DeepXHttpError, Result, models::DeepXResponseCode, should_retry_http_error,
 };
-
-/// Documented backend confirmation states, none of which proves canonical finality.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DeepXRestTransactionConfirmation {
-    /// Backend accepted the transaction but is still reconciling its best-block events.
-    Pending,
-    /// Backend decoded an action result from its current best-chain observation.
-    Best,
-    /// Backend reports successful execution but exhausted action-result decoding retries.
-    DecodeFailed,
-}
 
 /// Hash-bound backend observation, not canonical inclusion or business-event evidence.
 #[derive(Clone, Debug)]
@@ -243,62 +231,21 @@ async fn poll_status_attempts(
     DeepXRestStatusPollTermination::AttemptLimit
 }
 
-#[derive(Deserialize)]
-struct TransactionStatusData {
-    tx_hash: String,
-    #[serde(default)]
-    order_id: String,
-    confirmation: DeepXRestTransactionConfirmation,
-    status: Option<String>,
-}
-
 fn parse_transaction_status(
     data: Box<RawValue>,
     expected_hash: [u8; 32],
 ) -> Result<DeepXRestTransactionStatus> {
-    let invalid = |message: String| DeepXHttpError::InvalidTransactionStatus { message };
-    let decoded: TransactionStatusData =
-        serde_json::from_str(data.get()).map_err(|e| invalid(e.to_string()))?;
-    let extrinsic_hash = decoded
-        .tx_hash
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode_array::<32>(value).ok())
-        .ok_or_else(|| invalid("tx_hash must be a 0x-prefixed 32-byte hash".to_string()))?;
-
-    if extrinsic_hash != expected_hash {
-        return Err(invalid(format!(
-            "transaction hash mismatch: expected 0x{}, received {}",
-            hex::encode(expected_hash),
-            decoded.tx_hash,
-        )));
-    }
-    let order_id = if decoded.order_id.is_empty() {
-        None
-    } else {
-        if !decoded.order_id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid(
-                "order_id must be empty or a decimal u64 string".to_string(),
-            ));
+    let decoded = parse_sdk_transaction_status(data, expected_hash).map_err(|e| {
+        DeepXHttpError::InvalidTransactionStatus {
+            message: e.to_string(),
         }
-        Some(
-            decoded
-                .order_id
-                .parse::<u64>()
-                .map_err(|e| invalid(e.to_string()))?,
-        )
-    };
-
-    if decoded.confirmation != DeepXRestTransactionConfirmation::Best && order_id.is_some() {
-        return Err(invalid(
-            "pending/decode_failed result must have an empty order_id".to_string(),
-        ));
-    }
+    })?;
     Ok(DeepXRestTransactionStatus {
-        extrinsic_hash,
+        extrinsic_hash: decoded.extrinsic_hash,
         confirmation: decoded.confirmation,
-        order_id,
-        backend_status: decoded.status,
-        data,
+        order_id: decoded.order_id,
+        backend_status: decoded.backend_status,
+        data: decoded.data,
     })
 }
 
@@ -315,6 +262,7 @@ mod tests {
         http::StatusCode,
         routing::{get, post},
     };
+    use nautilus_core::hex;
     use nautilus_network::retry::RetryConfig;
     use rstest::rstest;
     use serde_json::{Value, json};

@@ -25,14 +25,17 @@ use std::{
 };
 
 use alloy::primitives::U256;
-use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_network::{
-    http::{HttpClient, HttpRedirectPolicy, Method},
-    retry::{RetryConfig, RetryManager},
+use deepx_rust_sdk::{
+    query::DEEPX_MAX_HISTORY_PAGE_SIZE,
+    rest::{
+        DeepXLiquidationExecutionRoute, DeepXRestError, DeepXRestResponse, DeepXRestTransport,
+        models::{DeepXInvitationStatusWire, DeepXQuotaClaimIdentity},
+    },
 };
+use nautilus_core::time::get_atomic_clock_realtime;
+use nautilus_network::retry::{RetryConfig, RetryManager};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::value::RawValue;
+use serde::de::DeserializeOwned;
 
 use super::{
     error::{DeepXHttpError, Result},
@@ -90,90 +93,134 @@ use crate::{
     signing::derive_signer_account_id,
 };
 
+#[cfg(test)]
 const SPOT_MARKETS_PATH: &str = "/internal/v1/market/spot/markets";
+#[cfg(test)]
 const SPOT_MARKET_BY_NAME_PATH: &str = "/internal/v1/market/spot/market-by-name";
+#[cfg(test)]
 const SPOT_MARKET_BY_PAIR_PATH: &str = "/internal/v1/market/spot/market-by-pair";
+#[cfg(test)]
 const PERP_MARKETS_PATH: &str = "/internal/v1/market/perp/markets";
+#[cfg(test)]
 const PERP_MARKET_BY_ID_PATH: &str = "/internal/v1/market/perp/market-by-id";
+#[cfg(test)]
 const PERP_MARKET_BY_NAME_PATH: &str = "/internal/v1/market/perp/market-by-name";
+#[cfg(test)]
 const PERP_FUNDING_RATE_PATH: &str = "/internal/v1/market/perp/funding_rate";
+#[cfg(test)]
 const PERP_LONG_SHORT_RATIO_PATH: &str = "/internal/v1/market/perp/long_short_ratio";
+#[cfg(test)]
 const PERP_OPEN_INTEREST_PATH: &str = "/internal/v1/market/perp/open_interest";
+#[cfg(test)]
 const PERP_TRADES_PATH: &str = "/internal/v1/market/perp/trades";
+#[cfg(test)]
 const PERP_CANDLES_PATH: &str = "/internal/v1/market/perp/candles";
-const CANDLE_PAGE_SIZE: u32 = 5_000;
+const CANDLE_PAGE_SIZE: u32 = DEEPX_MAX_HISTORY_PAGE_SIZE;
+#[cfg(test)]
 const PERP_MARK_PRICE_PATH: &str = "/internal/v1/market/perp/mark_price";
+#[cfg(test)]
 const PERP_ORACLE_PRICE_PATH: &str = "/internal/v1/market/perp/oracle_price";
+#[cfg(test)]
 const PERP_VOLUME_PATH: &str = "/internal/v1/market/perp/volume";
+#[cfg(test)]
 const PERP_LAST_PRICE_PATH: &str = "/internal/v1/market/perp/last_price";
+#[cfg(test)]
 const PERP_ORDER_BOOK_PATH: &str = "/internal/v1/market/perp/order-books";
+#[cfg(test)]
 const SPOT_TRADES_PATH: &str = "/internal/v1/market/spot/trades";
+#[cfg(test)]
 const SPOT_CANDLES_PATH: &str = "/internal/v1/market/spot/candles";
+#[cfg(test)]
 const SPOT_LAST_PRICE_PATH: &str = "/internal/v1/market/spot/last_price";
+#[cfg(test)]
 const SPOT_VOLUME_PATH: &str = "/internal/v1/market/spot/volume";
+#[cfg(test)]
 const SPOT_ORDER_BOOK_PATH: &str = "/internal/v1/market/spot/order-books";
+#[cfg(test)]
 const LENDING_ASSETS_PATH: &str = "/internal/v1/market/lending/assets";
+#[cfg(test)]
 const LENDING_INTEREST_RATE_PATH: &str = "/internal/v1/market/lending/interest-rate";
+#[cfg(test)]
 const LENDING_INTEREST_RATE_HISTORY_PATH: &str =
     "/internal/v1/market/lending/interest-rate-history";
+#[cfg(test)]
 const LENDING_STATUS_HISTORY_PATH: &str = "/internal/v1/market/lending/status-history";
+#[cfg(test)]
 const PERP_OPEN_ORDERS_PATH: &str = "/internal/v1/account/perp/open-orders";
+#[cfg(test)]
 const PERP_HISTORY_ORDERS_PATH: &str = "/internal/v1/account/perp/history-orders";
+#[cfg(test)]
 const PERP_POSITION_ORDERS_PATH: &str = "/internal/v1/account/perp/position-orders";
+#[cfg(test)]
 const SPOT_OPEN_ORDERS_PATH: &str = "/internal/v1/account/spot/open-orders";
+#[cfg(test)]
 const SPOT_HISTORY_ORDERS_PATH: &str = "/internal/v1/account/spot/history-orders";
+#[cfg(test)]
 const SPOT_ORDER_BY_ID_PATH: &str = "/internal/v1/account/spot/order-by-id";
+#[cfg(test)]
 const SPOT_ORDER_BY_TX_PATH: &str = "/internal/v1/account/spot/order-by-tx";
+#[cfg(test)]
 const SPOT_ACCOUNT_TRADES_PATH: &str = "/internal/v1/account/spot/trades";
+#[cfg(test)]
 const SPOT_WALLET_ORDERS_PATH: &str = "/internal/v1/account/spot/orders-by-wallet";
+#[cfg(test)]
 const SPOT_WALLET_TRADES_PATH: &str = "/internal/v1/account/spot/trades-by-wallet";
+#[cfg(test)]
 const PERP_ACCOUNT_TRADES_PATH: &str = "/internal/v1/account/perp/trades";
+#[cfg(test)]
 const PERP_WALLET_ORDERS_PATH: &str = "/internal/v1/account/perp/orders-by-wallet";
+#[cfg(test)]
 const PERP_WALLET_TRADES_PATH: &str = "/internal/v1/account/perp/trades-by-wallet";
+#[cfg(test)]
 const PERP_FUNDING_FEE_PATH: &str = "/internal/v1/account/funding-fee";
+#[cfg(test)]
 const WALLET_FUNDING_FEE_PATH: &str = "/internal/v1/account/funding-fee-by-wallet";
+#[cfg(test)]
 const HOURLY_UNSETTLED_FUNDING_PATH: &str = "/internal/v1/account/hourly-unsettled-funding";
-const SPOT_ADL_CANDIDATES_PATH: &str = "/internal/v1/adl/spot/candidates";
+#[cfg(test)]
 const PERP_POSITIONS_PATH: &str = "/internal/v1/account/position";
+#[cfg(test)]
 const BALANCE_CHANGES_PATH: &str = "/internal/v1/account/balance-changes";
+#[cfg(test)]
 const LIQUIDATION_RECORDS_PATH: &str = "/internal/v1/account/subaccounts/liquidation-records";
-const LIQUIDATION_ADL_RECORDS_PATH: &str = "/internal/v1/liquidation/adl-records";
+#[cfg(test)]
 const LIQUIDATION_EXECUTION_RECORDS_PATH: &str = "/internal/v1/liquidation/records";
+#[cfg(test)]
 const LIQUIDATION_CRANKER_RECORDS_PATH: &str = "/internal/v1/liquidation/cranker-records";
-const LIQUIDATION_KEEPER_STATE_PATH: &str = "/internal/v1/liquidation/keeper-state";
+#[cfg(test)]
 const LIQUIDATION_TP_SL_RECORDS_PATH: &str = "/internal/v1/liquidation/tp-sl-records";
+#[cfg(test)]
 const PERP_LIQUIDATION_PRICE_PATH: &str = "/internal/v1/account/perp/liquidate-price";
+#[cfg(test)]
 const USER_STATS_PATH: &str = "/internal/v1/account/user-stats";
+#[cfg(test)]
 const QUOTA_SUMMARY_PATH: &str = "/internal/v1/account/quota/summary";
+#[cfg(test)]
 const QUOTA_HISTORY_PATH: &str = "/internal/v1/account/quota/history";
+#[cfg(test)]
 const QUOTA_CLAIM_PATH: &str = "/internal/v1/account/quota/claim";
-const WALLET_SUBACCOUNTS_PATH: &str = "/internal/v1/account/subaccounts";
+#[cfg(test)]
 const ALL_SUBACCOUNTS_PATH: &str = "/internal/v1/account/subaccounts/all";
+#[cfg(test)]
 const SUBACCOUNT_INFO_PATH: &str = "/internal/v1/account/subaccount-info";
+#[cfg(test)]
 const SUBACCOUNT_BALANCES_PATH: &str = "/internal/v1/account/balances";
+#[cfg(test)]
 const SUBACCOUNT_EQUITY_PATH: &str = "/internal/v1/account/equity";
+#[cfg(test)]
 const SUBACCOUNT_MARGIN_RATIO_PATH: &str = "/internal/v1/account/margin-ratio";
+#[cfg(test)]
 const DELEGATE_ACCOUNTS_PATH: &str = "/internal/v1/account/delegate-accounts";
+#[cfg(test)]
 const DELEGATOR_ACCOUNTS_PATH: &str = "/internal/v1/account/delegator-accounts";
-const INVITATION_CHECK_PATH: &str = "/internal/v1/invitation/check";
-const INVITATION_CODE_PATH: &str = "/internal/v1/invitation/invitation-code";
-const PERP_ORDER_BY_TX_PATH: &str = "/internal/v1/account/perp/order-by-tx";
 
 const MAX_ERROR_BODY_CHARS: usize = 1_024;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TransactionStatusQuery {
-    tx_hash: String,
-}
 
 /// Raw client for unauthenticated, idempotent DeepX HTTP reads.
 #[derive(Clone, Debug)]
 pub struct DeepXHttpClient {
-    client: HttpClient,
-    transaction_client: HttpClient,
+    client: DeepXRestTransport,
     base_urls: Arc<[String]>,
-    timeout_secs: Option<u64>,
     retry_manager: Arc<RetryManager<DeepXHttpError>>,
 }
 
@@ -238,20 +285,10 @@ impl DeepXHttpClient {
         if base_urls.is_empty() {
             return Err(DeepXHttpError::InvalidBaseUrl(String::new()));
         }
-        let client = HttpClient::builder()
-            .maybe_timeout_secs(timeout_secs)
-            .maybe_proxy_url(proxy_url.clone())
-            .build()?;
-        let transaction_client = HttpClient::builder()
-            .maybe_timeout_secs(timeout_secs)
-            .maybe_proxy_url(proxy_url)
-            .redirect_policy(HttpRedirectPolicy::Reject)
-            .build()?;
+        let client = DeepXRestTransport::new(timeout_secs, proxy_url)?;
         Ok(Self {
             client,
-            transaction_client,
             base_urls: base_urls.into(),
-            timeout_secs,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
         })
     }
@@ -265,20 +302,10 @@ impl DeepXHttpClient {
     pub(crate) async fn post_transaction_once(
         &self,
         body: Vec<u8>,
-    ) -> std::result::Result<nautilus_network::http::HttpResponse, DeepXHttpError> {
+    ) -> std::result::Result<DeepXRestResponse, DeepXHttpError> {
         Ok(self
-            .transaction_client
-            .post(
-                format!("{}/internal/v1/chain/tx/transact", self.base_url()),
-                None,
-                Some(std::collections::HashMap::from([(
-                    "Content-Type".to_string(),
-                    "application/json".to_string(),
-                )])),
-                Some(body),
-                self.timeout_secs,
-                None,
-            )
+            .client
+            .post_transaction_once(self.base_url(), body)
             .await?)
     }
 
@@ -286,20 +313,10 @@ impl DeepXHttpClient {
         &self,
         extrinsic_hash: [u8; 32],
     ) -> Result<Box<serde_json::value::RawValue>> {
-        let query = TransactionStatusQuery {
-            tx_hash: format!("0x{}", nautilus_core::hex::encode(extrinsic_hash)),
-        };
+        let tx_hash = format!("0x{}", nautilus_core::hex::encode(extrinsic_hash));
         let response = self
-            .transaction_client
-            .request_with_params(
-                Method::GET,
-                format!("{}/internal/v1/chain/tx/status", self.base_url()),
-                Some(&query),
-                None,
-                None,
-                self.timeout_secs,
-                None,
-            )
+            .client
+            .get_transaction_status_once(self.base_url(), &tx_hash)
             .await?;
 
         if !response.status.is_success() {
@@ -357,7 +374,12 @@ impl DeepXHttpClient {
     }
 
     pub(crate) async fn get_spot_market_entries(&self) -> Result<Vec<DeepXSpotMarket>> {
-        let markets = self.get_market_data(SPOT_MARKETS_PATH).await?;
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client.get_spot_markets_raw(&self.base_urls[index])
+            })
+            .await?;
+        let markets: Vec<DeepXSpotMarket> = serde_json::from_str(raw.get())?;
         for market in &markets {
             validate_spot_market("spot markets", market)?;
         }
@@ -371,19 +393,18 @@ impl DeepXHttpClient {
     /// Returns an error for an empty name, transport or venue failures, malformed metadata, an
     /// identity mismatch, or invalid financial fields.
     pub async fn get_spot_market_by_name(&self, name: &str) -> Result<DeepXSpotMarket> {
-        #[derive(Serialize)]
-        struct MarketNameQuery<'a> {
-            name: &'a str,
-        }
-
         if name.trim().is_empty() {
             return Err(DeepXHttpError::InvalidRequest(
                 "spot-market-by-name name must not be empty".to_string(),
             ));
         }
-        let market: DeepXSpotMarket = self
-            .get_json_with_query(SPOT_MARKET_BY_NAME_PATH, &MarketNameQuery { name })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_market_by_name_raw(&self.base_urls[index], name)
+            })
             .await?;
+        let market: DeepXSpotMarket = serde_json::from_str(raw.get())?;
         validate_spot_market("spot market by name", &market)?;
         if market.name != name {
             return Err(DeepXHttpError::InvalidHistoryResponse {
@@ -401,16 +422,15 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid pair, transport or venue failures, malformed metadata, an
     /// identity mismatch, or invalid financial fields.
     pub async fn get_spot_market_by_pair(&self, pair: &str) -> Result<DeepXSpotMarket> {
-        #[derive(Serialize)]
-        struct MarketPairQuery<'a> {
-            pair: &'a str,
-        }
-
         let pair_identity = parse_bytes32_identity("spot-market-by-pair", "pair", pair)?;
         let pair = format!("0x{}", nautilus_core::hex::encode(pair_identity));
-        let market: DeepXSpotMarket = self
-            .get_json_with_query(SPOT_MARKET_BY_PAIR_PATH, &MarketPairQuery { pair: &pair })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_market_by_pair_raw(&self.base_urls[index], &pair)
+            })
             .await?;
+        let market: DeepXSpotMarket = serde_json::from_str(raw.get())?;
         validate_spot_market("spot market by pair", &market)?;
         if decode_bytes32_identity(&market.pair) != Some(pair_identity) {
             return Err(DeepXHttpError::InvalidHistoryResponse {
@@ -427,7 +447,12 @@ impl DeepXHttpClient {
     ///
     /// Returns a typed transport, HTTP status, response decoding, or venue API error.
     pub async fn get_perp_markets(&self) -> Result<Vec<DeepXPerpMarket>> {
-        self.get_market_data(PERP_MARKETS_PATH).await
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client.get_perp_markets_raw(&self.base_urls[index])
+            })
+            .await?;
+        Ok(serde_json::from_str(raw.get())?)
     }
 
     /// Returns validated perpetual market details selected by the deployment market ID.
@@ -440,20 +465,18 @@ impl DeepXHttpClient {
     /// Returns an error for a zero market ID, transport or venue failures, malformed metadata, an
     /// identity mismatch, or invalid financial fields.
     pub async fn get_perp_market_by_id(&self, market_id: u64) -> Result<DeepXPerpMarketLookup> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct MarketIdQuery {
-            market_id: u64,
-        }
-
         if market_id == 0 {
             return Err(DeepXHttpError::InvalidRequest(
                 "perp-market-by-id market ID must be positive".to_string(),
             ));
         }
-        let market: DeepXPerpMarketLookup = self
-            .get_json_with_query(PERP_MARKET_BY_ID_PATH, &MarketIdQuery { market_id })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_market_by_id_raw(&self.base_urls[index], market_id)
+            })
             .await?;
+        let market: DeepXPerpMarketLookup = serde_json::from_str(raw.get())?;
         validate_perp_market_lookup("perp market by id", &market)?;
         if market.id != market_id {
             return Err(DeepXHttpError::InvalidHistoryResponse {
@@ -474,19 +497,18 @@ impl DeepXHttpClient {
     /// Returns an error for an empty name, transport or venue failures, malformed metadata, an
     /// identity mismatch, or invalid financial fields.
     pub async fn get_perp_market_by_name(&self, name: &str) -> Result<DeepXPerpMarketLookup> {
-        #[derive(Serialize)]
-        struct MarketNameQuery<'a> {
-            name: &'a str,
-        }
-
         if name.trim().is_empty() {
             return Err(DeepXHttpError::InvalidRequest(
                 "perp-market-by-name name must not be empty".to_string(),
             ));
         }
-        let market: DeepXPerpMarketLookup = self
-            .get_json_with_query(PERP_MARKET_BY_NAME_PATH, &MarketNameQuery { name })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_market_by_name_raw(&self.base_urls[index], name)
+            })
             .await?;
+        let market: DeepXPerpMarketLookup = serde_json::from_str(raw.get())?;
         validate_perp_market_lookup("perp market by name", &market)?;
         if market.name != name {
             return Err(DeepXHttpError::InvalidHistoryResponse {
@@ -506,7 +528,12 @@ impl DeepXHttpClient {
     /// Returns an error for transport or venue failures, malformed responses, invalid fields, or
     /// duplicate market/asset identities.
     pub async fn get_lending_assets(&self) -> Result<Vec<DeepXLendingAsset>> {
-        let assets: Vec<DeepXLendingAsset> = self.get_market_data(LENDING_ASSETS_PATH).await?;
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client.get_lending_assets_raw(&self.base_urls[index])
+            })
+            .await?;
+        let assets: Vec<DeepXLendingAsset> = serde_json::from_str(raw.get())?;
         validate_lending_assets(&assets)?;
         Ok(assets)
     }
@@ -522,9 +549,13 @@ impl DeepXHttpClient {
         request: &DeepXLendingMarketRequest,
     ) -> Result<Vec<DeepXLendingInterestRateParams>> {
         request.validate()?;
-        let params: Vec<DeepXLendingInterestRateParams> = self
-            .get_json_with_query(LENDING_INTEREST_RATE_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_lending_interest_rate_params_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let params: Vec<DeepXLendingInterestRateParams> = serde_json::from_str(raw.get())?;
         validate_lending_interest_rate_params(&params, request)?;
         Ok(params)
     }
@@ -542,9 +573,13 @@ impl DeepXHttpClient {
         request: &DeepXLendingHistoryRequest,
     ) -> Result<DeepXLendingInterestRateHistory> {
         request.validate()?;
-        let history: DeepXLendingInterestRateHistory = self
-            .get_json_with_query(LENDING_INTEREST_RATE_HISTORY_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_lending_interest_rate_history_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let history: DeepXLendingInterestRateHistory = serde_json::from_str(raw.get())?;
         validate_lending_interest_rate_history(&history.details, request)?;
         Ok(history)
     }
@@ -562,9 +597,13 @@ impl DeepXHttpClient {
         request: &DeepXLendingHistoryRequest,
     ) -> Result<DeepXLendingStatusHistory> {
         request.validate()?;
-        let history: DeepXLendingStatusHistory = self
-            .get_json_with_query(LENDING_STATUS_HISTORY_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_lending_status_history_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let history: DeepXLendingStatusHistory = serde_json::from_str(raw.get())?;
         validate_lending_status_history(&history.details, request)?;
         Ok(history)
     }
@@ -580,10 +619,13 @@ impl DeepXHttpClient {
         request: &DeepXFundingRateRequest,
     ) -> Result<DeepXFundingRatePage> {
         request.validate()?;
-        let query = request.as_query();
-        let page: DeepXFundingRatePage = self
-            .get_json_with_query(PERP_FUNDING_RATE_PATH, &query)
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_funding_rates_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page: DeepXFundingRatePage = serde_json::from_str(raw.get())?;
         validate_response_market_id("perp funding-rate", request.market_id, page.market_id)?;
         validate_cursor_page(
             "perp funding-rate",
@@ -616,7 +658,7 @@ impl DeepXHttpClient {
             )
         })?;
         let page_size = request.limit.unwrap_or(100);
-        if page_size > 5_000 {
+        if page_size > DEEPX_MAX_HISTORY_PAGE_SIZE {
             return Err(DeepXHttpError::InvalidRequest(
                 "funding-rate page size exceeds 5000".to_string(),
             ));
@@ -634,10 +676,15 @@ impl DeepXHttpClient {
             let current_limit =
                 page_size.min(u32::try_from(limit.get() - records.len()).unwrap_or(u32::MAX));
             page_request.limit = Some(current_limit);
-            let query = page_request.as_descending_query();
-            let page: DeepXFundingRatePage = self
-                .get_json_with_query(PERP_FUNDING_RATE_PATH, &query)
+            let raw = self
+                .get_sdk_read_with_retry(|index| {
+                    self.client.get_perp_funding_rates_descending_raw(
+                        &self.base_urls[index],
+                        &page_request,
+                    )
+                })
                 .await?;
+            let page: DeepXFundingRatePage = serde_json::from_str(raw.get())?;
             validate_response_market_id("perp funding-rate", request.market_id, page.market_id)?;
             validate_cursor_page(
                 "perp funding-rate",
@@ -694,10 +741,13 @@ impl DeepXHttpClient {
         request: &DeepXLongShortRatioRequest,
     ) -> Result<DeepXLongShortRatioPage> {
         request.validate()?;
-        let query = request.as_query();
-        let page: DeepXLongShortRatioPage = self
-            .get_json_with_query(PERP_LONG_SHORT_RATIO_PATH, &query)
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_long_short_ratios_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page: DeepXLongShortRatioPage = serde_json::from_str(raw.get())?;
         validate_response_market_id("perp long-short-ratio", request.market_id, page.market_id)?;
         validate_cursor_page(
             "perp long-short-ratio",
@@ -729,7 +779,7 @@ impl DeepXHttpClient {
             )
         })?;
         let page_size = request.limit.unwrap_or(100);
-        if page_size > 5_000 {
+        if page_size > DEEPX_MAX_HISTORY_PAGE_SIZE {
             return Err(DeepXHttpError::InvalidRequest(
                 "long-short-ratio page size exceeds 5000".to_string(),
             ));
@@ -793,10 +843,13 @@ impl DeepXHttpClient {
         request: &DeepXOpenInterestRequest,
     ) -> Result<DeepXOpenInterestPage> {
         request.validate()?;
-        let query = request.as_query();
-        let page = self
-            .get_json_with_query(PERP_OPEN_INTEREST_PATH, &query)
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_open_interest_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page = serde_json::from_str(raw.get())?;
         validate_open_interest_page(&page, request)?;
         Ok(page)
     }
@@ -827,7 +880,7 @@ impl DeepXHttpClient {
             ));
         }
         let page_size = request.limit.unwrap_or(100) as usize;
-        if page_size > 5_000 {
+        if page_size > DEEPX_MAX_HISTORY_PAGE_SIZE as usize {
             return Err(DeepXHttpError::InvalidRequest(
                 "open-interest page size exceeds 5000".to_string(),
             ));
@@ -941,7 +994,13 @@ impl DeepXHttpClient {
         market_id: u64,
         page_size: Option<u32>,
     ) -> Result<DeepXPerpTradesPage> {
-        let page: DeepXPerpTradesPage = self.get_json_with_query(PERP_TRADES_PATH, &query).await?;
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_trades_raw(&self.base_urls[index], query)
+            })
+            .await?;
+        let page: DeepXPerpTradesPage = serde_json::from_str(raw.get())?;
         for trade in &page.items {
             validate_response_market_id("perp trades", market_id, trade.market_id)?;
         }
@@ -1192,9 +1251,13 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotTradesRequest,
     ) -> Result<DeepXSpotTradesPage> {
-        let page: DeepXSpotTradesPage = self
-            .get_json_with_query(SPOT_TRADES_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_trades_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page: DeepXSpotTradesPage = serde_json::from_str(raw.get())?;
         validate_cursor_page("spot trades", page.has_next, page.next_cursor.as_deref())?;
         if request
             .page_size
@@ -1229,9 +1292,13 @@ impl DeepXHttpClient {
         request: &DeepXSpotCandlesRequest,
     ) -> Result<DeepXSpotCandlesPage> {
         request.validate()?;
-        let page = self
-            .get_json_with_query(SPOT_CANDLES_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_candles_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page = serde_json::from_str(raw.get())?;
         validate_spot_candle_page(&page, request)?;
         Ok(page)
     }
@@ -1283,9 +1350,13 @@ impl DeepXHttpClient {
         request: &DeepXSpotVolumeRequest,
     ) -> Result<DeepXSpotVolume> {
         request.validate()?;
-        let volume = self
-            .get_json_with_query(SPOT_VOLUME_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_volume_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let volume = serde_json::from_str(raw.get())?;
         validate_spot_volume(&volume)?;
         Ok(volume)
     }
@@ -1303,9 +1374,13 @@ impl DeepXHttpClient {
         request: &DeepXSpotLastPriceRequest,
     ) -> Result<DeepXSpotLastPrice> {
         request.validate()?;
-        let price: DeepXSpotLastPrice = self
-            .get_json_with_query(SPOT_LAST_PRICE_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_last_price_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let price: DeepXSpotLastPrice = serde_json::from_str(raw.get())?;
         if price.0.is_sign_negative() {
             return Err(DeepXHttpError::InvalidHistoryResponse {
                 endpoint: "spot last price",
@@ -1331,9 +1406,13 @@ impl DeepXHttpClient {
         request: &DeepXSpotOrderBookRequest,
     ) -> Result<DeepXSpotOrderBook> {
         request.validate()?;
-        let book = self
-            .get_json_with_query(SPOT_ORDER_BOOK_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_order_book_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let book = serde_json::from_str(raw.get())?;
         validate_spot_order_book(&book, request)?;
         Ok(book)
     }
@@ -1349,8 +1428,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpCandlesRequest,
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
-        let query = request.as_query();
-        let page = self.get_json_with_query(PERP_CANDLES_PATH, &query).await?;
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_candles_raw(&self.base_urls[index], request)
+            })
+            .await?;
+        let page = serde_json::from_str(raw.get())?;
         validate_candle_page(
             "perp candles",
             &page,
@@ -1405,10 +1489,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpMarkPriceRequest,
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
-        let query = request.as_query();
-        let page = self
-            .get_json_with_query(PERP_MARK_PRICE_PATH, &query)
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_mark_prices_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page = serde_json::from_str(raw.get())?;
         validate_candle_page(
             "perp mark-price",
             &page,
@@ -1463,10 +1550,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpOraclePriceRequest,
     ) -> Result<DeepXPerpCandlesPage> {
         request.validate()?;
-        let query = request.as_query();
-        let page = self
-            .get_json_with_query(PERP_ORACLE_PRICE_PATH, &query)
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_oracle_prices_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let page = serde_json::from_str(raw.get())?;
         validate_candle_page(
             "perp oracle-price",
             &page,
@@ -1521,8 +1611,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpVolumeRequest,
     ) -> Result<DeepXPerpVolume> {
         request.validate()?;
-        let query = request.as_query();
-        self.get_json_with_query(PERP_VOLUME_PATH, &query).await
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_volume_raw(&self.base_urls[index], request)
+            })
+            .await?;
+        Ok(serde_json::from_str(raw.get())?)
     }
 
     /// Returns the raw perpetual last price without assigning observation-time semantics.
@@ -1536,8 +1631,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpLastPriceRequest,
     ) -> Result<DeepXPerpLastPrice> {
         request.validate()?;
-        let query = request.as_query();
-        self.get_json_with_query(PERP_LAST_PRICE_PATH, &query).await
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_last_price_raw(&self.base_urls[index], request)
+            })
+            .await?;
+        Ok(serde_json::from_str(raw.get())?)
     }
 
     /// Returns one exact, potentially price-aggregated perpetual order-book snapshot.
@@ -1555,9 +1655,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpOrderBookRequest,
     ) -> Result<DeepXPerpOrderBook> {
         request.validate()?;
-        let book = self
-            .get_json_with_query(PERP_ORDER_BOOK_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_order_book_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let book = serde_json::from_str(raw.get())?;
         validate_perp_order_book(&book, request)?;
         Ok(book)
     }
@@ -1577,33 +1681,10 @@ impl DeepXHttpClient {
         market_id: u64,
         order_id: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderQuery<'a> {
-            user: &'a str,
-            market_id: u64,
-            oid: &'a str,
-        }
-
-        if user.len() != 42
-            || !user.starts_with("0x")
-            || !user.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
-            || market_id == 0
-            || order_id.trim().is_empty()
-        {
-            return Err(DeepXHttpError::InvalidRequest(
-                "perp-order-by-id requires a 20-byte hex subaccount, positive market_id, and nonempty order_id"
-                    .to_string(),
-            ));
-        }
-        self.get_json_with_query(
-            "/internal/v1/account/perp/order-by-id",
-            &OrderQuery {
-                user,
-                market_id,
-                oid: order_id,
-            },
-        )
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_order_by_id_raw(&self.base_urls[index], user, market_id, order_id)
+        })
         .await
     }
 
@@ -1654,12 +1735,6 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
     /// record fields, or a response that does not identify the requested extrinsic hash.
     pub async fn get_perp_order_by_tx(&self, tx_hash: &str) -> Result<DeepXPerpOrderRecord> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderByTxQuery<'a> {
-            tx_hash: &'a str,
-        }
-
         let expected_hash = tx_hash
             .strip_prefix("0x")
             .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
@@ -1668,9 +1743,13 @@ impl DeepXHttpClient {
                     "perp-order-by-tx requires a 0x-prefixed 32-byte tx_hash".to_string(),
                 )
             })?;
-        let order: DeepXPerpOrderRecord = self
-            .get_json_with_query(PERP_ORDER_BY_TX_PATH, &OrderByTxQuery { tx_hash })
+        let raw: Box<serde_json::value::RawValue> = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_order_by_tx_raw(&self.base_urls[index], tx_hash)
+            })
             .await?;
+        let order: DeepXPerpOrderRecord = serde_json::from_str(raw.get())?;
         validate_perp_order_record_scope(
             "perp order by transaction hash",
             0,
@@ -1707,9 +1786,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotOrderByIdRequest,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        request.validate()?;
-        self.get_json_with_query(SPOT_ORDER_BY_ID_PATH, &request.as_query())
-            .await
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_spot_order_by_id_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns one validated typed Spot order for an exact subaccount, market, side, and order ID.
@@ -1757,12 +1838,6 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid transaction hash, transport or venue failures, malformed
     /// record fields, or a response that does not identify the requested extrinsic hash.
     pub async fn get_spot_order_by_tx(&self, tx_hash: &str) -> Result<DeepXSpotOrderRecord> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderByTxQuery<'a> {
-            tx_hash: &'a str,
-        }
-
         let expected_hash = tx_hash
             .strip_prefix("0x")
             .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
@@ -1771,9 +1846,13 @@ impl DeepXHttpClient {
                     "spot-order-by-tx requires a 0x-prefixed 32-byte tx_hash".to_string(),
                 )
             })?;
-        let order: DeepXSpotOrderRecord = self
-            .get_json_with_query(SPOT_ORDER_BY_TX_PATH, &OrderByTxQuery { tx_hash })
+        let raw: Box<serde_json::value::RawValue> = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_order_by_tx_raw(&self.base_urls[index], tx_hash)
+            })
             .await?;
+        let order: DeepXSpotOrderRecord = serde_json::from_str(raw.get())?;
         validate_spot_order_record(
             "spot order by transaction hash",
             0,
@@ -1815,16 +1894,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpOpenOrdersRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_OPEN_ORDERS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "perp open orders",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_open_orders_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all uninterpreted active perpetual-order pages within an explicit page budget.
@@ -1947,16 +2021,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpHistoryOrdersRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_HISTORY_ORDERS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "perp history orders",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_history_orders_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all historical perpetual order pages within an explicit page budget.
@@ -2079,16 +2148,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpPositionOrdersRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_POSITION_ORDERS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "perp position orders",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_position_orders_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw position-order pages under an explicit page budget.
@@ -2197,16 +2261,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotOpenOrdersRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(SPOT_OPEN_ORDERS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "spot open orders",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_spot_open_orders_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns one validated typed page of active Spot orders for a subaccount and market.
@@ -2329,16 +2388,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotHistoryOrdersRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(SPOT_HISTORY_ORDERS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "spot history orders",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_spot_history_orders_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw historical Spot order pages within an explicit page budget.
@@ -2438,16 +2492,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotAccountTradesRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(SPOT_ACCOUNT_TRADES_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "spot account trades",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_spot_account_trades_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw Spot account-trade pages within an explicit page budget.
@@ -2596,9 +2645,13 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotWalletOrdersRequest,
     ) -> Result<DeepXSpotWalletOrdersPage> {
-        let markets: Vec<DeepXSpotWalletOrderMarket> = self
-            .get_json_with_query(SPOT_WALLET_ORDERS_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_wallet_orders_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let markets: Vec<DeepXSpotWalletOrderMarket> = serde_json::from_str(raw.get())?;
         let (has_next, next_cursor) = normalize_spot_wallet_order_metadata(&markets)?;
         Ok(DeepXSpotWalletOrdersPage {
             markets,
@@ -2675,9 +2728,13 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotWalletTradesRequest,
     ) -> Result<DeepXSpotWalletTradesPage> {
-        let markets: Vec<DeepXSpotWalletTradeMarket> = self
-            .get_json_with_query(SPOT_WALLET_TRADES_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_spot_wallet_trades_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let markets: Vec<DeepXSpotWalletTradeMarket> = serde_json::from_str(raw.get())?;
         let (has_next, next_cursor) = normalize_spot_wallet_trade_metadata(&markets)?;
         Ok(DeepXSpotWalletTradesPage {
             markets,
@@ -2699,16 +2756,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpAccountTradesRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_ACCOUNT_TRADES_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "perp account trades",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_account_trades_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all perpetual account trade pages within an explicit page budget.
@@ -2890,9 +2942,13 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpWalletOrdersRequest,
     ) -> Result<DeepXPerpWalletOrdersPage> {
-        let markets: Vec<DeepXPerpWalletOrderMarket> = self
-            .get_json_with_query(PERP_WALLET_ORDERS_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_wallet_orders_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let markets: Vec<DeepXPerpWalletOrderMarket> = serde_json::from_str(raw.get())?;
         let mut metadata: Option<(bool, Option<String>)> = None;
         for market in &markets {
             if market.subaccounts.is_empty() {
@@ -2959,9 +3015,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpWalletTradesRequest,
     ) -> Result<Vec<DeepXPerpWalletTradeMarket>> {
         request.validate()?;
-        let groups: Vec<DeepXPerpWalletTradeMarket> = self
-            .get_json_with_query(PERP_WALLET_TRADES_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_wallet_trades_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let groups: Vec<DeepXPerpWalletTradeMarket> = serde_json::from_str(raw.get())?;
         let mut markets = HashSet::new();
         let mut trade_ids = HashSet::new();
         for group in &groups {
@@ -3148,16 +3208,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpFundingFeeRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_FUNDING_FEE_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "perp funding fees",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_funding_fees_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all perpetual funding-fee pages within an explicit page budget.
@@ -3275,16 +3330,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXWalletFundingFeeRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(WALLET_FUNDING_FEE_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "wallet funding fees",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_wallet_funding_fees_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw wallet funding-fee pages within an explicit page budget.
@@ -3402,9 +3452,13 @@ impl DeepXHttpClient {
         request: &DeepXHourlyUnsettledFundingRequest,
     ) -> Result<Vec<DeepXHourlyUnsettledFundingRecord>> {
         request.validate()?;
-        let records: Vec<DeepXHourlyUnsettledFundingRecord> = self
-            .get_json_with_query(HOURLY_UNSETTLED_FUNDING_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_hourly_unsettled_funding_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let records: Vec<DeepXHourlyUnsettledFundingRecord> = serde_json::from_str(raw.get())?;
         validate_hourly_unsettled_funding_page(&records, request)?;
         Ok(records)
     }
@@ -3473,12 +3527,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXPerpPositionsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(PERP_POSITIONS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page("perp positions", page.has_next, page.next_cursor.as_deref())?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_perp_positions_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all perpetual position lifecycle pages within an explicit page budget.
@@ -3611,14 +3664,12 @@ impl DeepXHttpClient {
         &self,
         subaccount: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        #[derive(Serialize)]
-        struct BalancesQuery<'a> {
-            subaccount: &'a str,
-        }
-
         validate_account_address("subaccount balances", "subaccount", subaccount)?;
-        self.get_json_with_query(SUBACCOUNT_BALANCES_PATH, &BalancesQuery { subaccount })
-            .await
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_subaccount_balances_raw(&self.base_urls[index], subaccount)
+        })
+        .await
     }
 
     /// Returns one raw page of balance changes for one subaccount or wallet.
@@ -3631,16 +3682,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXBalanceChangesRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(BALANCE_CHANGES_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "balance changes",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_balance_changes_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw balance-change pages within an explicit page budget.
@@ -3769,9 +3815,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXSpotAdlCandidatesRequest,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        request.validate()?;
-        self.get_json_with_query(SPOT_ADL_CANDIDATES_PATH, &request.as_query())
-            .await
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_spot_adl_candidates_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns validated spot ADL candidate data while preserving raw integer amounts.
@@ -3788,9 +3836,8 @@ impl DeepXHttpClient {
         request: &DeepXSpotAdlCandidatesRequest,
     ) -> Result<DeepXSpotAdlCandidates> {
         request.validate()?;
-        let candidates: DeepXSpotAdlCandidates = self
-            .get_json_with_query(SPOT_ADL_CANDIDATES_PATH, &request.as_query())
-            .await?;
+        let raw = self.get_spot_adl_candidates_raw(request).await?;
+        let candidates: DeepXSpotAdlCandidates = serde_json::from_str(raw.get())?;
         validate_spot_adl_candidates(&candidates, request)?;
         Ok(candidates)
     }
@@ -3808,16 +3855,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXLiquidationAdlRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(LIQUIDATION_ADL_RECORDS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "liquidation ADL records",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_liquidation_adl_records_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw ADL record pages within an explicit page budget.
@@ -3869,8 +3911,7 @@ impl DeepXHttpClient {
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
         self.get_liquidation_execution_records_raw_at(
-            LIQUIDATION_EXECUTION_RECORDS_PATH,
-            "liquidation execution records",
+            DeepXLiquidationExecutionRoute::Ordinary,
             request,
         )
         .await
@@ -3888,8 +3929,7 @@ impl DeepXHttpClient {
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
         self.get_liquidation_execution_record_pages_raw_at(
-            LIQUIDATION_EXECUTION_RECORDS_PATH,
-            "liquidation execution records",
+            DeepXLiquidationExecutionRoute::Ordinary,
             request,
             max_pages,
         )
@@ -3910,8 +3950,7 @@ impl DeepXHttpClient {
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
         self.get_liquidation_execution_records_raw_at(
-            LIQUIDATION_CRANKER_RECORDS_PATH,
-            "liquidation cranker records",
+            DeepXLiquidationExecutionRoute::Cranker,
             request,
         )
         .await
@@ -3924,8 +3963,7 @@ impl DeepXHttpClient {
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
         self.get_liquidation_execution_record_pages_raw_at(
-            LIQUIDATION_CRANKER_RECORDS_PATH,
-            "liquidation cranker records",
+            DeepXLiquidationExecutionRoute::Cranker,
             request,
             max_pages,
         )
@@ -3945,12 +3983,8 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        self.get_liquidation_execution_records_raw_at(
-            LIQUIDATION_TP_SL_RECORDS_PATH,
-            "liquidation TP/SL records",
-            request,
-        )
-        .await
+        self.get_liquidation_execution_records_raw_at(DeepXLiquidationExecutionRoute::TpSl, request)
+            .await
     }
 
     /// Returns all raw TP/SL execution pages within an explicit page budget.
@@ -3960,8 +3994,7 @@ impl DeepXHttpClient {
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
         self.get_liquidation_execution_record_pages_raw_at(
-            LIQUIDATION_TP_SL_RECORDS_PATH,
-            "liquidation TP/SL records",
+            DeepXLiquidationExecutionRoute::TpSl,
             request,
             max_pages,
         )
@@ -3970,26 +4003,22 @@ impl DeepXHttpClient {
 
     async fn get_liquidation_execution_records_raw_at(
         &self,
-        path: &str,
-        endpoint: &'static str,
+        route: DeepXLiquidationExecutionRoute,
         request: &DeepXLiquidationExecutionRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self.get_json_with_query(path, &request.as_query()).await?;
-        if page.items.len() > request.page_size.unwrap_or(20) as usize {
-            return Err(invalid_account_response(
-                endpoint,
-                "page exceeds requested page size".to_string(),
-            ));
-        }
-        validate_cursor_page(endpoint, page.has_next, page.next_cursor.as_deref())?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client.get_liquidation_execution_records_raw(
+                &self.base_urls[index],
+                route,
+                request,
+            )
+        })
+        .await
     }
 
     async fn get_liquidation_execution_record_pages_raw_at(
         &self,
-        path: &str,
-        endpoint: &'static str,
+        route: DeepXLiquidationExecutionRoute,
         request: &DeepXLiquidationExecutionRecordsRequest,
         max_pages: usize,
     ) -> Result<Vec<DeepXRawAccountPage>> {
@@ -4000,10 +4029,10 @@ impl DeepXHttpClient {
         let mut pages = Vec::new();
         loop {
             let page = self
-                .get_liquidation_execution_records_raw_at(path, endpoint, &next_request)
+                .get_liquidation_execution_records_raw_at(route, &next_request)
                 .await?;
             let decision = pagination.observe_response_page(
-                endpoint,
+                route.endpoint(),
                 page.items.len(),
                 page.has_next,
                 page.next_cursor.as_deref(),
@@ -4031,27 +4060,13 @@ impl DeepXHttpClient {
         subaccount: &str,
         chain_id: Option<&str>,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct KeeperStateQuery<'a> {
-            subaccount: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            chain_id: Option<&'a str>,
-        }
-
-        validate_account_address("liquidation keeper state", "subaccount", subaccount)?;
-        if chain_id.is_some_and(|value| value.trim().is_empty()) {
-            return Err(DeepXHttpError::InvalidRequest(
-                "liquidation keeper state chain_id must not be empty".to_string(),
-            ));
-        }
-        self.get_json_with_query(
-            LIQUIDATION_KEEPER_STATE_PATH,
-            &KeeperStateQuery {
+        self.get_sdk_read_with_retry(|index| {
+            self.client.get_liquidation_keeper_state_raw(
+                &self.base_urls[index],
                 subaccount,
                 chain_id,
-            },
-        )
+            )
+        })
         .await
     }
 
@@ -4065,16 +4080,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXLiquidationRecordsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(LIQUIDATION_RECORDS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "liquidation records",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_liquidation_records_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw liquidation-record pages within an explicit page budget.
@@ -4206,9 +4216,13 @@ impl DeepXHttpClient {
         request: &DeepXPerpLiquidationPriceRequest,
     ) -> Result<DeepXPerpLiquidationPrice> {
         request.validate()?;
-        let price: DeepXPerpLiquidationPrice = self
-            .get_json_with_query(PERP_LIQUIDATION_PRICE_PATH, &request.as_query())
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_perp_liquidation_price_raw(&self.base_urls[index], request)
+            })
             .await?;
+        let price: DeepXPerpLiquidationPrice = serde_json::from_str(raw.get())?;
         validate_perp_liquidation_price(&price, request)?;
         Ok(price)
     }
@@ -4223,15 +4237,14 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, invalid or duplicate subaccounts, inconsistent counters, or a negative amount.
     pub async fn get_user_stats(&self, address: &str) -> Result<DeepXUserStats> {
-        #[derive(Serialize)]
-        struct UserStatsQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("user stats", "wallet", address)?;
-        let stats: DeepXUserStats = self
-            .get_json_with_query(USER_STATS_PATH, &UserStatsQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_user_stats_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let stats: DeepXUserStats = serde_json::from_str(raw.get())?;
         validate_user_stats(&stats)?;
         Ok(stats)
     }
@@ -4243,34 +4256,25 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// data, or a response for another address.
     pub async fn get_invitation_status(&self, address: &str) -> Result<DeepXInvitationStatus> {
-        #[derive(Serialize)]
-        struct InvitationStatusQuery<'a> {
-            address: &'a str,
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum InvitationStatusData {
-            /// Current testnet response shape.
-            Flag(bool),
-            /// OpenAPI-documented response example shape.
-            Detailed(DeepXInvitationStatus),
-        }
-
         validate_account_address("invitation status", "wallet", address)?;
-        let status: InvitationStatusData = self
-            .get_json_with_query(INVITATION_CHECK_PATH, &InvitationStatusQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_invitation_status_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let status: DeepXInvitationStatusWire = serde_json::from_str(raw.get())?;
         match status {
-            InvitationStatusData::Flag(is_bound) => Ok(DeepXInvitationStatus {
+            DeepXInvitationStatusWire::Flag(is_bound) => Ok(DeepXInvitationStatus {
                 address: address.to_string(),
                 is_bound,
             }),
-            InvitationStatusData::Detailed(status)
+            DeepXInvitationStatusWire::Detailed(status)
                 if status.address.eq_ignore_ascii_case(address) =>
             {
                 Ok(status)
             }
-            InvitationStatusData::Detailed(_) => Err(invalid_account_state_response(
+            DeepXInvitationStatusWire::Detailed(_) => Err(invalid_account_state_response(
                 "invitation status",
                 "response belongs to another wallet".to_string(),
             )),
@@ -4287,15 +4291,14 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet, transport or HTTP failures, malformed responses,
     /// empty or duplicate codes, or a venue-level failure envelope.
     pub async fn get_invitation_codes(&self, address: &str) -> Result<Vec<String>> {
-        #[derive(Serialize)]
-        struct InvitationCodesQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("invitation codes", "wallet", address)?;
-        let codes: Vec<String> = self
-            .get_json_with_query(INVITATION_CODE_PATH, &InvitationCodesQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_invitation_codes_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let codes: Vec<String> = serde_json::from_str(raw.get())?;
         let mut unique = HashSet::with_capacity(codes.len());
         for code in &codes {
             if code.trim().is_empty() {
@@ -4324,15 +4327,14 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, identity or timestamp mismatches, negative volumes, or an inconsistent total.
     pub async fn get_quota_summary(&self, wallet: &str) -> Result<DeepXQuotaSummary> {
-        #[derive(Serialize)]
-        struct QuotaSummaryQuery<'a> {
-            wallet: &'a str,
-        }
-
         validate_account_address("quota summary", "wallet", wallet)?;
-        let summary: DeepXQuotaSummary = self
-            .get_json_with_query(QUOTA_SUMMARY_PATH, &QuotaSummaryQuery { wallet })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_quota_summary_raw(&self.base_urls[index], wallet)
+            })
             .await?;
+        let summary: DeepXQuotaSummary = serde_json::from_str(raw.get())?;
         validate_quota_summary(&summary, wallet)?;
         Ok(summary)
     }
@@ -4351,24 +4353,18 @@ impl DeepXHttpClient {
         &self,
         claim_id: u64,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        #[derive(Serialize)]
-        struct QuotaClaimQuery {
-            id: u64,
-        }
-        #[derive(Deserialize)]
-        struct QuotaClaimIdentity {
-            id: u64,
-        }
-
         if claim_id == 0 {
             return Err(DeepXHttpError::InvalidRequest(
                 "quota-claim id must be greater than zero".to_string(),
             ));
         }
-        let raw: Box<serde_json::value::RawValue> = self
-            .get_json_with_query(QUOTA_CLAIM_PATH, &QuotaClaimQuery { id: claim_id })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_quota_claim_raw(&self.base_urls[index], claim_id)
+            })
             .await?;
-        let identity: QuotaClaimIdentity = serde_json::from_str(raw.get())?;
+        let identity: DeepXQuotaClaimIdentity = serde_json::from_str(raw.get())?;
         if identity.id != claim_id {
             return Err(invalid_account_state_response(
                 "quota claim",
@@ -4391,12 +4387,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXQuotaHistoryRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(QUOTA_HISTORY_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page("quota history", page.has_next, page.next_cursor.as_deref())?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_quota_history_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns one validated typed wallet quota-history page.
@@ -4464,16 +4459,11 @@ impl DeepXHttpClient {
         &self,
         request: &DeepXAllSubaccountsRequest,
     ) -> Result<DeepXRawAccountPage> {
-        request.validate()?;
-        let page: DeepXRawAccountPage = self
-            .get_json_with_query(ALL_SUBACCOUNTS_PATH, &request.as_query())
-            .await?;
-        validate_cursor_page(
-            "all subaccounts",
-            page.has_next,
-            page.next_cursor.as_deref(),
-        )?;
-        Ok(page)
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_all_subaccounts_raw(&self.base_urls[index], request)
+        })
+        .await
     }
 
     /// Returns all raw global subaccount-directory pages within an explicit page budget.
@@ -4555,17 +4545,14 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or HTTP failures, malformed
     /// responses, venue-level failures, invalid returned addresses, or duplicate subaccounts.
     pub async fn get_wallet_subaccounts(&self, address: &str) -> Result<DeepXWalletSubaccounts> {
-        #[derive(Serialize)]
-        struct SubaccountsQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("wallet subaccounts", "wallet", address)?;
-        let addresses: Vec<String> = self
-            .get_json_with_query(WALLET_SUBACCOUNTS_PATH, &SubaccountsQuery { address })
+        let addresses = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_wallet_subaccounts(&self.base_urls[index], address)
+            })
             .await?;
         let subaccounts = DeepXWalletSubaccounts::new(address.to_string(), addresses);
-        validate_wallet_subaccounts(&subaccounts)?;
         Ok(subaccounts)
     }
 
@@ -4758,18 +4745,17 @@ impl DeepXHttpClient {
         address: &str,
         expected_authority: Option<&str>,
     ) -> Result<DeepXSubaccountProfile> {
-        #[derive(Serialize)]
-        struct SubaccountInfoQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("subaccount info", "subaccount", address)?;
         if let Some(authority) = expected_authority {
             validate_account_address("subaccount info", "expected authority", authority)?;
         }
-        let profile: DeepXSubaccountProfile = self
-            .get_json_with_query(SUBACCOUNT_INFO_PATH, &SubaccountInfoQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_subaccount_info_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let profile: DeepXSubaccountProfile = serde_json::from_str(raw.get())?;
         validate_subaccount_profile(&profile, address, expected_authority)?;
         Ok(profile)
     }
@@ -4877,15 +4863,8 @@ impl DeepXHttpClient {
         &self,
         subaccount: &str,
     ) -> Result<DeepXSubaccountBalances> {
-        #[derive(Serialize)]
-        struct BalancesQuery<'a> {
-            subaccount: &'a str,
-        }
-
-        validate_account_address("subaccount balances", "subaccount", subaccount)?;
-        let balances: DeepXSubaccountBalances = self
-            .get_json_with_query(SUBACCOUNT_BALANCES_PATH, &BalancesQuery { subaccount })
-            .await?;
+        let raw = self.get_subaccount_balances_raw(subaccount).await?;
+        let balances: DeepXSubaccountBalances = serde_json::from_str(raw.get())?;
         validate_subaccount_balances(&balances, subaccount)?;
         Ok(balances)
     }
@@ -4897,15 +4876,14 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid subaccount address, transport or HTTP failures, malformed
     /// responses, venue-level failures, identity mismatches, or invalid nonnegative totals.
     pub async fn get_subaccount_equity(&self, address: &str) -> Result<DeepXSubaccountEquity> {
-        #[derive(Serialize)]
-        struct EquityQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("subaccount equity", "subaccount", address)?;
-        let equity: DeepXSubaccountEquity = self
-            .get_json_with_query(SUBACCOUNT_EQUITY_PATH, &EquityQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_subaccount_equity_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let equity: DeepXSubaccountEquity = serde_json::from_str(raw.get())?;
         validate_subaccount_equity(&equity, address)?;
         Ok(equity)
     }
@@ -4923,15 +4901,14 @@ impl DeepXHttpClient {
         &self,
         address: &str,
     ) -> Result<DeepXSubaccountMarginRatio> {
-        #[derive(Serialize)]
-        struct MarginRatioQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("subaccount margin ratio", "subaccount", address)?;
-        let margin_ratio: DeepXSubaccountMarginRatio = self
-            .get_json_with_query(SUBACCOUNT_MARGIN_RATIO_PATH, &MarginRatioQuery { address })
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_subaccount_margin_ratio_raw(&self.base_urls[index], address)
+            })
             .await?;
+        let margin_ratio: DeepXSubaccountMarginRatio = serde_json::from_str(raw.get())?;
         validate_subaccount_margin_ratio(&margin_ratio)?;
         Ok(margin_ratio)
     }
@@ -4948,14 +4925,12 @@ impl DeepXHttpClient {
         &self,
         address: &str,
     ) -> Result<Box<serde_json::value::RawValue>> {
-        #[derive(Serialize)]
-        struct DelegateQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("delegate accounts", "wallet", address)?;
-        self.get_json_with_query(DELEGATE_ACCOUNTS_PATH, &DelegateQuery { address })
-            .await
+        self.get_sdk_read_with_retry(|index| {
+            self.client
+                .get_delegate_accounts_raw(&self.base_urls[index], address)
+        })
+        .await
     }
 
     /// Returns the validated wallet-level delegate configurations for one wallet.
@@ -4968,15 +4943,9 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid wallet address, transport or venue failures, malformed
     /// responses, invalid or duplicate delegate addresses, or inconsistent timestamps.
     pub async fn get_delegate_accounts(&self, wallet: &str) -> Result<DeepXWalletDelegateAccounts> {
-        #[derive(Serialize)]
-        struct DelegateQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("delegate accounts", "wallet", wallet)?;
-        let accounts: Vec<DeepXDelegateAccount> = self
-            .get_json_with_query(DELEGATE_ACCOUNTS_PATH, &DelegateQuery { address: wallet })
-            .await?;
+        let raw = self.get_delegate_accounts_raw(wallet).await?;
+        let accounts: Vec<DeepXDelegateAccount> = serde_json::from_str(raw.get())?;
         let directory = DeepXWalletDelegateAccounts::new(wallet.to_string(), accounts);
         validate_wallet_delegate_accounts(&directory)?;
         Ok(directory)
@@ -4992,79 +4961,32 @@ impl DeepXHttpClient {
     /// Returns an error for an invalid delegate address, transport or venue failures, malformed
     /// responses, invalid returned wallet addresses, or duplicate wallets.
     pub async fn get_delegator_accounts(&self, delegate: &str) -> Result<DeepXDelegateWallets> {
-        #[derive(Serialize)]
-        struct DelegatorQuery<'a> {
-            address: &'a str,
-        }
-
         validate_account_address("delegator accounts", "delegate", delegate)?;
-        let wallets: Vec<String> = self
-            .get_json_with_query(
-                DELEGATOR_ACCOUNTS_PATH,
-                &DelegatorQuery { address: delegate },
-            )
+        let raw = self
+            .get_sdk_read_with_retry(|index| {
+                self.client
+                    .get_delegator_accounts_raw(&self.base_urls[index], delegate)
+            })
             .await?;
+        let wallets: Vec<String> = serde_json::from_str(raw.get())?;
         let directory = DeepXDelegateWallets::new(delegate.to_string(), wallets);
         validate_delegate_wallets(&directory)?;
         Ok(directory)
     }
 
-    async fn get_market_data<T>(&self, path: &str) -> Result<Vec<T>>
+    async fn get_sdk_read_with_retry<T, F, Fut>(&self, read: F) -> Result<T>
     where
-        T: DeserializeOwned,
+        F: Fn(usize) -> Fut,
+        Fut: Future<Output = std::result::Result<T, DeepXRestError>>,
     {
-        self.get_api_json(path).await
-    }
-
-    async fn get_api_json<T>(&self, path: &str) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        validate_path(path)?;
         let attempt = AtomicUsize::new(0);
         self.retry_manager
             .execute_with_retry(
                 "DeepX public HTTP GET",
                 || {
                     let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
-                    async move {
-                        let response = self
-                            .get_json_once::<DeepXApiResponse<Box<RawValue>>>(
-                                &self.base_urls[index],
-                                path,
-                            )
-                            .await?;
-                        decode_api_data(response)
-                    }
-                },
-                should_retry_http_error,
-                DeepXHttpError::from,
-            )
-            .await
-    }
-
-    async fn get_json_with_query<T, Q>(&self, path: &str, query: &Q) -> Result<T>
-    where
-        T: DeserializeOwned,
-        Q: Serialize + Sync,
-    {
-        validate_path(path)?;
-        let attempt = AtomicUsize::new(0);
-        self.retry_manager
-            .execute_with_retry(
-                "DeepX public HTTP GET",
-                || {
-                    let index = attempt.fetch_add(1, Ordering::Relaxed) % self.base_urls.len();
-                    async move {
-                        let response = self
-                            .get_json_once_with_query::<DeepXApiResponse<Box<RawValue>>, _>(
-                                &self.base_urls[index],
-                                path,
-                                query,
-                            )
-                            .await?;
-                        decode_api_data(response)
-                    }
+                    let read = &read;
+                    async move { read(index).await.map_err(DeepXHttpError::from) }
                 },
                 should_retry_http_error,
                 DeepXHttpError::from,
@@ -5076,54 +4998,7 @@ impl DeepXHttpClient {
     where
         R: DeserializeOwned,
     {
-        let response = self
-            .client
-            .get(
-                format!("{base_url}{path}"),
-                None,
-                None,
-                self.timeout_secs,
-                None,
-            )
-            .await?;
-        if !response.status.is_success() {
-            return Err(DeepXHttpError::Http {
-                status: response.status.as_u16(),
-                message: bounded_body(&response.body),
-            });
-        }
-        Ok(serde_json::from_slice(&response.body)?)
-    }
-
-    async fn get_json_once_with_query<R, Q>(
-        &self,
-        base_url: &str,
-        path: &str,
-        query: &Q,
-    ) -> Result<R>
-    where
-        R: DeserializeOwned,
-        Q: Serialize,
-    {
-        let response = self
-            .client
-            .request_with_params(
-                Method::GET,
-                format!("{base_url}{path}"),
-                Some(query),
-                None,
-                None,
-                self.timeout_secs,
-                None,
-            )
-            .await?;
-        if !response.status.is_success() {
-            return Err(DeepXHttpError::Http {
-                status: response.status.as_u16(),
-                message: bounded_body(&response.body),
-            });
-        }
-        Ok(serde_json::from_slice(&response.body)?)
+        Ok(self.client.get_json(base_url, path).await?)
     }
 }
 
@@ -6856,25 +6731,6 @@ fn decode_bytes32_identity(identity: &str) -> Option<[u8; 32]> {
     nautilus_core::hex::decode_array::<32>(identity.strip_prefix("0x").unwrap_or(identity)).ok()
 }
 
-fn validate_wallet_subaccounts(subaccounts: &DeepXWalletSubaccounts) -> Result<()> {
-    let mut addresses = HashSet::new();
-    for (index, address) in subaccounts.addresses.iter().enumerate() {
-        if validate_account_address("wallet subaccounts", "subaccount", address).is_err() {
-            return Err(invalid_account_state_response(
-                "wallet subaccounts",
-                format!("item {index} is not a 20-byte hex subaccount address"),
-            ));
-        }
-        if !addresses.insert(address.to_ascii_lowercase()) {
-            return Err(invalid_account_state_response(
-                "wallet subaccounts",
-                format!("item {index} repeats a subaccount address"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_wallet_delegate_accounts(directory: &DeepXWalletDelegateAccounts) -> Result<()> {
     let endpoint = "delegate accounts";
     let mut addresses = HashSet::new();
@@ -7270,42 +7126,8 @@ pub(crate) fn validate_subaccount_balances(
     balances: &DeepXSubaccountBalances,
     requested_address: &str,
 ) -> Result<()> {
-    if !balances.address.eq_ignore_ascii_case(requested_address) {
-        return Err(invalid_account_state_response(
-            "subaccount balances",
-            "balances belong to another subaccount".to_string(),
-        ));
-    }
-    let mut symbols = HashSet::new();
-    for (index, asset) in balances.assets.iter().enumerate() {
-        let symbol = asset.symbol.trim();
-        if symbol.is_empty() || !symbols.insert(symbol.to_ascii_uppercase()) {
-            return Err(invalid_account_state_response(
-                "subaccount balances",
-                format!("asset {index} has an empty or duplicate symbol"),
-            ));
-        }
-        let quantity_exceeds_precision =
-            [asset.balance, asset.balance_borrowed, asset.borrow_interest]
-                .into_iter()
-                .any(|amount| amount.normalize().scale() > u32::from(asset.decimals));
-        if asset.decimals > 28
-            || quantity_exceeds_precision
-            || asset.price.is_sign_negative()
-            || asset.balance.is_sign_negative()
-            || asset.balance_usd.is_sign_negative()
-            || asset.balance_borrowed.is_sign_negative()
-            || asset.balance_borrowed_usd.is_sign_negative()
-            || asset.borrow_interest.is_sign_negative()
-            || asset.borrow_interest_usd.is_sign_negative()
-        {
-            return Err(invalid_account_state_response(
-                "subaccount balances",
-                format!("asset {index} has invalid token precision or financial values"),
-            ));
-        }
-    }
-    Ok(())
+    deepx_rust_sdk::rest::models::validate_subaccount_balances(balances, requested_address)
+        .map_err(|e| invalid_account_state_response("subaccount balances", e.to_string()))
 }
 
 fn validate_subaccount_equity(
@@ -7400,11 +7222,6 @@ fn into_api_data<T>(response: DeepXApiResponse<T>) -> Result<T> {
         });
     }
     Ok(response.data)
-}
-
-fn decode_api_data<T: DeserializeOwned>(response: DeepXApiResponse<Box<RawValue>>) -> Result<T> {
-    let data = into_api_data(response)?;
-    Ok(serde_json::from_str(data.get())?)
 }
 
 trait CandleHistoryRecord {
@@ -7538,7 +7355,7 @@ fn validate_open_interest_page(
     if page.pair.trim().is_empty() {
         return Err(invalid("missing pair identity".to_string()));
     }
-    if page.details.len() > 5_000
+    if page.details.len() > DEEPX_MAX_HISTORY_PAGE_SIZE as usize
         || request
             .limit
             .is_some_and(|limit| page.details.len() > limit as usize)
@@ -7579,7 +7396,7 @@ fn validate_candle_page(
     if page.pair.trim().is_empty() {
         return Err(invalid("missing pair identity".to_string()));
     }
-    if page.details.len() > 5_000 {
+    if page.details.len() > DEEPX_MAX_HISTORY_PAGE_SIZE as usize {
         return Err(invalid("page exceeds venue limit of 5000".to_string()));
     }
     if limit.is_some_and(|limit| page.details.len() > limit as usize) {
@@ -7626,7 +7443,7 @@ fn validate_spot_candle_page(
             "response has a missing or unexpected market name".to_string(),
         ));
     }
-    if page.details.len() > 5_000
+    if page.details.len() > DEEPX_MAX_HISTORY_PAGE_SIZE as usize
         || request
             .limit
             .is_some_and(|limit| page.details.len() > limit as usize)
@@ -8248,31 +8065,11 @@ fn validate_response_market_id(endpoint: &'static str, expected: u64, received: 
 }
 
 fn normalize_base_url(base_url: String) -> Result<String> {
-    let normalized = base_url.trim_end_matches('/').to_string();
-    let Ok(url) = reqwest::Url::parse(&normalized) else {
-        return Err(DeepXHttpError::InvalidBaseUrl(base_url));
-    };
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(DeepXHttpError::InvalidBaseUrl(base_url));
-    }
-    Ok(normalized)
+    Ok(deepx_rust_sdk::rest::normalize_base_url(base_url)?)
 }
 
 fn validate_path(path: &str) -> Result<()> {
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains('?')
-        || path.contains('#')
-        || path.contains("://")
-        || path.split('/').any(|segment| segment == "..")
-    {
-        return Err(DeepXHttpError::InvalidPath(path.to_string()));
-    }
-    Ok(())
+    Ok(deepx_rust_sdk::rest::validate_path(path)?)
 }
 
 fn bounded_body(body: &[u8]) -> String {
@@ -10820,7 +10617,7 @@ mod tests {
     async fn typed_account_state_readers_validate_captured_transport_responses() {
         let app = Router::new()
             .route(
-                WALLET_SUBACCOUNTS_PATH,
+                deepx_rust_sdk::rest::WALLET_SUBACCOUNTS_PATH,
                 get(|| async { WALLET_SUBACCOUNTS_RESPONSE }),
             )
             .route(
@@ -10894,7 +10691,7 @@ mod tests {
     #[tokio::test]
     async fn wallet_subaccounts_preserves_api_error_with_null_data() {
         let app = Router::new().route(
-            WALLET_SUBACCOUNTS_PATH,
+            deepx_rust_sdk::rest::WALLET_SUBACCOUNTS_PATH,
             get(|| async {
                 r#"{"code":10009,"msg":"Subaccount not found.","data":null,"fail":true}"#
             }),
@@ -12790,7 +12587,7 @@ mod tests {
         }
         let app = Router::new()
             .route(
-                WALLET_SUBACCOUNTS_PATH,
+                deepx_rust_sdk::rest::WALLET_SUBACCOUNTS_PATH,
                 get(move || {
                     let directory = directory.clone();
                     let directory_reads = directory_reads.clone();
@@ -12911,7 +12708,7 @@ mod tests {
         let profile_subaccount = subaccount.clone();
         let app = Router::new()
             .route(
-                WALLET_SUBACCOUNTS_PATH,
+                deepx_rust_sdk::rest::WALLET_SUBACCOUNTS_PATH,
                 get(
                     move |Query(query): Query<std::collections::HashMap<String, String>>| {
                         let wallet = directory_wallet.clone();
@@ -13026,7 +12823,7 @@ mod tests {
                 }),
             )
             .route(
-                WALLET_SUBACCOUNTS_PATH,
+                deepx_rust_sdk::rest::WALLET_SUBACCOUNTS_PATH,
                 get(move || async move {
                     Json(json!({
                         "code": 200, "msg": "success", "fail": false,
@@ -13103,12 +12900,14 @@ mod tests {
             ],
         );
         assert!(matches!(
-            validate_wallet_subaccounts(&subaccounts),
+            deepx_rust_sdk::rest::validate_wallet_subaccounts(&subaccounts.addresses)
+                .map_err(DeepXHttpError::from),
             Err(DeepXHttpError::InvalidAccountResponse { .. })
         ));
         subaccounts.addresses[1] = "invalid".to_string();
         assert!(matches!(
-            validate_wallet_subaccounts(&subaccounts),
+            deepx_rust_sdk::rest::validate_wallet_subaccounts(&subaccounts.addresses)
+                .map_err(DeepXHttpError::from),
             Err(DeepXHttpError::InvalidAccountResponse { .. })
         ));
 

@@ -23,10 +23,7 @@ pub mod account_positions;
 pub mod account_spot_orders;
 pub mod account_spot_trades;
 pub mod account_trades;
-pub mod book;
 pub mod candles;
-pub mod error;
-pub mod frame;
 pub mod handler;
 pub mod lending_rates;
 pub mod open_interest;
@@ -34,8 +31,6 @@ pub mod orderbook_rpc;
 pub mod protocol;
 pub mod public;
 pub(crate) mod spot_trades;
-pub mod task;
-pub mod trades;
 pub mod transport;
 
 pub use account::{
@@ -78,8 +73,9 @@ pub use account_trades::{
 pub use candles::{
     DeepXWsCandleStream, DeepXWsSupersededCandle, observe_first_superseded_perp_candle,
 };
-pub use error::DeepXWsError;
-pub use frame::DeepXWsFrame;
+pub use deepx_rust_sdk::websocket::{
+    DeepXWsError, DeepXWsFrame, DeepXWsRequestId, book, task, trades,
+};
 pub use handler::{
     DeepXWsProtocolHandle, DeepXWsProtocolHandler, DeepXWsRegisteredAuthentication,
     DeepXWsRegisteredRequest, deepx_ws_protocol_handler,
@@ -93,6 +89,6 @@ pub use open_interest::{
 };
 pub use protocol::{
     DeepXWsAuthenticatedFrame, DeepXWsAuthenticatedSession, DeepXWsAuthenticationAttempt,
-    DeepXWsProtocolCore, DeepXWsRequest, DeepXWsRequestId,
+    DeepXWsProtocolCore, DeepXWsRequest,
 };
 pub use task::{DeepXWsTaskHandles, DeepXWsTaskOutcome};

@@ -18,8 +18,8 @@
 use nautilus_model::identifiers::{InstrumentId, Symbol};
 
 use super::{
+    DeepXProductType,
     consts::DEEPX_VENUE,
-    enums::DeepXProductType,
     error::{DeepXError, Result},
 };
 

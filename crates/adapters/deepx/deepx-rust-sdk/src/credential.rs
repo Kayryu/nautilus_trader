@@ -21,10 +21,9 @@ use std::{
 };
 
 use alloy::signers::local::PrivateKeySigner;
-use nautilus_core::hex;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use super::{
+use crate::{
     enums::DeepXEnvironment,
     error::{DeepXError, Result},
 };
@@ -83,13 +82,14 @@ impl DeepXPrivateKey {
 
         let value = value.trim();
         let hex_value = value.strip_prefix("0x").unwrap_or(value);
-        let bytes = hex::decode_array::<32>(hex_value).map_err(|_| {
+        let mut bytes = [0_u8; 32];
+        hex::decode_to_slice(hex_value, &mut bytes).map_err(|_| {
             DeepXError::InvalidCredential(
                 "private key must be exactly 32 bytes of hexadecimal".to_string(),
             )
         })?;
 
-        let normalized = hex::encode_prefixed(bytes);
+        let normalized = format!("0x{}", hex::encode(bytes));
         PrivateKeySigner::from_str(&normalized).map_err(|_| {
             DeepXError::InvalidCredential(
                 "private key must be a valid non-zero secp256k1 scalar".to_string(),

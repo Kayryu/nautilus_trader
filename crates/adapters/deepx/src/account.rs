@@ -667,18 +667,19 @@ mod tests {
             wallet.clone(),
             vec![subaccount.clone(), format!("0x{}", hex::encode([0x22; 20]))],
         );
-        let profile = DeepXSubaccountProfile {
-            authority: wallet,
-            address: subaccount.clone(),
-            name: "test".to_string(),
-            status: "Active".to_string(),
-            spot_positions: Vec::new(),
-            next_order_id: 1,
-            spot_margin_trading_enabled: false,
-            margin_strategy: "Cross".to_string(),
-            height: 50_070_126,
-            created_at: 1_779_848_876_302,
-        };
+        let profile =
+            DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
+                authority: wallet,
+                address: subaccount.clone(),
+                name: "test".to_string(),
+                status: "Active".to_string(),
+                spot_positions: Vec::new(),
+                next_order_id: 1,
+                spot_margin_trading_enabled: false,
+                margin_strategy: "Cross".to_string(),
+                height: 50_070_126,
+                created_at: 1_779_848_876_302,
+            });
         (directory, profile, subaccount)
     }
 
@@ -699,14 +700,16 @@ mod tests {
         let directory = DeepXWalletSubaccounts::new(wallet.clone(), directory.addresses);
         let delegates = DeepXWalletDelegateAccounts::new(
             wallet.clone(),
-            vec![DeepXDelegateAccount {
-                delegate_address: signer.clone(),
-                delegate_name: "order bot".to_string(),
-                valid_until: 2_000,
-                mode: DeepXDelegateMode::PlaceOrCancelOrder,
-                create_time: 100,
-                active: true,
-            }],
+            vec![DeepXDelegateAccount(
+                deepx_rust_sdk::rest::models::DeepXDelegateAccount {
+                    delegate_address: signer.clone(),
+                    delegate_name: "order bot".to_string(),
+                    valid_until: 2_000,
+                    mode: DeepXDelegateMode::PlaceOrCancelOrder,
+                    create_time: 100,
+                    active: true,
+                },
+            )],
         );
         let delegators = DeepXDelegateWallets::new(signer, vec![wallet]);
         (directory, profile, delegates, delegators, subaccount)

@@ -22,25 +22,7 @@ use nautilus_network::websocket::{AuthTracker, SubscriptionState, auth::AuthResu
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use super::{DeepXWsError, DeepXWsFrame};
-
-/// Numeric correlator carried by one DeepX WebSocket request and response.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DeepXWsRequestId(u64);
-
-impl DeepXWsRequestId {
-    /// Creates an ID decoded from a WebSocket response frame.
-    #[must_use]
-    pub(crate) const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the wire-level numeric request ID.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
+use super::{DeepXWsError, DeepXWsFrame, DeepXWsRequestId};
 
 /// Connection-owned request registration created before a send is exposed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,7 +169,7 @@ impl DeepXWsProtocolCore {
             .next_send_token
             .checked_add(1)
             .ok_or(DeepXWsError::SendTokenExhausted)?;
-        let request_id = DeepXWsRequestId(self.next_request_id);
+        let request_id = DeepXWsRequestId::new(self.next_request_id);
         let send_token = self.next_send_token;
         self.next_request_id = next_request_id;
         self.next_send_token = next_send_token;

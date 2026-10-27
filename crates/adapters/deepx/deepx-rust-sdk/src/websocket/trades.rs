@@ -23,7 +23,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use super::public::{DeepXWsPublicChannel, DeepXWsPublicFrame};
-use crate::http::{DeepXPerpTrade, DeepXPerpTradesPage, DeepXSpotMarket, DeepXSpotTrade};
+use crate::rest::models::{DeepXPerpTrade, DeepXPerpTradesPage, DeepXSpotMarket, DeepXSpotTrade};
 
 #[derive(Debug, thiserror::Error)]
 #[error("unseen older DeepX trade requires stream recovery")]
@@ -286,7 +286,7 @@ impl DeepXWsTradeStream {
 
 /// A bounded, market-bound public Spot trade stream with explicit recovery boundaries.
 #[derive(Clone, Debug)]
-pub(crate) struct DeepXWsSpotTradeStream {
+pub struct DeepXWsSpotTradeStream {
     market_name: String,
     pair: String,
     capacity: NonZeroUsize,
@@ -299,7 +299,7 @@ pub(crate) struct DeepXWsSpotTradeStream {
 impl DeepXWsSpotTradeStream {
     /// Creates an uninitialized stream bound to one finalized Spot market.
     #[must_use]
-    pub(crate) fn new(market: &DeepXSpotMarket, capacity: NonZeroUsize) -> Self {
+    pub fn new(market: &DeepXSpotMarket, capacity: NonZeroUsize) -> Self {
         Self {
             market_name: market.name.clone(),
             pair: market.pair.clone(),
@@ -313,7 +313,7 @@ impl DeepXWsSpotTradeStream {
 
     /// Returns whether the stream has accepted its initial trade page.
     #[must_use]
-    pub(crate) const fn is_initialized(&self) -> bool {
+    pub const fn is_initialized(&self) -> bool {
         self.initialized
     }
 
@@ -324,7 +324,7 @@ impl DeepXWsSpotTradeStream {
     /// # Errors
     ///
     /// Returns an error for foreign, malformed, unordered, conflicting, or unretained old trades.
-    pub(crate) fn ingest(
+    pub fn ingest(
         &mut self,
         frame: &super::spot_trades::DeepXWsSpotTradeFrame,
     ) -> anyhow::Result<Vec<DeepXSpotTrade>> {
@@ -352,7 +352,7 @@ impl DeepXWsSpotTradeStream {
     /// # Errors
     ///
     /// Returns an error when either page is empty, invalid, or moves behind the retained boundary.
-    pub(crate) fn recovery_window(
+    pub fn recovery_window(
         &self,
         frame: &super::spot_trades::DeepXWsSpotTradeFrame,
     ) -> anyhow::Result<(u64, u64)> {
@@ -385,7 +385,7 @@ impl DeepXWsSpotTradeStream {
     ///
     /// Returns an error for missing or conflicting retained identities, invalid bounds, or invalid
     /// history. Failed reconciliation leaves stream state unchanged.
-    pub(crate) fn reconcile_history(
+    pub fn reconcile_history(
         &mut self,
         history: &[DeepXSpotTrade],
         fresh: &super::spot_trades::DeepXWsSpotTradeFrame,
@@ -539,7 +539,7 @@ fn valid_spot_order_id(value: &str) -> bool {
 }
 
 fn valid_spot_address(value: &str) -> bool {
-    nautilus_core::hex::decode_array::<20>(value.strip_prefix("0x").unwrap_or(value)).is_ok()
+    hex::decode(value.strip_prefix("0x").unwrap_or(value)).is_ok_and(|address| address.len() == 20)
 }
 
 fn spot_trade_time(trade: &DeepXSpotTrade) -> anyhow::Result<i64> {
@@ -564,6 +564,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[rstest]
+    fn spot_account_identity_requires_twenty_hex_bytes() {
+        let address = "11".repeat(20);
+        assert!(valid_spot_address(&address));
+        assert!(valid_spot_address(&format!("0x{address}")));
+        assert!(!valid_spot_address(&"11".repeat(19)));
+        assert!(!valid_spot_address(&"gg".repeat(20)));
+    }
 
     fn trade(id: u64, second: u8) -> serde_json::Value {
         json!({"id":id,"marketId":2,"buyerOrderId":"10","buyer":"0x11",
@@ -791,7 +800,10 @@ mod tests {
             emitted.iter().map(|trade| trade.id).collect::<Vec<_>>(),
             vec![2, 3, 5]
         );
-        assert_eq!(stream.order.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+        assert_eq!(
+            stream.order.iter().copied().collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
         let latest: jiff::Timestamp = emitted[2].created_at.parse().unwrap();
         assert_eq!(stream.watermark_ms, Some(latest.as_millisecond()));
     }

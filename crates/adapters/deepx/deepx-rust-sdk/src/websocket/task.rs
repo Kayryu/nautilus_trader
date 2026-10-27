@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Owned task lifecycle for a future DeepX WebSocket handler.
+//! Owned task lifecycle for a DeepX WebSocket handler.
 
 use std::{future::Future, time::Duration};
 

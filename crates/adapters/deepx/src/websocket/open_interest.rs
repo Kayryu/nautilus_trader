@@ -18,63 +18,18 @@
 use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::{Result, ensure};
-use rust_decimal::Decimal;
-use serde_json::value::RawValue;
+use deepx_rust_sdk::websocket::open_interest::parse_open_interest;
+pub use deepx_rust_sdk::websocket::open_interest::{
+    DeepXWsOpenInterestObservation, match_open_interest_to_rest,
+};
 
-use super::public::{DeepXWsPublicChannel, DeepXWsPublicConnection, DeepXWsPublicFrame};
+use super::public::{DeepXWsPublicChannel, DeepXWsPublicConnection};
+#[cfg(test)]
 use crate::http::{DeepXOpenInterestPage, DeepXOpenInterestRecord};
+#[cfg(test)]
+use crate::websocket::public::DeepXWsPublicFrame;
 
 const PRE_ACK_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero capacity");
-
-/// One raw open-interest bucket from an acknowledged public subscription.
-#[derive(Debug)]
-pub struct DeepXWsOpenInterestObservation {
-    /// Deployment market ID.
-    pub market_id: u16,
-    /// Pair name bound to the validated REST market directory.
-    pub pair: String,
-    /// Exact venue values and statistic bucket.
-    pub record: DeepXOpenInterestRecord,
-    /// WebSocket envelope timestamp in Unix milliseconds.
-    pub timestamp_ms: u64,
-    raw: Box<RawValue>,
-}
-
-impl DeepXWsOpenInterestObservation {
-    /// Returns the original JSON data object, preserving numeric lexemes.
-    #[must_use]
-    pub fn raw(&self) -> &RawValue {
-        &self.raw
-    }
-}
-
-/// Checks one WebSocket bucket against a separately scoped typed REST response.
-///
-/// The caller must independently bind the REST request to the same market and bucket. Matching
-/// mutable observations does not prove continuity, finality, units, or a framework data mapping.
-///
-/// # Errors
-///
-/// Returns an error unless REST contains exactly one identical record for the selected pair.
-pub fn match_open_interest_to_rest(
-    observation: &DeepXWsOpenInterestObservation,
-    rest: &DeepXOpenInterestPage,
-) -> Result<()> {
-    ensure!(
-        rest.pair == observation.pair && rest.details.len() == 1,
-        "REST open interest does not contain one matching pair bucket"
-    );
-    ensure!(
-        rest.details[0] == observation.record,
-        "REST open interest conflicts with WebSocket market={} pair={} time={}: ws={:?}, REST={:?}",
-        observation.market_id,
-        observation.pair,
-        observation.record.statistic_time,
-        observation.record,
-        rest.details[0],
-    );
-    Ok(())
-}
 
 /// Reads the first acknowledged open-interest update for one validated perpetual market.
 ///
@@ -143,50 +98,6 @@ pub async fn observe_first_open_interest(
         }
         Err(e) => Err(e),
     }
-}
-
-fn parse_open_interest(
-    frame: DeepXWsPublicFrame,
-    market_id: u16,
-    pair: &str,
-) -> Result<Option<DeepXWsOpenInterestObservation>> {
-    let DeepXWsPublicFrame::Data {
-        market,
-        channel,
-        data,
-        timestamp,
-    } = frame
-    else {
-        ensure!(
-            matches!(frame, DeepXWsPublicFrame::Pong { .. }),
-            "unexpected DeepX open-interest frame"
-        );
-        return Ok(None);
-    };
-    ensure!(
-        channel == DeepXWsPublicChannel::OpenInterest
-            && market.id == market_id
-            && market.name.as_deref() == Some(pair),
-        "foreign DeepX open-interest market or channel"
-    );
-    let record: DeepXOpenInterestRecord = serde_json::from_str(data.get())?;
-    ensure!(
-        timestamp > 0
-            && i64::try_from(timestamp).is_ok()
-            && record.statistic_time > 0
-            && record.statistic_time.is_multiple_of(60_000)
-            && record.statistic_time <= timestamp
-            && record.total_oi >= Decimal::ZERO
-            && record.long_short_ratio >= Decimal::ZERO,
-        "invalid DeepX open-interest time or value"
-    );
-    Ok(Some(DeepXWsOpenInterestObservation {
-        market_id,
-        pair: pair.to_string(),
-        record,
-        timestamp_ms: timestamp,
-        raw: data,
-    }))
 }
 
 #[cfg(test)]

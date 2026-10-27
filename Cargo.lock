@@ -3456,6 +3456,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepx-rust-sdk"
+version = "0.63.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "frame-metadata",
+ "hex",
+ "jiff",
+ "parity-scale-codec",
+ "reqwest 0.13.4",
+ "rstest",
+ "rust_decimal",
+ "rustls",
+ "scale-info",
+ "serde",
+ "serde_json",
+ "sp-crypto-hashing",
+ "subxt-core",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "zeroize",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6185,6 +6210,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "bon",
+ "deepx-rust-sdk",
  "frame-metadata",
  "futures-util",
  "jiff",

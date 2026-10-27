@@ -206,10 +206,12 @@ async fn collect_relevant_wallet_trade_groups(
             } else {
                 first.trades.clone()
             };
-            subaccount_groups.push(DeepXPerpWalletSubaccountTrades {
-                subaccount: address,
-                trades,
-            });
+            subaccount_groups.push(DeepXPerpWalletSubaccountTrades(
+                deepx_rust_sdk::rest::models::DeepXPerpWalletSubaccountTrades {
+                    subaccount: address,
+                    trades,
+                },
+            ));
         }
         let latest = http.get_perp_wallet_trades(&request).await?;
         let latest_market = latest
@@ -236,11 +238,13 @@ async fn collect_relevant_wallet_trade_groups(
                 "perpetual wallet first page changed during traversal"
             );
         }
-        complete.push(DeepXPerpWalletTradeMarket {
-            market_id,
-            market_name: market.market_name,
-            subaccounts: subaccount_groups,
-        });
+        complete.push(DeepXPerpWalletTradeMarket(
+            deepx_rust_sdk::rest::models::DeepXPerpWalletTradeMarket {
+                market_id,
+                market_name: market.0.market_name,
+                subaccounts: subaccount_groups,
+            },
+        ));
     }
     Ok(complete)
 }

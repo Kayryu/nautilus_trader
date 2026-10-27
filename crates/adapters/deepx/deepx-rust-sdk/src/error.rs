@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Adapter-level DeepX errors.
+//! Shared DeepX errors.
 
 use thiserror::Error;
 

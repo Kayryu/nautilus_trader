@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! DeepX environment and product selectors.
+//! DeepX deployment environment and market product selectors.
 
 use std::fmt::{Display, Formatter};
 

@@ -15,6 +15,7 @@
 
 //! Error types for the DeepX HTTP transport.
 
+use deepx_rust_sdk::rest::DeepXRestError;
 use nautilus_network::{http::HttpClientError, retry::RetryError};
 use thiserror::Error;
 
@@ -108,6 +109,39 @@ impl DeepXHttpError {
 impl From<HttpClientError> for DeepXHttpError {
     fn from(value: HttpClientError) -> Self {
         Self::Transport(value.to_string())
+    }
+}
+
+impl From<DeepXRestError> for DeepXHttpError {
+    fn from(value: DeepXRestError) -> Self {
+        match value {
+            DeepXRestError::Transport(message) => Self::Transport(message),
+            DeepXRestError::Http { status, message } => Self::Http { status, message },
+            DeepXRestError::Decode(e) => Self::Decode(e),
+            DeepXRestError::Api { code, message } => Self::Api { code, message },
+            DeepXRestError::InvalidRequest(message) => Self::InvalidRequest(message),
+            DeepXRestError::InvalidPaginationLimit => Self::InvalidPaginationLimit,
+            DeepXRestError::PaginationLimitExceeded { max_pages } => {
+                Self::PaginationLimitExceeded { max_pages }
+            }
+            DeepXRestError::PaginationNoProgress { cursor } => {
+                Self::PaginationNoProgress { cursor }
+            }
+            DeepXRestError::MissingPaginationCursor { endpoint } => {
+                Self::MissingPaginationCursor { endpoint }
+            }
+            DeepXRestError::RepeatedPaginationCursor { cursor } => {
+                Self::RepeatedPaginationCursor { cursor }
+            }
+            DeepXRestError::InvalidAccountResponse { endpoint, message } => {
+                Self::InvalidAccountResponse { endpoint, message }
+            }
+            DeepXRestError::InvalidHistoryResponse { endpoint, message } => {
+                Self::InvalidHistoryResponse { endpoint, message }
+            }
+            DeepXRestError::InvalidPath(path) => Self::InvalidPath(path),
+            DeepXRestError::InvalidBaseUrl(url) => Self::InvalidBaseUrl(url),
+        }
     }
 }
 

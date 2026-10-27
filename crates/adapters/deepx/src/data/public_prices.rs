@@ -14,6 +14,7 @@
 
 //! Exact conversion of observed public mark, oracle, and funding frames.
 
+use deepx_rust_sdk::websocket::public::{parse_public_funding_rate, parse_public_price};
 use nautilus_common::messages::DataEvent;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -21,22 +22,10 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::Price,
 };
+#[cfg(test)]
 use rust_decimal::Decimal;
-use serde::Deserialize;
-use serde_json::value::RawValue;
 
-use crate::{
-    http::models::exact_decimal,
-    websocket::public::{DeepXWsPublicChannel, DeepXWsPublicFrame},
-};
-
-#[derive(Deserialize)]
-struct FundingPayload {
-    #[serde(deserialize_with = "exact_decimal::deserialize")]
-    funding_rate: Decimal,
-    last_cacl_funding_rate_time: u64,
-    last_funding_rate_time: u64,
-}
+use crate::websocket::public::{DeepXWsPublicChannel, DeepXWsPublicFrame};
 
 pub(super) fn parse_public_price_event(
     frame: &DeepXWsPublicFrame,
@@ -61,8 +50,7 @@ pub(super) fn parse_public_price_event(
     let ts_event = timestamp_ns(*timestamp)?;
     match channel {
         DeepXWsPublicChannel::MarkPrice | DeepXWsPublicChannel::OraclePrice => {
-            let value = parse_scalar_decimal(data)?;
-            anyhow::ensure!(value > Decimal::ZERO, "DeepX public price must be positive");
+            let value = parse_public_price(data)?;
             let price = Price::from_decimal(value)?;
             anyhow::ensure!(
                 price.as_decimal() == value,
@@ -85,15 +73,10 @@ pub(super) fn parse_public_price_event(
             }
         }
         DeepXWsPublicChannel::FundingRate => {
-            let payload: FundingPayload = serde_json::from_str(data.get())?;
-            anyhow::ensure!(
-                payload.last_cacl_funding_rate_time <= payload.last_funding_rate_time
-                    && payload.last_funding_rate_time <= *timestamp,
-                "DeepX funding timestamps are inconsistent"
-            );
+            let funding_rate = parse_public_funding_rate(data, *timestamp)?;
             Ok(DataEvent::FundingRate(FundingRateUpdate::new(
                 instrument.id(),
-                payload.funding_rate,
+                funding_rate,
                 None,
                 None,
                 ts_event,
@@ -102,18 +85,6 @@ pub(super) fn parse_public_price_event(
         }
         _ => anyhow::bail!("DeepX public channel is not a framework price feed"),
     }
-}
-
-fn parse_scalar_decimal(raw: &RawValue) -> anyhow::Result<Decimal> {
-    #[derive(Deserialize)]
-    #[serde(transparent)]
-    struct ExactNumber(#[serde(deserialize_with = "exact_decimal::deserialize")] Decimal);
-
-    anyhow::ensure!(
-        !raw.get().starts_with('"'),
-        "DeepX public price payload is not a scalar JSON number"
-    );
-    Ok(serde_json::from_str::<ExactNumber>(raw.get())?.0)
 }
 
 fn timestamp_ns(timestamp_ms: u64) -> anyhow::Result<UnixNanos> {

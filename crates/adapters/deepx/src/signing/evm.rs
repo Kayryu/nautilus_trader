@@ -15,99 +15,17 @@
 
 //! Offline EVM transaction envelopes matching the pinned DeepX SDK's explicit-parameter path.
 
-use alloy::{
-    consensus::{SignableTransaction, TxEip1559, TxLegacy},
-    primitives::{Address, Bytes, Signature, TxKind, U256, keccak256},
-    signers::{SignerSync, local::PrivateKeySigner},
-    sol,
-    sol_types::SolCall,
+use alloy::primitives::U256;
+pub use deepx_rust_sdk::signing::{
+    DeepXEvmTransactionKind, DeepXOfflineEvmExtrinsic, DeepXOfflineEvmSignError,
+    DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams, DeepXOfflinePerpPnlEvmParams,
+    sign_offline_evm_transaction,
 };
 use subxt_core::{config::substrate::BlakeTwo256, dynamic::Value, tx};
 use thiserror::Error;
 
-use super::{
-    DeepXPerpProfitAndLossPointParams, DeepXRuntimeConfig, DeepXRuntimeSnapshotPermit, SigningError,
-};
+use super::{DeepXRuntimeConfig, DeepXRuntimeSnapshotPermit, SigningError};
 use crate::common::DeepXPrivateKey;
-
-const DEEPX_TESTNET_PERP_PRECOMPILE: [u8; 20] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x4e,
-];
-
-sol! {
-    function setProfitAndLossPoint(
-        address subaccount,
-        uint16 marketId,
-        uint128 takeProfitPoint,
-        uint128 stopLossPoint
-    ) external;
-}
-
-/// EVM envelope mode selected explicitly by the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeepXEvmTransactionKind {
-    /// EIP-1559 envelope with zero fee caps, as in the pinned SDK.
-    Eip1559,
-    /// EIP-155 legacy envelope with zero gas price, as in the pinned SDK.
-    Legacy,
-}
-
-/// Explicit inputs for an offline DeepX EVM precompile transaction.
-///
-/// Callers supply an independently verified precompile address, ABI calldata, nonce, gas limit,
-/// and chain ID. This type does not discover or validate venue business semantics.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXOfflineEvmTransactionParams {
-    /// EVM envelope mode.
-    pub kind: DeepXEvmTransactionKind,
-    /// Chain ID included in the EVM signature.
-    pub chain_id: u64,
-    /// Explicit transaction nonce.
-    pub nonce: u64,
-    /// Explicit gas limit; no RPC gas estimation occurs.
-    pub gas_limit: u64,
-    /// Precompile destination address.
-    pub precompile_address: [u8; 20],
-    /// Wei transferred to the precompile.
-    pub value: U256,
-    /// Complete ABI calldata bytes.
-    pub calldata: Vec<u8>,
-}
-
-/// Explicit envelope and call inputs for offline perpetual profit/loss-point management.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeepXOfflinePerpPnlEvmParams {
-    /// EVM envelope mode.
-    pub kind: DeepXEvmTransactionKind,
-    /// Explicit timestamp nonce; reservation is owned by the caller.
-    pub nonce: u64,
-    /// Explicit gas limit; no RPC estimate occurs.
-    pub gas_limit: u64,
-    /// Exact runtime profit/loss-point arguments.
-    pub call: DeepXPerpProfitAndLossPointParams,
-}
-
-/// Signed EVM envelope and independently computed identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXOfflineEvmTransaction {
-    /// Complete signed EVM transaction bytes.
-    pub bytes: Vec<u8>,
-    /// Keccak-256 hash of the complete signed EVM transaction.
-    pub tx_hash: [u8; 32],
-    /// Ethereum AccountId20 derived from the signing key.
-    pub signer: [u8; 20],
-}
-
-/// Signed EVM transaction embedded in an unsigned Substrate v4 extrinsic.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeepXOfflineEvmExtrinsic {
-    /// Signed Ethereum transaction and its Keccak identity.
-    pub evm: DeepXOfflineEvmTransaction,
-    /// Complete SCALE-encoded unsigned `Ethereum.transact` extrinsic.
-    pub bytes: Vec<u8>,
-    /// Blake2-256 hash of the complete SCALE extrinsic.
-    pub extrinsic_hash: [u8; 32],
-}
 
 /// Errors before an offline legacy EVM wrapper is available.
 #[derive(Debug, Error)]
@@ -123,93 +41,6 @@ pub enum DeepXOfflineEvmWrapperError {
     Runtime(#[from] SigningError),
 }
 
-/// Errors before an offline EVM envelope is available.
-#[derive(Debug, Error)]
-pub enum DeepXOfflineEvmSignError {
-    /// The transaction parameters cannot identify a valid explicit EVM envelope.
-    #[error("invalid DeepX offline EVM transaction parameters")]
-    InvalidParams,
-    /// The private scalar is invalid.
-    #[error("invalid DeepX secp256k1 signing key")]
-    InvalidKey,
-    /// The local EVM signer failed.
-    #[error("DeepX offline EVM signing failed")]
-    Sign,
-}
-
-/// Signs an explicit EVM envelope entirely offline, with the pinned SDK's zero-fee fields.
-///
-/// This primitive does not encode an ABI call, construct an unsigned `Ethereum.transact` wrapper,
-/// allocate a nonce, inspect chain state, or submit a transaction.
-///
-/// # Errors
-///
-/// Returns an error for invalid inputs, key material, or signature construction.
-pub fn sign_offline_evm_transaction(
-    key: &DeepXPrivateKey,
-    params: &DeepXOfflineEvmTransactionParams,
-) -> Result<DeepXOfflineEvmTransaction, DeepXOfflineEvmSignError> {
-    sign_offline_evm_transaction_parts(key, params).map(|(transaction, _)| transaction)
-}
-
-fn sign_offline_evm_transaction_parts(
-    key: &DeepXPrivateKey,
-    params: &DeepXOfflineEvmTransactionParams,
-) -> Result<(DeepXOfflineEvmTransaction, Signature), DeepXOfflineEvmSignError> {
-    if params.chain_id == 0 || params.gas_limit == 0 || params.precompile_address == [0; 20] {
-        return Err(DeepXOfflineEvmSignError::InvalidParams);
-    }
-    let signer = PrivateKeySigner::from_slice(key.as_bytes())
-        .map_err(|_| DeepXOfflineEvmSignError::InvalidKey)?;
-    let to = TxKind::Call(params.precompile_address.into());
-    let input = Bytes::copy_from_slice(&params.calldata);
-    let mut bytes = Vec::new();
-    let signature = match params.kind {
-        DeepXEvmTransactionKind::Eip1559 => {
-            let tx = TxEip1559 {
-                chain_id: params.chain_id,
-                nonce: params.nonce,
-                gas_limit: params.gas_limit,
-                max_fee_per_gas: 0,
-                max_priority_fee_per_gas: 0,
-                to,
-                value: params.value,
-                input,
-                ..Default::default()
-            };
-            let signature = signer
-                .sign_hash_sync(&tx.signature_hash())
-                .map_err(|_| DeepXOfflineEvmSignError::Sign)?;
-            tx.into_signed(signature).eip2718_encode(&mut bytes);
-            signature
-        }
-        DeepXEvmTransactionKind::Legacy => {
-            let tx = TxLegacy {
-                chain_id: Some(params.chain_id),
-                nonce: params.nonce,
-                gas_price: 0,
-                gas_limit: params.gas_limit,
-                to,
-                value: params.value,
-                input,
-            };
-            let signature = signer
-                .sign_hash_sync(&tx.signature_hash())
-                .map_err(|_| DeepXOfflineEvmSignError::Sign)?;
-            tx.into_signed(signature).rlp_encode(&mut bytes);
-            signature
-        }
-    };
-    Ok((
-        DeepXOfflineEvmTransaction {
-            tx_hash: keccak256(&bytes).0,
-            signer: signer.address().into_array(),
-            bytes,
-        },
-        signature,
-    ))
-}
-
 /// Signs an EVM envelope and embeds it in the approved runtime's unsigned wrapper offline.
 ///
 /// The caller still owns precompile discovery, ABI encoding, nonce reservation, persistence,
@@ -223,7 +54,7 @@ pub fn sign_offline_evm_transact_extrinsic(
     key: &DeepXPrivateKey,
     params: &DeepXOfflineEvmTransactionParams,
 ) -> Result<DeepXOfflineEvmExtrinsic, DeepXOfflineEvmWrapperError> {
-    if params.chain_id != 4846 {
+    if params.chain_id != u64::from(crate::common::consts::DEEPX_TESTNET_CHAIN_ID) {
         return Err(DeepXOfflineEvmWrapperError::ChainId);
     }
     permit.ensure_active().map_err(SigningError::from)?;
@@ -232,7 +63,8 @@ pub fn sign_offline_evm_transact_extrinsic(
         .interfaces()
         .call("Ethereum", "transact")
         .map_err(SigningError::from)?;
-    let (evm, signature) = sign_offline_evm_transaction_parts(key, params)?;
+    let evm = sign_offline_evm_transaction(key, params)?;
+    let signature = evm.signature();
     let action = Value::unnamed_variant("Call", [Value::from_bytes(params.precompile_address)]);
     let r = Value::from_bytes(signature.r().to_be_bytes::<32>());
     let s = Value::from_bytes(signature.s().to_be_bytes::<32>());
@@ -302,26 +134,7 @@ pub fn sign_offline_perp_pnl_evm_transact_extrinsic(
     key: &DeepXPrivateKey,
     params: DeepXOfflinePerpPnlEvmParams,
 ) -> Result<DeepXOfflineEvmExtrinsic, DeepXOfflineEvmWrapperError> {
-    let calldata = setProfitAndLossPointCall {
-        subaccount: Address::from(params.call.subaccount),
-        marketId: params.call.market_id,
-        takeProfitPoint: params.call.take_profit_point,
-        stopLossPoint: params.call.stop_loss_point,
-    }
-    .abi_encode();
-    sign_offline_evm_transact_extrinsic(
-        permit,
-        key,
-        &DeepXOfflineEvmTransactionParams {
-            kind: params.kind,
-            chain_id: 4846,
-            nonce: params.nonce,
-            gas_limit: params.gas_limit,
-            precompile_address: DEEPX_TESTNET_PERP_PRECOMPILE,
-            value: U256::ZERO,
-            calldata,
-        },
-    )
+    sign_offline_evm_transact_extrinsic(permit, key, &params.into_transaction_params())
 }
 
 fn runtime_u256(value: U256) -> Value {
@@ -338,7 +151,10 @@ mod tests {
     use super::*;
     use crate::{
         common::{DeepXEnvironment, DeepXKeyScheme},
-        signing::{DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService, RuntimeSnapshot},
+        signing::{
+            DeepXPerpProfitAndLossPointParams, DeepXReadOnlyRuntimeSnapshot,
+            DeepXRuntimeSnapshotService, RuntimeSnapshot,
+        },
     };
 
     #[derive(Deserialize)]

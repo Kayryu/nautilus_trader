@@ -7817,11 +7817,10 @@ impl DeepXExecutionClient {
         let network = self.config.network.clone();
         let proxy_url = self.config.proxy_url.clone();
         let timeout = Duration::from_secs(self.config.websocket_timeout_secs);
-        let subaccount = self
-            .config
-            .subaccount_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DeepX account monitor has no configured subaccount"))?;
+        let subaccount =
+            self.config.subaccount_id.clone().ok_or_else(|| {
+                anyhow::anyhow!("DeepX account monitor has no configured subaccount")
+            })?;
         let cancellation = self.account_tasks.cancellation_token();
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
@@ -13188,18 +13187,19 @@ mod tests {
         let signer = derive_signer_account_id(credential).unwrap();
         let wallet = format!("0x{}", hex::encode(signer));
         let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.to_string()]);
-        let profile = DeepXSubaccountProfile {
-            authority: wallet,
-            address: subaccount.to_string(),
-            name: "test".to_string(),
-            status: "Active".to_string(),
-            spot_positions: Vec::new(),
-            next_order_id: 1,
-            spot_margin_trading_enabled: false,
-            margin_strategy: "Cross".to_string(),
-            height: 1,
-            created_at: 1,
-        };
+        let profile =
+            DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
+                authority: wallet,
+                address: subaccount.to_string(),
+                name: "test".to_string(),
+                status: "Active".to_string(),
+                spot_positions: Vec::new(),
+                next_order_id: 1,
+                spot_margin_trading_enabled: false,
+                margin_strategy: "Cross".to_string(),
+                height: 1,
+                created_at: 1,
+            });
         verify_account_ownership(credential, subaccount, &directory, &profile).unwrap()
     }
 
@@ -14449,28 +14449,31 @@ mod tests {
         let signer_address = format!("0x{}", hex::encode(signer));
         let wallet = format!("0x{}", hex::encode([0x33; 20]));
         let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.clone()]);
-        let profile = DeepXSubaccountProfile {
-            authority: wallet.clone(),
-            address: subaccount.clone(),
-            name: "test".to_string(),
-            status: "Active".to_string(),
-            spot_positions: Vec::new(),
-            next_order_id: 1,
-            spot_margin_trading_enabled: false,
-            margin_strategy: "Cross".to_string(),
-            height: 1,
-            created_at: 1,
-        };
+        let profile =
+            DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
+                authority: wallet.clone(),
+                address: subaccount.clone(),
+                name: "test".to_string(),
+                status: "Active".to_string(),
+                spot_positions: Vec::new(),
+                next_order_id: 1,
+                spot_margin_trading_enabled: false,
+                margin_strategy: "Cross".to_string(),
+                height: 1,
+                created_at: 1,
+            });
         let delegates = DeepXWalletDelegateAccounts::new(
             wallet.clone(),
-            vec![DeepXDelegateAccount {
-                delegate_address: signer_address.clone(),
-                delegate_name: "test".to_string(),
-                valid_until: 2_000,
-                mode: DeepXDelegateMode::PlaceOrCancelOrder,
-                create_time: 1,
-                active: true,
-            }],
+            vec![DeepXDelegateAccount(
+                deepx_rust_sdk::rest::models::DeepXDelegateAccount {
+                    delegate_address: signer_address.clone(),
+                    delegate_name: "test".to_string(),
+                    valid_until: 2_000,
+                    mode: DeepXDelegateMode::PlaceOrCancelOrder,
+                    create_time: 1,
+                    active: true,
+                },
+            )],
         );
         let delegators = DeepXDelegateWallets::new(signer_address, vec![wallet]);
         let proof = verify_delegated_account_ownership(

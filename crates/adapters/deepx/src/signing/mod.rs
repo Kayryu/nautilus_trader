@@ -16,18 +16,24 @@
 //! Fixture-gated DeepX runtime snapshots and offline pallet signing.
 
 mod evm;
-mod quota;
 mod snapshot;
 
+pub use deepx_rust_sdk::signing::{
+    DeepXBuyQuotaParams, DeepXDeleteSubaccountParams, DeepXInitializeSubaccountParams,
+    DeepXNonceEra, DeepXPerpCancelParams, DeepXPerpCloseParams, DeepXPerpModifyParams,
+    DeepXPerpOrderType, DeepXPerpPlaceParams, DeepXPerpProfitAndLossPointParams,
+    DeepXPostOnlyParam, DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError,
+    DeepXRemoveDelegateAccountParams, DeepXRenameSubaccountParams, DeepXSetDelegateAccountParams,
+    DeepXSetGlobalLeverageParams, DeepXSetPerMarketLeverageParams, DeepXSetSpotMarginParams,
+    DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce,
+    DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode, sign_quota_claim,
+};
 pub use evm::{
     DeepXEvmTransactionKind, DeepXOfflineEvmExtrinsic, DeepXOfflineEvmSignError,
     DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams, DeepXOfflineEvmWrapperError,
     DeepXOfflinePerpPnlEvmParams, sign_offline_evm_transact_extrinsic,
     sign_offline_evm_transaction, sign_offline_perp_pnl_evm_transact_extrinsic,
 };
-use parity_scale_codec::Decode;
-pub use quota::{DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError, sign_quota_claim};
-use serde::{Deserialize, Serialize};
 pub use snapshot::{
     ApprovedRuntimeIdentity, DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeChangeDecision,
     DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
@@ -59,13 +65,6 @@ pub enum DeepXRuntimeConfig {}
 #[derive(Debug)]
 pub struct CheckNonceEra {
     genesis_hash: H256,
-}
-
-#[doc(hidden)]
-#[derive(Debug, Decode)]
-pub enum DeepXNonceEra {
-    Immortal,
-    Mortal(u64),
 }
 
 impl ExtrinsicParams<DeepXRuntimeConfig> for CheckNonceEra {
@@ -173,346 +172,6 @@ pub struct SignedPalletExtrinsic {
     pub(crate) nonce: u64,
     /// Approved runtime identity used to encode and sign the extrinsic.
     pub(crate) runtime: ApprovedRuntimeIdentity,
-}
-
-/// Runtime time-in-force variants accepted by a DeepX perpetual limit order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DeepXTimeInForce {
-    /// Good until canceled.
-    Gtc,
-    /// Immediate or cancel.
-    Ioc,
-    /// Fill or kill.
-    Fok,
-}
-
-impl DeepXTimeInForce {
-    fn into_dynamic_value(self) -> Value {
-        let variant = match self {
-            Self::Gtc => "GTC",
-            Self::Ioc => "IOC",
-            Self::Fok => "FOK",
-        };
-        Value::unnamed_variant(variant, Vec::<Value>::new())
-    }
-}
-
-/// Runtime order-type variants accepted by a DeepX perpetual order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DeepXPerpOrderType {
-    /// Limit order with an explicit time-in-force policy.
-    Limit(DeepXTimeInForce),
-    /// Market order with optional exact runtime slippage basis points.
-    Market(Option<u64>),
-    /// System stop order. This type only proves encoding and does not grant placement authority.
-    Stop,
-}
-
-impl DeepXPerpOrderType {
-    fn into_dynamic_value(self) -> Value {
-        match self {
-            Self::Limit(time_in_force) => {
-                Value::unnamed_variant("Limit", [time_in_force.into_dynamic_value()])
-            }
-            Self::Market(slippage) => Value::unnamed_variant(
-                "Market",
-                [match slippage {
-                    Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
-                    None => Value::unnamed_variant("None", Vec::<Value>::new()),
-                }],
-            ),
-            Self::Stop => Value::unnamed_variant("Stop", Vec::<Value>::new()),
-        }
-    }
-}
-
-/// Runtime post-only behavior accepted by a DeepX perpetual order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DeepXPostOnlyParam {
-    /// No post-only restriction.
-    None,
-    /// Reject the order unless it posts to the book.
-    MustPostOnly,
-    /// Allow the runtime to adjust the price so the order posts.
-    Adaptive,
-}
-
-impl DeepXPostOnlyParam {
-    fn into_dynamic_value(self) -> Value {
-        let variant = match self {
-            Self::None => "None",
-            Self::MustPostOnly => "MustPostOnly",
-            Self::Adaptive => "Adaptive",
-        };
-        Value::unnamed_variant(variant, Vec::<Value>::new())
-    }
-}
-
-/// Exact raw runtime arguments for a DeepX perpetual order placement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXPerpPlaceParams {
-    /// DeepX subaccount identity.
-    pub subaccount: [u8; 20],
-    /// Runtime perpetual market identifier.
-    pub market_id: u16,
-    /// Whether the order opens or extends a long position.
-    pub is_long: bool,
-    /// Exact runtime size integer, without inferred financial scaling.
-    pub size: u128,
-    /// Exact runtime price integer, without inferred financial scaling.
-    pub price: u128,
-    /// Runtime order type and its exact associated data.
-    pub order_type: DeepXPerpOrderType,
-    /// Optional exact runtime take-profit integer.
-    pub take_profit: Option<u128>,
-    /// Optional exact runtime stop-loss integer.
-    pub stop_loss: Option<u128>,
-    /// Whether the order may only reduce an existing position.
-    pub reduce_only: bool,
-    /// Runtime post-only behavior.
-    pub post_only: DeepXPostOnlyParam,
-}
-
-impl DeepXPerpPlaceParams {
-    fn into_dynamic_value(self) -> Value {
-        let optional_u128 = |value| match value {
-            Some(value) => Value::unnamed_variant("Some", [Value::u128(value)]),
-            None => Value::unnamed_variant("None", Vec::<Value>::new()),
-        };
-        Value::named_composite([
-            ("subaccount", Value::from_bytes(self.subaccount)),
-            ("market_id", Value::u128(u128::from(self.market_id))),
-            ("is_long", Value::bool(self.is_long)),
-            ("size", Value::u128(self.size)),
-            ("price", Value::u128(self.price)),
-            ("order_type", self.order_type.into_dynamic_value()),
-            ("take_profit", optional_u128(self.take_profit)),
-            ("stop_loss", optional_u128(self.stop_loss)),
-            ("reduce_only", Value::bool(self.reduce_only)),
-            ("post_only", self.post_only.into_dynamic_value()),
-            (
-                "stp_mode",
-                Value::unnamed_variant("None", Vec::<Value>::new()),
-            ),
-        ])
-    }
-
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::named_composite([(
-            "params",
-            self.into_dynamic_value(),
-        )])]
-    }
-}
-
-/// Runtime order types accepted by a DeepX Spot order.
-///
-/// Spot and perpetual placement use the same runtime `OrderType` definition in the captured
-/// metadata.
-pub type DeepXSpotOrderType = DeepXPerpOrderType;
-
-fn u256_from_le_bytes(value: [u8; 32]) -> Value {
-    let limbs = std::array::from_fn::<_, 4, _>(|index| {
-        let offset = index * 8;
-        Value::u128(u128::from(u64::from_le_bytes(
-            value[offset..offset + 8]
-                .try_into()
-                .expect("fixed U256 limb"),
-        )))
-    });
-    Value::unnamed_composite([Value::unnamed_composite(limbs)])
-}
-
-/// Exact raw runtime arguments for a DeepX Spot order placement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSpotPlaceParams {
-    /// DeepX subaccount identity.
-    pub subaccount: [u8; 20],
-    /// Deployment-provided bytes32 Spot pair identifier.
-    pub pair: [u8; 32],
-    /// Whether the order buys the base asset.
-    pub is_buy: bool,
-    /// Exact little-endian runtime `U256` quote amount.
-    pub quote_amount: [u8; 32],
-    /// Exact little-endian runtime `U256` base amount.
-    pub base_amount: [u8; 32],
-    /// Runtime order type and its exact associated data.
-    pub order_type: DeepXSpotOrderType,
-    /// Runtime post-only behavior.
-    pub post_only: DeepXPostOnlyParam,
-    /// Whether the order may only reduce an existing balance or liability.
-    pub reduce_only: bool,
-}
-
-impl DeepXSpotPlaceParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::named_composite([
-            ("subaccount", Value::from_bytes(self.subaccount)),
-            ("pair", Value::from_bytes(self.pair)),
-            ("is_buy", Value::bool(self.is_buy)),
-            ("quote_amount", u256_from_le_bytes(self.quote_amount)),
-            ("base_amount", u256_from_le_bytes(self.base_amount)),
-            ("order_type", self.order_type.into_dynamic_value()),
-            ("post_only", self.post_only.into_dynamic_value()),
-            ("reduce_only", Value::bool(self.reduce_only)),
-            (
-                "stp_mode",
-                Value::unnamed_variant("None", Vec::<Value>::new()),
-            ),
-        ])]
-    }
-}
-
-/// Exact raw runtime arguments for a DeepX perpetual position close.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXPerpCloseParams {
-    /// DeepX subaccount identity.
-    pub subaccount: [u8; 20],
-    /// Runtime perpetual market identifier.
-    pub market_id: u16,
-    /// Exact runtime price integer, without inferred financial scaling.
-    pub price: u128,
-    /// Optional exact runtime slippage integer, without inferred units.
-    pub slippage: Option<u64>,
-}
-
-impl DeepXPerpCloseParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.subaccount),
-            Value::u128(u128::from(self.market_id)),
-            Value::u128(self.price),
-            match self.slippage {
-                Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
-                None => Value::unnamed_variant("None", Vec::<Value>::new()),
-            },
-        ]
-    }
-}
-
-/// Exact raw runtime arguments for perpetual profit and loss point management.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXPerpProfitAndLossPointParams {
-    /// DeepX subaccount identity.
-    pub subaccount: [u8; 20],
-    /// Runtime perpetual market identifier.
-    pub market_id: u16,
-    /// Exact runtime integer, without inferred scaling or trigger semantics.
-    pub take_profit_point: u128,
-    /// Exact runtime integer, without inferred scaling or trigger semantics.
-    pub stop_loss_point: u128,
-}
-
-impl DeepXPerpProfitAndLossPointParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.subaccount),
-            Value::u128(u128::from(self.market_id)),
-            Value::u128(self.take_profit_point),
-            Value::u128(self.stop_loss_point),
-        ]
-    }
-}
-
-/// Exact arguments for a user-requested DeepX perpetual order cancellation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXPerpCancelParams {
-    /// DeepX subaccount which owns the order.
-    pub subaccount: [u8; 20],
-    /// Runtime-assigned order identifier.
-    pub order_id: u64,
-    /// Perpetual market identifier.
-    pub market_id: u16,
-    /// Whether the runtime should use its high-priority cancellation path.
-    pub fast_cancel: bool,
-}
-
-impl DeepXPerpCancelParams {
-    fn into_dynamic_value(self) -> Value {
-        Value::named_composite([
-            ("subaccount", Value::from_bytes(self.subaccount)),
-            ("order_id", Value::u128(u128::from(self.order_id))),
-            ("market_id", Value::u128(u128::from(self.market_id))),
-            (
-                "cancel_reason",
-                Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
-            ),
-            ("fast_cancel", Value::bool(self.fast_cancel)),
-        ])
-    }
-
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::named_composite([(
-            "params",
-            self.into_dynamic_value(),
-        )])]
-    }
-}
-
-/// Exact arguments for a transactional perpetual cancel-and-place modification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXPerpModifyParams {
-    /// Existing order to cancel.
-    pub cancel: DeepXPerpCancelParams,
-    /// Replacement order to place using the modify extrinsic nonce as its order ID.
-    pub place: DeepXPerpPlaceParams,
-}
-
-impl DeepXPerpModifyParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        let cancel = Value::unnamed_variant(
-            "Cancel",
-            [Value::unnamed_variant(
-                "Perp",
-                [self.cancel.into_dynamic_value()],
-            )],
-        );
-        let place = Value::unnamed_variant(
-            "Place",
-            [Value::unnamed_variant(
-                "Perp",
-                [self.place.into_dynamic_value()],
-            )],
-        );
-        vec![Value::unnamed_composite([cancel, place])]
-    }
-}
-
-/// Exact arguments for a user-requested DeepX Spot order cancellation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSpotCancelParams {
-    /// DeepX subaccount which owns the order.
-    pub subaccount: [u8; 20],
-    /// Deployment-provided bytes32 Spot pair identifier.
-    pub pair: [u8; 32],
-    /// Runtime-assigned order identifier.
-    pub order_id: u64,
-    /// Whether the canceled order is a buy.
-    pub is_buy: bool,
-    /// Whether the runtime should use its high-priority cancellation path.
-    pub fast_cancel: bool,
-}
-
-impl DeepXSpotCancelParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::named_composite([(
-            "params",
-            Value::named_composite([
-                ("subaccount", Value::from_bytes(self.subaccount)),
-                ("pair", Value::from_bytes(self.pair)),
-                ("order_id", Value::u128(u128::from(self.order_id))),
-                ("is_buy", Value::bool(self.is_buy)),
-                (
-                    "cancel_reason",
-                    Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
-                ),
-                ("fast_cancel", Value::bool(self.fast_cancel)),
-            ]),
-        )])]
-    }
 }
 
 impl SignedPalletExtrinsic {
@@ -766,24 +425,6 @@ pub fn sign_perp_set_profit_and_loss_point(
     )
 }
 
-/// Exact raw arguments for an owner-signed global leverage setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSetGlobalLeverageParams {
-    /// Exact runtime subaccount identity, without inferred ownership.
-    pub subaccount: [u8; 20],
-    /// Raw runtime leverage, or `None` to clear the global setting.
-    pub max_leverage: Option<u64>,
-}
-
-impl DeepXSetGlobalLeverageParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.subaccount),
-            optional_leverage(self.max_leverage),
-        ]
-    }
-}
-
 /// Signs a global perpetual leverage setting without submitting it.
 ///
 /// The runtime checks ownership and leverage bounds. This offline API does not establish either
@@ -808,27 +449,6 @@ pub fn sign_set_global_leverage(
     )
 }
 
-/// Exact raw arguments for an owner-signed per-market leverage override.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSetPerMarketLeverageParams {
-    /// Exact runtime subaccount identity, without inferred ownership.
-    pub subaccount: [u8; 20],
-    /// Runtime perpetual market identifier.
-    pub market_id: u16,
-    /// Raw runtime leverage, or `None` to remove this market override.
-    pub max_leverage: Option<u64>,
-}
-
-impl DeepXSetPerMarketLeverageParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.subaccount),
-            Value::u128(u128::from(self.market_id)),
-            optional_leverage(self.max_leverage),
-        ]
-    }
-}
-
 /// Signs a per-market perpetual leverage setting without submitting it.
 ///
 /// The runtime checks ownership, market eligibility, and leverage bounds. This offline API does
@@ -851,26 +471,6 @@ pub fn sign_set_per_market_leverage(
         params.into_dynamic_arguments(),
         nonce,
     )
-}
-
-fn optional_leverage(value: Option<u64>) -> Value {
-    match value {
-        Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
-        None => Value::unnamed_variant("None", Vec::<Value>::new()),
-    }
-}
-
-/// Exact raw arguments for subaccount initialization.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeepXInitializeSubaccountParams {
-    /// Opaque name bytes, bounded to 32 by the runtime call type.
-    pub name: Vec<u8>,
-}
-
-impl DeepXInitializeSubaccountParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::from_bytes(self.name)]
-    }
 }
 
 /// Signs subaccount initialization without submitting it.
@@ -903,19 +503,6 @@ pub fn sign_initialize_subaccount(
     )
 }
 
-/// Exact raw arguments for subaccount deletion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXDeleteSubaccountParams {
-    /// Exact runtime subaccount identity, without inferred authorization.
-    pub subaccount: [u8; 20],
-}
-
-impl DeepXDeleteSubaccountParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::from_bytes(self.subaccount)]
-    }
-}
-
 /// Signs subaccount deletion without submitting it.
 ///
 /// This offline API infers no ownership, eligibility, or deletion semantics and performs no
@@ -938,24 +525,6 @@ pub fn sign_delete_subaccount(
         params.into_dynamic_arguments(),
         nonce,
     )
-}
-
-/// Exact raw arguments for subaccount renaming.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeepXRenameSubaccountParams {
-    /// Exact runtime subaccount identity, without inferred ownership.
-    pub subaccount: [u8; 20],
-    /// Opaque new name bytes, bounded to 32 by the runtime call type.
-    pub new_name: Vec<u8>,
-}
-
-impl DeepXRenameSubaccountParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.subaccount),
-            Value::from_bytes(self.new_name),
-        ]
-    }
 }
 
 /// Signs subaccount renaming without submitting it.
@@ -988,24 +557,6 @@ pub fn sign_rename_subaccount(
     )
 }
 
-/// Exact raw arguments for a subaccount Spot margin setting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSetSpotMarginParams {
-    /// Exact runtime subaccount identity, without inferred ownership.
-    pub address: [u8; 20],
-    /// Requested Spot margin setting.
-    pub enable_spot_margin: bool,
-}
-
-impl DeepXSetSpotMarginParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.address),
-            Value::bool(self.enable_spot_margin),
-        ]
-    }
-}
-
 /// Signs a subaccount Spot margin change without submitting it.
 ///
 /// The runtime requires ownership and no open Spot orders. This offline API does not establish
@@ -1028,27 +579,6 @@ pub fn sign_set_spot_margin(
         params.into_dynamic_arguments(),
         nonce,
     )
-}
-
-/// Exact raw arguments for wallet delegate creation or renewal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeepXSetDelegateAccountParams {
-    /// Exact runtime delegate identity, without inferred authorization.
-    pub delegate: [u8; 20],
-    /// Opaque runtime label bytes.
-    pub name: Vec<u8>,
-    /// Raw Unix millisecond expiry supplied by the caller.
-    pub valid_until: u64,
-}
-
-impl DeepXSetDelegateAccountParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.delegate),
-            Value::from_bytes(self.name),
-            Value::u128(u128::from(self.valid_until)),
-        ]
-    }
 }
 
 /// Signs wallet delegate creation or renewal without submitting it.
@@ -1075,43 +605,6 @@ pub fn sign_set_delegate_account(
     )
 }
 
-/// Delegate modes accepted by the captured runtime's update call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepXWritableDelegateMode {
-    /// Allows order placement and cancellation.
-    PlaceOrCancelOrder,
-    /// Disables delegate permissions.
-    Disable,
-}
-
-impl DeepXWritableDelegateMode {
-    fn into_dynamic_value(self) -> Value {
-        let variant = match self {
-            Self::PlaceOrCancelOrder => "PlaceOrCancelOrder",
-            Self::Disable => "Disable",
-        };
-        Value::unnamed_variant(variant, Vec::<Value>::new())
-    }
-}
-
-/// Exact raw arguments for a wallet delegate mode update.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXUpdateDelegateModeParams {
-    /// Exact delegate identity, without inferred ownership or eligibility.
-    pub address: [u8; 20],
-    /// Mode accepted by the captured runtime dispatch logic.
-    pub new_mode: DeepXWritableDelegateMode,
-}
-
-impl DeepXUpdateDelegateModeParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![
-            Value::from_bytes(self.address),
-            self.new_mode.into_dynamic_value(),
-        ]
-    }
-}
-
 /// Signs a wallet delegate mode update without submitting it.
 ///
 /// This offline API does not check account existence, owner authorization, expiry, or business
@@ -1136,19 +629,6 @@ pub fn sign_update_delegate_mode(
     )
 }
 
-/// Exact raw arguments for wallet delegate removal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXRemoveDelegateAccountParams {
-    /// Exact runtime delegate identity, without inferred authorization.
-    pub delegate: [u8; 20],
-}
-
-impl DeepXRemoveDelegateAccountParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::from_bytes(self.delegate)]
-    }
-}
-
 /// Signs wallet delegate removal without submitting it.
 ///
 /// This offline API infers no authorization or revocation semantics and performs no network
@@ -1171,31 +651,6 @@ pub fn sign_remove_delegate_account(
         params.into_dynamic_arguments(),
         nonce,
     )
-}
-
-/// Exact raw arguments for a Lending quota purchase call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXBuyQuotaParams {
-    /// AccountId20 whose quota would be increased.
-    pub address: [u8; 20],
-    /// Raw runtime quota count.
-    pub quota: u32,
-    /// Optional source subaccount for the runtime purchase path.
-    pub from_subaccount: Option<[u8; 20]>,
-}
-
-impl DeepXBuyQuotaParams {
-    fn into_dynamic_arguments(self) -> Vec<Value> {
-        let from_subaccount = match self.from_subaccount {
-            Some(address) => Value::unnamed_variant("Some", [Value::from_bytes(address)]),
-            None => Value::unnamed_variant("None", Vec::<Value>::new()),
-        };
-        vec![
-            Value::from_bytes(self.address),
-            Value::u128(u128::from(self.quota)),
-            from_subaccount,
-        ]
-    }
 }
 
 /// Signs a Lending quota purchase call without submitting it.

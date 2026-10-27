@@ -15,21 +15,22 @@
 
 //! Bounded public lending interest-rate observations without yield interpretation.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
+pub use deepx_rust_sdk::websocket::lending_rates::{DeepXWsLendingRate, DeepXWsLendingRatesBatch};
+use deepx_rust_sdk::websocket::lending_rates::{
+    DeepXWsLendingRatesFrame, DeepXWsLendingRatesRequest as SdkLendingRatesRequest,
+};
 use nautilus_network::transport::Message;
-use rust_decimal::Decimal;
-use serde::Deserialize;
-use serde_json::{json, value::RawValue};
 
 use super::transport::DeepXWsReadConnection;
-use crate::http::{DeepXLendingAsset, DeepXLendingInterestRateRecord, models::exact_decimal};
+use crate::http::{DeepXLendingAsset, DeepXLendingInterestRateRecord};
 
 /// One read-only aggregate lending-rate subscription bound to a validated REST directory.
 #[derive(Clone, Debug)]
 pub struct DeepXWsLendingRatesRequest {
-    assets: BTreeSet<(u64, String)>,
+    inner: SdkLendingRatesRequest,
 }
 
 impl DeepXWsLendingRatesRequest {
@@ -39,173 +40,23 @@ impl DeepXWsLendingRatesRequest {
     ///
     /// Returns an error for an empty, duplicated, or invalid asset identity.
     pub fn new(assets: &[DeepXLendingAsset]) -> Result<Self> {
-        ensure!(!assets.is_empty(), "DeepX lending asset directory is empty");
-        let mut expected = BTreeSet::new();
-        for asset in assets {
-            ensure!(
-                asset.market_id != 0 && !asset.asset.is_empty(),
-                "invalid DeepX lending asset identity"
-            );
-            ensure!(
-                expected.insert((asset.market_id, asset.asset.to_ascii_lowercase())),
-                "duplicate DeepX lending asset identity"
-            );
-        }
-        Ok(Self { assets: expected })
+        let inner = SdkLendingRatesRequest::new(
+            assets
+                .iter()
+                .map(|asset| (asset.market_id, asset.asset.clone())),
+        )?;
+        Ok(Self { inner })
     }
 
     /// Serializes the documented uncompressed subscription.
     #[must_use]
     pub fn to_text(&self) -> String {
-        json!({
-            "action": "subscribe",
-            "market": {"type": "lending"},
-            "subscriptions": ["lending_interest_rate"],
-            "options": {"compress": false},
-        })
-        .to_string()
+        self.inner.to_text()
     }
 
     fn parse(&self, text: &str) -> Result<DeepXWsLendingRatesFrame> {
-        #[derive(Deserialize)]
-        struct Market {
-            #[serde(rename = "type")]
-            kind: String,
-        }
-        #[derive(Deserialize)]
-        struct Frame {
-            #[serde(rename = "type")]
-            kind: String,
-            market: Option<Market>,
-            subscriptions: Option<Vec<String>>,
-            channel: Option<String>,
-            data: Option<Box<RawValue>>,
-            timestamp: Option<u64>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Data {
-            items: Vec<Box<RawValue>>,
-            statistic_time: u64,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Item {
-            asset: String,
-            #[serde(deserialize_with = "exact_decimal::deserialize")]
-            borrow_apr: Decimal,
-            market_id: u64,
-            statistic_time: u64,
-            #[serde(deserialize_with = "exact_decimal::deserialize")]
-            supply_apr: Decimal,
-        }
-
-        let frame: Frame = serde_json::from_str(text)?;
-        if frame.kind == "pong" {
-            return Ok(DeepXWsLendingRatesFrame::Pong);
-        }
-        ensure!(
-            frame.market.is_some_and(|market| market.kind == "lending"),
-            "foreign DeepX lending market"
-        );
-        match frame.kind.as_str() {
-            "subscribed" => {
-                ensure!(
-                    frame.subscriptions.as_deref() == Some(&["lending_interest_rate".to_string()]),
-                    "foreign DeepX lending-rate acknowledgement"
-                );
-                Ok(DeepXWsLendingRatesFrame::Subscribed)
-            }
-            "data" => {
-                ensure!(
-                    frame.channel.as_deref() == Some("lending_interest_rate"),
-                    "foreign DeepX lending-rate channel"
-                );
-                let raw = frame
-                    .data
-                    .ok_or_else(|| anyhow::anyhow!("missing DeepX lending-rate data"))?;
-                let data: Data = serde_json::from_str(raw.get())?;
-                ensure!(
-                    !data.items.is_empty()
-                        && data.items.len() <= self.assets.len()
-                        && valid_timestamp(data.statistic_time)
-                        && data.statistic_time.is_multiple_of(60_000),
-                    "invalid DeepX lending-rate batch"
-                );
-                let timestamp_ms = frame
-                    .timestamp
-                    .ok_or_else(|| anyhow::anyhow!("missing DeepX lending-rate timestamp"))?;
-                ensure!(
-                    valid_timestamp(timestamp_ms) && data.statistic_time <= timestamp_ms,
-                    "invalid DeepX lending-rate frame timestamp"
-                );
-                let mut seen = BTreeSet::new();
-                let mut rates = Vec::with_capacity(data.items.len());
-                for raw in data.items {
-                    let item: Item = serde_json::from_str(raw.get())?;
-                    let key = (item.market_id, item.asset.to_ascii_lowercase());
-                    ensure!(
-                        self.assets.contains(&key)
-                            && seen.insert(key)
-                            && item.statistic_time == data.statistic_time
-                            && item.borrow_apr >= Decimal::ZERO
-                            && item.supply_apr >= Decimal::ZERO,
-                        "foreign or invalid DeepX lending-rate item"
-                    );
-                    rates.push(DeepXWsLendingRate {
-                        market_id: item.market_id,
-                        asset: item.asset,
-                        borrow_apr: item.borrow_apr,
-                        supply_apr: item.supply_apr,
-                        raw,
-                    });
-                }
-                Ok(DeepXWsLendingRatesFrame::Rates(DeepXWsLendingRatesBatch {
-                    rates,
-                    statistic_time_ms: data.statistic_time,
-                    timestamp_ms,
-                }))
-            }
-            _ => anyhow::bail!("unsupported DeepX lending-rate frame"),
-        }
+        self.inner.parse(text)
     }
-}
-
-fn valid_timestamp(timestamp: u64) -> bool {
-    timestamp > 0 && i64::try_from(timestamp).is_ok()
-}
-
-/// One exact-decimal lending APR observation with its original JSON.
-#[derive(Debug)]
-pub struct DeepXWsLendingRate {
-    /// Venue lending market ID.
-    pub market_id: u64,
-    /// Venue asset symbol.
-    pub asset: String,
-    /// Exact borrow APR as sent by the venue.
-    pub borrow_apr: Decimal,
-    /// Exact supply APR as sent by the venue.
-    pub supply_apr: Decimal,
-    raw: Box<RawValue>,
-}
-
-impl DeepXWsLendingRate {
-    /// Returns the original item JSON, preserving decimal lexemes.
-    #[must_use]
-    pub fn raw(&self) -> &RawValue {
-        &self.raw
-    }
-}
-
-/// One mutable lending-rate batch with venue millisecond timestamps.
-#[derive(Debug)]
-pub struct DeepXWsLendingRatesBatch {
-    /// Validated items in venue order.
-    pub rates: Vec<DeepXWsLendingRate>,
-    /// Venue statistic bucket timestamp.
-    pub statistic_time_ms: u64,
-    /// WebSocket envelope timestamp.
-    pub timestamp_ms: u64,
 }
 
 /// Checks that every observed WebSocket rate has one identical typed REST history record.
@@ -246,12 +97,6 @@ pub fn match_lending_rate_batch_to_rest(
         );
     }
     Ok(())
-}
-
-enum DeepXWsLendingRatesFrame {
-    Subscribed,
-    Rates(DeepXWsLendingRatesBatch),
-    Pong,
 }
 
 /// Reads the first bounded lending-rate batch after an exact acknowledgement.
@@ -345,13 +190,11 @@ mod tests {
     const FRAME: &str = r#"{"type":"data","channel":"lending_interest_rate","market":{"type":"lending"},"data":{"items":[{"asset":"eth","borrowApr":0.00019907914921343624,"marketId":1,"statisticTime":1791629700000,"supplyApr":1.2127547341372958e-6}],"statisticTime":1791629700000},"timestamp":1791629721075}"#;
 
     fn request() -> DeepXWsLendingRatesRequest {
-        DeepXWsLendingRatesRequest::new(&[DeepXLendingAsset {
-            market_id: 1,
-            asset: "ETH".to_string(),
-            height: 1,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        }])
-        .unwrap()
+        let asset: DeepXLendingAsset = serde_json::from_str(
+            r#"{"marketId":1,"asset":"ETH","height":1,"createdAt":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        DeepXWsLendingRatesRequest::new(&[asset]).unwrap()
     }
 
     #[rstest]

@@ -17,15 +17,13 @@
 
 use std::sync::LazyLock;
 
+pub use deepx_rust_sdk::deployment::{
+    DEEPX_TESTNET_CHAIN_ID, DEEPX_TESTNET_GENESIS_HASH, DEEPX_TESTNET_REST_URL,
+    DEEPX_TESTNET_RPC_URL, DEEPX_TESTNET_WS_URL,
+};
 use nautilus_model::identifiers::{ClientId, Venue};
 
-pub const DEEPX: &str = "DEEPX";
+pub const DEEPX: &str = deepx_rust_sdk::deployment::DEEPX;
+
 pub static DEEPX_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(DEEPX));
 pub static DEEPX_CLIENT_ID: LazyLock<ClientId> = LazyLock::new(|| ClientId::new(DEEPX));
-
-pub const DEEPX_TESTNET_REST_URL: &str = "https://api-testnet.deepx.fi";
-pub const DEEPX_TESTNET_WS_URL: &str = "wss://ws-testnet.deepx.fi";
-pub const DEEPX_TESTNET_RPC_URL: &str = "https://rpc1-testnet.deepx.fi";
-pub const DEEPX_TESTNET_CHAIN_ID: u32 = 4_846;
-pub const DEEPX_TESTNET_GENESIS_HASH: &str =
-    "0x87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";

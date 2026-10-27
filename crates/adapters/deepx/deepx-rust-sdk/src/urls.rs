@@ -15,8 +15,8 @@
 
 //! DeepX deployment URL resolution.
 
-use super::{
-    consts::{DEEPX_TESTNET_REST_URL, DEEPX_TESTNET_RPC_URL, DEEPX_TESTNET_WS_URL},
+use crate::{
+    deployment::{DEEPX_TESTNET_REST_URL, DEEPX_TESTNET_RPC_URL, DEEPX_TESTNET_WS_URL},
     enums::DeepXEnvironment,
     error::{DeepXError, Result},
 };

@@ -41,6 +41,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use deepx_rust_sdk::query::DEEPX_MAX_HISTORY_PAGE_SIZE;
 use nautilus_common::{
     cache::CacheView,
     clients::DataClient,
@@ -1323,7 +1324,7 @@ impl DataClient for DeepXDataClient {
             .ok_or_else(|| anyhow::anyhow!("DeepX candle end overflows"))?;
         let limit = request.limit.map(|limit| limit.get());
         anyhow::ensure!(
-            limit.is_none_or(|limit| limit <= 5_000),
+            limit.is_none_or(|limit| limit <= DEEPX_MAX_HISTORY_PAGE_SIZE as usize),
             "DeepX candle request limit exceeds 5000"
         );
         let http = self.http.clone();
