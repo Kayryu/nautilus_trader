@@ -431,9 +431,11 @@ mod tests {
 
     use super::*;
 
-    const SPOT_MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
-    const SPOT_BOOK: &str =
-        include_str!("../../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
+    const SPOT_MARKETS: &str =
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+    const SPOT_BOOK: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
+    );
 
     struct Server(tokio::task::JoinHandle<()>);
 

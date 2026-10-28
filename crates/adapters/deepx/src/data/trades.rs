@@ -170,9 +170,11 @@ mod tests {
     use super::*;
     use crate::http::{DeepXApiResponse, DeepXSpotMarket};
 
-    const SPOT_MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
-    const SPOT_TRADES: &str =
-        include_str!("../../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
+    const SPOT_MARKETS: &str =
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+    const SPOT_TRADES: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_trades_eth_usdc_page_1.json"
+    );
 
     fn spot_instrument() -> InstrumentAny {
         let base = Currency::new_checked("ETH", 18, 0, "ETH", CurrencyType::Crypto).unwrap();

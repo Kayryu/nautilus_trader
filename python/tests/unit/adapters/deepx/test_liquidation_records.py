@@ -39,7 +39,7 @@ from nautilus_trader.adapters.deepx import get_deepx_liquidation_records
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/wallet_liquidation_records_page_1.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/wallet_liquidation_records_page_1.json"
 )
 
 

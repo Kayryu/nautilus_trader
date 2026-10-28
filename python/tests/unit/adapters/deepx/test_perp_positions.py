@@ -42,7 +42,7 @@ from nautilus_trader.adapters.deepx import get_deepx_wallet_perp_positions
 SUBACCOUNT = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
 SECOND_SUBACCOUNT = "0x977654069311fa41b88f7901dc65fae9a76fd60b"
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
-FIXTURE_DIR = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/test_data/http/testnet"
+FIXTURE_DIR = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet"
 FIXTURE = FIXTURE_DIR / "perp_positions_account_market_3.json"
 
 

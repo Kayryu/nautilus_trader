@@ -429,7 +429,8 @@ fn capture_options(args: impl Iterator<Item = String>) -> anyhow::Result<(u64, P
     Ok((
         block_number.context("--block-number is required")?,
         output_root.unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/runtime/testnet")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("deepx-rust-sdk/test_data/runtime/testnet")
         }),
     ))
 }

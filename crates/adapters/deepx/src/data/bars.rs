@@ -185,7 +185,7 @@ mod tests {
     use super::*;
 
     const SPOT_CANDLES: &str =
-        include_str!("../../test_data/http/testnet/spot_candles_eth_usdc_1m.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_candles_eth_usdc_1m.json");
 
     fn spot_instrument() -> InstrumentAny {
         let base = Currency::new_checked("ETH", 18, 0, "ETH", CurrencyType::Crypto).unwrap();

@@ -38,7 +38,7 @@ SUBACCOUNT = "0x08bdb660e03c75954e0fcaa1e7ead150a92c891c"
 ORDER_ID = "1789627349907"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
 )
 
 

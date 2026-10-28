@@ -316,7 +316,7 @@ mod tests {
 
     fn request() -> DeepXWsSpotTradeHistoryRequest {
         let response: DeepXApiResponse<Vec<DeepXSpotMarket>> = serde_json::from_str(include_str!(
-            "../../../test_data/http/testnet/spot_markets.json"
+            "../../test_data/http/testnet/spot_markets.json"
         ))
         .unwrap();
         let market = response

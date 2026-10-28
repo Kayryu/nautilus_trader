@@ -961,7 +961,7 @@ Complete signed vectors match the pinned Python SDK under spec366, spec369, and 
 absent slippage and `Some(50)` raw slippage. Other argument combinations remain unproven.
 
 The proof source is the existing runtime fixture under
-`crates/adapters/deepx/test_data/runtime/testnet/` with metadata SHA-256
+`crates/adapters/deepx/deepx-rust-sdk/test_data/runtime/testnet/` with metadata SHA-256
 `e6b8b68e26fdd49e47e0af2ce4b6fe947f5d4520cb10171f250665e90e7b1c37`.
 No price or slippage unit conversion is inferred. This offline API does not reserve nonces,
 persist, submit, reconcile close events, or enable execution commands. Maintainer approval,

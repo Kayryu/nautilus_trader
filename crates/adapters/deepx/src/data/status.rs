@@ -163,7 +163,8 @@ mod tests {
 
     use super::*;
 
-    const PERP: &str = include_str!("../../test_data/http/testnet/perp_markets.json");
+    const PERP: &str =
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
     const EMPTY: &str = r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
     const FAILED: &str =
         r#"{"code":10012,"msg":"Service temporarily unavailable","data":null,"fail":true}"#;

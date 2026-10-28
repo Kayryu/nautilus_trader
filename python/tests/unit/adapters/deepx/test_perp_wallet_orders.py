@@ -38,7 +38,7 @@ from nautilus_trader.adapters.deepx import get_deepx_perp_wallet_orders
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/perp_wallet_orders_page_1.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/perp_wallet_orders_page_1.json"
 )
 
 

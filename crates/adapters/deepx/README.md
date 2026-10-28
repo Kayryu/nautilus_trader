@@ -1254,8 +1254,8 @@ streaming connections.
 against testnet without account access, signing, or submission. A live run on 2026-09-17
 successfully cross-checked both ETH-USDC lookup routes, published and queried nine perpetual
 instruments, and disconnected. The captured public directory response and provenance sidecar are
-`test_data/http/testnet/perp_markets_spec369.*`; the response is not block-pinned and establishes
-no streaming or trading authority.
+`deepx-rust-sdk/test_data/http/testnet/perp_markets_spec369.*`. The response is not block-pinned
+and establishes no streaming or trading authority.
 
 `get_perp_market_by_id` and `get_perp_market_by_name` expose validated single-market lookup
 responses. Those responses omit the directory's tick size, quantity step, height, network,
@@ -1635,7 +1635,7 @@ version, and the pinned Python SDK independently reproduced exact `System.remark
 the observed runtime identity; invalid genesis, metadata, and unsupported transaction extensions
 fail closed.
 
-Sanitized public REST fixtures under `test_data/http/testnet` include sidecar manifests when a
+Sanitized public REST fixtures under `deepx-rust-sdk/test_data/http/testnet` include sidecar manifests when a
 capture is associated with the independently verified testnet runtime identity. REST responses are
 not block-hash-pinned unless a manifest explicitly states otherwise; these fixtures prove only the
 wire properties named in their tests and limitations.

@@ -5025,7 +5025,7 @@ mod tests {
         let encoded_hash = format!("0x{}", hex::encode(block_hash));
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
@@ -5136,11 +5136,11 @@ mod tests {
     fn spec_376_finalized_event_fixture_is_complete_and_read_only_approved() {
         const FIXTURE_ROOT: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-19592700-spec376/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/",
         );
         let metadata_response: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
@@ -5162,22 +5162,22 @@ mod tests {
         .unwrap();
         let manifest: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-19592700-spec376/manifest.json",
+            "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/manifest.json",
         )))
         .unwrap();
         let initial: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events.json",
+            "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events.json",
         )))
         .unwrap();
         let repeated: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_repeated.json",
+            "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_repeated.json",
         )))
         .unwrap();
         let queried: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_query_storage_at.json",
+            "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/system_events_query_storage_at.json",
         )))
         .unwrap();
         assert_eq!(
@@ -5198,7 +5198,7 @@ mod tests {
         let event_bytes = hex::decode(
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/test_data/runtime/testnet/finalized-events-19592700-spec376/",
+                "/deepx-rust-sdk/test_data/runtime/testnet/finalized-events-19592700-spec376/",
                 "reassembled_events.hex",
             ))
             .trim()
@@ -5349,7 +5349,7 @@ mod tests {
     fn read_only_runtime_snapshot() -> DeepXReadOnlyRuntimeSnapshot {
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
@@ -5911,7 +5911,7 @@ mod tests {
 
         let response: MetadataResponse = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();

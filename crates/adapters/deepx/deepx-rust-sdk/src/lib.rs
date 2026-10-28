@@ -31,3 +31,6 @@ pub mod urls;
 pub mod websocket;
 
 mod transport;
+
+#[cfg(test)]
+mod fixture_tests;

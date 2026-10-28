@@ -38,7 +38,7 @@ from nautilus_trader.adapters.deepx import get_deepx_delegator_accounts
 
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 DELEGATE = "0x1b856b9bf1d0ceeb0927a081c759813cd703a54f"
-FIXTURE_DIR = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/test_data/http/testnet"
+FIXTURE_DIR = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet"
 
 
 @pytest.fixture

@@ -1916,16 +1916,18 @@ mod tests {
 
     use super::*;
 
-    const SPOT: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+    const SPOT: &str = include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
     const EMPTY_SPOT: &str = r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
     const SPOT_TRADES: &str =
-        include_str!("../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
+        include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
     const SPOT_CANDLES: &str =
-        include_str!("../test_data/http/testnet/spot_candles_eth_usdc_1m.json");
-    const SPOT_BOOK: &str =
-        include_str!("../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
-    const PERP: &str = include_str!("../test_data/http/testnet/perp_markets.json");
-    const CAPTURED_PERP: &str = include_str!("../test_data/http/testnet/perp_markets_spec369.json");
+        include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_candles_eth_usdc_1m.json");
+    const SPOT_BOOK: &str = include_str!(
+        "../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
+    );
+    const PERP: &str = include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+    const CAPTURED_PERP: &str =
+        include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets_spec369.json");
 
     static DATA_EVENT_SENDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -5862,7 +5864,7 @@ mod tests {
     #[tokio::test]
     async fn captured_spec369_markets_load_and_publish_every_perpetual() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/perp_markets_spec369.manifest.json"
+            "../deepx-rust-sdk/test_data/http/testnet/perp_markets_spec369.manifest.json"
         ))
         .unwrap();
         let digest =

@@ -271,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn selected_wallet_group_requires_stable_identity(#[case] outcome: &str) {
         let mut first: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/perp_wallet_trades_page.json"
+            "../deepx-rust-sdk/test_data/http/testnet/perp_wallet_trades_page.json"
         ))
         .unwrap();
         first["data"].as_array_mut().unwrap().truncate(1);

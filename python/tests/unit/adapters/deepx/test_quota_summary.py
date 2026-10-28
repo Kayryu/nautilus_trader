@@ -40,11 +40,11 @@ from nautilus_trader.adapters.deepx import get_deepx_quota_summary
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/wallet_quota_summary.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/wallet_quota_summary.json"
 )
 HISTORY_FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/quota_history_purchase_page.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/quota_history_purchase_page.json"
 )
 PURCHASE_WALLET = "0x0a40c3efbc3b3bebdf1fb6f0f8c612eb336b25ae"
 PURCHASE_BUYER = "0x5f5f4a75ca927ff4ef5f2debb6214ee2b5e63eb2"

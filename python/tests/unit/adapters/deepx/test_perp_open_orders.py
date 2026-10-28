@@ -37,7 +37,7 @@ from nautilus_trader.adapters.deepx import get_deepx_perp_open_orders
 SUBACCOUNT = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/perp_history_orders_account_market_3.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/perp_history_orders_account_market_3.json"
 )
 
 

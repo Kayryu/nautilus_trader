@@ -283,7 +283,7 @@ mod tests {
     fn duplicate_observed_trade_fails_before_finalized_reads() {
         let wallet: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/http/testnet/perp_wallet_trades_page.json",
+            "/deepx-rust-sdk/test_data/http/testnet/perp_wallet_trades_page.json",
         )))
         .unwrap();
         let address = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";

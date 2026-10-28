@@ -34,11 +34,11 @@ from nautilus_trader.adapters.deepx import load_deepx_spot_trade_ticks
 
 MARKETS = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/perp_markets.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/perp_markets.json"
 ).read_bytes()
 SPOT_MARKETS = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/spot_markets.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/spot_markets.json"
 ).read_bytes()
 START_MS = 1_788_220_800_000
 END_MS = START_MS + 600_000

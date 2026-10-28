@@ -205,8 +205,25 @@ pub mod optional_exact_u64 {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use serde::Deserialize;
 
     use super::*;
+
+    #[rstest]
+    fn preserves_exact_json_number_lexeme() {
+        #[derive(Deserialize)]
+        struct ExactPrice {
+            #[serde(deserialize_with = "exact_decimal::deserialize")]
+            price: Decimal,
+        }
+
+        let value: ExactPrice = serde_json::from_str(r#"{"price":2453.980000000000001}"#).unwrap();
+
+        assert_eq!(
+            value.price,
+            "2453.980000000000001".parse::<Decimal>().unwrap()
+        );
+    }
 
     #[rstest]
     #[case("1.2867e1", "12.867")]

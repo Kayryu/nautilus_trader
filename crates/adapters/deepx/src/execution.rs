@@ -12002,26 +12002,29 @@ mod tests {
     }
 
     const GENESIS_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
          genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          genesis_hash.json"
     );
     const FINALIZED_HEAD_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
          genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
     const METADATA_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          metadata.json"
     );
-    const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
-        include_str!("../test_data/http/testnet/perp_history_orders_account_market_3.json");
-    const PERP_POSITIONS_ACCOUNT_RESPONSE: &str =
-        include_str!("../test_data/http/testnet/perp_positions_account_market_3.json");
-    const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str =
-        include_str!("../test_data/http/testnet/perp_account_trades_account_market_3.json");
+    const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str = include_str!(
+        "../deepx-rust-sdk/test_data/http/testnet/perp_history_orders_account_market_3.json"
+    );
+    const PERP_POSITIONS_ACCOUNT_RESPONSE: &str = include_str!(
+        "../deepx-rust-sdk/test_data/http/testnet/perp_positions_account_market_3.json"
+    );
+    const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str = include_str!(
+        "../deepx-rust-sdk/test_data/http/testnet/perp_account_trades_account_market_3.json"
+    );
     const EMPTY_SPOT_MARKETS_RESPONSE: &str =
         r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
     const TEST_SUBACCOUNT: &str = "0x1111111111111111111111111111111111111111";
@@ -12353,7 +12356,8 @@ mod tests {
     }
 
     async fn report_test_client(path: &'static str, mut response: Value) -> DeepXExecutionClient {
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         for item in response["data"]["items"].as_array_mut().unwrap() {
             item["owner"] = TEST_SUBACCOUNT.into();
         }
@@ -12421,7 +12425,8 @@ mod tests {
         mut open_response: Value,
         mut history_response: Value,
     ) -> DeepXExecutionClient {
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         for response in [&mut open_response, &mut history_response] {
             for item in response["data"]["items"].as_array_mut().unwrap() {
                 item["owner"] = TEST_SUBACCOUNT.into();
@@ -12489,7 +12494,8 @@ mod tests {
         mut trade_response: Value,
         mut position_response: Value,
     ) -> DeepXExecutionClient {
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         trade_response["data"]["items"]
             .as_array_mut()
             .unwrap()
@@ -12566,7 +12572,8 @@ mod tests {
     }
 
     fn commission_test_client() -> (DeepXExecutionClient, InstrumentAny) {
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let response: Value = serde_json::from_str(PERP_RESPONSE).unwrap();
         let market: DeepXPerpMarket = serde_json::from_value(
             response["data"]
@@ -14749,8 +14756,10 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_startup_accepts_complete_market_catalog() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -14912,7 +14921,7 @@ mod tests {
         DeepXSpotReportMarket,
     ) {
         let response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record: DeepXSpotOrderRecord =
@@ -15025,7 +15034,7 @@ mod tests {
     async fn live_spot_backend_order_lookup_waits_for_indexing() {
         let (record, transaction, market) = backend_spot_order_fixture();
         let mut response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["txHash"] = json!(record.tx_hash);
@@ -16236,8 +16245,10 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_catalog_snapshot_is_cleared_on_startup_reset() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16272,8 +16283,10 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_startup_coordinator_loads_complete_configured_catalog() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16307,7 +16320,8 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_startup_coordinator_keeps_gate_after_partial_load_failure() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         let router = Router::new().route(
             "/internal/v1/market/spot/markets",
             get(|| async { SPOT_RESPONSE }),
@@ -16335,8 +16349,10 @@ mod tests {
 
     #[tokio::test]
     async fn account_state_preparation_failure_resets_prior_startup_evidence() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16414,8 +16430,10 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_startup_rejects_unconfigured_rest_endpoint_without_advancing() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16451,8 +16469,10 @@ mod tests {
 
     #[tokio::test]
     async fn instrument_startup_rejects_unconfigured_failover_endpoint() {
-        const SPOT_RESPONSE: &str = include_str!("../test_data/http/testnet/spot_markets.json");
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const SPOT_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -18938,7 +18958,8 @@ mod tests {
 
     #[tokio::test]
     async fn direct_pallet_tracked_order_report_uses_validated_rest_record() {
-        const PERP_RESPONSE: &str = include_str!("../test_data/http/testnet/perp_markets.json");
+        const PERP_RESPONSE: &str =
+            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let mut fixture: Value =
             serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
         let mut order = fixture["data"]["items"][2].take();
@@ -19092,7 +19113,7 @@ mod tests {
         let context = OrderContext::from(&order);
         let venue_order_id = VenueOrderId::from("1789627379350");
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19151,7 +19172,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_spot_order_status_command_queries_and_maps_rest_record() {
         let mut response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["maker"] = TEST_SUBACCOUNT.into();
@@ -19252,7 +19273,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_spot_order_reports_include_only_tracked_open_orders() {
         let mut response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["maker"] = TEST_SUBACCOUNT.into();
@@ -19349,7 +19370,7 @@ mod tests {
         let order = test_order_with_instrument("O-DEEPX-SPOT-STATUS", "0.8849", "ETH-USDC.DEEPX");
         let context = OrderContext::from(&order);
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19403,7 +19424,7 @@ mod tests {
         #[case] filled_at_better_price: bool,
     ) {
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19544,7 +19565,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19716,7 +19737,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -20856,7 +20877,7 @@ mod tests {
         #[case] expected_spot_requests: usize,
     ) {
         let spot_response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
         ))
         .unwrap();
         let spot_requests = Arc::new(AtomicUsize::new(0));
@@ -20973,7 +20994,7 @@ mod tests {
         #[case] all_markets: bool,
     ) {
         let response: Value = serde_json::from_str(include_str!(
-            "../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+            "../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
         ))
         .unwrap();
         let item = response["data"]["items"][2].clone();

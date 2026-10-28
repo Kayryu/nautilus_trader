@@ -36,7 +36,7 @@ from nautilus_trader.adapters.deepx import get_deepx_perp_order_by_tx
 from nautilus_trader.adapters.deepx import get_deepx_spot_order_by_tx
 
 
-FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/test_data/http/testnet"
+FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet"
 PERP_HASH = "0x247ef3967338c6985714731a49752455ebe877d8678e0b261b3638892cfae554"
 SPOT_HASH = "0x437279a6138febacf1a416ad24e3377f8c1ecd4ee0f9cdd6702f11f20d9e1750"
 

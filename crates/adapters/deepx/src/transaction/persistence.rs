@@ -5214,7 +5214,7 @@ mod tests {
         }
         let metadata: RpcResponse = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();

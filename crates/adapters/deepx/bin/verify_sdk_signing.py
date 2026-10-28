@@ -25,7 +25,7 @@ SPEC_376_FINALIZED_PERP_CANCEL = (
     "aa1aafe5d278e5ce591801000b0dc99734a101001603a13c7ab8decf4d32cf80c371647c93d0e2"
     "f4183e60982d21a101000002000000"
 )
-FIXTURES = Path(__file__).resolve().parents[1] / "test_data/runtime/testnet"
+FIXTURES = Path(__file__).resolve().parents[1] / "deepx-rust-sdk/test_data/runtime/testnet"
 SNAPSHOT = FIXTURES / "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2"
 
 

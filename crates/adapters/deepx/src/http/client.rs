@@ -8106,27 +8106,32 @@ mod tests {
     };
 
     const PERP_VOLUME_1H_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_volume_1h.json");
-    const SPOT_TRADES_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_trades_eth_usdc_page_1.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_volume_1h.json");
+    const SPOT_TRADES_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_trades_eth_usdc_page_1.json"
+    );
     const SPOT_CANDLES_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_candles_eth_usdc_1m.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_candles_eth_usdc_1m.json");
     const SPOT_LAST_PRICE_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_last_price_eth_usdc.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_last_price_eth_usdc.json");
     const SPOT_VOLUME_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_volume_eth_usdc_1h.json");
-    const SPOT_ORDER_BOOK_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json");
-    const PERP_ORDER_BOOK_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_order_book_eth_usdc_tick_001.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_volume_eth_usdc_1h.json");
+    const SPOT_ORDER_BOOK_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
+    );
+    const PERP_ORDER_BOOK_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_order_book_eth_usdc_tick_001.json"
+    );
     const SPOT_MARKETS_SPEC369_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_markets_spec369.json");
-    const SPOT_MARKET_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_market_eth_usdc_by_pair.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets_spec369.json");
+    const SPOT_MARKET_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_market_eth_usdc_by_pair.json"
+    );
     const PERP_MARKET_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_market_eth_usdc_by_id.json");
-    const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_history_orders_account_market_3.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_market_eth_usdc_by_id.json");
+    const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_history_orders_account_market_3.json"
+    );
 
     fn active_perp_open_order_fixture() -> serde_json::Value {
         let mut response: serde_json::Value =
@@ -8139,72 +8144,87 @@ mod tests {
         }
         response
     }
-    const SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_history_orders_eth_usdc_page_1.json");
-    const SPOT_ACCOUNT_TRADES_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json");
-    const SPOT_WALLET_ORDERS_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_wallet_orders_eth_usdc_page_1.json");
-    const SPOT_WALLET_TRADES_ETH_USDC_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json");
+    const SPOT_HISTORY_ORDERS_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_history_orders_eth_usdc_page_1.json"
+    );
+    const SPOT_ACCOUNT_TRADES_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+    );
+    const SPOT_WALLET_ORDERS_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_orders_eth_usdc_page_1.json"
+    );
+    const SPOT_WALLET_TRADES_ETH_USDC_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
+    );
     const SPOT_ORDER_BY_ID_CANCELED_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/spot_order_by_id_canceled.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json");
     const PERP_ORDER_BY_TX_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_order_by_tx.json");
-    const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_account_trades_account_market_3.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_order_by_tx.json");
+    const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_account_trades_account_market_3.json"
+    );
     const PERP_WALLET_TRADES_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_wallet_trades_page.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_wallet_trades_page.json");
     const PERP_WALLET_ORDERS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_wallet_orders_page_1.json");
-    const PERP_FUNDING_FEES_ACCOUNT_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_funding_fees_account_market_3.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_wallet_orders_page_1.json");
+    const PERP_FUNDING_FEES_ACCOUNT_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_funding_fees_account_market_3.json"
+    );
     const WALLET_FUNDING_FEES_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_funding_fees_page_2.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/wallet_funding_fees_page_2.json");
     const WALLET_HOURLY_FUNDING_PAGE_1_RESPONSE: &str = include_str!(
-        "../../test_data/http/testnet/wallet_hourly_unsettled_funding_market_3_page_1.json"
+        "../../deepx-rust-sdk/test_data/http/testnet/wallet_hourly_unsettled_funding_market_3_page_1.json"
     );
     const WALLET_HOURLY_FUNDING_PAGE_2_RESPONSE: &str = include_str!(
-        "../../test_data/http/testnet/wallet_hourly_unsettled_funding_market_3_page_2.json"
+        "../../deepx-rust-sdk/test_data/http/testnet/wallet_hourly_unsettled_funding_market_3_page_2.json"
     );
-    const PERP_POSITIONS_ACCOUNT_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_positions_account_market_3.json");
+    const PERP_POSITIONS_ACCOUNT_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_positions_account_market_3.json"
+    );
     const WALLET_SUBACCOUNTS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_subaccounts.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/wallet_subaccounts.json");
     const ALL_SUBACCOUNTS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/all_subaccounts_page_1.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/all_subaccounts_page_1.json");
     const WALLET_DELEGATE_ACCOUNTS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_delegate_accounts.json");
-    const DELEGATE_DELEGATOR_ACCOUNTS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/delegate_delegator_accounts.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/wallet_delegate_accounts.json");
+    const DELEGATE_DELEGATOR_ACCOUNTS_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/delegate_delegator_accounts.json"
+    );
     const SUBACCOUNT_INFO_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/subaccount_info.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/subaccount_info.json");
     const SUBACCOUNT_BALANCES_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/subaccount_balances.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/subaccount_balances.json");
     const SUBACCOUNT_EQUITY_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/subaccount_equity.json");
-    const SUBACCOUNT_MARGIN_RATIO_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/subaccount_margin_ratio_exact.json");
-    const WALLET_BALANCE_CHANGES_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_balance_changes_page_2.json");
-    const WALLET_LIQUIDATION_RECORDS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_liquidation_records_page_1.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/subaccount_equity.json");
+    const SUBACCOUNT_MARGIN_RATIO_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/subaccount_margin_ratio_exact.json"
+    );
+    const WALLET_BALANCE_CHANGES_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/wallet_balance_changes_page_2.json"
+    );
+    const WALLET_LIQUIDATION_RECORDS_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/wallet_liquidation_records_page_1.json"
+    );
     const WALLET_USER_STATS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_user_stats.json");
-    const PERP_LIQUIDATION_PRICE_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/perp_liquidation_price_account_market_3.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/wallet_user_stats.json");
+    const PERP_LIQUIDATION_PRICE_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/perp_liquidation_price_account_market_3.json"
+    );
     const WALLET_QUOTA_SUMMARY_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/wallet_quota_summary.json");
-    const QUOTA_HISTORY_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/quota_history_purchase_page.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/wallet_quota_summary.json");
+    const QUOTA_HISTORY_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/quota_history_purchase_page.json"
+    );
     const LENDING_ASSETS_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/lending_assets.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/lending_assets.json");
     const LENDING_INTEREST_RATE_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/lending_interest_rate_usdc.json");
-    const LENDING_INTEREST_RATE_HISTORY_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/lending_interest_rate_history_usdc_1h.json");
-    const LENDING_STATUS_HISTORY_RESPONSE: &str =
-        include_str!("../../test_data/http/testnet/lending_status_history_usdc_1h.json");
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/lending_interest_rate_usdc.json");
+    const LENDING_INTEREST_RATE_HISTORY_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/lending_interest_rate_history_usdc_1h.json"
+    );
+    const LENDING_STATUS_HISTORY_RESPONSE: &str = include_str!(
+        "../../deepx-rust-sdk/test_data/http/testnet/lending_status_history_usdc_1h.json"
+    );
 
     fn raw_account_fixture(response: &str) -> DeepXRawAccountPage {
         serde_json::from_str::<DeepXApiResponse<DeepXRawAccountPage>>(response)

@@ -4820,22 +4820,22 @@ mod tests {
     const DEEPX_SPEC_376_VERSION: u32 = 376;
 
     const GENESIS_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          genesis_hash.json"
     );
     const FINALIZED_HEAD_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
     const SPEC_376_METADATA_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          metadata.json"
     );
     const SPOT_MARKET_STORAGE_SPEC_376_FIXTURE: &str = include_str!(
-        "../test_data/runtime/testnet/\
+        "../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
             spot_market_eth_usdc.json"
     );

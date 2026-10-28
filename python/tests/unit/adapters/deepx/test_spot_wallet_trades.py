@@ -38,7 +38,7 @@ from nautilus_trader.adapters.deepx import get_deepx_spot_wallet_trades
 CAPTURED_WALLET = "0x89bb0946046588f4f257ffc71bd3231aba13474a"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
 )
 
 

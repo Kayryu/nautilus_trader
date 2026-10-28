@@ -34,7 +34,7 @@ from nautilus_trader.adapters.deepx import get_deepx_hourly_unsettled_funding_pa
 
 
 WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
-FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/test_data/http/testnet"
+FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet"
 START_MS = 1_789_488_862_441
 END_MS = 1_789_521_262_677
 

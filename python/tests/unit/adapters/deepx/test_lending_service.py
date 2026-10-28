@@ -32,7 +32,7 @@ from nautilus_trader.adapters.deepx import DeepXLendingService
 from nautilus_trader.adapters.deepx import DeepXNetworkConfig
 
 
-FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/test_data/http/testnet"
+FIXTURES = Path(__file__).resolve().parents[5] / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet"
 PREFIX = "/internal/v1/market/lending"
 START_MS = 1_789_430_000_000
 

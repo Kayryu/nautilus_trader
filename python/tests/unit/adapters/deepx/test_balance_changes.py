@@ -41,7 +41,7 @@ WALLET = "0x781ed35b167068c93dfadab41dfb680edaca4e50"
 SUBACCOUNT = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"
 FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "crates/adapters/deepx/test_data/http/testnet/wallet_balance_changes_page_2.json"
+    / "crates/adapters/deepx/deepx-rust-sdk/test_data/http/testnet/wallet_balance_changes_page_2.json"
 )
 
 

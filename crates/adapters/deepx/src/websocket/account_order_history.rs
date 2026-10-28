@@ -136,7 +136,7 @@ mod tests {
 
     fn spot_request() -> DeepXWsSpotOrderHistoryRequest {
         let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> = serde_json::from_str(
-            include_str!("../../test_data/http/testnet/spot_markets.json"),
+            include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json"),
         )
         .unwrap();
         let market = response

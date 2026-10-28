@@ -403,7 +403,7 @@ mod tests {
 
     const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
     const BALANCES_FRAME: &str =
-        include_str!("../../test_data/websocket/testnet/user_balances.json");
+        include_str!("../../deepx-rust-sdk/test_data/websocket/testnet/user_balances.json");
 
     #[rstest]
     fn request_binds_documented_aggregate_market_channel_and_address() {

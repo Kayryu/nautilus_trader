@@ -208,7 +208,7 @@ mod tests {
     fn metadata_bytes() -> Vec<u8> {
         let fixture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test_data/runtime/testnet/",
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         ));
         let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();

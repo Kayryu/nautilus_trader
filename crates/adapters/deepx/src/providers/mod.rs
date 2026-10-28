@@ -295,8 +295,10 @@ mod tests {
     use super::*;
     use crate::common::consts::DEEPX_VENUE;
 
-    const SPOT_RESPONSE: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
-    const PERP_RESPONSE: &str = include_str!("../../test_data/http/testnet/perp_markets.json");
+    const SPOT_RESPONSE: &str =
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+    const PERP_RESPONSE: &str =
+        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
 
     async fn provider(
         fail_perp: Arc<AtomicBool>,
