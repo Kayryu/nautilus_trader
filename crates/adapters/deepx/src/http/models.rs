@@ -19,6 +19,7 @@ use deepx_rust_sdk::rest::models::{
     DeepXBalanceChangePosition as DeepXBalanceChangePositionWire,
     DeepXBalanceChangeRecord as DeepXBalanceChangeRecordWire,
     DeepXDelegateAccount as DeepXDelegateAccountWire,
+    DeepXDelegateWallets as DeepXDelegateWalletsWire,
     DeepXHourlyUnsettledFundingRecord as DeepXHourlyUnsettledFundingRecordWire,
     DeepXLendingAsset as DeepXLendingAssetWire,
     DeepXLendingInterestRateHistory as DeepXLendingInterestRateHistoryWire,
@@ -33,6 +34,7 @@ use deepx_rust_sdk::rest::models::{
     DeepXPerpOrderRecord as DeepXPerpOrderRecordWire,
     DeepXPerpPositionRecord as DeepXPerpPositionRecordWire,
     DeepXPerpWalletOrderMarket as DeepXPerpWalletOrderMarketWire,
+    DeepXPerpWalletOrdersPage as DeepXPerpWalletOrdersPageWire,
     DeepXPerpWalletSubaccountOrders as DeepXPerpWalletSubaccountOrdersWire,
     DeepXPerpWalletSubaccountTrades as DeepXPerpWalletSubaccountTradesWire,
     DeepXPerpWalletTradeMarket as DeepXPerpWalletTradeMarketWire,
@@ -41,14 +43,22 @@ use deepx_rust_sdk::rest::models::{
     DeepXSpotAccountTradeRecord as DeepXSpotAccountTradeRecordWire,
     DeepXSpotOrderRecord as DeepXSpotOrderRecordWire,
     DeepXSpotWalletOrderMarket as DeepXSpotWalletOrderMarketWire,
+    DeepXSpotWalletOrdersPage as DeepXSpotWalletOrdersPageWire,
     DeepXSpotWalletSubaccountOrders as DeepXSpotWalletSubaccountOrdersWire,
     DeepXSpotWalletSubaccountTrades as DeepXSpotWalletSubaccountTradesWire,
     DeepXSpotWalletTradeMarket as DeepXSpotWalletTradeMarketWire,
+    DeepXSpotWalletTradesPage as DeepXSpotWalletTradesPageWire,
     DeepXSubaccountBalanceAsset as DeepXSubaccountBalanceAssetWire,
     DeepXSubaccountBalances as DeepXSubaccountBalancesWire,
     DeepXSubaccountEquity as DeepXSubaccountEquityWire,
     DeepXSubaccountMarginRatio as DeepXSubaccountMarginRatioWire,
-    DeepXSubaccountProfile as DeepXSubaccountProfileWire, DeepXUserStats as DeepXUserStatsWire,
+    DeepXSubaccountPerpPositions as DeepXSubaccountPerpPositionsWire,
+    DeepXSubaccountProfile as DeepXSubaccountProfileWire,
+    DeepXSubaccountSnapshot as DeepXSubaccountSnapshotWire, DeepXUserStats as DeepXUserStatsWire,
+    DeepXWalletAccountSnapshot as DeepXWalletAccountSnapshotWire,
+    DeepXWalletDelegateAccounts as DeepXWalletDelegateAccountsWire,
+    DeepXWalletPerpPositions as DeepXWalletPerpPositionsWire,
+    DeepXWalletSubaccounts as DeepXWalletSubaccountsWire,
 };
 pub use deepx_rust_sdk::rest::{
     DeepXAccountPage, DeepXApiCode as DeepXResponseCode, DeepXApiResponse, DeepXRawAccountPage,
@@ -67,6 +77,12 @@ use serde::Deserialize;
 
 macro_rules! impl_wire_deref {
     ($wrapper:ident => $wire:ty) => {
+        impl From<$wire> for $wrapper {
+            fn from(value: $wire) -> Self {
+                Self(value)
+            }
+        }
+
         impl std::ops::Deref for $wrapper {
             type Target = $wire;
 
@@ -81,6 +97,14 @@ macro_rules! impl_wire_deref {
             }
         }
     };
+}
+
+fn wrap_account_page<T, U: From<T>>(page: DeepXAccountPage<T>) -> DeepXAccountPage<U> {
+    DeepXAccountPage {
+        items: page.items.into_iter().map(Into::into).collect(),
+        next_cursor: page.next_cursor,
+        has_next: page.has_next,
+    }
 }
 
 /// One lending pool asset identity exposed by the public market directory.
@@ -125,6 +149,12 @@ impl_wire_deref!(DeepXLendingInterestRateParams => DeepXLendingInterestRateParam
 pub struct DeepXLendingInterestRateRecord(pub DeepXLendingInterestRateRecordWire);
 impl_wire_deref!(DeepXLendingInterestRateRecord => DeepXLendingInterestRateRecordWire);
 
+impl std::borrow::Borrow<DeepXLendingInterestRateRecordWire> for DeepXLendingInterestRateRecord {
+    fn borrow(&self) -> &DeepXLendingInterestRateRecordWire {
+        &self.0
+    }
+}
+
 /// Lending interest-rate history in venue response order.
 pub type DeepXLendingInterestRateHistory =
     DeepXLendingInterestRateHistoryWire<DeepXLendingInterestRateRecord>;
@@ -156,24 +186,8 @@ pub type DeepXLendingStatusHistory = DeepXLendingStatusHistoryWire<DeepXLendingS
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXWalletSubaccounts {
-    /// Wallet address used for the directory query.
-    wallet: String,
-    /// Subaccount addresses in venue response order.
-    pub addresses: Vec<String>,
-}
-
-impl DeepXWalletSubaccounts {
-    pub(crate) fn new(wallet: String, addresses: Vec<String>) -> Self {
-        Self { wallet, addresses }
-    }
-
-    /// Returns the wallet address used for the directory query.
-    #[must_use]
-    pub fn wallet(&self) -> &str {
-        &self.wallet
-    }
-}
+pub struct DeepXWalletSubaccounts(pub DeepXWalletSubaccountsWire);
+impl_wire_deref!(DeepXWalletSubaccounts => DeepXWalletSubaccountsWire);
 
 /// One wallet-level delegate configuration in the observed REST wire form.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -189,6 +203,12 @@ impl DeepXWalletSubaccounts {
 pub struct DeepXDelegateAccount(pub DeepXDelegateAccountWire);
 impl_wire_deref!(DeepXDelegateAccount => DeepXDelegateAccountWire);
 
+impl std::borrow::Borrow<DeepXDelegateAccountWire> for DeepXDelegateAccount {
+    fn borrow(&self) -> &DeepXDelegateAccountWire {
+        &self.0
+    }
+}
+
 /// Request-scoped delegate configurations for one wallet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -200,21 +220,35 @@ impl_wire_deref!(DeepXDelegateAccount => DeepXDelegateAccountWire);
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
 pub struct DeepXWalletDelegateAccounts {
-    /// Wallet address used for the delegate-directory query.
-    wallet: String,
-    /// Delegate configurations in venue response order.
-    pub accounts: Vec<DeepXDelegateAccount>,
+    /// SDK-owned directory with Python-facing delegate records.
+    pub(crate) inner: DeepXWalletDelegateAccountsWire<DeepXDelegateAccount>,
 }
 
 impl DeepXWalletDelegateAccounts {
     pub(crate) fn new(wallet: String, accounts: Vec<DeepXDelegateAccount>) -> Self {
-        Self { wallet, accounts }
+        Self {
+            inner: DeepXWalletDelegateAccountsWire::new(wallet, accounts),
+        }
     }
 
     /// Returns the wallet address used for the delegate-directory query.
     #[must_use]
     pub fn wallet(&self) -> &str {
-        &self.wallet
+        self.inner.wallet()
+    }
+}
+
+impl std::ops::Deref for DeepXWalletDelegateAccounts {
+    type Target = DeepXWalletDelegateAccountsWire<DeepXDelegateAccount>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for DeepXWalletDelegateAccounts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -228,24 +262,8 @@ impl DeepXWalletDelegateAccounts {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXDelegateWallets {
-    /// Delegate address used for the reverse-directory query.
-    delegate: String,
-    /// Wallet addresses in venue response order.
-    pub wallets: Vec<String>,
-}
-
-impl DeepXDelegateWallets {
-    pub(crate) fn new(delegate: String, wallets: Vec<String>) -> Self {
-        Self { delegate, wallets }
-    }
-
-    /// Returns the delegate address used for the reverse-directory query.
-    #[must_use]
-    pub fn delegate(&self) -> &str {
-        &self.delegate
-    }
-}
+pub struct DeepXDelegateWallets(pub DeepXDelegateWalletsWire);
+impl_wire_deref!(DeepXDelegateWallets => DeepXDelegateWalletsWire);
 
 /// One fully validated point-in-time subaccount snapshot.
 #[derive(Clone, Debug)]
@@ -257,16 +275,15 @@ impl DeepXDelegateWallets {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXSubaccountSnapshot {
-    /// Subaccount profile bound to the requested wallet authority.
-    pub profile: DeepXSubaccountProfile,
-    /// Exact lending balances bound to the profile address.
-    pub balances: DeepXSubaccountBalances,
-    /// Exact equity summary bound to the profile address.
-    pub equity: DeepXSubaccountEquity,
-    /// Request-scoped collateral and margin requirement summary.
-    pub margin_ratio: DeepXSubaccountMarginRatio,
-}
+pub struct DeepXSubaccountSnapshot(
+    pub  DeepXSubaccountSnapshotWire<
+        DeepXSubaccountProfile,
+        DeepXSubaccountBalances,
+        DeepXSubaccountEquity,
+        DeepXSubaccountMarginRatio,
+    >,
+);
+impl_wire_deref!(DeepXSubaccountSnapshot => DeepXSubaccountSnapshotWire<DeepXSubaccountProfile, DeepXSubaccountBalances, DeepXSubaccountEquity, DeepXSubaccountMarginRatio>);
 
 /// Failure-atomic point-in-time snapshots for every subaccount in one wallet directory.
 ///
@@ -282,14 +299,14 @@ pub struct DeepXSubaccountSnapshot {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXWalletAccountSnapshot {
-    /// Validated wallet directory in venue response order.
-    pub directory: DeepXWalletSubaccounts,
-    /// Validated wallet statistics with a subaccount set matching the directory.
-    pub stats: DeepXUserStats,
-    /// Validated subaccount snapshots in the same order as `directory.addresses`.
-    pub subaccounts: Vec<DeepXSubaccountSnapshot>,
-}
+pub struct DeepXWalletAccountSnapshot(
+    pub  DeepXWalletAccountSnapshotWire<
+        DeepXWalletSubaccounts,
+        DeepXUserStats,
+        DeepXSubaccountSnapshot,
+    >,
+);
+impl_wire_deref!(DeepXWalletAccountSnapshot => DeepXWalletAccountSnapshotWire<DeepXWalletSubaccounts, DeepXUserStats, DeepXSubaccountSnapshot>);
 
 /// Validated position lifecycle pages for one wallet-owned subaccount.
 #[derive(Clone, Debug)]
@@ -301,12 +318,10 @@ pub struct DeepXWalletAccountSnapshot {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXSubaccountPerpPositions {
-    /// Profile whose authority matches the requested wallet.
-    pub profile: DeepXSubaccountProfile,
-    /// Validated position pages in venue cursor order.
-    pub pages: Vec<DeepXAccountPage<DeepXPerpPositionRecord>>,
-}
+pub struct DeepXSubaccountPerpPositions(
+    pub DeepXSubaccountPerpPositionsWire<DeepXSubaccountProfile, DeepXPerpPositionRecord>,
+);
+impl_wire_deref!(DeepXSubaccountPerpPositions => DeepXSubaccountPerpPositionsWire<DeepXSubaccountProfile, DeepXPerpPositionRecord>);
 
 /// Bounded, failure-atomic wallet position lifecycle observations.
 ///
@@ -320,14 +335,14 @@ pub struct DeepXSubaccountPerpPositions {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXWalletPerpPositions {
-    /// Validated wallet directory in venue response order.
-    pub directory: DeepXWalletSubaccounts,
-    /// Validated statistics whose subaccount set matches the directory.
-    pub stats: DeepXUserStats,
-    /// Position pages in the same order as `directory.addresses`.
-    pub subaccounts: Vec<DeepXSubaccountPerpPositions>,
-}
+pub struct DeepXWalletPerpPositions(
+    pub  DeepXWalletPerpPositionsWire<
+        DeepXWalletSubaccounts,
+        DeepXUserStats,
+        DeepXSubaccountPerpPositions,
+    >,
+);
+impl_wire_deref!(DeepXWalletPerpPositions => DeepXWalletPerpPositionsWire<DeepXWalletSubaccounts, DeepXUserStats, DeepXSubaccountPerpPositions>);
 
 /// One subaccount profile in the observed account-info wire form.
 #[derive(Clone, Debug, Deserialize)]
@@ -539,6 +554,12 @@ impl_wire_deref!(DeepXSpotOrderRecord => DeepXSpotOrderRecordWire);
 pub struct DeepXSpotAccountTradeRecord(pub DeepXSpotAccountTradeRecordWire);
 impl_wire_deref!(DeepXSpotAccountTradeRecord => DeepXSpotAccountTradeRecordWire);
 
+impl std::borrow::Borrow<DeepXSpotAccountTradeRecordWire> for DeepXSpotAccountTradeRecord {
+    fn borrow(&self) -> &DeepXSpotAccountTradeRecordWire {
+        &self.0
+    }
+}
+
 /// Spot orders for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -585,13 +606,38 @@ impl_wire_deref!(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXSpotWalletOrdersPage {
-    /// Market and subaccount groups in venue response order.
-    pub markets: Vec<DeepXSpotWalletOrderMarket>,
-    /// Opaque global cursor repeated consistently by every nonempty nested group.
-    pub next_cursor: Option<String>,
-    /// Whether every nonempty nested group reports another global page.
-    pub has_next: bool,
+pub struct DeepXSpotWalletOrdersPage(pub DeepXSpotWalletOrdersPageWire<DeepXSpotWalletOrderMarket>);
+impl_wire_deref!(DeepXSpotWalletOrdersPage => DeepXSpotWalletOrdersPageWire<DeepXSpotWalletOrderMarket>);
+
+impl From<DeepXSpotWalletOrdersPageWire> for DeepXSpotWalletOrdersPage {
+    fn from(page: DeepXSpotWalletOrdersPageWire) -> Self {
+        Self(DeepXSpotWalletOrdersPageWire {
+            markets: page
+                .markets
+                .into_iter()
+                .map(|market| {
+                    DeepXSpotWalletOrderMarket(DeepXSpotWalletOrderMarketWire {
+                        pair: market.pair,
+                        name: market.name,
+                        subaccounts: market
+                            .subaccounts
+                            .into_iter()
+                            .map(|group| {
+                                DeepXSpotWalletSubaccountOrders(
+                                    DeepXSpotWalletSubaccountOrdersWire {
+                                        subaccount: group.subaccount,
+                                        orders: wrap_account_page(group.orders),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+            has_next: page.has_next,
+        })
+    }
 }
 
 /// Spot trades for one subaccount within a wallet-grouped response.
@@ -640,13 +686,38 @@ impl_wire_deref!(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXSpotWalletTradesPage {
-    /// Market and subaccount groups in venue response order.
-    pub markets: Vec<DeepXSpotWalletTradeMarket>,
-    /// Opaque global cursor repeated consistently by every nonempty nested group.
-    pub next_cursor: Option<String>,
-    /// Whether every nonempty nested group reports another global page.
-    pub has_next: bool,
+pub struct DeepXSpotWalletTradesPage(pub DeepXSpotWalletTradesPageWire<DeepXSpotWalletTradeMarket>);
+impl_wire_deref!(DeepXSpotWalletTradesPage => DeepXSpotWalletTradesPageWire<DeepXSpotWalletTradeMarket>);
+
+impl From<DeepXSpotWalletTradesPageWire> for DeepXSpotWalletTradesPage {
+    fn from(page: DeepXSpotWalletTradesPageWire) -> Self {
+        Self(DeepXSpotWalletTradesPageWire {
+            markets: page
+                .markets
+                .into_iter()
+                .map(|market| {
+                    DeepXSpotWalletTradeMarket(DeepXSpotWalletTradeMarketWire {
+                        pair: market.pair,
+                        name: market.name,
+                        subaccounts: market
+                            .subaccounts
+                            .into_iter()
+                            .map(|group| {
+                                DeepXSpotWalletSubaccountTrades(
+                                    DeepXSpotWalletSubaccountTradesWire {
+                                        subaccount: group.subaccount,
+                                        trades: wrap_account_page(group.trades),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+            has_next: page.has_next,
+        })
+    }
 }
 
 /// Python-facing perpetual funding-fee record.
@@ -691,6 +762,12 @@ impl_wire_deref!(DeepXHourlyUnsettledFundingRecord => DeepXHourlyUnsettledFundin
 pub struct DeepXPerpAccountTradeRecord(pub DeepXPerpAccountTradeRecordWire);
 impl_wire_deref!(DeepXPerpAccountTradeRecord => DeepXPerpAccountTradeRecordWire);
 
+impl std::borrow::Borrow<DeepXPerpAccountTradeRecordWire> for DeepXPerpAccountTradeRecord {
+    fn borrow(&self) -> &DeepXPerpAccountTradeRecordWire {
+        &self.0
+    }
+}
+
 /// Perpetual trades for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -709,6 +786,14 @@ impl_wire_deref!(
     DeepXPerpWalletSubaccountTrades => DeepXPerpWalletSubaccountTradesWire<DeepXPerpAccountTradeRecord>
 );
 
+impl std::borrow::Borrow<DeepXPerpWalletSubaccountTradesWire<DeepXPerpAccountTradeRecord>>
+    for DeepXPerpWalletSubaccountTrades
+{
+    fn borrow(&self) -> &DeepXPerpWalletSubaccountTradesWire<DeepXPerpAccountTradeRecord> {
+        &self.0
+    }
+}
+
 /// One market group in a wallet-scoped perpetual trade response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -726,6 +811,33 @@ pub struct DeepXPerpWalletTradeMarket(
 impl_wire_deref!(
     DeepXPerpWalletTradeMarket => DeepXPerpWalletTradeMarketWire<DeepXPerpWalletSubaccountTrades>
 );
+
+impl std::borrow::Borrow<DeepXPerpWalletTradeMarketWire<DeepXPerpWalletSubaccountTrades>>
+    for DeepXPerpWalletTradeMarket
+{
+    fn borrow(&self) -> &DeepXPerpWalletTradeMarketWire<DeepXPerpWalletSubaccountTrades> {
+        &self.0
+    }
+}
+
+impl From<DeepXPerpWalletTradeMarketWire> for DeepXPerpWalletTradeMarket {
+    fn from(market: DeepXPerpWalletTradeMarketWire) -> Self {
+        Self(DeepXPerpWalletTradeMarketWire {
+            market_id: market.market_id,
+            market_name: market.market_name,
+            subaccounts: market
+                .subaccounts
+                .into_iter()
+                .map(|group| {
+                    DeepXPerpWalletSubaccountTrades(DeepXPerpWalletSubaccountTradesWire {
+                        subaccount: group.subaccount,
+                        trades: wrap_account_page(group.trades),
+                    })
+                })
+                .collect(),
+        })
+    }
+}
 
 /// Perpetual orders for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -773,13 +885,38 @@ impl_wire_deref!(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXPerpWalletOrdersPage {
-    /// Market and subaccount groups in venue response order.
-    pub markets: Vec<DeepXPerpWalletOrderMarket>,
-    /// Opaque global cursor repeated consistently by every nested group.
-    pub next_cursor: Option<String>,
-    /// Whether every nested group reports another global page.
-    pub has_next: bool,
+pub struct DeepXPerpWalletOrdersPage(pub DeepXPerpWalletOrdersPageWire<DeepXPerpWalletOrderMarket>);
+impl_wire_deref!(DeepXPerpWalletOrdersPage => DeepXPerpWalletOrdersPageWire<DeepXPerpWalletOrderMarket>);
+
+impl From<DeepXPerpWalletOrdersPageWire> for DeepXPerpWalletOrdersPage {
+    fn from(page: DeepXPerpWalletOrdersPageWire) -> Self {
+        Self(DeepXPerpWalletOrdersPageWire {
+            markets: page
+                .markets
+                .into_iter()
+                .map(|market| {
+                    DeepXPerpWalletOrderMarket(DeepXPerpWalletOrderMarketWire {
+                        market_id: market.market_id,
+                        market_name: market.market_name,
+                        subaccounts: market
+                            .subaccounts
+                            .into_iter()
+                            .map(|group| {
+                                DeepXPerpWalletSubaccountOrders(
+                                    DeepXPerpWalletSubaccountOrdersWire {
+                                        subaccount: group.subaccount,
+                                        orders: wrap_account_page(group.orders),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    })
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+            has_next: page.has_next,
+        })
+    }
 }
 
 /// One perpetual position lifecycle in the observed account-position wire form.
@@ -795,3 +932,79 @@ pub struct DeepXPerpWalletOrdersPage {
 )]
 pub struct DeepXPerpPositionRecord(pub DeepXPerpPositionRecordWire);
 impl_wire_deref!(DeepXPerpPositionRecord => DeepXPerpPositionRecordWire);
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn sdk_wallet_pages_preserve_records_and_cursors_in_adapter_wrappers() {
+        let spot_orders: DeepXApiResponse<Vec<DeepXSpotWalletOrderMarketWire>> =
+            serde_json::from_str(include_str!(
+                "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_orders_eth_usdc_page_1.json"
+            ))
+            .unwrap();
+        let cursor = spot_orders.data[0].subaccounts[0]
+            .orders
+            .next_cursor
+            .clone();
+        let first_order = spot_orders.data[0].subaccounts[0].orders.items[0].clone();
+        let wrapped: DeepXSpotWalletOrdersPage = DeepXSpotWalletOrdersPageWire {
+            markets: spot_orders.data,
+            next_cursor: cursor.clone(),
+            has_next: true,
+        }
+        .into();
+        assert_eq!(wrapped.next_cursor, cursor);
+        assert_eq!(
+            wrapped.markets[0].subaccounts[0].orders.items[0].0,
+            first_order
+        );
+
+        let spot_trades: DeepXApiResponse<Vec<DeepXSpotWalletTradeMarketWire>> =
+            serde_json::from_str(include_str!(
+                "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
+            ))
+            .unwrap();
+        let cursor = spot_trades.data[0].subaccounts[0]
+            .trades
+            .next_cursor
+            .clone();
+        let first_trade = spot_trades.data[0].subaccounts[0].trades.items[0].clone();
+        let wrapped: DeepXSpotWalletTradesPage = DeepXSpotWalletTradesPageWire {
+            markets: spot_trades.data,
+            next_cursor: cursor.clone(),
+            has_next: true,
+        }
+        .into();
+        assert_eq!(wrapped.next_cursor, cursor);
+        assert_eq!(
+            wrapped.markets[0].subaccounts[0].trades.items[0].0,
+            first_trade
+        );
+
+        let perp_orders: DeepXApiResponse<Vec<DeepXPerpWalletOrderMarketWire>> =
+            serde_json::from_str(include_str!(
+                "../../deepx-rust-sdk/test_data/http/testnet/perp_wallet_orders_page_1.json"
+            ))
+            .unwrap();
+        let cursor = perp_orders.data[0].subaccounts[0]
+            .orders
+            .next_cursor
+            .clone();
+        let first_order = perp_orders.data[0].subaccounts[0].orders.items[0].clone();
+        let wrapped: DeepXPerpWalletOrdersPage = DeepXPerpWalletOrdersPageWire {
+            markets: perp_orders.data,
+            next_cursor: cursor.clone(),
+            has_next: true,
+        }
+        .into();
+        assert_eq!(wrapped.next_cursor, cursor);
+        assert_eq!(
+            wrapped.markets[0].subaccounts[0].orders.items[0].0,
+            first_order
+        );
+    }
+}

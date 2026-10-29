@@ -16,17 +16,3 @@
 //! DeepX cursor pagination reexported for the adapter interface.
 
 pub use deepx_rust_sdk::pagination::{CursorPagination, PaginationDecision};
-
-use super::Result;
-
-pub(crate) fn validate_cursor_page(
-    endpoint: &'static str,
-    has_next: bool,
-    next_cursor: Option<&str>,
-) -> Result<()> {
-    Ok(deepx_rust_sdk::pagination::validate_cursor_page(
-        endpoint,
-        has_next,
-        next_cursor,
-    )?)
-}

@@ -309,3 +309,173 @@ impl DeepXWsSpotOpenOrdersFrame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    const ADDRESS: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+    const OTHER: &str = "0x977654069311fa41b88f7901dc65fae9a76fd60b";
+    const WALLET: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
+    const PAIR: &str = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"spot","name":"ETH/USDC","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"},"subscriptions":[{"channel":"user_spot_open_orders","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}],"message":"Successfully subscribed to 1 channels"}"#;
+    const SNAPSHOT: &str = r#"{"type":"data","channel":"user_spot_open_orders","market":{"type":"spot","name":"ETH/USDC","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","orders":{"hasNext":false,"hasPrev":false,"items":[],"pageNo":1,"pageSize":100,"totalCount":0,"totalPage":0}},"timestamp":1791491471048}"#;
+    const MARKETS: &str = include_str!("../../test_data/http/testnet/spot_markets.json");
+
+    fn market() -> DeepXSpotMarket {
+        let response: crate::rest::DeepXApiResponse<Vec<DeepXSpotMarket>> =
+            serde_json::from_str(MARKETS).unwrap();
+        response
+            .data
+            .into_iter()
+            .find(|market| market.name == "ETH/USDC")
+            .unwrap()
+    }
+
+    fn request() -> DeepXWsSpotOpenOrdersRequest {
+        DeepXWsSpotOpenOrdersRequest::new(&market(), ADDRESS).unwrap()
+    }
+
+    fn wallet_request() -> DeepXWsSpotOpenOrdersRequest {
+        DeepXWsSpotOpenOrdersRequest::for_wallet(
+            &market(),
+            WALLET,
+            &[ADDRESS.to_string(), OTHER.to_string()],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn parses_observed_ack_and_empty_snapshot() {
+        let request = request();
+        let encoded: serde_json::Value = serde_json::from_str(&request.to_text()).unwrap();
+        assert_eq!(encoded["market"]["name"], "ETH/USDC");
+        assert_eq!(encoded["subscriptions"][0]["address"], ADDRESS);
+        assert_eq!(encoded["options"]["compress"], false);
+        assert!(matches!(
+            DeepXWsSpotOpenOrdersFrame::parse(ACK, &request).unwrap(),
+            DeepXWsSpotOpenOrdersFrame::Subscribed
+        ));
+        let DeepXWsSpotOpenOrdersFrame::OrderPage { page, timestamp_ms } =
+            DeepXWsSpotOpenOrdersFrame::parse(SNAPSHOT, &request).unwrap()
+        else {
+            panic!("expected initial Spot order page");
+        };
+        assert!(page.items().is_empty());
+        assert_eq!(page.subaccount(), ADDRESS);
+        assert_eq!(timestamp_ms, 1_791_491_471_048);
+    }
+
+    #[rstest]
+    fn preserves_nonempty_raw_item_with_bound_identity() {
+        let item = format!(
+            "{{\"orderId\":\"123\",\"maker\":\"{ADDRESS}\",\"pair\":\"{PAIR}\",\"price\":1.2300}}"
+        );
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        let DeepXWsSpotOpenOrdersFrame::OrderPage { page, .. } =
+            DeepXWsSpotOpenOrdersFrame::parse(&frame, &request()).unwrap()
+        else {
+            panic!("expected initial Spot order page");
+        };
+        assert_eq!(page.items()[0].get(), item);
+    }
+
+    #[rstest]
+    #[case("00", ADDRESS, PAIR)]
+    #[case("1.0", ADDRESS, PAIR)]
+    #[case("1", "0x0000000000000000000000000000000000000000", PAIR)]
+    #[case(
+        "1",
+        ADDRESS,
+        "0x0000000000000000000000000000000000000000000000000000000000000000"
+    )]
+    fn rejects_invalid_order_identity(
+        #[case] order_id: &str,
+        #[case] maker: &str,
+        #[case] pair: &str,
+    ) {
+        let item =
+            format!("{{\"orderId\":\"{order_id}\",\"maker\":\"{maker}\",\"pair\":\"{pair}\"}}");
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        assert!(DeepXWsSpotOpenOrdersFrame::parse(&frame, &request()).is_err());
+    }
+
+    #[rstest]
+    fn rejects_duplicate_numeric_order_ids() {
+        let items = format!(
+            "[{{\"orderId\":\"1\",\"maker\":\"{ADDRESS}\",\"pair\":\"{PAIR}\"}},{{\"orderId\":\"01\",\"maker\":\"{ADDRESS}\",\"pair\":\"{PAIR}\"}}]"
+        );
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":{items}"))
+            .replace("\"totalCount\":0", "\"totalCount\":2")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        assert!(DeepXWsSpotOpenOrdersFrame::parse(&frame, &request()).is_err());
+    }
+
+    #[rstest]
+    fn accepts_first_generated_order_id_zero() {
+        let item = format!("{{\"orderId\":\"0\",\"maker\":\"{ADDRESS}\",\"pair\":\"{PAIR}\"}}");
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        let DeepXWsSpotOpenOrdersFrame::OrderPage { page, .. } =
+            DeepXWsSpotOpenOrdersFrame::parse(&frame, &request()).unwrap()
+        else {
+            panic!("expected zero-ID Spot order page");
+        };
+        assert_eq!(page.items()[0].get(), item);
+    }
+
+    #[rstest]
+    #[case(
+        "pair",
+        "\"pair\":\"0x0000000000000000000000000000000000000000000000000000000000000000\""
+    )]
+    #[case(
+        "address",
+        "\"address\":\"0x0000000000000000000000000000000000000000\""
+    )]
+    #[case("channel", "\"channel\":\"user_spot_order_history\"")]
+    #[case("pagination", "\"hasNext\":true")]
+    fn rejects_foreign_or_incomplete_snapshot(#[case] field: &str, #[case] replacement: &str) {
+        let original = match field {
+            "pair" => format!("\"pair\":\"{PAIR}\""),
+            "address" => format!("\"address\":\"{ADDRESS}\""),
+            "channel" => "\"channel\":\"user_spot_open_orders\"".to_string(),
+            "pagination" => "\"hasNext\":false".to_string(),
+            _ => unreachable!(),
+        };
+        let changed = SNAPSHOT.replacen(&original, replacement, 1);
+        assert_ne!(changed, SNAPSHOT);
+        assert!(DeepXWsSpotOpenOrdersFrame::parse(&changed, &request()).is_err());
+    }
+
+    #[rstest]
+    fn wallet_request_requires_valid_unique_subaccounts() {
+        assert!(DeepXWsSpotOpenOrdersRequest::for_wallet(&market(), WALLET, &[]).is_err());
+        assert!(
+            DeepXWsSpotOpenOrdersRequest::for_wallet(
+                &market(),
+                WALLET,
+                &[ADDRESS.to_string(), ADDRESS.to_string()],
+            )
+            .is_err()
+        );
+        assert!(
+            DeepXWsSpotOpenOrdersRequest::for_wallet(&market(), WALLET, &["invalid".to_string()],)
+                .is_err()
+        );
+        let encoded: serde_json::Value = serde_json::from_str(&wallet_request().to_text()).unwrap();
+        assert_eq!(encoded["subscriptions"][0]["address"], WALLET);
+        assert_eq!(encoded["subscriptions"][0]["addressType"], "wallet");
+    }
+}

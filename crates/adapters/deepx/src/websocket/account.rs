@@ -16,40 +16,14 @@
 
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 
-use deepx_rust_sdk::websocket::account::{DeepXWsAccountWireFrame, parse_subaccount_address};
+use deepx_rust_sdk::websocket::account::parse_subaccount_address;
 pub use deepx_rust_sdk::websocket::account::{
-    DeepXWsAllMarket, DeepXWsUserBalancesRequest, DeepXWsUserBalancesSubscription,
+    DeepXWsAccountWireFrame as DeepXWsAccountFrame, DeepXWsAllMarket, DeepXWsUserBalancesRequest,
+    DeepXWsUserBalancesSubscription,
 };
 use nautilus_core::UUID4;
 
 use crate::http::DeepXSubaccountBalances;
-
-/// Schema-validated frames for one DeepX user-balances subscription.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeepXWsAccountFrame {
-    /// The server accepted one or more account subscription descriptors.
-    Subscribed {
-        /// Aggregate market identity echoed by the server.
-        market: DeepXWsAllMarket,
-        /// Exact address-scoped subscriptions echoed by the server.
-        subscriptions: Vec<DeepXWsUserBalancesSubscription>,
-        /// Informational acknowledgement message.
-        message: String,
-    },
-    /// A complete current lending-balance snapshot for one subaccount.
-    UserBalances {
-        /// Aggregate market identity carried by the update.
-        market: DeepXWsAllMarket,
-        /// Exact validated account balances.
-        balances: DeepXSubaccountBalances,
-        /// Venue update timestamp in Unix milliseconds.
-        timestamp: u64,
-    },
-    /// Application heartbeat response; timestamp units are not inferred.
-    Pong { timestamp: u64 },
-    /// Server protocol error, not evidence of a trading outcome.
-    Error { code: String, message: String },
-}
 
 /// Opaque proof that one account subscription was acknowledged on a specific connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,38 +65,6 @@ impl DeepXWsConfirmedBalancesFrame {
     #[must_use]
     pub const fn timestamp(&self) -> u64 {
         self.timestamp
-    }
-}
-
-impl DeepXWsAccountFrame {
-    /// Parses one account-channel frame and validates its market and balance payload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for malformed, unsupported, foreign-market, or invalid balance frames.
-    pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(match DeepXWsAccountWireFrame::parse(text)? {
-            DeepXWsAccountWireFrame::Subscribed {
-                market,
-                subscriptions,
-                message,
-            } => Self::Subscribed {
-                market,
-                subscriptions,
-                message,
-            },
-            DeepXWsAccountWireFrame::UserBalances {
-                market,
-                balances,
-                timestamp,
-            } => Self::UserBalances {
-                market,
-                balances: DeepXSubaccountBalances(balances),
-                timestamp,
-            },
-            DeepXWsAccountWireFrame::Pong { timestamp } => Self::Pong { timestamp },
-            DeepXWsAccountWireFrame::Error { code, message } => Self::Error { code, message },
-        })
     }
 }
 
@@ -238,9 +180,11 @@ impl DeepXWsAccountConnection {
         loop {
             let frame = self.read_frame().await?;
             match &frame {
-                DeepXWsAccountFrame::Subscribed { .. } => {
-                    return validate_ack(&frame, expected);
-                }
+                DeepXWsAccountFrame::Subscribed {
+                    market,
+                    subscriptions,
+                    ..
+                } => return request.validate_ack(market, subscriptions),
                 DeepXWsAccountFrame::UserBalances { balances, .. } => {
                     anyhow::ensure!(
                         balances.address.eq_ignore_ascii_case(expected),
@@ -327,7 +271,7 @@ impl DeepXWsAccountConnection {
                 } => {
                     return Ok(DeepXWsConfirmedBalancesFrame {
                         subscription,
-                        balances,
+                        balances: balances.into(),
                         timestamp,
                     });
                 }
@@ -370,24 +314,6 @@ impl DeepXWsAccountConnection {
     }
 }
 
-fn validate_ack(frame: &DeepXWsAccountFrame, expected: &str) -> anyhow::Result<()> {
-    let DeepXWsAccountFrame::Subscribed {
-        market,
-        subscriptions,
-        ..
-    } = frame
-    else {
-        anyhow::bail!("DeepX account response is not a subscription acknowledgement");
-    };
-    anyhow::ensure!(
-        market.kind == "all"
-            && subscriptions.len() == 1
-            && subscriptions[0].address().eq_ignore_ascii_case(expected),
-        "DeepX account subscription acknowledgement conflicts with pending intent"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -396,7 +322,6 @@ mod tests {
         routing::get,
     };
     use rstest::rstest;
-    use rust_decimal::Decimal;
     use serde_json::json;
 
     use super::*;
@@ -404,75 +329,6 @@ mod tests {
     const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
     const BALANCES_FRAME: &str =
         include_str!("../../deepx-rust-sdk/test_data/websocket/testnet/user_balances.json");
-
-    #[rstest]
-    fn request_binds_documented_aggregate_market_channel_and_address() {
-        let request = DeepXWsUserBalancesRequest::new(SUBACCOUNT).unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&request.to_text().unwrap()).unwrap(),
-            json!({
-                "action": "subscribe",
-                "market": {"type": "all"},
-                "subscriptions": [{"channel": "user_balances", "address": SUBACCOUNT}],
-                "options": {"compress": false}
-            })
-        );
-        assert_eq!(request.subaccount(), SUBACCOUNT);
-    }
-
-    #[rstest]
-    #[case("")]
-    #[case("4ded31cb63949b52f9dfc9bcfade4eab7017eadc")]
-    #[case("0x4ded31cb63949b52f9dfc9bcfade4eab7017ead")]
-    #[case("0x4ded31cb63949b52f9dfc9bcfade4eab7017eadcz")]
-    fn request_rejects_non_account_id20_addresses(#[case] address: &str) {
-        assert!(DeepXWsUserBalancesRequest::new(address).is_err());
-    }
-
-    #[rstest]
-    fn captured_balance_frame_decodes_exact_values() {
-        let frame = DeepXWsAccountFrame::parse(BALANCES_FRAME).unwrap();
-        let DeepXWsAccountFrame::UserBalances {
-            market,
-            balances,
-            timestamp,
-        } = frame
-        else {
-            panic!("expected user balances frame");
-        };
-        assert_eq!(market.kind, "all");
-        assert_eq!(balances.address, SUBACCOUNT);
-        assert_eq!(balances.assets.len(), 3);
-        assert_eq!(balances.assets[0].symbol, "USDC");
-        assert_eq!(balances.assets[0].balance, Decimal::new(999_783_267, 6));
-        assert_eq!(timestamp, 1_789_451_784_924);
-    }
-
-    #[rstest]
-    #[case(concat!(
-        r#"{"type":"data","channel":"user_balances","market":{"type":"perp","id":3},"#,
-        r#""data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","#,
-        r#""assets":[]},"timestamp":1}"#,
-    ))]
-    #[case(r#"{"type":"data","channel":"trades","market":{"type":"all"},"data":{},"timestamp":1}"#)]
-    #[case(concat!(
-        r#"{"type":"data","channel":"user_balances","market":{"type":"all"},"#,
-        r#""data":{"address":"invalid","assets":[]},"timestamp":1}"#,
-    ))]
-    #[case(concat!(
-        r#"{"type":"data","channel":"user_balances","market":{"type":"all"},"#,
-        r#""data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","#,
-        r#""assets":[]},"timestamp":0}"#,
-    ))]
-    #[case(concat!(
-        r#"{"type":"subscribed","market":{"type":"all"},"subscriptions":[{"#,
-        r#""channel":"user_balances","address":"#,
-        r#""0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","addressType":"wallet"}],"#,
-        r#""message":"ok"}"#,
-    ))]
-    fn malformed_or_foreign_account_frames_are_rejected(#[case] text: &str) {
-        assert!(DeepXWsAccountFrame::parse(text).is_err());
-    }
 
     struct Server(tokio::task::JoinHandle<()>);
 

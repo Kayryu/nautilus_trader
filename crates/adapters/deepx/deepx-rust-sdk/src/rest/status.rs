@@ -111,7 +111,7 @@ pub fn parse_transaction_status(
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -125,6 +125,19 @@ mod tests {
             "status": "observed",
         }))
         .unwrap()
+    }
+
+    fn status_data(confirmation: &str, order_id: &str) -> Value {
+        json!({
+            "tx_hash": format!("0x{}", hex::encode(HASH)),
+            "confirmation": confirmation,
+            "order_id": order_id,
+            "status": "included",
+        })
+    }
+
+    fn raw(data: &Value) -> Box<RawValue> {
+        RawValue::from_string(data.to_string()).unwrap()
     }
 
     #[rstest]
@@ -145,5 +158,93 @@ mod tests {
     #[rstest]
     fn rejects_order_id_before_best_confirmation() {
         assert!(parse_transaction_status(raw_status("pending", "1"), HASH).is_err());
+    }
+
+    #[rstest]
+    #[case("pending", "", DeepXRestTransactionConfirmation::Pending, None)]
+    #[case("best", "", DeepXRestTransactionConfirmation::Best, None)]
+    #[case("best", "0", DeepXRestTransactionConfirmation::Best, Some(0))]
+    #[case("best", "00042", DeepXRestTransactionConfirmation::Best, Some(42))]
+    #[case(
+        "decode_failed",
+        "",
+        DeepXRestTransactionConfirmation::DecodeFailed,
+        None
+    )]
+    fn parses_documented_backend_states(
+        #[case] confirmation: &str,
+        #[case] id: &str,
+        #[case] expected: DeepXRestTransactionConfirmation,
+        #[case] order_id: Option<u64>,
+    ) {
+        let status = parse_transaction_status(raw(&status_data(confirmation, id)), HASH).unwrap();
+        assert_eq!(status.extrinsic_hash, HASH);
+        assert_eq!(status.confirmation, expected);
+        assert_eq!(status.order_id, order_id);
+        assert_eq!(status.backend_status.as_deref(), Some("included"));
+    }
+
+    #[test]
+    fn preserves_original_numeric_lexemes_and_optional_status() {
+        let body = format!(
+            r#"{{"tx_hash":"0x{}","confirmation":"best","order_id":"42","extra":0.1234567890123456789012345678}}"#,
+            hex::encode(HASH)
+        );
+        let status =
+            parse_transaction_status(RawValue::from_string(body.clone()).unwrap(), HASH).unwrap();
+        assert_eq!(status.data.get(), body);
+        assert_eq!(status.backend_status, None);
+    }
+
+    #[rstest]
+    #[case("confirmation", json!("finalized"))]
+    #[case("confirmation", json!("unknown"))]
+    #[case("confirmation", json!("Best"))]
+    #[case("confirmation", json!(null))]
+    #[case("tx_hash", json!("0x1234"))]
+    #[case("tx_hash", json!("abababababababababababababababababababababababababababababababab"))]
+    #[case("tx_hash", json!("0x0000000000000000000000000000000000000000000000000000000000000000"))]
+    #[case("tx_hash", json!(42))]
+    #[case("order_id", json!("18446744073709551616"))]
+    #[case("order_id", json!("-1"))]
+    #[case("order_id", json!("+1"))]
+    #[case("order_id", json!("1.0"))]
+    #[case("order_id", json!(" 1"))]
+    #[case("order_id", json!("1 "))]
+    #[case("order_id", json!(42))]
+    #[case("order_id", json!(null))]
+    #[case("status", json!(42))]
+    fn malformed_observations_fail_closed(#[case] field: &str, #[case] value: Value) {
+        let mut data = status_data("best", "42");
+        data[field] = value;
+        assert!(parse_transaction_status(raw(&data), HASH).is_err());
+    }
+
+    #[rstest]
+    #[case("confirmation")]
+    #[case("tx_hash")]
+    fn missing_required_status_fields_fail_closed(#[case] field: &str) {
+        let mut data = status_data("best", "42");
+        data.as_object_mut().unwrap().remove(field);
+        assert!(parse_transaction_status(raw(&data), HASH).is_err());
+    }
+
+    #[rstest]
+    #[case("pending")]
+    #[case("best")]
+    #[case("decode_failed")]
+    fn absent_order_id_does_not_invent_an_action_result(#[case] confirmation: &str) {
+        let mut data = status_data(confirmation, "");
+        data.as_object_mut().unwrap().remove("order_id");
+        let status = parse_transaction_status(raw(&data), HASH).unwrap();
+        assert_eq!(status.order_id, None);
+        assert_eq!(status.data.get(), data.to_string());
+    }
+
+    #[rstest]
+    #[case("pending")]
+    #[case("decode_failed")]
+    fn unresolved_order_result_must_remain_empty(#[case] confirmation: &str) {
+        assert!(parse_transaction_status(raw(&status_data(confirmation, "42")), HASH).is_err());
     }
 }

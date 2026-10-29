@@ -15,14 +15,14 @@
 
 //! Exact-decimal public lending-rate WebSocket frames.
 
-use std::collections::BTreeSet;
+use std::{borrow::Borrow, collections::BTreeSet};
 
 use anyhow::{Result, ensure};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue};
 
-use crate::decimal::exact_decimal;
+use crate::{decimal::exact_decimal, rest::models::DeepXLendingInterestRateRecord};
 
 /// One read-only aggregate lending-rate subscription bound to a validated asset directory.
 #[derive(Clone, Debug)]
@@ -108,6 +108,51 @@ pub struct DeepXWsLendingRatesBatch {
     pub statistic_time_ms: u64,
     /// WebSocket envelope timestamp.
     pub timestamp_ms: u64,
+}
+
+/// Checks that every observed WebSocket rate has one identical REST history record.
+///
+/// The caller independently validates REST request scope and history bounds. This comparison
+/// does not establish finality, continuity, or a tolerance for decimal disagreement.
+///
+/// # Errors
+///
+/// Returns an error for a missing, duplicate, or conflicting REST record.
+pub fn match_lending_rate_batch_to_rest<R>(
+    batch: &DeepXWsLendingRatesBatch,
+    records: &[R],
+) -> Result<()>
+where
+    R: Borrow<DeepXLendingInterestRateRecord>,
+{
+    for rate in &batch.rates {
+        let mut candidates = records.iter().filter(|candidate| {
+            let record: &DeepXLendingInterestRateRecord = (*candidate).borrow();
+            record.market_id == rate.market_id
+                && record.asset.eq_ignore_ascii_case(&rate.asset)
+                && record.statistic_time == batch.statistic_time_ms
+        });
+        let record = candidates
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("REST lending history omitted the WebSocket bucket"))?;
+        ensure!(
+            candidates.next().is_none(),
+            "REST lending history repeated the WebSocket bucket"
+        );
+        let record: &DeepXLendingInterestRateRecord = record.borrow();
+        ensure!(
+            record.borrow_apr == rate.borrow_apr && record.supply_apr == rate.supply_apr,
+            "REST lending rates conflict with WebSocket bucket market={} asset={} time={}: ws borrow={} supply={}, REST borrow={} supply={}",
+            rate.market_id,
+            rate.asset,
+            batch.statistic_time_ms,
+            rate.borrow_apr,
+            rate.supply_apr,
+            record.borrow_apr,
+            record.supply_apr,
+        );
+    }
+    Ok(())
 }
 
 /// A lending-rate subscription acknowledgement, batch, or heartbeat.
@@ -235,6 +280,41 @@ mod tests {
 
     use super::*;
 
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"lending"},"subscriptions":["lending_interest_rate"]}"#;
+    const FRAME: &str = r#"{"type":"data","channel":"lending_interest_rate","market":{"type":"lending"},"data":{"items":[{"asset":"eth","borrowApr":0.00019907914921343624,"marketId":1,"statisticTime":1791629700000,"supplyApr":1.2127547341372958e-6}],"statisticTime":1791629700000},"timestamp":1791629721075}"#;
+
+    fn request() -> DeepXWsLendingRatesRequest {
+        DeepXWsLendingRatesRequest::new([(1, "ETH".to_string())]).unwrap()
+    }
+
+    #[rstest]
+    fn parses_observed_rate_without_float_conversion() {
+        assert!(matches!(
+            request().parse(ACK).unwrap(),
+            DeepXWsLendingRatesFrame::Subscribed
+        ));
+        let DeepXWsLendingRatesFrame::Rates(batch) = request().parse(FRAME).unwrap() else {
+            panic!("expected lending-rate batch");
+        };
+        assert_eq!(batch.rates.len(), 1);
+        assert_eq!(batch.statistic_time_ms, 1_791_629_700_000);
+        assert_eq!(
+            batch.rates[0].supply_apr.to_string(),
+            "0.0000012127547341372958"
+        );
+        assert!(batch.rates[0].raw().get().contains("1.2127547341372958e-6"));
+    }
+
+    #[rstest]
+    #[case("asset", FRAME.replace("\"eth\"", "\"btc\""))]
+    #[case("market", FRAME.replace("\"marketId\":1", "\"marketId\":2"))]
+    #[case("negative", FRAME.replace("\"borrowApr\":0.00019907914921343624", "\"borrowApr\":-1"))]
+    #[case("timestamp", FRAME.replace("\"statisticTime\":1791629700000},\"timestamp\"", "\"statisticTime\":1791629721076},\"timestamp\""))]
+    #[case("unaligned", FRAME.replace("1791629700000", "1791629700001"))]
+    fn rejects_foreign_or_invalid_rate(#[case] _scenario: &str, #[case] frame: String) {
+        assert!(request().parse(&frame).is_err());
+    }
+
     #[rstest]
     fn request_requires_distinct_valid_assets() {
         assert!(DeepXWsLendingRatesRequest::new([]).is_err());
@@ -245,5 +325,26 @@ mod tests {
         assert!(duplicate.is_err());
         let request = DeepXWsLendingRatesRequest::new([(1, "ETH".to_string())]).unwrap();
         assert!(request.to_text().contains("lending_interest_rate"));
+    }
+
+    #[rstest]
+    fn exact_rest_match_rejects_one_digit_apr_conflict() {
+        let request = DeepXWsLendingRatesRequest::new([(1, "ETH".to_string())]).unwrap();
+        let DeepXWsLendingRatesFrame::Rates(batch) = request.parse(FRAME).unwrap() else {
+            panic!("expected lending-rate batch");
+        };
+        let matching: DeepXLendingInterestRateRecord = serde_json::from_str(
+            r#"{"market_id":1,"asset":"eth","borrow_apr":"0.00019907914921343624","supply_apr":"0.0000012127547341372958","statistic_time":1791629700000}"#,
+        )
+        .unwrap();
+        match_lending_rate_batch_to_rest(&batch, std::slice::from_ref(&matching)).unwrap();
+        let mut conflicting = matching.clone();
+        conflicting.supply_apr = "0.0000012127547341372959".parse().unwrap();
+        assert!(match_lending_rate_batch_to_rest(&batch, &[conflicting]).is_err());
+        assert!(
+            match_lending_rate_batch_to_rest::<DeepXLendingInterestRateRecord>(&batch, &[])
+                .is_err()
+        );
+        assert!(match_lending_rate_batch_to_rest(&batch, &[matching.clone(), matching]).is_err());
     }
 }

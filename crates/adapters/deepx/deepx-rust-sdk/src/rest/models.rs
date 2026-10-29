@@ -27,8 +27,48 @@ use crate::{
         exact_decimal, exact_i128, exact_u128, optional_exact_decimal, optional_exact_u64,
         optional_exact_u128, optional_none_decimal,
     },
-    query::{DeepXQuotaBuyerType, DeepXQuotaHistoryType},
+    query::{DeepXHourlyUnsettledFundingCursor, DeepXQuotaBuyerType, DeepXQuotaHistoryType},
 };
+
+/// Wallet-scoped subaccount directory in venue response order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXWalletSubaccounts {
+    wallet: String,
+    /// Subaccount addresses in venue response order.
+    pub addresses: Vec<String>,
+}
+
+impl DeepXWalletSubaccounts {
+    /// Binds a directory response to the wallet used for the query.
+    #[must_use]
+    pub fn new(wallet: String, addresses: Vec<String>) -> Self {
+        Self { wallet, addresses }
+    }
+
+    /// Returns the wallet address used for the directory query.
+    #[must_use]
+    pub fn wallet(&self) -> &str {
+        &self.wallet
+    }
+
+    /// Checks case-insensitive subaccount membership, independent of response order.
+    #[must_use]
+    pub fn has_same_membership(&self, addresses: &[String]) -> bool {
+        if self.addresses.len() != addresses.len() {
+            return false;
+        }
+        let expected: HashSet<_> = self
+            .addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        let observed: HashSet<_> = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        expected.len() == self.addresses.len() && expected == observed
+    }
+}
 
 /// One lending pool asset identity exposed by the public market directory.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -352,6 +392,111 @@ pub struct DeepXDelegateAccount {
     pub active: bool,
 }
 
+/// Delegate configurations returned for one queried wallet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXWalletDelegateAccounts<T = DeepXDelegateAccount> {
+    wallet: String,
+    /// Delegate configurations in venue response order.
+    pub accounts: Vec<T>,
+}
+
+impl<T> DeepXWalletDelegateAccounts<T> {
+    /// Associates delegate configurations with the queried wallet.
+    #[must_use]
+    pub fn new(wallet: String, accounts: Vec<T>) -> Self {
+        Self { wallet, accounts }
+    }
+
+    /// Returns the wallet address used for the directory query.
+    #[must_use]
+    pub fn wallet(&self) -> &str {
+        &self.wallet
+    }
+}
+
+/// Grouped account reads for one subaccount.
+#[derive(Clone, Debug)]
+pub struct DeepXSubaccountSnapshot<
+    P = DeepXSubaccountProfile,
+    B = DeepXSubaccountBalances,
+    E = DeepXSubaccountEquity,
+    M = DeepXSubaccountMarginRatio,
+> {
+    /// Subaccount profile bound to the requested wallet authority.
+    pub profile: P,
+    /// Exact lending balances bound to the profile address.
+    pub balances: B,
+    /// Exact equity summary bound to the profile address.
+    pub equity: E,
+    /// Request-scoped collateral and margin requirement summary.
+    pub margin_ratio: M,
+}
+
+/// Grouped account reads for every subaccount in one wallet directory.
+///
+/// Constituent REST reads are not block-pinned and do not form an atomic venue snapshot.
+#[derive(Clone, Debug)]
+pub struct DeepXWalletAccountSnapshot<
+    D = DeepXWalletSubaccounts,
+    S = DeepXUserStats,
+    A = DeepXSubaccountSnapshot,
+> {
+    /// Wallet directory in venue response order.
+    pub directory: D,
+    /// Wallet statistics for the directory's subaccounts.
+    pub stats: S,
+    /// Account reads in directory order.
+    pub subaccounts: Vec<A>,
+}
+
+/// Grouped position lifecycle pages for one subaccount.
+#[derive(Clone, Debug)]
+pub struct DeepXSubaccountPerpPositions<P = DeepXSubaccountProfile, R = DeepXPerpPositionRecord> {
+    /// Profile whose authority matches the requested wallet.
+    pub profile: P,
+    /// Position pages in venue cursor order.
+    pub pages: Vec<crate::rest::DeepXAccountPage<R>>,
+}
+
+/// Grouped position lifecycle observations for one wallet.
+///
+/// Constituent REST reads are mutable and do not form a block-pinned snapshot.
+#[derive(Clone, Debug)]
+pub struct DeepXWalletPerpPositions<
+    D = DeepXWalletSubaccounts,
+    S = DeepXUserStats,
+    P = DeepXSubaccountPerpPositions,
+> {
+    /// Wallet directory in venue response order.
+    pub directory: D,
+    /// Wallet statistics for the directory's subaccounts.
+    pub stats: S,
+    /// Position pages in directory order.
+    pub subaccounts: Vec<P>,
+}
+
+/// Wallet addresses returned for one queried delegate account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXDelegateWallets {
+    delegate: String,
+    /// Wallet addresses in venue response order.
+    pub wallets: Vec<String>,
+}
+
+impl DeepXDelegateWallets {
+    /// Associates wallet addresses with the queried delegate account.
+    #[must_use]
+    pub fn new(delegate: String, wallets: Vec<String>) -> Self {
+        Self { delegate, wallets }
+    }
+
+    /// Returns the delegate address used for the reverse-directory query.
+    #[must_use]
+    pub fn delegate(&self) -> &str {
+        &self.delegate
+    }
+}
+
 fn default_delegate_active() -> bool {
     true
 }
@@ -522,6 +667,17 @@ pub struct DeepXSpotWalletOrderMarket<T = DeepXSpotWalletSubaccountOrders> {
     pub subaccounts: Vec<T>,
 }
 
+/// Globally paginated Spot wallet orders grouped by market and subaccount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXSpotWalletOrdersPage<T = DeepXSpotWalletOrderMarket> {
+    /// Market groups in venue response order.
+    pub markets: Vec<T>,
+    /// Opaque cursor repeated by every nonempty nested group.
+    pub next_cursor: Option<String>,
+    /// Whether every nonempty nested group reports another global page.
+    pub has_next: bool,
+}
+
 /// Spot trades for one subaccount within a wallet-grouped response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -542,6 +698,17 @@ pub struct DeepXSpotWalletTradeMarket<T = DeepXSpotWalletSubaccountTrades> {
     pub name: String,
     /// Per-subaccount trade groups returned for this market.
     pub subaccounts: Vec<T>,
+}
+
+/// Globally paginated Spot wallet trades grouped by market and subaccount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXSpotWalletTradesPage<T = DeepXSpotWalletTradeMarket> {
+    /// Market groups in venue response order.
+    pub markets: Vec<T>,
+    /// Opaque cursor repeated by every nonempty nested group.
+    pub next_cursor: Option<String>,
+    /// Whether every nonempty nested group reports another global page.
+    pub has_next: bool,
 }
 
 /// Perpetual trades for one subaccount within a wallet-grouped response.
@@ -586,6 +753,17 @@ pub struct DeepXPerpWalletOrderMarket<T = DeepXPerpWalletSubaccountOrders> {
     pub market_name: String,
     /// Per-subaccount order groups returned for this market.
     pub subaccounts: Vec<T>,
+}
+
+/// Globally paginated perpetual wallet orders grouped by market and subaccount.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXPerpWalletOrdersPage<T = DeepXPerpWalletOrderMarket> {
+    /// Market groups in venue response order.
+    pub markets: Vec<T>,
+    /// Opaque cursor repeated by every nested group.
+    pub next_cursor: Option<String>,
+    /// Whether every nested group reports another global page.
+    pub has_next: bool,
 }
 
 /// Aggregated wallet directory counters returned by the user-stats endpoint.
@@ -735,6 +913,19 @@ pub struct DeepXHourlyUnsettledFundingRecord {
     pub boundary_event_index: u64,
     /// Stable backend boundary-event identity used by keyset pagination.
     pub boundary_event_id: String,
+}
+
+impl DeepXHourlyUnsettledFundingRecord {
+    /// Returns the complete keyset cursor for this funding boundary.
+    #[must_use]
+    pub fn cursor(&self) -> DeepXHourlyUnsettledFundingCursor {
+        DeepXHourlyUnsettledFundingCursor {
+            boundary_timestamp_ms: self.boundary_timestamp_ms,
+            market_id: self.market_id,
+            subaccount: self.subaccount.clone(),
+            event_id: self.boundary_event_id.clone(),
+        }
+    }
 }
 
 /// One perpetual execution in the observed account-trade wire form.
@@ -1715,6 +1906,32 @@ pub enum DeepXInvitationStatusWire {
 pub struct DeepXQuotaClaimIdentity {
     /// Venue claim ID.
     pub id: u64,
+}
+
+/// Claim identity and exact backend payload for an asynchronous quota task.
+#[derive(Clone, Debug)]
+pub struct DeepXQuotaClaim {
+    /// Venue claim ID bound to the request.
+    pub id: u64,
+    data: Box<RawValue>,
+}
+
+impl DeepXQuotaClaim {
+    pub(crate) fn new(id: u64, data: Box<RawValue>) -> Self {
+        Self { id, data }
+    }
+
+    /// Returns the original task payload, including fields without a stable schema.
+    #[must_use]
+    pub fn data(&self) -> &RawValue {
+        &self.data
+    }
+
+    /// Returns the original task payload without changing its numeric lexemes.
+    #[must_use]
+    pub fn into_raw(self) -> Box<RawValue> {
+        self.data
+    }
 }
 
 /// Chain-defined permission mode reported for one wallet delegate.

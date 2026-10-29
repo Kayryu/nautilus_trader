@@ -27,6 +27,7 @@ pub mod query;
 pub mod rest;
 pub mod rpc;
 pub mod signing;
+pub mod symbol;
 pub mod urls;
 pub mod websocket;
 

@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use deepx_rust_sdk::websocket::account_order_history::DeepXWsOrderHistoryControlFrame;
 pub use deepx_rust_sdk::websocket::account_order_history::{
     DeepXWsPerpOrderHistoryRequest, DeepXWsSpotOrderHistoryRequest,
 };
@@ -43,7 +44,7 @@ pub async fn observe_perp_order_history_ack(
     request: &DeepXWsPerpOrderHistoryRequest,
 ) -> Result<()> {
     observe_order_history_ack(network, proxy_url, timeout, request.to_text(), |text| {
-        request.validate_ack(text)
+        request.parse_control_frame(text)
     })
     .await
 }
@@ -63,7 +64,7 @@ pub async fn observe_spot_order_history_ack(
     request: &DeepXWsSpotOrderHistoryRequest,
 ) -> Result<()> {
     observe_order_history_ack(network, proxy_url, timeout, request.to_text(), |text| {
-        request.validate_ack(text)
+        request.parse_control_frame(text)
     })
     .await
 }
@@ -73,7 +74,7 @@ async fn observe_order_history_ack(
     proxy_url: Option<&str>,
     timeout: Duration,
     request_text: String,
-    validate_ack: impl Fn(&str) -> Result<()>,
+    parse_frame: impl Fn(&str) -> Result<DeepXWsOrderHistoryControlFrame>,
 ) -> Result<()> {
     ensure!(
         !timeout.is_zero(),
@@ -92,12 +93,10 @@ async fn observe_order_history_ack(
             match message {
                 Message::Text(bytes) => {
                     let text = std::str::from_utf8(&bytes)?;
-                    let frame: serde_json::Value = serde_json::from_str(text)?;
-                    if frame.get("type").and_then(serde_json::Value::as_str) == Some("pong") {
-                        continue;
+                    match parse_frame(text)? {
+                        DeepXWsOrderHistoryControlFrame::Pong => continue,
+                        DeepXWsOrderHistoryControlFrame::Subscribed => break Ok(()),
                     }
-                    validate_ack(text)?;
-                    break Ok::<_, anyhow::Error>(());
                 }
                 Message::Ping(_) | Message::Pong(_) => {}
                 _ => anyhow::bail!("unsupported DeepX order-history stream message"),
@@ -126,9 +125,6 @@ mod tests {
     use super::*;
 
     const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
-    const ACK: &str = r#"{"type":"subscribed","market":{"type":"perp","id":3,"name":"ETH-USDC"},"subscriptions":[{"channel":"user_perp_order_history","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}],"message":"Successfully subscribed to 1 channels"}"#;
-    const SPOT_PAIR: &str = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
-    const SPOT_ACK: &str = r#"{"type":"subscribed","market":{"type":"spot","name":"ETH/USDC","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"},"subscriptions":[{"channel":"user_spot_order_history","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}],"message":"Successfully subscribed to 1 channels"}"#;
 
     fn request() -> DeepXWsPerpOrderHistoryRequest {
         DeepXWsPerpOrderHistoryRequest::new(3, SUBACCOUNT).unwrap()
@@ -145,50 +141,6 @@ mod tests {
             .find(|market| market.name == "ETH/USDC")
             .unwrap();
         DeepXWsSpotOrderHistoryRequest::new(&market, SUBACCOUNT).unwrap()
-    }
-
-    #[rstest]
-    fn binds_observed_ack_to_exact_scope() {
-        let request = request();
-        let encoded: serde_json::Value = serde_json::from_str(&request.to_text()).unwrap();
-        assert_eq!(encoded["market"]["id"], 3);
-        assert_eq!(encoded["subscriptions"][0]["address"], SUBACCOUNT);
-        assert_eq!(
-            encoded["subscriptions"][0]["channel"],
-            "user_perp_order_history"
-        );
-        request.validate_ack(ACK).unwrap();
-
-        for foreign in [
-            ACK.replace("\"id\":3", "\"id\":4"),
-            ACK.replace("user_perp_order_history", "user_perp_open_orders"),
-            ACK.replace(SUBACCOUNT, "0x0000000000000000000000000000000000000000"),
-            ACK.replace("\"type\":\"subscribed\"", "\"type\":\"data\""),
-        ] {
-            assert!(request.validate_ack(&foreign).is_err());
-        }
-    }
-
-    #[rstest]
-    fn binds_observed_spot_ack_to_exact_scope() {
-        let request = spot_request();
-        let encoded: serde_json::Value = serde_json::from_str(&request.to_text()).unwrap();
-        assert_eq!(encoded["market"]["name"], "ETH/USDC");
-        assert_eq!(encoded["subscriptions"][0]["address"], SUBACCOUNT);
-        assert_eq!(
-            encoded["subscriptions"][0]["channel"],
-            "user_spot_order_history"
-        );
-        request.validate_ack(SPOT_ACK).unwrap();
-
-        for foreign in [
-            SPOT_ACK.replace("ETH/USDC", "SOL/USDC"),
-            SPOT_ACK.replace(SPOT_PAIR, &format!("0x{}", "00".repeat(32))),
-            SPOT_ACK.replace("user_spot_order_history", "user_spot_open_orders"),
-            SPOT_ACK.replace(SUBACCOUNT, "0x0000000000000000000000000000000000000000"),
-        ] {
-            assert!(request.validate_ack(&foreign).is_err());
-        }
     }
 
     #[rstest]

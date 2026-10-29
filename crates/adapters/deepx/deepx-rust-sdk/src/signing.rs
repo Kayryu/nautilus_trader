@@ -21,12 +21,16 @@ pub mod runtime_interface;
 
 mod evm;
 mod management;
+mod operation;
 mod pallet;
 mod quota;
+mod runtime;
+mod snapshot;
 
 pub use evm::{
     DeepXEvmTransactionKind, DeepXOfflineEvmExtrinsic, DeepXOfflineEvmSignError,
-    DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams, DeepXOfflinePerpPnlEvmParams,
+    DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams, DeepXOfflineEvmWrapperSignError,
+    DeepXOfflinePerpPnlEvmParams, sign_offline_evm_transact_extrinsic,
     sign_offline_evm_transaction,
 };
 pub use management::{
@@ -35,12 +39,20 @@ pub use management::{
     DeepXSetGlobalLeverageParams, DeepXSetPerMarketLeverageParams, DeepXSetSpotMarginParams,
     DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode,
 };
+pub use operation::{DeepXDirectRuntimeIdentity, DeepXNonceReservation, DeepXTransactionOperation};
 pub use pallet::{
     DeepXPerpCancelParams, DeepXPerpCloseParams, DeepXPerpModifyParams, DeepXPerpOrderType,
     DeepXPerpPlaceParams, DeepXPerpProfitAndLossPointParams, DeepXPostOnlyParam,
     DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce,
 };
 pub use quota::{DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError, sign_quota_claim};
+pub use runtime::{
+    CheckNonceEra, DeepXEncodedPalletExtrinsic, DeepXOfflinePalletCall, DeepXPalletSigningError,
+    DeepXRuntimeConfig, derive_signer_account_id, sign_dynamic_pallet_call, sign_pallet_call,
+};
+pub use snapshot::{
+    ApprovedRuntimeIdentity, DeepXValidatedRuntime, SnapshotError, validate_testnet_runtime,
+};
 
 /// Nonce-era extension decoded from DeepX runtime extrinsics.
 #[doc(hidden)]

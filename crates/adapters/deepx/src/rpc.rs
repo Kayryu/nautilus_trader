@@ -29,6 +29,8 @@ use alloy::{primitives::Bytes, sol_types::SolValue};
 use deepx_rust_sdk::rpc::execute_rpc_read_with_retry;
 #[cfg(test)]
 use deepx_rust_sdk::rpc::precompile::{DeepXPerpMarketAbi, DeepXPerpOrderSpecAbi};
+#[cfg(test)]
+use deepx_rust_sdk::rpc::storage::DeepXStoredOrderSide;
 use deepx_rust_sdk::rpc::{
     DEEPX_LENDING_BORROW_RUNTIME_API_METHOD, DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD,
     DEEPX_LENDING_POOL_RUNTIME_API_METHOD, DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD,
@@ -36,22 +38,42 @@ use deepx_rust_sdk::rpc::{
     DeepXRpcBlockHeader as ObservedBlockHeader,
     DeepXRpcBlockResponse as ObservedTimestampBlockResponse, DeepXRpcClient,
     DeepXRpcResponse as RpcNodeHttpResponse, DeepXRpcRuntimeVersion as ObservedRuntimeVersion,
-    DeepXRpcStorageChangeSet as ObservedStorageChangeSet, get_finalized_head,
-    get_genesis_block_hash, get_header, get_metadata, get_rpc_methods, get_runtime_version,
-    lending_positions::DeepXRawLendingPosition,
+    DeepXRpcStorageChangeSet as ObservedStorageChangeSet,
+    chain_decode::{decode_block_number_u32, decode_prefixed_hash as sdk_decode_prefixed_hash},
+    endpoint_identity::{
+        observe_and_validate_rpc_method_capabilities as sdk_observe_all_rpc_method_capabilities,
+        observe_rpc_method_capabilities as sdk_observe_rpc_method_capabilities,
+    },
+    get_finalized_head, get_genesis_block_hash, get_header, get_metadata, get_runtime_version,
+    lending_positions::{
+        DeepXRawLendingPosition, decode_lending_amount_response, decode_lending_pool_response,
+    },
+    market_spec::{decode_perp_market_storage, decode_perp_order_spec, decode_spot_market_storage},
     precompile::{
         DEEPX_LENDING_PRECOMPILE_ADDRESS, DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS,
-        decode_max_withdraw_return, decode_perp_market_return, encode_max_withdraw_call,
-        encode_perp_market_call,
+        decode_max_withdraw_hex, encode_max_withdraw_call, encode_perp_market_call,
     },
     storage::{
         DeepXActivePerpOrderIndexEntry, DeepXLendingPoolStorage, DeepXPerpOrderStorage,
-        DeepXPerpPositionStorage, DeepXSpotOrderStorage, DeepXStoredOrderSide,
+        DeepXPerpPositionStorage, DeepXSpotOrderStorage,
+    },
+    storage_decode::{
+        active_perp_orders_storage_key, active_spot_orders_storage_key, decode_active_perp_order,
+        decode_active_perp_order_index as decode_sdk_active_perp_order_index,
+        decode_active_spot_order_index, decode_max_perp_positions as decode_sdk_max_perp_positions,
+        decode_perp_order_by_id, decode_perp_positions as decode_sdk_perp_positions,
+        decode_spot_order_by_id, perp_market_storage_key, perp_order_info_storage_key,
+        spot_market_storage_key, spot_order_info_storage_key,
+        subaccount_max_perp_positions_storage_key, user_perp_positions_storage_key,
     },
     timestamp::{DeepXTimestampReadError, get_timestamp_now, timestamp_now_storage_key},
 };
 pub use deepx_rust_sdk::rpc::{
     DeepXMarginDirection,
+    endpoint_identity::{
+        DEEPX_RECOVERY_RPC_METHODS, DEEPX_SUBMISSION_RPC_METHODS, DEEPX_WATCH_RPC_METHODS,
+        DeepXRpcMethodCapabilitiesError, DeepXRpcMethodCapabilityError,
+    },
     storage::{
         DeepXLendingPoolStatus, DeepXStoredOrderStatus, DeepXStoredPerpOrderType,
         DeepXStoredPostOnlyParam, DeepXStoredSpotOrderType, DeepXStoredTimeInForce,
@@ -59,14 +81,15 @@ pub use deepx_rust_sdk::rpc::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use nautilus_core::hex;
-use parity_scale_codec::{Compact, Decode, Encode};
+#[cfg(test)]
+use parity_scale_codec::Compact;
+use parity_scale_codec::{Decode, Encode};
 #[cfg(test)]
 use serde_json::json;
 pub use spot_margin::{
     DeepXFinalizedSpotMarginError, DeepXFinalizedSpotMarginEvidence,
     observe_finalized_spot_margin_evidence,
 };
-use subxt_core::ext::scale_value::{Composite, ValueDef, scale::decode_as_type};
 use thiserror::Error;
 
 use crate::{
@@ -82,38 +105,9 @@ use crate::{
     },
 };
 
-/// RPC methods required from the transaction submission endpoint.
-pub const DEEPX_SUBMISSION_RPC_METHODS: &[&str] =
-    &["author_pendingExtrinsics", "author_submitExtrinsic"];
-
-/// RPC methods required from the finalized runtime watch endpoint.
-pub const DEEPX_WATCH_RPC_METHODS: &[&str] = &[
-    "chain_getBlock",
-    "chain_getBlockHash",
-    "chain_getFinalizedHead",
-    "chain_getHeader",
-    "eth_call",
-    "state_getStorage",
-    "state_queryStorageAt",
-    "state_call",
-];
-
 const DEEPX_ETH_CALL_PROBE_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
-const DEEPX_MAX_PERP_MARKET_STORAGE_BYTES: usize = 16_384;
-const DEEPX_MAX_SPOT_MARKET_STORAGE_BYTES: usize = 16_384;
 const DEEPX_LENDING_ASSET_QUERY_CONCURRENCY: usize = 8;
-const DEEPX_DEFAULT_MAX_PERP_POSITIONS: u32 = 8;
-const DEEPX_ABSOLUTE_MAX_PERP_POSITIONS: u32 = 256;
-const DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS: u32 = 256;
 const DEEPX_ABSOLUTE_MAX_PERP_ORDERS: u32 = 4_096;
-/// RPC methods required from the transaction recovery endpoint.
-pub const DEEPX_RECOVERY_RPC_METHODS: &[&str] = &[
-    "chain_getBlock",
-    "chain_getBlockHash",
-    "chain_getFinalizedHead",
-    "chain_getHeader",
-    "state_getStorage",
-];
 
 /// Evidence that one identity-validated endpoint advertised every requested RPC method.
 #[derive(Clone, PartialEq, Eq)]
@@ -1276,42 +1270,6 @@ pub enum DeepXRpcIdentityError {
     InvalidGenesisHash,
 }
 
-/// Errors raised while probing role-specific RPC method availability.
-#[derive(Debug, Error)]
-pub enum DeepXRpcMethodCapabilityError {
-    /// No methods were supplied for the role probe.
-    #[error("no required DeepX RPC methods supplied for role {0:?}")]
-    EmptyRequirements(DeepXRpcRole),
-    /// The endpoint request or JSON-RPC response failed.
-    #[error("failed to query DeepX RPC methods for role {role:?}: {source}")]
-    Rpc {
-        /// Role whose identity-validated endpoint was queried.
-        role: DeepXRpcRole,
-        /// Underlying request or response error.
-        #[source]
-        source: anyhow::Error,
-    },
-    /// The endpoint did not advertise one required method.
-    #[error("DeepX RPC endpoint for role {role:?} does not advertise required method {method}")]
-    MissingMethod {
-        /// Role whose endpoint lacks the method.
-        role: DeepXRpcRole,
-        /// Required method absent from the advertised method set.
-        method: String,
-    },
-}
-
-/// Errors raised while collecting complete role-specific RPC method capabilities.
-#[derive(Debug, Error)]
-#[error("failed to observe DeepX RPC method capabilities for role {role:?}: {source}")]
-pub struct DeepXRpcMethodCapabilitiesError {
-    /// Role whose identity-validated endpoint was queried.
-    pub role: DeepXRpcRole,
-    /// Underlying capability observation error.
-    #[source]
-    pub source: DeepXRpcMethodCapabilityError,
-}
-
 /// Errors raised while collecting and validating every DeepX RPC role endpoint.
 #[derive(Debug, Error)]
 pub enum DeepXRpcEndpointIdentityError {
@@ -1852,89 +1810,47 @@ pub async fn observe_and_validate_rpc_endpoint_identities(
 /// Probes required methods on one identity-validated role endpoint.
 ///
 /// This evidence proves only that `rpc_methods` advertised each requested name at observation
-/// time. It does not prove method semantics, authorize requests, or enable transaction operations.
+/// time. It does not prove method semantics or authorize transaction operations.
 ///
 /// # Errors
 ///
-/// Returns an error when no methods are requested, the probe fails, or any required method is not
-/// advertised by the endpoint.
+/// Returns an error when no methods are requested, the probe fails, or a required method is absent.
 pub async fn observe_rpc_method_capabilities(
     endpoints: &DeepXValidatedRpcEndpoints,
     role: DeepXRpcRole,
     required_methods: impl IntoIterator<Item = impl Into<String>>,
 ) -> Result<DeepXRpcMethodCapabilities, DeepXRpcMethodCapabilityError> {
-    let required_methods: BTreeSet<String> = required_methods.into_iter().map(Into::into).collect();
-    if required_methods.is_empty() {
-        return Err(DeepXRpcMethodCapabilityError::EmptyRequirements(role));
-    }
-    let observed = get_rpc_methods(endpoints.url_for(role))
-        .await
-        .map_err(|source| DeepXRpcMethodCapabilityError::Rpc { role, source })?;
-    for method in &required_methods {
-        if !observed.contains(method) {
-            return Err(DeepXRpcMethodCapabilityError::MissingMethod {
-                role,
-                method: method.clone(),
-            });
-        }
-    }
-
+    let observed = sdk_observe_rpc_method_capabilities(endpoints, role, required_methods).await?;
     Ok(DeepXRpcMethodCapabilities {
-        role,
-        endpoint_url: endpoints.url_for(role).to_string(),
-        methods: required_methods,
+        role: observed.role(),
+        endpoint_url: observed.endpoint_url().to_string(),
+        methods: observed.methods().clone(),
     })
 }
 
-/// Collects the minimum RPC method capabilities required for all endpoint roles.
-///
-/// All three probes complete before errors are evaluated in submission, watch, then recovery
-/// order. This proves advertised method names only; protocol semantics remain separately gated.
+/// Collects the required RPC method capabilities for all endpoint roles.
 ///
 /// # Errors
 ///
-/// Returns a role-attributed error unless every identity-validated endpoint advertises all methods
-/// required by its role.
+/// Returns a role-attributed error unless every validated endpoint advertises its required methods.
 pub async fn observe_and_validate_rpc_method_capabilities(
     endpoints: &DeepXValidatedRpcEndpoints,
 ) -> Result<DeepXValidatedRpcMethodCapabilities, DeepXRpcMethodCapabilitiesError> {
-    let (submission, watch, recovery) = tokio::join!(
-        observe_rpc_method_capabilities(
-            endpoints,
-            DeepXRpcRole::Submission,
-            DEEPX_SUBMISSION_RPC_METHODS.iter().copied(),
-        ),
-        observe_rpc_method_capabilities(
-            endpoints,
-            DeepXRpcRole::Watch,
-            DEEPX_WATCH_RPC_METHODS.iter().copied(),
-        ),
-        observe_rpc_method_capabilities(
-            endpoints,
-            DeepXRpcRole::Recovery,
-            DEEPX_RECOVERY_RPC_METHODS.iter().copied(),
-        ),
-    );
-    let submission = submission.map_err(|source| DeepXRpcMethodCapabilitiesError {
-        role: DeepXRpcRole::Submission,
-        source,
-    })?;
-    let watch = watch.map_err(|source| DeepXRpcMethodCapabilitiesError {
-        role: DeepXRpcRole::Watch,
-        source,
-    })?;
-    let recovery = recovery.map_err(|source| DeepXRpcMethodCapabilitiesError {
-        role: DeepXRpcRole::Recovery,
-        source,
-    })?;
-
+    let observed = sdk_observe_all_rpc_method_capabilities(endpoints).await?;
+    let copy = |role| {
+        let capabilities = observed.for_role(role);
+        DeepXRpcMethodCapabilities {
+            role: capabilities.role(),
+            endpoint_url: capabilities.endpoint_url().to_string(),
+            methods: capabilities.methods().clone(),
+        }
+    };
     Ok(DeepXValidatedRpcMethodCapabilities {
-        submission,
-        watch,
-        recovery,
+        submission: copy(DeepXRpcRole::Submission),
+        watch: copy(DeepXRpcRole::Watch),
+        recovery: copy(DeepXRpcRole::Recovery),
     })
 }
-
 /// Collects a signing runtime from one finalized DeepX block.
 ///
 /// The ordinary configured RPC endpoint is used without asserting role-specific method support.
@@ -2702,11 +2618,9 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
             first == second,
             "DeepX current Spot market storage changed at a fixed hash"
         );
-        let (min_order_size, tick_size, step_size) = first
+        let spec = first
             .as_deref()
-            .and_then(|encoded| {
-                decode_finalized_spot_market_storage(encoded, snapshot.metadata(), *pair)
-            })
+            .and_then(|encoded| decode_spot_market_storage(encoded, snapshot.metadata(), *pair))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "invalid current DeepX Spot market spec for {}",
@@ -2715,9 +2629,9 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
             })?;
         specs.push(DeepXCurrentSpotMarketSpec {
             pair: *pair,
-            min_order_size,
-            tick_size,
-            step_size,
+            min_order_size: spec.min_order_size,
+            tick_size: spec.tick_size,
+            step_size: spec.step_size,
         });
     }
     let canonical_hash = client
@@ -2746,9 +2660,9 @@ async fn observe_spot_market_spec_at(
             pair: pair_hex.clone(),
             source,
         })?;
-    let (min_order_size, tick_size, step_size) = stored
+    let spec = stored
         .as_deref()
-        .and_then(|encoded| decode_finalized_spot_market_storage(encoded, metadata, pair))
+        .and_then(|encoded| decode_spot_market_storage(encoded, metadata, pair))
         .ok_or_else(|| DeepXFinalizedSpotMarketSpecError::InvalidEvidence(pair_hex.clone()))?;
     let repeated: Option<String> = client
         .get_storage_result(&key, &checkpoint_hash)
@@ -2765,59 +2679,10 @@ async fn observe_spot_market_spec_at(
         checkpoint: observation.checkpoint(),
         runtime_identity: observation.snapshot().identity().clone(),
         pair,
-        min_order_size,
-        tick_size,
-        step_size,
+        min_order_size: spec.min_order_size,
+        tick_size: spec.tick_size,
+        step_size: spec.step_size,
     })
-}
-
-fn decode_finalized_spot_market_storage(
-    encoded: &str,
-    metadata: &subxt_core::Metadata,
-    pair: [u8; 32],
-) -> Option<(u128, u128, u128)> {
-    let value_type = metadata
-        .pallet_by_name("SpotMarket")?
-        .storage()?
-        .entry_by_name("SpotMarkets")?
-        .entry_type()
-        .value_ty();
-    if encoded.len() > 2 + 2 * DEEPX_MAX_SPOT_MARKET_STORAGE_BYTES {
-        return None;
-    }
-    let bytes = decode_storage_hex(encoded)?;
-    let mut input = bytes.as_slice();
-    let market = decode_as_type(&mut input, value_type, metadata.types()).ok()?;
-    if !input.is_empty() {
-        return None;
-    }
-    let ValueDef::Composite(Composite::Named(fields)) = &market.value else {
-        return None;
-    };
-    let ValueDef::Composite(Composite::Unnamed(pair_wrapper)) =
-        &fields.iter().find(|(name, _)| name == "pair")?.1.value
-    else {
-        return None;
-    };
-    let [wrapped_pair] = pair_wrapper.as_slice() else {
-        return None;
-    };
-    let ValueDef::Composite(Composite::Unnamed(stored_pair)) = &wrapped_pair.value else {
-        return None;
-    };
-    if stored_pair.len() != pair.len()
-        || !stored_pair
-            .iter()
-            .zip(pair)
-            .all(|(value, expected)| value.as_u128() == Some(u128::from(expected)))
-    {
-        return None;
-    }
-    let spec = fields.iter().find(|(name, _)| name == "order_spec")?;
-    let min_size = named_scale_u128(&spec.1.value, "min_qty")?;
-    let tick = named_scale_u128(&spec.1.value, "tick_size")?;
-    let step = named_scale_u128(&spec.1.value, "step_size")?;
-    (min_size > 0 && tick > 0 && step > 0).then_some((min_size, tick, step))
 }
 
 /// Observes raw Perp order constraints at an approved finalized checkpoint.
@@ -2869,26 +2734,21 @@ pub async fn observe_finalized_perp_order_spec_evidence(
         )
         .await
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::Rpc { market_id, source })?;
-    let (min_order_size, tick_size, step_size) =
-        decode_finalized_perp_order_spec(&encoded, market_id)
-            .ok_or(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id))?;
+    let spec = decode_perp_order_spec(&encoded, market_id)
+        .ok_or(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id))?;
     let storage_key = perp_market_storage_key(market_id);
     let checkpoint_hash = format!("0x{}", hex::encode(observation.checkpoint().block_hash()));
     let stored: Option<String> = client
         .get_storage_result(&storage_key, &checkpoint_hash)
         .await
         .map_err(|source| DeepXFinalizedPerpOrderSpecError::StorageRpc { market_id, source })?;
-    let (stored_min_size, stored_tick, stored_step, min_notional) = stored
+    let stored_spec = stored
         .as_deref()
         .and_then(|encoded| {
-            decode_finalized_perp_market_storage(
-                encoded,
-                observation.snapshot().metadata(),
-                market_id,
-            )
+            decode_perp_market_storage(encoded, observation.snapshot().metadata(), market_id)
         })
         .ok_or(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id))?;
-    if (min_order_size, tick_size, step_size) != (stored_min_size, stored_tick, stored_step) {
+    if spec != stored_spec.order_spec {
         return Err(DeepXFinalizedPerpOrderSpecError::InvalidEvidence(market_id));
     }
     let repeated: Option<String> = client
@@ -2906,59 +2766,11 @@ pub async fn observe_finalized_perp_order_spec_evidence(
         checkpoint: observation.checkpoint(),
         runtime_identity: observation.snapshot().identity().clone(),
         market_id,
-        min_order_size,
-        tick_size,
-        step_size,
-        min_notional,
+        min_order_size: spec.min_order_size,
+        tick_size: spec.tick_size,
+        step_size: spec.step_size,
+        min_notional: stored_spec.min_notional,
     })
-}
-
-fn decode_finalized_perp_order_spec(encoded: &str, market_id: u16) -> Option<(u128, u128, u128)> {
-    let bytes = encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())?;
-    let market = decode_perp_market_return(&bytes)?;
-    let spec = market.order_spec;
-    (market.id == market_id && spec.min_order_size > 0 && spec.tick_size > 0 && spec.step_size > 0)
-        .then_some((spec.min_order_size, spec.tick_size, spec.step_size))
-}
-
-fn decode_finalized_perp_market_storage(
-    encoded: &str,
-    metadata: &subxt_core::Metadata,
-    market_id: u16,
-) -> Option<(u128, u128, u128, u128)> {
-    let value_type = metadata
-        .pallet_by_name("PerpMarket")?
-        .storage()?
-        .entry_by_name("PerpMarkets")?
-        .entry_type()
-        .value_ty();
-    if encoded.len() > 2 + 2 * DEEPX_MAX_PERP_MARKET_STORAGE_BYTES {
-        return None;
-    }
-    let bytes = decode_storage_hex(encoded)?;
-    let mut input = bytes.as_slice();
-    let market = decode_as_type(&mut input, value_type, metadata.types()).ok()?;
-    if !input.is_empty() || named_scale_u128(&market.value, "id")? != u128::from(market_id) {
-        return None;
-    }
-    let ValueDef::Composite(Composite::Named(fields)) = &market.value else {
-        return None;
-    };
-    let spec = fields.iter().find(|(name, _)| name == "order_spec")?;
-    let min_size = named_scale_u128(&spec.1.value, "min_qty")?;
-    let tick = named_scale_u128(&spec.1.value, "tick_size")?;
-    let step = named_scale_u128(&spec.1.value, "step_size")?;
-    let min_notional = named_scale_u128(&spec.1.value, "min_notional")?;
-    (min_size > 0 && tick > 0 && step > 0).then_some((min_size, tick, step, min_notional))
-}
-
-fn named_scale_u128(value: &ValueDef<u32>, name: &str) -> Option<u128> {
-    let ValueDef::Composite(Composite::Named(fields)) = value else {
-        return None;
-    };
-    fields.iter().find(|(field, _)| field == name)?.1.as_u128()
 }
 
 /// Observes all V2 lending positions and effective balances at one finalized Watch checkpoint.
@@ -3337,15 +3149,9 @@ async fn observe_finalized_perp_orders_with_client(
             .get(&key)
             .and_then(Option::as_deref)
             .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
-        let bytes = decode_storage_hex(encoded)
+        let order = decode_active_perp_order(encoded, &index_entry, subaccount)
             .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
-        let mut input = bytes.as_slice();
-        let order = DeepXPerpOrderStorageEvidence::decode(&mut input)
-            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
-        if !input.is_empty() || !perp_order_matches_index(&order, &index_entry, subaccount) {
-            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
-        }
-        orders.push(order);
+        orders.push(DeepXPerpOrderStorageEvidence(order));
     }
     orders.sort_unstable_by_key(|order| (order.0.market_id, order.0.order_id));
     Ok(orders)
@@ -3432,42 +3238,10 @@ async fn observe_finalized_perp_orders_by_id_at(
             .get(order_key)
             .and_then(Option::as_deref)
             .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
-        let bytes = decode_storage_hex(encoded_order)
-            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
-        let mut input = bytes.as_slice();
-        let order = DeepXPerpOrderStorageEvidence::decode(&mut input)
-            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
         let active_entry = active_by_id.get(&order_id);
-        if !input.is_empty()
-            || order.0.order_id != order_id
-            || order.0.owner != subaccount
-            || order.0.create_time == 0
-            || order.0.size == 0
-            || order.0.size_filled.checked_add(order.0.size_remain) != Some(order.0.size)
-            || order.0.status.is_active() != active_entry.is_some()
-            || active_entry
-                .is_some_and(|entry| !perp_order_matches_index(&order, entry, subaccount))
-        {
-            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
-        }
-        let status_quantities_match = match order.0.status {
-            DeepXStoredOrderStatus::Open => {
-                order.0.size_filled == 0 && order.0.size_remain == order.0.size
-            }
-            DeepXStoredOrderStatus::PartiallyFilled => {
-                order.0.size_filled > 0 && order.0.size_remain > 0
-            }
-            DeepXStoredOrderStatus::Filled => {
-                order.0.size_filled == order.0.size && order.0.size_remain == 0
-            }
-            DeepXStoredOrderStatus::Canceled
-            | DeepXStoredOrderStatus::Rejected
-            | DeepXStoredOrderStatus::Expired => true,
-        };
-        if !status_quantities_match {
-            return Err(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence);
-        }
-        orders.push(order);
+        let order = decode_perp_order_by_id(encoded_order, order_id, subaccount, active_entry)
+            .ok_or(DeepXFinalizedPerpOrdersError::InvalidOrderEvidence)?;
+        orders.push(DeepXPerpOrderStorageEvidence(order));
     }
     Ok(orders)
 }
@@ -3612,55 +3386,19 @@ async fn observe_finalized_spot_orders_by_id_with_client(
     if changes.len() != keys.len() || keys.iter().any(|key| !changes.contains_key(key)) {
         return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
     }
-    let mut active_by_id = BTreeMap::new();
     let encoded_index = changes
         .get(&index_key)
         .cloned()
         .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-    if let Some(encoded_index) = encoded_index {
-        let index_bytes = decode_storage_hex(&encoded_index)
-            .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-        let mut input = index_bytes.as_slice();
-        let Compact(pair_count) = Compact::<u32>::decode(&mut input)
-            .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-        if pair_count > DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS {
-            return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
-        }
-        let mut previous_pair = None;
-        let mut total_orders = 0_u32;
-        for _ in 0..pair_count {
-            let pair = <[u8; 32]>::decode(&mut input)
-                .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-            if previous_pair.is_some_and(|previous| previous >= pair) {
-                return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
-            }
-            previous_pair = Some(pair);
-            let Compact(order_count) = Compact::<u32>::decode(&mut input)
-                .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-            total_orders = total_orders
-                .checked_add(order_count)
-                .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-            if order_count == 0 || total_orders > DEEPX_ABSOLUTE_MAX_PERP_ORDERS {
-                return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
-            }
-            for _ in 0..order_count {
-                let id = u64::decode(&mut input)
-                    .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-                let is_buy = bool::decode(&mut input)
-                    .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidIndex)?;
-                if id == 0 || active_by_id.insert(id, (pair, is_buy)).is_some() {
-                    return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
-                }
-            }
-        }
-        if !input.is_empty() {
-            return Err(DeepXFinalizedSpotOrdersError::InvalidIndex);
-        }
-    }
+    let active_by_id = decode_active_spot_order_index(encoded_index.as_deref())
+        .ok_or(DeepXFinalizedSpotOrdersError::InvalidIndex)?
+        .into_iter()
+        .map(|entry| (entry.order_id, entry))
+        .collect::<BTreeMap<_, _>>();
     let active_order_ids = active_by_id.keys().copied().collect::<Vec<_>>();
     let active_order_pairs = active_by_id
         .iter()
-        .map(|(id, (pair, _))| (*id, *pair))
+        .map(|(id, entry)| (*id, entry.pair))
         .collect::<Vec<_>>();
     let mut orders = Vec::with_capacity(expected.len());
     for id in expected {
@@ -3671,26 +3409,10 @@ async fn observe_finalized_spot_orders_by_id_with_client(
             .get(key)
             .and_then(Option::as_deref)
             .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
-        let bytes = decode_storage_hex(encoded)
-            .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
-        let mut input = bytes.as_slice();
-        let order = DeepXSpotOrderStorageEvidence::decode(&mut input)
-            .map_err(|_| DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
-        if !input.is_empty()
-            || order.0.order_id != id
-            || order.0.owner != subaccount
-            || order.0.create_time == 0
-        {
-            return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
-        }
         let indexed = active_by_id.get(&id);
-        if order.0.status.is_active() != indexed.is_some()
-            || indexed
-                .is_some_and(|(pair, is_buy)| *pair != order.0.pair || *is_buy != order.0.is_buy)
-        {
-            return Err(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence);
-        }
-        orders.push(order);
+        let order = decode_spot_order_by_id(encoded, id, subaccount, indexed)
+            .ok_or(DeepXFinalizedSpotOrdersError::InvalidOrderEvidence)?;
+        orders.push(DeepXSpotOrderStorageEvidence(order));
     }
     Ok((orders, active_order_ids, active_order_pairs))
 }
@@ -3699,75 +3421,8 @@ fn decode_active_perp_order_index(
     encoded: Option<String>,
     subaccount: [u8; 20],
 ) -> Result<Vec<DeepXActivePerpOrderIndexEntry>, DeepXFinalizedPerpOrdersError> {
-    let Some(encoded) = encoded else {
-        return Ok(Vec::new());
-    };
-    let bytes = decode_storage_hex(&encoded).ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-    let mut input = bytes.as_slice();
-    let Compact(market_count) = Compact::<u32>::decode(&mut input)
-        .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-    if market_count > DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS {
-        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
-    }
-    let mut previous_market = None;
-    let mut order_ids = BTreeSet::new();
-    let mut entries = Vec::new();
-    for _ in 0..market_count {
-        let market_id =
-            u16::decode(&mut input).map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-        if previous_market.is_some_and(|previous| previous >= market_id) {
-            return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
-        }
-        previous_market = Some(market_id);
-        let Compact(order_count) = Compact::<u32>::decode(&mut input)
-            .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-        let total = u32::try_from(entries.len())
-            .ok()
-            .and_then(|length| length.checked_add(order_count))
-            .ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-        if order_count == 0 || total > DEEPX_ABSOLUTE_MAX_PERP_ORDERS {
-            return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
-        }
-        entries.reserve(order_count as usize);
-        for _ in 0..order_count {
-            let entry = DeepXActivePerpOrderIndexEntry::decode(&mut input)
-                .map_err(|_| DeepXFinalizedPerpOrdersError::InvalidIndex)?;
-            if entry.address != subaccount
-                || entry.market_id != market_id
-                || entry.created_at == 0
-                || !order_ids.insert(entry.order_id)
-            {
-                return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
-            }
-            entries.push(entry);
-        }
-    }
-    if !input.is_empty() {
-        return Err(DeepXFinalizedPerpOrdersError::InvalidIndex);
-    }
-    Ok(entries)
-}
-
-fn perp_order_matches_index(
-    order: &DeepXPerpOrderStorageEvidence,
-    index: &DeepXActivePerpOrderIndexEntry,
-    subaccount: [u8; 20],
-) -> bool {
-    let expected_long = matches!(index.order_side, DeepXStoredOrderSide::Buy);
-    order.0.order_id == index.order_id
-        && order.0.owner == subaccount
-        && order.0.market_id == index.market_id
-        && order.0.is_long == expected_long
-        && order.0.order_type == index.order_type
-        && order.0.price == index.price
-        && order.0.create_time == index.created_at
-        && order.0.create_time != 0
-        && order.0.leverage != 0
-        && order.0.status.is_active()
-        && order.0.size != 0
-        && order.0.size_remain != 0
-        && order.0.size_filled.checked_add(order.0.size_remain) == Some(order.0.size)
-        && (!matches!(order.0.order_type, DeepXStoredPerpOrderType::Limit(_)) || order.0.price != 0)
+    decode_sdk_active_perp_order_index(encoded.as_deref(), subaccount)
+        .ok_or(DeepXFinalizedPerpOrdersError::InvalidIndex)
 }
 
 /// Observes finalized perpetual positions and applies the runtime to a signing snapshot service.
@@ -4295,24 +3950,8 @@ async fn observe_finalized_perp_positions_with_client(
 fn decode_max_perp_positions(
     encoded: Option<String>,
 ) -> Result<u32, DeepXFinalizedPerpPositionsError> {
-    let maximum = match encoded {
-        None => DEEPX_DEFAULT_MAX_PERP_POSITIONS,
-        Some(encoded) => {
-            let bytes = decode_storage_hex(&encoded)
-                .ok_or(DeepXFinalizedPerpPositionsError::InvalidMaximum)?;
-            let mut input = bytes.as_slice();
-            let value = u32::decode(&mut input)
-                .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidMaximum)?;
-            if !input.is_empty() {
-                return Err(DeepXFinalizedPerpPositionsError::InvalidMaximum);
-            }
-            value
-        }
-    };
-    if maximum == 0 || maximum > DEEPX_ABSOLUTE_MAX_PERP_POSITIONS {
-        return Err(DeepXFinalizedPerpPositionsError::InvalidMaximum);
-    }
-    Ok(maximum)
+    decode_sdk_max_perp_positions(encoded.as_deref())
+        .ok_or(DeepXFinalizedPerpPositionsError::InvalidMaximum)
 }
 
 fn decode_perp_positions(
@@ -4320,102 +3959,14 @@ fn decode_perp_positions(
     subaccount: [u8; 20],
     maximum: u32,
 ) -> Result<Vec<DeepXPerpPositionStorageEvidence>, DeepXFinalizedPerpPositionsError> {
-    let Some(encoded) = encoded else {
-        return Ok(Vec::new());
-    };
-    let bytes =
-        decode_storage_hex(&encoded).ok_or(DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
-    let mut input = bytes.as_slice();
-    let Compact(length) = Compact::<u32>::decode(&mut input)
-        .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
-    if length > maximum {
-        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
-    }
-    let mut market_ids = BTreeSet::new();
-    let mut positions = Vec::with_capacity(length as usize);
-    for _ in 0..length {
-        let position = DeepXPerpPositionStorageEvidence::decode(&mut input)
-            .map_err(|_| DeepXFinalizedPerpPositionsError::InvalidEvidence)?;
-        if position.0.owner != subaccount
-            || position.0.base_asset_amount == 0
-            || position.0.entry_price == 0
-            || position.0.leverage == 0
-            || position.0.last_settle_price == 0
-            || !market_ids.insert(position.0.market_id)
-        {
-            return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
-        }
-        positions.push(position);
-    }
-    if !input.is_empty() {
-        return Err(DeepXFinalizedPerpPositionsError::InvalidEvidence);
-    }
-    positions.sort_unstable_by_key(DeepXPerpPositionStorageEvidence::market_id);
-    Ok(positions)
-}
-
-fn decode_storage_hex(encoded: &str) -> Option<Vec<u8>> {
-    encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())
-}
-
-fn storage_value_key(pallet: &[u8], item: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(32);
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(pallet));
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(item));
-    encoded
-}
-
-fn subaccount_max_perp_positions_storage_key() -> String {
-    format!(
-        "0x{}",
-        hex::encode(storage_value_key(b"Subaccount", b"MaxPerpPositions")),
-    )
-}
-
-fn perp_market_storage_key(market_id: u16) -> String {
-    let mut encoded = storage_value_key(b"PerpMarket", b"PerpMarkets");
-    encoded.extend_from_slice(&market_id.encode());
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn spot_market_storage_key(pair: [u8; 32]) -> String {
-    let mut encoded = storage_value_key(b"SpotMarket", b"SpotMarkets");
-    encoded.extend_from_slice(&pair);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn user_perp_positions_storage_key(subaccount: [u8; 20]) -> String {
-    let mut encoded = storage_value_key(b"PerpMarket", b"UserPerpPositions");
-    encoded.extend_from_slice(&subaccount);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn active_perp_orders_storage_key(subaccount: [u8; 20]) -> String {
-    let mut encoded = storage_value_key(b"PerpMarket", b"ActivePerpOrdersFor");
-    encoded.extend_from_slice(&subaccount);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn active_spot_orders_storage_key(subaccount: [u8; 20]) -> String {
-    let mut encoded = storage_value_key(b"SpotMarket", b"ActiveSpotOrdersFor");
-    encoded.extend_from_slice(&subaccount);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn spot_order_info_storage_key(subaccount: [u8; 20], order_id: u64) -> String {
-    let mut encoded = storage_value_key(b"SpotMarket", b"OrderInfo");
-    encoded.extend_from_slice(&subaccount);
-    encoded.extend_from_slice(&order_id.encode());
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn perp_order_info_storage_key(subaccount: [u8; 20], order_id: u64) -> String {
-    let mut encoded = storage_value_key(b"PerpMarket", b"OrderInfo");
-    encoded.extend_from_slice(&subaccount);
-    encoded.extend_from_slice(&order_id.encode());
-    format!("0x{}", hex::encode(encoded))
+    decode_sdk_perp_positions(encoded.as_deref(), subaccount, maximum)
+        .map(|positions| {
+            positions
+                .into_iter()
+                .map(DeepXPerpPositionStorageEvidence)
+                .collect()
+        })
+        .ok_or(DeepXFinalizedPerpPositionsError::InvalidEvidence)
 }
 
 async fn observe_finalized_lending_at(
@@ -4497,13 +4048,14 @@ async fn observe_finalized_lending_asset(
         call(DEEPX_LENDING_BORROW_RUNTIME_API_METHOD, balance_input),
         withdrawal,
     );
-    let pool =
-        decode_lending_asset_response::<Option<DeepXLendingPoolEvidence>>(&pool?, market_id)?
-            .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
-    let effective_deposit =
-        decode_lending_asset_response::<Option<u128>>(&effective_deposit?, market_id)?;
-    let effective_borrow =
-        decode_lending_asset_response::<Option<u128>>(&effective_borrow?, market_id)?;
+    let pool = decode_lending_pool_response(&pool?)
+        .flatten()
+        .map(DeepXLendingPoolEvidence)
+        .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
+    let effective_deposit = decode_lending_amount_response(&effective_deposit?)
+        .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
+    let effective_borrow = decode_lending_amount_response(&effective_borrow?)
+        .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
     let max_withdraw_amount = max_withdraw_amount?;
 
     validate_lending_asset_evidence(
@@ -4535,13 +4087,9 @@ async fn observe_finalized_max_withdrawal(
 }
 
 fn decode_max_withdrawal(encoded: &str, market_id: u8) -> Result<u128, DeepXFinalizedLendingError> {
-    encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())
-        .and_then(|bytes| decode_max_withdraw_return(&bytes))
-        .ok_or(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(
-            market_id,
-        ))
+    decode_max_withdraw_hex(encoded).ok_or(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(
+        market_id,
+    ))
 }
 
 fn validate_lending_asset_evidence(
@@ -4582,23 +4130,6 @@ fn decode_lending_positions(
 ) -> Result<Vec<DeepXRawLendingPosition>, DeepXFinalizedLendingError> {
     deepx_rust_sdk::rpc::lending_positions::decode_lending_positions(encoded, subaccount)
         .ok_or(DeepXFinalizedLendingError::InvalidPositions)
-}
-
-fn decode_lending_asset_response<T: Decode>(
-    encoded: &str,
-    market_id: u8,
-) -> Result<T, DeepXFinalizedLendingError> {
-    let bytes = encoded
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode(value).ok())
-        .ok_or(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
-    let mut input = bytes.as_slice();
-    let value = T::decode(&mut input)
-        .map_err(|_| DeepXFinalizedLendingError::InvalidAssetEvidence(market_id))?;
-    if !input.is_empty() {
-        return Err(DeepXFinalizedLendingError::InvalidAssetEvidence(market_id));
-    }
-    Ok(value)
 }
 
 async fn observe_finalized_margin_requirements_at(
@@ -4651,26 +4182,9 @@ fn decode_margin_requirement(
     subaccount: [u8; 20],
     direction: DeepXMarginDirection,
 ) -> Result<DeepXMarginRequirement, DeepXFinalizedMarginError> {
-    let bytes = encoded
-        .strip_prefix("0x")
-        .ok_or(DeepXFinalizedMarginError::InvalidEvidence(direction))
-        .and_then(|value| {
-            hex::decode(value).map_err(|_| DeepXFinalizedMarginError::InvalidEvidence(direction))
-        })?;
-    let mut input = bytes.as_slice();
-    let values = BTreeMap::<[u8; 20], (u128, u128)>::decode(&mut input)
-        .map_err(|_| DeepXFinalizedMarginError::InvalidEvidence(direction))?;
-    if !input.is_empty() || values.len() != 1 {
-        return Err(DeepXFinalizedMarginError::InvalidEvidence(direction));
-    }
-    let (total_collateral, total_margin_required) = values
-        .get(&subaccount)
-        .copied()
-        .ok_or(DeepXFinalizedMarginError::InvalidEvidence(direction))?;
-    Ok(DeepXMarginRequirement(DeepXRawMarginRequirement {
-        total_collateral,
-        total_margin_required,
-    }))
+    deepx_rust_sdk::rpc::margin::decode_margin_requirement(encoded, subaccount)
+        .map(DeepXMarginRequirement)
+        .map_err(|_| DeepXFinalizedMarginError::InvalidEvidence(direction))
 }
 
 async fn observe_finalized_chain_time_with_client(
@@ -4774,24 +4288,14 @@ fn decode_prefixed_hash(
     encoded_hash: &str,
     name: &'static str,
 ) -> Result<[u8; 32], DeepXRuntimeSnapshotObservationError> {
-    encoded_hash
-        .strip_prefix("0x")
+    sdk_decode_prefixed_hash(encoded_hash)
         .ok_or(DeepXRuntimeSnapshotObservationError::InvalidHash(name))
-        .and_then(|value| {
-            hex::decode_array::<32>(value)
-                .map_err(|_| DeepXRuntimeSnapshotObservationError::InvalidHash(name))
-        })
 }
 
 fn decode_block_number(encoded_number: &str) -> Result<u32, DeepXRuntimeSnapshotObservationError> {
-    let value = encoded_number
-        .strip_prefix("0x")
-        .filter(|value| !value.is_empty());
-    value
-        .and_then(|value| u32::from_str_radix(value, 16).ok())
-        .ok_or_else(|| {
-            DeepXRuntimeSnapshotObservationError::InvalidBlockNumber(encoded_number.to_string())
-        })
+    decode_block_number_u32(encoded_number).ok_or_else(|| {
+        DeepXRuntimeSnapshotObservationError::InvalidBlockNumber(encoded_number.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -4842,23 +4346,6 @@ mod tests {
     const FINALIZED_HASH: &str = DEEPX_SPEC_376_FINALIZED_HASH;
     const FINALIZED_BLOCK_NUMBER: u32 = 19_592_700;
     const FINALIZED_BLOCK_NUMBER_HEX: &str = "0x12af5fc";
-
-    #[rstest]
-    fn timestamp_inherent_decodes_exact_milliseconds() {
-        let captured = "0x280402000bf4a65c1ba101".to_string();
-        assert_eq!(
-            decode_timestamp_set_inherent(std::slice::from_ref(&captured)).unwrap(),
-            1_791_460_419_316,
-        );
-        assert!(matches!(
-            decode_timestamp_set_inherent(&[captured.clone(), captured]),
-            Err(DeepXFinalizedAccountError::InvalidBlockTimestamp),
-        ));
-        assert!(matches!(
-            decode_timestamp_set_inherent(&["0x280402000bf4a65c1ba1".to_string()]),
-            Err(DeepXFinalizedAccountError::InvalidBlockTimestamp),
-        ));
-    }
 
     #[derive(Encode)]
     struct EncodedLendingPosition {
@@ -5172,178 +4659,6 @@ mod tests {
             order_id: order.0.order_id,
             price: order.0.price,
             created_at: order.0.create_time,
-        }
-    }
-
-    #[test]
-    fn finalized_perp_order_storage_keys_use_identity_encoding() {
-        let subaccount = [0x11; 20];
-        let index = active_perp_orders_storage_key(subaccount);
-        let order = perp_order_info_storage_key(subaccount, 0x0102_0304_0506_0708);
-
-        assert_eq!(index.len(), 106);
-        assert_eq!(order.len(), 122);
-        assert!(index.ends_with(&hex::encode(subaccount)));
-        assert!(order.ends_with("0807060504030201"));
-        assert_ne!(order, perp_order_info_storage_key(subaccount, 2));
-        assert_eq!(DeepXStoredOrderSide::Buy.encode(), [1]);
-        assert_eq!(DeepXStoredOrderSide::Sell.encode(), [0]);
-    }
-
-    #[test]
-    fn finalized_perp_order_index_decoder_is_bounded_scoped_and_canonical() {
-        let subaccount = [0x11; 20];
-        let first = perp_order(subaccount, 2, 10);
-        let second = perp_order(subaccount, 3, 11);
-        let encoded = BTreeMap::from([
-            (2_u16, vec![active_perp_order_index_entry(&first)]),
-            (3_u16, vec![active_perp_order_index_entry(&second)]),
-        ])
-        .encode();
-
-        let decoded =
-            decode_active_perp_order_index(Some(format!("0x{}", hex::encode(encoded))), subaccount)
-                .unwrap();
-
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].market_id, 2);
-        assert_eq!(decoded[1].order_id, 11);
-        assert_eq!(
-            decode_active_perp_order_index(None, subaccount).unwrap(),
-            vec![]
-        );
-        assert!(perp_order_matches_index(
-            &first,
-            &active_perp_order_index_entry(&first),
-            subaccount,
-        ));
-        let first_generated = perp_order(subaccount, 2, 0);
-        let encoded =
-            BTreeMap::from([(2_u16, vec![active_perp_order_index_entry(&first_generated)])])
-                .encode();
-        let decoded =
-            decode_active_perp_order_index(Some(format!("0x{}", hex::encode(encoded))), subaccount)
-                .unwrap();
-        assert_eq!(decoded[0].order_id, 0);
-        assert!(perp_order_matches_index(
-            &first_generated,
-            &decoded[0],
-            subaccount,
-        ));
-    }
-
-    #[test]
-    fn finalized_perp_order_evidence_rejects_contradictions() {
-        let subaccount = [0x11; 20];
-        let order = perp_order(subaccount, 2, 10);
-        let mut foreign = active_perp_order_index_entry(&order);
-        foreign.address = [0x22; 20];
-        let mut trailing =
-            BTreeMap::from([(2_u16, vec![active_perp_order_index_entry(&order)])]).encode();
-        trailing.push(0);
-        for encoded in [
-            BTreeMap::from([(2_u16, vec![foreign])]).encode(),
-            trailing,
-            Compact(DEEPX_ABSOLUTE_MAX_PERP_ORDER_MARKETS + 1).encode(),
-        ] {
-            assert!(matches!(
-                decode_active_perp_order_index(
-                    Some(format!("0x{}", hex::encode(encoded))),
-                    subaccount,
-                ),
-                Err(DeepXFinalizedPerpOrdersError::InvalidIndex),
-            ));
-        }
-
-        let index = active_perp_order_index_entry(&order);
-        let mut invalid = order.clone();
-        invalid.0.status = DeepXStoredOrderStatus::Filled;
-        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
-        invalid = order.clone();
-        invalid.0.size_remain -= 1;
-        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
-        invalid = order;
-        invalid.0.owner = [0x22; 20];
-        assert!(!perp_order_matches_index(&invalid, &index, subaccount));
-    }
-
-    #[test]
-    fn finalized_perp_position_storage_keys_use_identity_map_encoding() {
-        let subaccount = [0x11; 20];
-        let maximum = subaccount_max_perp_positions_storage_key();
-        let positions = user_perp_positions_storage_key(subaccount);
-
-        assert_eq!(maximum.len(), 66);
-        assert_eq!(positions.len(), 106);
-        assert!(positions.ends_with(&hex::encode(subaccount)));
-        assert_ne!(positions, user_perp_positions_storage_key([0x22; 20]));
-    }
-
-    #[test]
-    fn finalized_perp_position_decoder_is_bounded_scoped_and_canonical() {
-        let subaccount = [0x11; 20];
-        let first = perp_position(subaccount, 3);
-        let second = perp_position(subaccount, 2);
-        let encoded = format!("0x{}", hex::encode(vec![first, second].encode()));
-
-        let positions = decode_perp_positions(Some(encoded), subaccount, 8).unwrap();
-
-        assert_eq!(
-            positions
-                .iter()
-                .map(DeepXPerpPositionStorageEvidence::market_id)
-                .collect::<Vec<_>>(),
-            vec![2, 3],
-        );
-        assert_eq!(decode_perp_positions(None, subaccount, 8).unwrap(), vec![]);
-        assert_eq!(decode_max_perp_positions(None).unwrap(), 8);
-        assert_eq!(
-            decode_max_perp_positions(Some(format!("0x{}", hex::encode(12_u32.encode())))).unwrap(),
-            12,
-        );
-    }
-
-    #[test]
-    fn finalized_perp_position_decoder_rejects_contradictory_evidence() {
-        let subaccount = [0x11; 20];
-        let valid = perp_position(subaccount, 2);
-        let mut foreign = valid.clone();
-        foreign.0.owner = [0x22; 20];
-        let mut zero_amount = valid.clone();
-        zero_amount.0.base_asset_amount = 0;
-
-        for positions in [vec![valid.clone(), valid], vec![foreign], vec![zero_amount]] {
-            assert!(matches!(
-                decode_perp_positions(
-                    Some(format!("0x{}", hex::encode(positions.encode()))),
-                    subaccount,
-                    8,
-                ),
-                Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
-            ));
-        }
-        let mut trailing = vec![perp_position(subaccount, 2)].encode();
-        trailing.push(0);
-        assert!(matches!(
-            decode_perp_positions(Some(format!("0x{}", hex::encode(trailing))), subaccount, 8,),
-            Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
-        ));
-        assert!(matches!(
-            decode_perp_positions(
-                Some(format!(
-                    "0x{}",
-                    hex::encode(vec![perp_position(subaccount, 2)].encode()),
-                )),
-                subaccount,
-                0,
-            ),
-            Err(DeepXFinalizedPerpPositionsError::InvalidEvidence),
-        ));
-        for invalid in [Some("0x".to_string()), Some("0x0000000000".to_string())] {
-            assert!(matches!(
-                decode_max_perp_positions(invalid),
-                Err(DeepXFinalizedPerpPositionsError::InvalidMaximum),
-            ));
         }
     }
 
@@ -5663,105 +4978,6 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("0x")]
-    #[case("0x01")]
-    #[case(&format!("0x01{}", "00".repeat(31)))]
-    #[case(&format!("0x{}00", "00".repeat(32)))]
-    fn finalized_lending_rejects_non_canonical_withdrawal_abi(#[case] encoded: &str) {
-        assert!(matches!(
-            decode_max_withdrawal(encoded, 1),
-            Err(DeepXFinalizedLendingError::InvalidWithdrawalEvidence(1)),
-        ));
-    }
-
-    #[rstest::rstest]
-    #[case(BTreeMap::from([(
-        [0x22; 20],
-        BTreeMap::from([(
-            1_u8,
-            EncodedLendingPosition {
-                positions: BTreeMap::from([(b"usdc".to_vec(), (1_u128, 0_u128))]),
-            },
-        )]),
-    )]).encode())]
-    #[case(BTreeMap::from([(
-        [0x11; 20],
-        BTreeMap::from([(
-            1_u8,
-            EncodedLendingPosition {
-                positions: BTreeMap::from([(b"usdc".to_vec(), (0_u128, 0_u128))]),
-            },
-        )]),
-    )]).encode())]
-    #[case(BTreeMap::from([(
-        [0x11; 20],
-        BTreeMap::from([(
-            1_u8,
-            EncodedLendingPosition {
-                positions: BTreeMap::from([(vec![b'x'; 33], (1_u128, 0_u128))]),
-            },
-        )]),
-    )]).encode())]
-    #[case({
-        let mut encoded = BTreeMap::from([(
-            [0x11; 20],
-            BTreeMap::from([(
-                1_u8,
-                EncodedLendingPosition {
-                    positions: BTreeMap::from([(b"usdc".to_vec(), (1_u128, 0_u128))]),
-                },
-            )]),
-        )]).encode();
-        encoded.push(0);
-        encoded
-    })]
-    fn finalized_lending_decoder_rejects_foreign_zero_overlong_and_trailing_evidence(
-        #[case] encoded: Vec<u8>,
-    ) {
-        let result = decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]);
-
-        assert!(matches!(
-            result,
-            Err(DeepXFinalizedLendingError::InvalidPositions)
-        ));
-    }
-
-    #[rstest::rstest]
-    fn finalized_lending_decoder_accepts_canonical_empty_account_evidence() {
-        let encoded = BTreeMap::<[u8; 20], BTreeMap<u8, EncodedLendingPosition>>::new().encode();
-
-        assert_eq!(
-            decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]).unwrap(),
-            Vec::new(),
-        );
-    }
-
-    #[rstest::rstest]
-    #[case(BTreeMap::<[u8; 20], (u128, u128)>::new().encode())]
-    #[case(BTreeMap::from([([0x22; 20], (1_u128, 2_u128))]).encode())]
-    #[case({
-        let mut encoded = BTreeMap::from([([0x11; 20], (1_u128, 2_u128))]).encode();
-        encoded.push(0);
-        encoded
-    })]
-    fn finalized_margin_decoder_rejects_missing_foreign_and_trailing_evidence(
-        #[case] encoded: Vec<u8>,
-    ) {
-        let result = decode_margin_requirement(
-            &format!("0x{}", hex::encode(encoded)),
-            [0x11; 20],
-            DeepXMarginDirection::Initial,
-        );
-
-        assert!(matches!(
-            result,
-            Err(DeepXFinalizedMarginError::InvalidEvidence(
-                DeepXMarginDirection::Initial
-            ))
-        ));
-    }
-
-    #[rstest::rstest]
     fn rpc_capability_debug_redacts_endpoint_url() {
         let secret_url = "https://rpc.example.test/path?token=secret";
         let endpoints = validated_endpoints(secret_url);
@@ -5979,66 +5195,6 @@ mod tests {
                 role: DeepXRpcRole::Recovery,
                 source: DeepXRpcIdentityError::InvalidGenesisHash,
             }
-        ));
-    }
-
-    #[tokio::test]
-    async fn observes_required_rpc_methods_for_validated_role_endpoint() {
-        let rpc_url = spawn_rpc_methods_server(&["author_submitExtrinsic", "system_health"]).await;
-        let endpoints = validated_endpoints(&rpc_url);
-
-        let capabilities = observe_rpc_method_capabilities(
-            &endpoints,
-            DeepXRpcRole::Submission,
-            ["author_submitExtrinsic"],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(capabilities.role(), DeepXRpcRole::Submission);
-        assert_eq!(
-            capabilities.methods(),
-            &BTreeSet::from(["author_submitExtrinsic".to_string()])
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_rpc_role_endpoint_missing_required_method() {
-        let rpc_url = spawn_rpc_methods_server(&["chain_getFinalizedHead"]).await;
-        let endpoints = validated_endpoints(&rpc_url);
-
-        let error = observe_rpc_method_capabilities(
-            &endpoints,
-            DeepXRpcRole::Watch,
-            ["chain_getFinalizedHead", "chain_getHeader"],
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            DeepXRpcMethodCapabilityError::MissingMethod {
-                role: DeepXRpcRole::Watch,
-                method,
-            } if method == "chain_getHeader"
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_empty_rpc_method_requirements_without_network_io() {
-        let endpoints = validated_endpoints("http://127.0.0.1:1");
-
-        let error = observe_rpc_method_capabilities(
-            &endpoints,
-            DeepXRpcRole::Recovery,
-            std::iter::empty::<&str>(),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            DeepXRpcMethodCapabilityError::EmptyRequirements(DeepXRpcRole::Recovery)
         ));
     }
 
@@ -6726,7 +5882,14 @@ mod tests {
             ("is_paused", ScaleValue::bool(false)),
         ]);
         let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
-        let metadata_bytes = decode_storage_hex(metadata["result"].as_str().unwrap()).unwrap();
+        let metadata_bytes = hex::decode(
+            metadata["result"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("0x")
+                .unwrap(),
+        )
+        .unwrap();
         let metadata = subxt_core::Metadata::decode_all(&mut &metadata_bytes[..]).unwrap();
         let value_type = metadata
             .pallet_by_name("PerpMarket")
@@ -6746,55 +5909,6 @@ mod tests {
         )
         .unwrap();
         format!("0x{}", hex::encode(bytes))
-    }
-
-    #[rstest]
-    fn decodes_complete_finalized_perp_market_storage() {
-        assert_eq!(
-            perp_market_storage_key(3),
-            "0xb052a07884e121f56b64aa711c766532bdc7a97672ba816c4074df5f464124630300",
-        );
-        let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet().unwrap();
-        let metadata = snapshot.metadata();
-        let encoded = encoded_perp_market_storage();
-        assert_eq!(
-            decode_finalized_perp_market_storage(&encoded, metadata, 3),
-            Some((11, 2, 3, 50)),
-        );
-        assert_eq!(
-            decode_finalized_perp_market_storage(&encoded, metadata, 4),
-            None,
-        );
-        assert_eq!(
-            decode_finalized_perp_market_storage(&format!("{encoded}00"), metadata, 3),
-            None,
-        );
-        assert_eq!(
-            decode_finalized_perp_market_storage("0x", metadata, 3),
-            None,
-        );
-    }
-
-    #[rstest]
-    fn decodes_only_matching_positive_perp_order_specs() {
-        let encoded = encoded_perp_market(3, (11, 2, 3));
-        assert_eq!(
-            decode_finalized_perp_order_spec(&encoded, 3),
-            Some((11, 2, 3))
-        );
-        assert_eq!(decode_finalized_perp_order_spec(&encoded, 4), None);
-        assert_eq!(decode_finalized_perp_order_spec("0x", 3), None);
-        assert_eq!(decode_finalized_perp_order_spec("0xzz", 3), None);
-        for spec in [(0, 2, 3), (11, 0, 3), (11, 2, 0)] {
-            assert_eq!(
-                decode_finalized_perp_order_spec(&encoded_perp_market(3, spec), 3),
-                None
-            );
-        }
-        assert_eq!(
-            decode_finalized_perp_order_spec(&format!("{encoded}00"), 3),
-            None
-        );
     }
 
     #[rstest]
@@ -7011,36 +6125,6 @@ mod tests {
             } else {
                 12
             },
-        );
-    }
-
-    #[rstest]
-    fn decodes_only_matching_complete_spot_market_storage() {
-        let snapshot = DeepXReadOnlyRuntimeSnapshot::built_in_testnet().unwrap();
-        let metadata = snapshot.metadata();
-        let storage: Value = serde_json::from_str(SPOT_MARKET_STORAGE_SPEC_376_FIXTURE).unwrap();
-        let encoded = storage["result"].as_str().unwrap();
-        let pair = hex::decode("9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37")
-            .unwrap()
-            .try_into()
-            .unwrap();
-        assert_eq!(
-            decode_finalized_spot_market_storage(encoded, metadata, pair,),
-            Some((100_000_000_000_000, 10_000, 100_000_000_000_000)),
-        );
-        for encoded in [
-            "0x".to_string(),
-            format!("{encoded}00"),
-            encoded.replace("00407a10f35a00000000000000000000", &"00".repeat(16)),
-        ] {
-            assert_eq!(
-                decode_finalized_spot_market_storage(&encoded, metadata, pair),
-                None
-            );
-        }
-        assert_eq!(
-            decode_finalized_spot_market_storage(encoded, metadata, [0x33; 32],),
-            None,
         );
     }
 
@@ -8223,21 +7307,6 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("")]
-    #[case("42")]
-    #[case("0x")]
-    #[case("0x0000000000000000")]
-    #[case("0x01000000000000")]
-    #[case("0x010000000000000000")]
-    #[case("0xgg00000000000000")]
-    fn rejects_invalid_timestamp_now_storage(#[case] encoded: &str) {
-        assert!(matches!(
-            decode_timestamp_now(encoded),
-            Err(DeepXFinalizedChainTimeError::InvalidStorage)
-        ));
-    }
-
-    #[rstest::rstest]
     #[case("chain_getFinalizedHead")]
     #[case("chain_getHeader")]
     #[tokio::test]
@@ -8365,19 +7434,6 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, DeepXRpcIdentityError::InvalidGenesisHash));
-    }
-
-    #[rstest::rstest]
-    #[case("")]
-    #[case("42")]
-    #[case("0x")]
-    #[case("0xgg")]
-    #[case("0x100000000")]
-    fn rejects_invalid_finalized_block_number(#[case] value: &str) {
-        assert!(matches!(
-            decode_block_number(value),
-            Err(DeepXRuntimeSnapshotObservationError::InvalidBlockNumber(_))
-        ));
     }
 
     async fn spawn_server(router: Router) -> String {

@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         quota.quota_reserved,
         quota.quota_pending,
     );
-    for delegate in delegates.accounts {
+    for delegate in &delegates.accounts {
         let delegators = client
             .get_delegator_accounts(&delegate.delegate_address)
             .await?;
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    for subaccount in snapshot.subaccounts {
+    for subaccount in snapshot.0.subaccounts {
         let exact = subaccount
             .margin_ratio
             .exact_margin

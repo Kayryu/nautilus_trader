@@ -164,6 +164,11 @@ fn scale_account_id20(value: &Value<u32>) -> Option<[u8; 20]> {
 
 #[cfg(test)]
 mod tests {
+    use frame_metadata::{
+        RuntimeMetadata, RuntimeMetadataPrefixed,
+        v14::{StorageEntryModifier, StorageEntryType},
+    };
+    use parity_scale_codec::Decode;
     use rstest::rstest;
 
     use super::*;
@@ -178,7 +183,7 @@ mod tests {
     ];
     const STORAGE: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e504ded31cb63949b52f9dfc9bcfade4eab7017eadc146b617a656501000100000000000100000000";
 
-    fn metadata() -> subxt_core::Metadata {
+    fn metadata_bytes() -> Vec<u8> {
         let fixture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/test_data/runtime/testnet/",
@@ -190,8 +195,11 @@ mod tests {
             .unwrap()
             .strip_prefix("0x")
             .unwrap();
-        let bytes = hex::decode(encoded).unwrap();
-        subxt_core::metadata::decode_from(&bytes).unwrap()
+        hex::decode(encoded).unwrap()
+    }
+
+    fn metadata() -> subxt_core::Metadata {
+        subxt_core::metadata::decode_from(&metadata_bytes()).unwrap()
     }
 
     #[rstest]
@@ -199,6 +207,51 @@ mod tests {
         assert_eq!(
             subaccount_info_storage_key(SUBACCOUNT),
             "0x7a722acdbb19d1db692588a0209d14499ac3b2b9666a5eaa79e0ca457b2ea3a94ded31cb63949b52f9dfc9bcfade4eab7017eadc"
+        );
+    }
+
+    #[rstest]
+    fn captured_runtime_uses_identity_subaccount_info_storage() {
+        let bytes = metadata_bytes();
+        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
+            RuntimeMetadataPrefixed::decode(&mut bytes.as_slice()).unwrap()
+        else {
+            panic!("approved runtime metadata must be V14");
+        };
+        let pallet = metadata
+            .pallets
+            .iter()
+            .find(|pallet| pallet.name == "Subaccount")
+            .unwrap();
+        let storage = pallet.storage.as_ref().unwrap();
+        assert_eq!(storage.prefix, "Subaccount");
+        let entry = storage
+            .entries
+            .iter()
+            .find(|entry| entry.name == "SubaccountInfo")
+            .unwrap();
+        assert_eq!(entry.modifier, StorageEntryModifier::Optional);
+        let StorageEntryType::Map {
+            hashers,
+            key,
+            value,
+        } = &entry.ty
+        else {
+            panic!("SubaccountInfo must be a storage map");
+        };
+        assert!(matches!(
+            hashers.as_slice(),
+            [frame_metadata::v14::StorageHasher::Identity]
+        ));
+        let account_id = metadata.types.resolve(key.id).unwrap();
+        assert_eq!(
+            account_id.path.segments.last().map(String::as_str),
+            Some("H160")
+        );
+        let account_info = metadata.types.resolve(value.id).unwrap();
+        assert_eq!(
+            account_info.path.segments.last().map(String::as_str),
+            Some("AccountInfo")
         );
     }
 
@@ -220,6 +273,21 @@ mod tests {
         assert_eq!(
             decode_spot_margin(&metadata, &format!("{STORAGE}00"), SUBACCOUNT, WALLET),
             None
+        );
+        assert_eq!(
+            decode_spot_margin(&metadata, &STORAGE[..STORAGE.len() - 2], SUBACCOUNT, WALLET),
+            None
+        );
+        let mut enabled = hex::decode(STORAGE.strip_prefix("0x").unwrap()).unwrap();
+        enabled[52] = 1;
+        assert_eq!(
+            decode_spot_margin(
+                &metadata,
+                &format!("0x{}", hex::encode(&enabled)),
+                SUBACCOUNT,
+                WALLET,
+            ),
+            Some(true)
         );
     }
 }

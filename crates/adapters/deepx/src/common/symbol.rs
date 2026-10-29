@@ -15,6 +15,7 @@
 
 //! Bidirectional DeepX product-aware symbol mapping.
 
+use deepx_rust_sdk::symbol::{format_product_symbol, parse_product_symbol};
 use nautilus_model::identifiers::{InstrumentId, Symbol};
 
 use super::{
@@ -22,8 +23,6 @@ use super::{
     consts::DEEPX_VENUE,
     error::{DeepXError, Result},
 };
-
-const PERPETUAL_SUFFIX: &str = "-PERP";
 
 /// Builds a canonical DeepX [`InstrumentId`] from a venue pair and product type.
 ///
@@ -34,14 +33,7 @@ pub fn format_instrument_id(
     venue_pair: &str,
     product_type: &DeepXProductType,
 ) -> Result<InstrumentId> {
-    let pair = canonical_pair(venue_pair)?;
-    let symbol = match product_type {
-        DeepXProductType::Spot => pair,
-        DeepXProductType::Perpetual => format!("{pair}{PERPETUAL_SUFFIX}"),
-        DeepXProductType::Unknown(value) => {
-            return Err(DeepXError::UnsupportedProduct(value.clone()));
-        }
-    };
+    let symbol = format_product_symbol(venue_pair, product_type)?;
 
     Ok(InstrumentId::new(
         Symbol::from_str_unchecked(symbol),
@@ -62,26 +54,7 @@ pub fn parse_instrument_id(instrument_id: &InstrumentId) -> Result<(String, Deep
         )));
     }
 
-    let symbol = instrument_id.symbol.as_str();
-    let (pair, product_type) = match symbol.strip_suffix(PERPETUAL_SUFFIX) {
-        Some(pair) => (pair, DeepXProductType::Perpetual),
-        None => (symbol, DeepXProductType::Spot),
-    };
-    let pair = canonical_pair(pair)?;
-    Ok((pair, product_type))
-}
-
-fn canonical_pair(value: &str) -> Result<String> {
-    let pair = value.trim().to_ascii_uppercase();
-    let mut components = pair.split('-');
-    let base = components.next().unwrap_or_default();
-    let quote = components.next().unwrap_or_default();
-    if base.is_empty() || quote.is_empty() || components.next().is_some() {
-        return Err(DeepXError::InvalidSymbol(format!(
-            "expected BASE-QUOTE pair, received {value:?}",
-        )));
-    }
-    Ok(format!("{base}-{quote}"))
+    parse_product_symbol(instrument_id.symbol.as_str())
 }
 
 #[cfg(test)]
@@ -101,24 +74,6 @@ mod tests {
         assert_eq!(
             parse_instrument_id(&instrument_id).unwrap(),
             ("ETH-USDC".to_string(), product_type),
-        );
-    }
-
-    #[rstest]
-    #[case("")]
-    #[case("ETH")]
-    #[case("ETH-")]
-    #[case("-USDC")]
-    #[case("ETH-USDC-PERP")]
-    fn malformed_pairs_are_rejected(#[case] pair: &str) {
-        assert!(format_instrument_id(pair, &DeepXProductType::Spot).is_err());
-    }
-
-    #[rstest]
-    fn unknown_products_are_rejected() {
-        assert_eq!(
-            format_instrument_id("ETH-USDC", &DeepXProductType::Unknown("option".to_string()),),
-            Err(DeepXError::UnsupportedProduct("option".to_string())),
         );
     }
 

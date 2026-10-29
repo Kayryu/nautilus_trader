@@ -13193,7 +13193,11 @@ mod tests {
     ) -> DeepXAccountOwnershipProof {
         let signer = derive_signer_account_id(credential).unwrap();
         let wallet = format!("0x{}", hex::encode(signer));
-        let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.to_string()]);
+        let directory =
+            DeepXWalletSubaccounts(deepx_rust_sdk::rest::models::DeepXWalletSubaccounts::new(
+                wallet.clone(),
+                vec![subaccount.to_string()],
+            ));
         let profile =
             DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
                 authority: wallet,
@@ -14455,7 +14459,11 @@ mod tests {
         let signer = derive_signer_account_id(&client.credential).unwrap();
         let signer_address = format!("0x{}", hex::encode(signer));
         let wallet = format!("0x{}", hex::encode([0x33; 20]));
-        let directory = DeepXWalletSubaccounts::new(wallet.clone(), vec![subaccount.clone()]);
+        let directory =
+            DeepXWalletSubaccounts(deepx_rust_sdk::rest::models::DeepXWalletSubaccounts::new(
+                wallet.clone(),
+                vec![subaccount.clone()],
+            ));
         let profile =
             DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
                 authority: wallet.clone(),
@@ -14482,7 +14490,9 @@ mod tests {
                 },
             )],
         );
-        let delegators = DeepXDelegateWallets::new(signer_address, vec![wallet]);
+        let delegators = DeepXDelegateWallets(
+            deepx_rust_sdk::rest::models::DeepXDelegateWallets::new(signer_address, vec![wallet]),
+        );
         let proof = verify_delegated_account_ownership(
             &client.credential,
             &subaccount,

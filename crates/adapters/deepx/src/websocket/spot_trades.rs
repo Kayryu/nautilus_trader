@@ -17,7 +17,7 @@
 use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
 
 pub(crate) use deepx_rust_sdk::websocket::spot_trades::{
-    DeepXWsSpotMarket, DeepXWsSpotTradeFrame, DeepXWsSpotTradeRequest,
+    DeepXWsSpotTradeFrame, DeepXWsSpotTradeRequest,
 };
 
 use crate::{config::DeepXNetworkConfig, http::DeepXSpotMarket};
@@ -26,7 +26,7 @@ use crate::{config::DeepXNetworkConfig, http::DeepXSpotMarket};
 #[derive(Debug)]
 pub(crate) struct DeepXWsSpotTradeConnection {
     transport: super::transport::DeepXWsReadConnection,
-    market: DeepXSpotMarket,
+    request: DeepXWsSpotTradeRequest,
     buffered: VecDeque<DeepXWsSpotTradeFrame>,
     buffer_capacity: NonZeroUsize,
     timeout: Duration,
@@ -47,12 +47,13 @@ impl DeepXWsSpotTradeConnection {
         buffer_capacity: NonZeroUsize,
         market: DeepXSpotMarket,
     ) -> anyhow::Result<Self> {
+        let request = DeepXWsSpotTradeRequest::subscribe(&market)?;
         let mut connection = Self {
             transport: super::transport::DeepXWsReadConnection::connect(
                 network, proxy_url, timeout,
             )
             .await?,
-            market,
+            request,
             buffered: VecDeque::new(),
             buffer_capacity,
             timeout,
@@ -64,8 +65,9 @@ impl DeepXWsSpotTradeConnection {
     }
 
     async fn subscribe(&mut self) -> anyhow::Result<()> {
-        let request = DeepXWsSpotTradeRequest::subscribe(&self.market)?;
-        self.transport.send_spot_trade_request(&request).await?;
+        self.transport
+            .send_spot_trade_request(&self.request)
+            .await?;
         let result = tokio::time::timeout(self.timeout, async {
             loop {
                 let frame = self.read_frame().await?;
@@ -74,20 +76,13 @@ impl DeepXWsSpotTradeConnection {
                         market,
                         subscriptions,
                     } => {
-                        anyhow::ensure!(
-                            market.name == self.market.name
-                                && market.pair.as_deref().is_some_and(
-                                    |pair| pair.eq_ignore_ascii_case(&self.market.pair)
-                                )
-                                && subscriptions.as_slice() == ["trades"],
-                            "DeepX Spot trade acknowledgement conflicts with subscription"
-                        );
+                        self.request.validate_ack(market, subscriptions)?;
                         self.subscribed = true;
                         return Ok(());
                     }
                     DeepXWsSpotTradeFrame::Data { market, .. } => {
                         anyhow::ensure!(
-                            self.matches_market(market),
+                            self.request.matches_market(market),
                             "DeepX Spot pre-ack trade identity mismatch"
                         );
                         anyhow::ensure!(
@@ -136,7 +131,7 @@ impl DeepXWsSpotTradeConnection {
         match &frame {
             DeepXWsSpotTradeFrame::Data { market, .. } => {
                 anyhow::ensure!(
-                    self.matches_market(market),
+                    self.request.matches_market(market),
                     "DeepX Spot trade market mismatch"
                 );
             }
@@ -174,15 +169,6 @@ impl DeepXWsSpotTradeConnection {
         self.poisoned = true;
         self.buffered.clear();
         self.transport.close().await
-    }
-
-    fn matches_market(&self, market: &DeepXWsSpotMarket) -> bool {
-        market.kind == "spot"
-            && market.name == self.market.name
-            && market
-                .pair
-                .as_deref()
-                .is_some_and(|pair| pair.eq_ignore_ascii_case(&self.market.pair))
     }
 
     async fn read_frame(&mut self) -> anyhow::Result<DeepXWsSpotTradeFrame> {

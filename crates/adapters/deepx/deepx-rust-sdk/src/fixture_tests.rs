@@ -906,6 +906,14 @@ fn decodes_hourly_unsettled_funding_fixtures_exactly() {
     assert_eq!(first_boundary.baseline_index_raw, 76_843_886_126_453_109);
     assert_eq!(second_boundary.cumulative_index_raw, 76_843_886_126_453_109);
     assert!(first_boundary.boundary_timestamp_ms > second_boundary.boundary_timestamp_ms);
+    let cursor = first_boundary.cursor();
+    assert_eq!(
+        cursor.boundary_timestamp_ms,
+        first_boundary.boundary_timestamp_ms
+    );
+    assert_eq!(cursor.market_id, first_boundary.market_id);
+    assert_eq!(cursor.subaccount, first_boundary.subaccount);
+    assert_eq!(cursor.event_id, first_boundary.boundary_event_id);
 }
 
 #[rstest]

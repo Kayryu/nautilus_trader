@@ -15,13 +15,28 @@
 
 //! Bounded reads from a DeepX JSON-RPC endpoint.
 
+pub mod chain_decode;
+pub mod endpoint_identity;
+pub mod event_decode;
+pub mod event_storage;
 pub mod events;
 pub mod lending_positions;
+pub mod margin;
+pub mod market_spec;
+pub mod perp_modify;
+pub mod perp_place;
+pub mod perp_position;
 pub mod precompile;
+pub mod spot_cancel;
 pub mod spot_margin;
 pub mod spot_market_spec;
+pub mod spot_place;
 pub mod storage;
+pub mod storage_decode;
+pub mod submission;
 pub mod timestamp;
+pub mod trade_event_decode;
+pub mod trade_match;
 
 use std::{collections::BTreeSet, fmt::Debug, net::IpAddr, time::Duration};
 

@@ -321,3 +321,177 @@ impl DeepXWsPerpOpenOrdersFrame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    const ADDRESS: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+    const OTHER: &str = "0x977654069311fa41b88f7901dc65fae9a76fd60b";
+    const WALLET: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"perp","id":3,"name":"ETH-USDC"},"subscriptions":[{"channel":"user_perp_open_orders","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}],"message":"Successfully subscribed to 1 channels"}"#;
+    const SNAPSHOT: &str = r#"{"type":"data","channel":"user_perp_open_orders","market":{"type":"perp","id":3,"name":"ETH-USDC"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","orders":{"hasNext":false,"hasPrev":false,"items":[],"pageNo":1,"pageSize":100,"totalCount":0,"totalPage":0}},"timestamp":1791475653766}"#;
+
+    fn wallet_request() -> DeepXWsPerpOpenOrdersRequest {
+        DeepXWsPerpOpenOrdersRequest::for_wallet(
+            3,
+            WALLET,
+            &[ADDRESS.to_string(), OTHER.to_string()],
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn parses_observed_ack_and_empty_snapshot() {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(&request.to_text().unwrap()).unwrap();
+        assert_eq!(encoded["market"]["id"], 3);
+        assert_eq!(encoded["subscriptions"][0]["address"], ADDRESS);
+        assert!(matches!(
+            DeepXWsPerpOpenOrdersFrame::parse(ACK, &request).unwrap(),
+            DeepXWsPerpOpenOrdersFrame::Subscribed
+        ));
+        let DeepXWsPerpOpenOrdersFrame::OrderPage { page, timestamp_ms } =
+            DeepXWsPerpOpenOrdersFrame::parse(SNAPSHOT, &request).unwrap()
+        else {
+            panic!("expected initial snapshot");
+        };
+        assert!(page.items().is_empty());
+        assert_eq!(page.subaccount(), ADDRESS);
+        assert_eq!(timestamp_ms, 1_791_475_653_766);
+    }
+
+    #[rstest]
+    fn preserves_nonempty_order_items_without_assigning_report_semantics() {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let item = format!(
+            "{{\"orderId\":\"1791486151624\",\"owner\":\"{ADDRESS}\",\"marketId\":3,\"price\":1.2300}}"
+        );
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        let DeepXWsPerpOpenOrdersFrame::OrderPage { page, .. } =
+            DeepXWsPerpOpenOrdersFrame::parse(&frame, &request).unwrap()
+        else {
+            panic!("expected initial snapshot");
+        };
+        assert_eq!(page.items()[0].get(), item);
+    }
+
+    #[rstest]
+    #[case("00", ADDRESS, 3)]
+    #[case("1.0", ADDRESS, 3)]
+    #[case("1", "0x0000000000000000000000000000000000000000", 3)]
+    #[case("1", ADDRESS, 4)]
+    fn rejects_invalid_order_item_identity(
+        #[case] order_id: &str,
+        #[case] owner: &str,
+        #[case] market_id: u64,
+    ) {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let item = format!(
+            "{{\"orderId\":\"{order_id}\",\"owner\":\"{owner}\",\"marketId\":{market_id}}}"
+        );
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        assert!(DeepXWsPerpOpenOrdersFrame::parse(&frame, &request).is_err());
+    }
+
+    #[rstest]
+    fn rejects_duplicate_numeric_order_ids() {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let items = format!(
+            "[{{\"orderId\":\"1\",\"owner\":\"{ADDRESS}\",\"marketId\":3}},{{\"orderId\":\"01\",\"owner\":\"{ADDRESS}\",\"marketId\":3}}]"
+        );
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":{items}"))
+            .replace("\"totalCount\":0", "\"totalCount\":2")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        assert!(DeepXWsPerpOpenOrdersFrame::parse(&frame, &request).is_err());
+    }
+
+    #[rstest]
+    fn accepts_first_generated_order_id_zero() {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let item = format!("{{\"orderId\":\"0\",\"owner\":\"{ADDRESS}\",\"marketId\":3}}");
+        let frame = SNAPSHOT
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        let DeepXWsPerpOpenOrdersFrame::OrderPage { page, .. } =
+            DeepXWsPerpOpenOrdersFrame::parse(&frame, &request).unwrap()
+        else {
+            panic!("expected zero-ID order page");
+        };
+        assert_eq!(page.items()[0].get(), item);
+    }
+
+    #[rstest]
+    #[case("market", "\"id\":4")]
+    #[case(
+        "address",
+        "\"address\":\"0x0000000000000000000000000000000000000000\""
+    )]
+    #[case("channel", "\"channel\":\"user_perp_trade_history\"")]
+    #[case("pagination", "\"hasNext\":true")]
+    fn rejects_foreign_or_incomplete_snapshot(#[case] field: &str, #[case] replacement: &str) {
+        let request = DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap();
+        let original = match field {
+            "market" => "\"id\":3".to_string(),
+            "address" => format!("\"address\":\"{ADDRESS}\""),
+            "channel" => "\"channel\":\"user_perp_open_orders\"".to_string(),
+            "pagination" => "\"hasNext\":false".to_string(),
+            _ => unreachable!(),
+        };
+        let changed = SNAPSHOT.replacen(&original, replacement, 1);
+        assert_ne!(changed, SNAPSHOT);
+        assert!(DeepXWsPerpOpenOrdersFrame::parse(&changed, &request).is_err());
+    }
+
+    #[rstest]
+    fn wallet_request_requires_valid_unique_subaccounts() {
+        assert!(DeepXWsPerpOpenOrdersRequest::for_wallet(3, WALLET, &[]).is_err());
+        assert!(
+            DeepXWsPerpOpenOrdersRequest::for_wallet(
+                3,
+                WALLET,
+                &[ADDRESS.to_string(), ADDRESS.to_string()],
+            )
+            .is_err()
+        );
+        assert!(DeepXWsPerpOpenOrdersRequest::for_wallet(3, WALLET, &["bad".to_string()]).is_err());
+        let encoded: serde_json::Value =
+            serde_json::from_str(&wallet_request().to_text().unwrap()).unwrap();
+        assert_eq!(encoded["subscriptions"][0]["address"], WALLET);
+        assert_eq!(encoded["subscriptions"][0]["addressType"], "wallet");
+    }
+
+    #[rstest]
+    fn wallet_order_identity_is_bound_to_page_subaccount() {
+        let item = format!("{{\"orderId\":\"123\",\"owner\":\"{OTHER}\",\"marketId\":3}}");
+        let frame = SNAPSHOT
+            .replace(ADDRESS, OTHER)
+            .replace("\"items\":[]", &format!("\"items\":[{item}]"))
+            .replace("\"totalCount\":0", "\"totalCount\":1")
+            .replace("\"totalPage\":0", "\"totalPage\":1");
+        let DeepXWsPerpOpenOrdersFrame::OrderPage { page, .. } =
+            DeepXWsPerpOpenOrdersFrame::parse(&frame, &wallet_request()).unwrap()
+        else {
+            panic!("expected wallet order page");
+        };
+        assert_eq!(page.subaccount(), OTHER);
+        assert_eq!(page.items()[0].get(), item);
+        assert!(
+            DeepXWsPerpOpenOrdersFrame::parse(
+                &frame,
+                &DeepXWsPerpOpenOrdersRequest::new(3, ADDRESS).unwrap()
+            )
+            .is_err()
+        );
+    }
+}

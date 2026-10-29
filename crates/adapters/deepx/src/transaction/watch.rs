@@ -14,29 +14,84 @@
 
 //! Fail-closed DeepX canonical block and submission-pool observations.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
-pub use deepx_rust_sdk::rpc::events::{
-    DeepXDelegateAccountChangeKind, DeepXFinalizedDelegateAccountChange,
-    DeepXFinalizedDelegateModeChange, DeepXFinalizedPerpTrade, DeepXFinalizedSpotTrade,
-};
 #[cfg(test)]
 use deepx_rust_sdk::rpc::execute_rpc_read_with_retry;
 use deepx_rust_sdk::rpc::{
     DeepXRpcBlockHeader as RpcBlockHeader, DeepXRpcBlockResponse as RpcBlockResponse,
-    DeepXRpcClient, DeepXRpcRuntimeVersion as HistoricalRuntimeVersion, get_metadata,
-    get_runtime_version,
+    DeepXRpcClient, DeepXRpcRuntimeVersion as HistoricalRuntimeVersion,
+    chain_decode::{decode_block_number_u64, decode_prefixed_hash},
+    event_decode::{
+        DeepXDelegateAccountExpected, DeepXDelegateModeExpected, DeepXFinalizedEventLocation,
+        DeepXIndexedSystemDispatchError, DeepXPerpCancelBusinessOutcome, DeepXPerpCancelEventError,
+        DeepXPerpCancelExpected, DeepXPerpCancelInclusionError, DeepXPerpCancelInclusionOutcome,
+        DeepXSystemDispatchError, DeepXSystemDispatchOutcome,
+        decode_finalized_delegate_account_changes as sdk_decode_finalized_delegate_account_changes,
+        decode_finalized_delegate_mode_changes as sdk_decode_finalized_delegate_mode_changes,
+        decode_perp_cancel_business_event, decode_perp_cancel_inclusion, decode_system_dispatch,
+        verify_finalized_delegate_account_change_events as sdk_verify_delegate_account_change,
+        verify_finalized_delegate_mode_change_events as sdk_verify_delegate_mode_change,
+    },
+    event_storage::{
+        SYSTEM_EVENTS_STORAGE_KEY, combine_events_map_batches, decode_event_storage_value,
+        decode_event_threads, system_events_map_storage_key, system_threads_storage_key,
+    },
+    get_metadata, get_runtime_version,
+    perp_modify::{
+        DeepXPerpModifyEventError, DeepXPerpModifyEventOrder, DeepXPerpModifySizingExpected,
+        decode_perp_modify_event_order, decode_perp_modify_sizing_event,
+    },
+    perp_place::{
+        DeepXPerpPlaceEventError, DeepXPerpPlaceExpected, DeepXPerpPlaceInclusionOutcome,
+        decode_perp_place_inclusion,
+    },
+    perp_position::{
+        DeepXPerpCloseExpected, DeepXPerpPointUpdateExpected, DeepXPerpPositionEventError,
+        DeepXPerpPositionInclusionOutcome, decode_perp_close_inclusion,
+        decode_perp_point_update_inclusion,
+    },
+    spot_cancel::{
+        DeepXSpotCancelEventError, DeepXSpotCancelExpected, DeepXSpotCancelInclusionOutcome,
+        decode_spot_cancel_inclusion,
+    },
+    spot_place::{
+        DeepXSpotPlaceEventError, DeepXSpotPlaceExpected, DeepXSpotPlaceInclusionOutcome,
+        decode_spot_place_inclusion,
+    },
+    submission::{DeepXExtrinsicLookupError, find_extrinsic_by_hash},
+    trade_match::{
+        match_finalized_perp_account_trade as sdk_match_finalized_perp_account_trade,
+        match_finalized_spot_account_trade as sdk_match_finalized_spot_account_trade,
+        match_finalized_wallet_perp_trades as sdk_match_finalized_wallet_perp_trades,
+    },
+};
+pub use deepx_rust_sdk::rpc::{
+    event_decode::{
+        DeepXDelegateAccountEventError, DeepXDelegateAccountVerificationError,
+        DeepXDelegateModeEventError, DeepXDelegateModeVerificationError,
+    },
+    events::{
+        DeepXDelegateAccountChangeKind, DeepXFinalizedDelegateAccountChange,
+        DeepXFinalizedDelegateModeChange, DeepXFinalizedPerpTrade, DeepXFinalizedSpotTrade,
+    },
+    trade_event_decode::{DeepXPerpTradeEventError, DeepXSpotTradeEventError},
+    trade_match::{
+        DeepXFinalizedWalletPerpTradeMatchError, DeepXPerpTradeMatchError, DeepXSpotTradeMatchError,
+    },
 };
 use nautilus_core::hex;
-use parity_scale_codec::{Compact, Decode, Encode};
-use scale_info::{TypeDef, TypeDefPrimitive};
+#[cfg(test)]
+use parity_scale_codec::{Compact, Decode};
 #[cfg(test)]
 use serde_json::json;
-use subxt_core::{
-    config::{Hasher, substrate::BlakeTwo256},
-    events::{Events, Phase},
-    ext::scale_value::{Composite, Value as ScaleValue, ValueDef},
-};
+#[cfg(test)]
+use subxt_core::config::{Hasher, substrate::BlakeTwo256};
+#[cfg(test)]
+use subxt_core::events::{Events, Phase};
+#[cfg(test)]
+use subxt_core::ext::scale_value::{Composite, Value as ScaleValue, ValueDef};
 use thiserror::Error;
 
 use super::{
@@ -48,10 +103,7 @@ use super::{
     classify_reorganization, plan_missed_block_scan,
 };
 use crate::{
-    common::{
-        DeepXEnvironment, DeepXPrivateKey,
-        parse::{decimal_to_scaled_i128, parse_canonical_order_id},
-    },
+    common::{DeepXEnvironment, DeepXPrivateKey},
     config::{DeepXRpcRole, DeepXValidatedRpcEndpoints},
     http::{
         DeepXDelegateMode, DeepXPerpAccountTradeRecord, DeepXPerpMarketLookup,
@@ -63,18 +115,16 @@ use crate::{
     },
     signing::{
         ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXReadOnlyRuntimeSnapshot,
-        DeepXRemoveDelegateAccountParams, DeepXRuntimeConfig, DeepXRuntimeInterfaceCatalog,
+        DeepXRemoveDelegateAccountParams, DeepXRuntimeInterfaceCatalog,
         DeepXRuntimeInterfaceError, DeepXRuntimeSnapshotPermit, DeepXSetDelegateAccountParams,
-        DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode, RuntimeSnapshot, SigningError,
-        SnapshotError, sign_remove_delegate_account, sign_set_delegate_account,
-        sign_update_delegate_mode,
+        DeepXSpotPlaceParams, DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode,
+        RuntimeSnapshot, SigningError, SnapshotError, sign_remove_delegate_account,
+        sign_set_delegate_account, sign_update_delegate_mode,
     },
 };
 
-const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
-    "0x26aa394eea5630e07c48ae0c9558cef7",
-    "80d41e5e16056765bc8461851072c9d7",
-);
+#[cfg(test)]
+use crate::signing::DeepXRuntimeConfig;
 
 async fn observe_historical_read_only_runtime(
     environment: &DeepXEnvironment,
@@ -159,143 +209,6 @@ impl<T: RuntimeMetadataView + ?Sized> RuntimeMetadataView for &T {
     }
 }
 
-/// Failures decoding complete delegate account event storage.
-#[derive(Debug, Error)]
-pub enum DeepXDelegateAccountEventError {
-    /// The approved runtime does not expose the required account events.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// SCALE decoding failed against approved metadata.
-    #[error("unable to decode DeepX delegate account events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The event count or encoded length is inconsistent.
-    #[error("DeepX delegate account evidence is not complete System.Events")]
-    MalformedEventBytes,
-    /// A delegate account event violates the approved field or phase contract.
-    #[error("invalid DeepX delegate account event at index {0}")]
-    InvalidChange(u32),
-}
-
-/// Failures binding a delegate account event to one finalized extrinsic.
-#[derive(Debug, Error)]
-pub enum DeepXDelegateAccountVerificationError {
-    /// Complete event storage could not be decoded.
-    #[error(transparent)]
-    Events(#[from] DeepXDelegateAccountEventError),
-    /// The runtime does not expose the required dispatch events.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// Dispatch event decoding failed against approved metadata.
-    #[error("unable to decode DeepX delegate account dispatch events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The target extrinsic has no unique successful dispatch event.
-    #[error("DeepX delegate account extrinsic has no unique successful dispatch")]
-    Dispatch,
-    /// The target extrinsic has no unique expected account event.
-    #[error("DeepX delegate account extrinsic has no unique expected event")]
-    Change,
-    /// The event differs from the expected owner, delegate, or operation.
-    #[error("DeepX delegate account event conflicts with expected terms")]
-    ConflictingChange,
-}
-
-/// Failures decoding complete delegate-mode event storage.
-#[derive(Debug, Error)]
-pub enum DeepXDelegateModeEventError {
-    /// The approved runtime does not expose the mode-change event.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// SCALE decoding failed against approved metadata.
-    #[error("unable to decode DeepX delegate mode events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The event count or encoded length is inconsistent.
-    #[error("DeepX delegate mode evidence is not complete System.Events")]
-    MalformedEventBytes,
-    /// A mode-change event violates the approved field or phase contract.
-    #[error("invalid DeepX delegate mode event at index {0}")]
-    InvalidChange(u32),
-}
-
-/// Failures binding one delegate mode change to an exact finalized extrinsic location.
-#[derive(Debug, Error)]
-pub enum DeepXDelegateModeVerificationError {
-    /// The complete event storage could not be decoded.
-    #[error(transparent)]
-    Events(#[from] DeepXDelegateModeEventError),
-    /// Dispatch event decoding failed against approved metadata.
-    #[error("unable to decode DeepX delegate mode dispatch events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The runtime does not expose the required dispatch events.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// The target extrinsic has no unique successful dispatch event.
-    #[error("DeepX delegate mode extrinsic has no unique successful dispatch")]
-    Dispatch,
-    /// The target extrinsic has no unique mode-change event.
-    #[error("DeepX delegate mode extrinsic has no unique mode change")]
-    Change,
-    /// The mode-change event differs from the expected wallet, delegate, or mode.
-    #[error("DeepX delegate mode change conflicts with expected terms")]
-    ConflictingChange,
-}
-
-/// Failures decoding complete Spot trade event storage.
-#[derive(Debug, Error)]
-pub enum DeepXSpotTradeEventError {
-    /// The approved runtime does not expose the Spot match event.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// SCALE decoding failed against approved metadata.
-    #[error("unable to decode DeepX Spot trade events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The event sequence was truncated or contained trailing bytes.
-    #[error("DeepX Spot trade evidence is not complete System.Events")]
-    MalformedEventBytes,
-    /// An event violates the approved runtime field contract.
-    #[error("invalid DeepX finalized Spot trade event at index {0}")]
-    InvalidTrade(u32),
-}
-
-/// Failures decoding complete finalized perpetual trade events.
-#[derive(Debug, Error)]
-pub enum DeepXPerpTradeEventError {
-    /// The approved runtime does not expose the trade event.
-    #[error(transparent)]
-    RuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-    /// SCALE event decoding failed against approved metadata.
-    #[error("unable to decode DeepX perpetual trade events: {0}")]
-    Decode(#[source] Box<subxt_core::Error>),
-    /// The event sequence was truncated or contained trailing bytes.
-    #[error("DeepX perpetual trade evidence is not complete System.Events")]
-    MalformedEventBytes,
-    /// A trade event violates the runtime field or block identity contract.
-    #[error("invalid DeepX finalized perpetual trade event at index {0}")]
-    InvalidTrade(u32),
-}
-
-/// Failures binding one REST account execution to finalized chain trade evidence.
-#[derive(Debug, Error)]
-pub enum DeepXPerpTradeMatchError {
-    /// The REST order ID or market scale cannot be used for exact matching.
-    #[error("invalid DeepX perpetual account trade identity or scale")]
-    InvalidInput,
-    /// A REST financial value cannot be represented in the chain's integer units.
-    #[error("inexact DeepX perpetual account trade {field}: {source}")]
-    InexactValue {
-        /// Financial field that could not be converted exactly.
-        field: &'static str,
-        /// Exact decimal conversion failure.
-        #[source]
-        source: crate::common::DeepXError,
-    },
-    /// No finalized trade agrees with every account, order, and financial field.
-    #[error("DeepX account trade has no matching finalized trade event")]
-    NotFound,
-    /// More than one finalized event agrees with the same REST execution.
-    #[error("DeepX account trade matches multiple finalized trade events")]
-    Ambiguous,
-}
-
 /// Matches one REST account trade to one decoded event, including its venue trade ID.
 ///
 /// The caller supplies the validated account and market's base/quote decimals and quote symbol.
@@ -315,117 +228,14 @@ pub fn match_finalized_perp_account_trade<'a>(
     quote_decimal: u8,
     quote_symbol: &str,
 ) -> Result<&'a DeepXFinalizedPerpTrade, DeepXPerpTradeMatchError> {
-    use DeepXPerpTradeMatchError as Error;
-    if record.id == 0
-        || record.market_id == 0
-        || base_decimal > 28
-        || quote_decimal > 28
-        || quote_symbol.is_empty()
-    {
-        return Err(Error::InvalidInput);
-    }
-    let order_id = parse_canonical_order_id(&record.order_id).ok_or(Error::InvalidInput)?;
-    if record.price <= rust_decimal::Decimal::ZERO
-        || record.size <= rust_decimal::Decimal::ZERO
-        || record.leverage <= rust_decimal::Decimal::ZERO
-        || !matches!(record.taker.as_str(), "Buyer" | "Seller")
-        || !matches!(record.filled_direction.as_str(), "Long" | "Short" | "Both")
-        || !record.fee_asset.is_empty() && !record.fee_asset.eq_ignore_ascii_case(quote_symbol)
-    {
-        return Err(Error::InvalidInput);
-    }
-    let price = decimal_to_scaled_i128(record.price, 6).map_err(|source| Error::InexactValue {
-        field: "price",
-        source,
-    })?;
-    let size = decimal_to_scaled_i128(record.size, u32::from(base_decimal)).map_err(|source| {
-        Error::InexactValue {
-            field: "size",
-            source,
-        }
-    })?;
-    let leverage =
-        decimal_to_scaled_i128(record.leverage, 3).map_err(|source| Error::InexactValue {
-            field: "leverage",
-            source,
-        })?;
-    let fee = decimal_to_scaled_i128(record.fee, u32::from(quote_decimal)).map_err(|source| {
-        Error::InexactValue {
-            field: "fee",
-            source,
-        }
-    })?;
-    let mut matching = trades.iter().filter(|trade| {
-        let (owner, venue_order_id, raw_leverage, raw_fee) = if record.is_long {
-            (
-                trade.buyer,
-                trade.buyer_order_id,
-                trade.buyer_leverage,
-                if trade.taker == "Buyer" {
-                    trade.taker_fee
-                } else {
-                    trade.maker_fee
-                },
-            )
-        } else {
-            (
-                trade.seller,
-                trade.seller_order_id,
-                trade.seller_leverage,
-                if trade.taker == "Seller" {
-                    trade.taker_fee
-                } else {
-                    trade.maker_fee
-                },
-            )
-        };
-        trade.event_index < 1_000_000
-            && trade
-                .block_number
-                .checked_mul(1_000_000)
-                .and_then(|base| base.checked_add(u64::from(trade.event_index)))
-                == Some(record.id)
-            && trade.market_id as u64 == record.market_id
-            && owner == subaccount
-            && venue_order_id == order_id
-            && trade.taker == record.taker
-            && trade.filled_direction == record.filled_direction
-            && trade
-                .fee_asset
-                .eq_ignore_ascii_case(quote_symbol.as_bytes())
-            && i128::try_from(trade.price) == Ok(price)
-            && i128::try_from(trade.size) == Ok(size)
-            && i128::from(raw_leverage) == leverage
-            && raw_fee.checked_neg() == Some(fee)
-    });
-    let matched = matching.next().ok_or(Error::NotFound)?;
-    if matching.next().is_some() {
-        return Err(Error::Ambiguous);
-    }
-    Ok(matched)
-}
-
-/// Failures binding one Spot REST execution to finalized `OrderMatched` evidence.
-#[derive(Debug, Error)]
-pub enum DeepXSpotTradeMatchError {
-    /// Market identity, side, or exact market scale is invalid.
-    #[error("invalid DeepX Spot account trade identity or scale")]
-    InvalidInput,
-    /// A REST value cannot be represented exactly in raw runtime units.
-    #[error("inexact DeepX Spot account trade {field}: {source}")]
-    InexactValue {
-        /// Financial field that could not be converted exactly.
-        field: &'static str,
-        /// Exact decimal conversion failure.
-        #[source]
-        source: crate::common::DeepXError,
-    },
-    /// No finalized event agrees with all REST fields.
-    #[error("DeepX Spot account trade has no matching finalized event")]
-    NotFound,
-    /// More than one event agrees with one REST trade.
-    #[error("DeepX Spot account trade matches multiple finalized events")]
-    Ambiguous,
+    sdk_match_finalized_perp_account_trade(
+        trades,
+        &record.0,
+        subaccount,
+        base_decimal,
+        quote_decimal,
+        quote_symbol,
+    )
 }
 
 /// Matches one Spot REST trade to a supplied finalized event and its global event index.
@@ -447,177 +257,23 @@ pub fn match_finalized_spot_account_trade<'a>(
     base_symbol: &str,
     quote_symbol: &str,
 ) -> Result<&'a DeepXFinalizedSpotTrade, DeepXSpotTradeMatchError> {
-    use DeepXSpotTradeMatchError as Error;
-
-    if record.id == 0
-        || base_decimal > 28
-        || quote_decimal > 28
-        || base_symbol.is_empty()
-        || quote_symbol.is_empty()
-        || !matches!(record.order_side.as_str(), "Buy" | "Sell")
-        || !matches!(record.taker.as_str(), "Buyer" | "Seller")
-    {
-        return Err(Error::InvalidInput);
-    }
-    let pair = record
-        .pair
-        .strip_prefix("0x")
-        .and_then(|encoded| hex::decode_array::<32>(encoded).ok())
-        .ok_or(Error::InvalidInput)?;
-    let order_id = parse_canonical_order_id(&record.order_id).ok_or(Error::InvalidInput)?;
-    if record.price <= rust_decimal::Decimal::ZERO
-        || record.base_amount <= rust_decimal::Decimal::ZERO
-        || record.quote_amount <= rust_decimal::Decimal::ZERO
-    {
-        return Err(Error::InvalidInput);
-    }
-    let scaled = |value, field, decimals| {
-        decimal_to_scaled_i128(value, decimals)
-            .map_err(|source| Error::InexactValue { field, source })
-    };
-    let price = scaled(record.price, "price", 6)?;
-    let base_amount = scaled(record.base_amount, "base amount", u32::from(base_decimal))?;
-    let quote_amount = scaled(
-        record.quote_amount,
-        "quote amount",
-        u32::from(quote_decimal),
-    )?;
-    let fee_decimals = if record.order_side == "Buy" {
-        base_decimal
-    } else {
-        quote_decimal
-    };
-    let fee = scaled(record.fee, "fee", u32::from(fee_decimals))?;
-    let expected_fee_asset = if record.order_side == "Buy" {
-        base_symbol
-    } else {
-        quote_symbol
-    };
-    if !record.fee_asset.is_empty() && !record.fee_asset.eq_ignore_ascii_case(expected_fee_asset) {
-        return Err(Error::InvalidInput);
-    }
-    let as_u256 = |value| {
-        let value = u128::try_from(value).ok()?;
-        let mut bytes = [0_u8; 32];
-        bytes[..16].copy_from_slice(&value.to_le_bytes());
-        Some(bytes)
-    };
-    let (price, base_amount, quote_amount) = (
-        as_u256(price).ok_or(Error::InvalidInput)?,
-        as_u256(base_amount).ok_or(Error::InvalidInput)?,
-        as_u256(quote_amount).ok_or(Error::InvalidInput)?,
-    );
-    let mut matching = trades.iter().filter(|trade| {
-        let (owner, venue_order_id, raw_fee, fee_asset, other_fee_asset, other_symbol) =
-            if record.order_side == "Buy" {
-                (
-                    trade.buyer,
-                    trade.buy_id,
-                    if trade.taker == "Buyer" {
-                        trade.taker_fee
-                    } else {
-                        trade.maker_fee
-                    },
-                    if trade.taker == "Buyer" {
-                        &trade.taker_fee_asset
-                    } else {
-                        &trade.maker_fee_asset
-                    },
-                    if trade.taker == "Buyer" {
-                        &trade.maker_fee_asset
-                    } else {
-                        &trade.taker_fee_asset
-                    },
-                    quote_symbol,
-                )
-            } else {
-                (
-                    trade.seller,
-                    trade.sell_id,
-                    if trade.taker == "Seller" {
-                        trade.taker_fee
-                    } else {
-                        trade.maker_fee
-                    },
-                    if trade.taker == "Seller" {
-                        &trade.taker_fee_asset
-                    } else {
-                        &trade.maker_fee_asset
-                    },
-                    if trade.taker == "Seller" {
-                        &trade.maker_fee_asset
-                    } else {
-                        &trade.taker_fee_asset
-                    },
-                    base_symbol,
-                )
-            };
-        trade.event_index < 1_000_000
-            && trade
-                .block_number
-                .checked_mul(1_000_000)
-                .and_then(|base| base.checked_add(u64::from(trade.event_index)))
-                == Some(record.id)
-            && trade.pair == pair
-            && owner == subaccount
-            && venue_order_id == order_id
-            && trade.taker == record.taker
-            && trade.price == price
-            && trade.trade_amount_b == base_amount
-            && trade.trade_amount_u == quote_amount
-            && fee_asset.eq_ignore_ascii_case(expected_fee_asset.as_bytes())
-            && other_fee_asset.eq_ignore_ascii_case(other_symbol.as_bytes())
-            && raw_fee.checked_neg() == Some(fee)
-    });
-    let matched = matching.next().ok_or(Error::NotFound)?;
-    if matching.next().is_some() {
-        return Err(Error::Ambiguous);
-    }
-    Ok(matched)
+    sdk_match_finalized_spot_account_trade(
+        trades,
+        &record.0,
+        subaccount,
+        base_decimal,
+        quote_decimal,
+        base_symbol,
+        quote_symbol,
+    )
 }
 
 /// One wallet account trade matched to a finalized perpetual event.
-#[derive(Clone, Copy, Debug)]
-pub struct DeepXFinalizedWalletPerpTradeMatch<'a> {
-    /// Wallet subaccount on the event's buyer or seller side.
-    pub subaccount: [u8; 20],
-    /// Complete finalized event evidence.
-    pub trade: &'a DeepXFinalizedPerpTrade,
-    /// Mutable REST account record whose financial fields match the event.
-    pub record: &'a DeepXPerpAccountTradeRecord,
-}
-
-/// Failures binding a complete wallet trade page to finalized perpetual events.
-#[derive(Debug, Error)]
-pub enum DeepXFinalizedWalletPerpTradeMatchError {
-    /// The supplied event slice mixes blocks or repeats an event index.
-    #[error("DeepX finalized wallet trade events have conflicting block identity")]
-    ConflictingEvents,
-    /// The directory repeats a subaccount or supplies no subaccounts.
-    #[error("DeepX wallet subaccount directory is empty or contains duplicates")]
-    InvalidSubaccounts,
-    /// Both sides of an event belong to one subaccount, which the REST identity cannot distinguish.
-    #[error("DeepX self-trade cannot be bound to one account trade record")]
-    SelfTrade,
-    /// Exactly one market group, subaccount group, or metadata record was not available.
-    #[error("DeepX finalized wallet trade market or subaccount identity is unavailable")]
-    MissingIdentity,
-    /// A current market identity disagrees with the REST wallet group.
-    #[error("DeepX finalized wallet trade market identity conflicts with metadata")]
-    MarketIdentityMismatch,
-    /// An involved group has more pages, so absence in the observed page is not authoritative.
-    #[error("DeepX finalized wallet trade group has an unresolved continuation cursor")]
-    IncompletePage,
-    /// The event's venue ID was absent from the complete observed group.
-    #[error("DeepX finalized wallet trade event is absent from the wallet page")]
-    MissingRecord,
-    /// The same event ID appeared more than once in its wallet group.
-    #[error("DeepX finalized wallet trade event has duplicate REST records")]
-    DuplicateRecord,
-    /// An account record disagrees with the event's exact fields.
-    #[error(transparent)]
-    Trade(#[from] DeepXPerpTradeMatchError),
-}
+pub type DeepXFinalizedWalletPerpTradeMatch<'a> =
+    deepx_rust_sdk::rpc::trade_match::DeepXFinalizedWalletPerpTradeMatch<
+        'a,
+        DeepXPerpAccountTradeRecord,
+    >;
 
 /// Matches every event involving a supplied wallet subaccount against complete REST groups.
 ///
@@ -635,92 +291,7 @@ pub fn match_finalized_wallet_perp_trades<'a>(
     subaccounts: &[[u8; 20]],
     markets: &[DeepXPerpMarketLookup],
 ) -> Result<Vec<DeepXFinalizedWalletPerpTradeMatch<'a>>, DeepXFinalizedWalletPerpTradeMatchError> {
-    use DeepXFinalizedWalletPerpTradeMatchError as Error;
-
-    if subaccounts.is_empty()
-        || subaccounts.iter().copied().collect::<HashSet<_>>().len() != subaccounts.len()
-    {
-        return Err(Error::InvalidSubaccounts);
-    }
-    if let Some(first) = trades.first() {
-        let mut indices = HashSet::new();
-        for trade in trades {
-            if trade.block_hash != first.block_hash
-                || trade.block_number != first.block_number
-                || !indices.insert(trade.event_index)
-            {
-                return Err(Error::ConflictingEvents);
-            }
-        }
-    }
-
-    let mut matched = Vec::new();
-    for trade in trades {
-        for subaccount in subaccounts {
-            if trade.buyer != *subaccount && trade.seller != *subaccount {
-                continue;
-            }
-            if trade.buyer == *subaccount && trade.seller == *subaccount {
-                return Err(Error::SelfTrade);
-            }
-            let mut matching_groups = groups
-                .iter()
-                .filter(|group| group.market_id == u64::from(trade.market_id));
-            let group = matching_groups.next().ok_or(Error::MissingIdentity)?;
-            if matching_groups.next().is_some() {
-                return Err(Error::MarketIdentityMismatch);
-            }
-            let mut matching_markets = markets.iter().filter(|market| market.id == group.market_id);
-            let market = matching_markets.next().ok_or(Error::MissingIdentity)?;
-            if matching_markets.next().is_some() || market.name != group.market_name {
-                return Err(Error::MarketIdentityMismatch);
-            }
-            let encoded_subaccount = format!("0x{}", hex::encode(subaccount));
-            let mut matching_subaccounts = group.subaccounts.iter().filter(|candidate| {
-                candidate
-                    .subaccount
-                    .eq_ignore_ascii_case(&encoded_subaccount)
-            });
-            let account_group = matching_subaccounts.next().ok_or(Error::MissingIdentity)?;
-            if matching_subaccounts.next().is_some() {
-                return Err(Error::MissingIdentity);
-            }
-            if account_group.trades.has_next {
-                return Err(Error::IncompletePage);
-            }
-            let expected_id = trade
-                .block_number
-                .checked_mul(1_000_000)
-                .and_then(|base| base.checked_add(u64::from(trade.event_index)))
-                .ok_or(Error::MissingRecord)?;
-            let mut records = account_group
-                .trades
-                .items
-                .iter()
-                .filter(|record| record.id == expected_id);
-            let record = records.next().ok_or(Error::MissingRecord)?;
-            if records.next().is_some() {
-                return Err(Error::DuplicateRecord);
-            }
-            let confirmed = match_finalized_perp_account_trade(
-                trades,
-                record,
-                *subaccount,
-                market.base_decimal,
-                market.quote_decimal,
-                &market.quote_symbol,
-            )?;
-            if confirmed.event_index != trade.event_index {
-                return Err(Error::ConflictingEvents);
-            }
-            matched.push(DeepXFinalizedWalletPerpTradeMatch {
-                subaccount: *subaccount,
-                trade: confirmed,
-                record,
-            });
-        }
-    }
-    Ok(matched)
+    sdk_match_finalized_wallet_perp_trades(trades, groups, subaccounts, markets)
 }
 
 /// Decodes delegate setup and removal from one complete finalized `System.Events` value.
@@ -752,79 +323,13 @@ fn decode_finalized_delegate_account_changes_with_runtime(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedDelegateAccountChange>, DeepXDelegateAccountEventError> {
-    snapshot
-        .interfaces()
-        .event("Subaccount", "DelegateAccountSet")?;
-    snapshot
-        .interfaces()
-        .event("Subaccount", "DelegateAccountRemoved")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXDelegateAccountEventError::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut changes = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| DeepXDelegateAccountEventError::Decode(Box::new(e)))?;
-        let event_index = count;
-        count = count
-            .checked_add(1)
-            .ok_or(DeepXDelegateAccountEventError::MalformedEventBytes)?;
-        consumed = consumed
-            .checked_add(event.bytes().len())
-            .ok_or(DeepXDelegateAccountEventError::MalformedEventBytes)?;
-        if event.pallet_name() != "Subaccount" {
-            continue;
-        }
-        let kind = match event.variant_name() {
-            "DelegateAccountSet" => DeepXDelegateAccountChangeKind::Set,
-            "DelegateAccountRemoved" => DeepXDelegateAccountChangeKind::Removed,
-            _ => continue,
-        };
-        let Phase::ApplyExtrinsic(extrinsic_index) = event.phase() else {
-            return Err(DeepXDelegateAccountEventError::InvalidChange(event_index));
-        };
-        let fields = event
-            .field_values()
-            .map_err(|e| DeepXDelegateAccountEventError::Decode(Box::new(e)))?;
-        let Composite::Named(fields) = fields else {
-            return Err(DeepXDelegateAccountEventError::InvalidChange(event_index));
-        };
-        if fields.len() != 2 {
-            return Err(DeepXDelegateAccountEventError::InvalidChange(event_index));
-        }
-        let field = |name| {
-            fields
-                .iter()
-                .find_map(|(candidate, value)| (candidate == name).then_some(value))
-        };
-        let owner = field("owner")
-            .and_then(decode_event_bytes)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(DeepXDelegateAccountEventError::InvalidChange(event_index))?;
-        let delegate = field("delegate")
-            .and_then(decode_event_bytes)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or(DeepXDelegateAccountEventError::InvalidChange(event_index))?;
-        changes.push(DeepXFinalizedDelegateAccountChange {
-            block_hash,
-            block_number,
-            event_index,
-            extrinsic_index,
-            owner,
-            delegate,
-            kind,
-        });
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(DeepXDelegateAccountEventError::MalformedEventBytes);
-    }
-    Ok(changes)
+    sdk_decode_finalized_delegate_account_changes(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        event_bytes,
+    )
 }
 
 /// Binds a delegate setup or removal and successful dispatch to one finalized location.
@@ -862,55 +367,21 @@ fn verify_finalized_delegate_account_change_events_with_runtime(
     expected_delegate: [u8; 20],
     expected_kind: DeepXDelegateAccountChangeKind,
 ) -> Result<DeepXFinalizedDelegateAccountChange, DeepXDelegateAccountVerificationError> {
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let changes = decode_finalized_delegate_account_changes_with_runtime(
-        snapshot,
-        location.block_hash(),
-        location.block_number(),
+    sdk_verify_delegate_account_change(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXFinalizedEventLocation {
+            block_hash: location.block_hash(),
+            block_number: location.block_number(),
+            extrinsic_index: location.extrinsic_index(),
+        },
         event_bytes,
-    )?;
-    let mut change = None;
-    for candidate in changes {
-        if candidate.extrinsic_index != location.extrinsic_index() {
-            continue;
-        }
-        if candidate.owner != expected_owner
-            || candidate.delegate != expected_delegate
-            || candidate.kind != expected_kind
-        {
-            return Err(DeepXDelegateAccountVerificationError::ConflictingChange);
-        }
-        if change.replace(candidate).is_some() {
-            return Err(DeepXDelegateAccountVerificationError::Change);
-        }
-    }
-    let mut dispatch = None;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event =
-            event.map_err(|e| DeepXDelegateAccountVerificationError::Decode(Box::new(e)))?;
-        if event.phase() != Phase::ApplyExtrinsic(location.extrinsic_index())
-            || event.pallet_name() != "System"
-        {
-            continue;
-        }
-        let outcome = match event.variant_name() {
-            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-            _ => continue,
-        };
-        if dispatch.replace(outcome).is_some() {
-            return Err(DeepXDelegateAccountVerificationError::Dispatch);
-        }
-    }
-    if dispatch != Some(DeepXDispatchOutcome::Success) {
-        return Err(DeepXDelegateAccountVerificationError::Dispatch);
-    }
-    change.ok_or(DeepXDelegateAccountVerificationError::Change)
+        DeepXDelegateAccountExpected {
+            owner: expected_owner,
+            delegate: expected_delegate,
+            kind: expected_kind,
+        },
+    )
 }
 
 /// Decodes delegate mode changes from one complete finalized `System.Events` value.
@@ -941,86 +412,13 @@ fn decode_finalized_delegate_mode_changes_with_runtime(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedDelegateModeChange>, DeepXDelegateModeEventError> {
-    snapshot
-        .interfaces()
-        .event("Subaccount", "DelegateAccountModeUpdated")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXDelegateModeEventError::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut changes = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| DeepXDelegateModeEventError::Decode(Box::new(e)))?;
-        let event_index = count;
-        count = count
-            .checked_add(1)
-            .ok_or(DeepXDelegateModeEventError::MalformedEventBytes)?;
-        consumed = consumed
-            .checked_add(event.bytes().len())
-            .ok_or(DeepXDelegateModeEventError::MalformedEventBytes)?;
-        if event.pallet_name() != "Subaccount"
-            || event.variant_name() != "DelegateAccountModeUpdated"
-        {
-            continue;
-        }
-        let Phase::ApplyExtrinsic(extrinsic_index) = event.phase() else {
-            return Err(DeepXDelegateModeEventError::InvalidChange(event_index));
-        };
-        let fields = event
-            .field_values()
-            .map_err(|e| DeepXDelegateModeEventError::Decode(Box::new(e)))?;
-        let Composite::Named(fields) = fields else {
-            return Err(DeepXDelegateModeEventError::InvalidChange(event_index));
-        };
-        let field = |name| {
-            fields
-                .iter()
-                .find_map(|(candidate, value)| (candidate == name).then_some(value))
-        };
-        let parsed = (|| {
-            if fields.len() != 3 {
-                return None;
-            }
-            let owner = decode_event_bytes(field("owner")?)?.try_into().ok()?;
-            let delegate = decode_event_bytes(field("delegate")?)?.try_into().ok()?;
-            let mode = match decode_unit_variant(
-                field("new_mode")?,
-                &[
-                    "PlaceOrCancelOrder",
-                    "DepositOrWithdraw",
-                    "UpdateSubaccount",
-                    "Disable",
-                ],
-            )? {
-                "PlaceOrCancelOrder" => DeepXDelegateMode::PlaceOrCancelOrder,
-                "DepositOrWithdraw" => DeepXDelegateMode::DepositOrWithdraw,
-                "UpdateSubaccount" => DeepXDelegateMode::UpdateSubaccount,
-                "Disable" => DeepXDelegateMode::Disable,
-                _ => return None,
-            };
-            Some((owner, delegate, mode))
-        })()
-        .ok_or(DeepXDelegateModeEventError::InvalidChange(event_index))?;
-        changes.push(DeepXFinalizedDelegateModeChange {
-            block_hash,
-            block_number,
-            event_index,
-            extrinsic_index,
-            owner: parsed.0,
-            delegate: parsed.1,
-            mode: parsed.2,
-        });
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(DeepXDelegateModeEventError::MalformedEventBytes);
-    }
-    Ok(changes)
+    sdk_decode_finalized_delegate_mode_changes(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        block_hash,
+        block_number,
+        event_bytes,
+    )
 }
 
 /// Binds a mode change and successful dispatch to one finalized extrinsic location.
@@ -1059,54 +457,21 @@ fn verify_finalized_delegate_mode_change_events_with_runtime(
     expected_delegate: [u8; 20],
     expected_mode: DeepXDelegateMode,
 ) -> Result<DeepXFinalizedDelegateModeChange, DeepXDelegateModeVerificationError> {
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let changes = decode_finalized_delegate_mode_changes_with_runtime(
-        snapshot,
-        location.block_hash(),
-        location.block_number(),
+    sdk_verify_delegate_mode_change(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXFinalizedEventLocation {
+            block_hash: location.block_hash(),
+            block_number: location.block_number(),
+            extrinsic_index: location.extrinsic_index(),
+        },
         event_bytes,
-    )?;
-    let mut change = None;
-    for candidate in changes {
-        if candidate.extrinsic_index != location.extrinsic_index() {
-            continue;
-        }
-        if candidate.owner != expected_owner
-            || candidate.delegate != expected_delegate
-            || candidate.mode != expected_mode
-        {
-            return Err(DeepXDelegateModeVerificationError::ConflictingChange);
-        }
-        if change.replace(candidate).is_some() {
-            return Err(DeepXDelegateModeVerificationError::Change);
-        }
-    }
-    let mut dispatch = None;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| DeepXDelegateModeVerificationError::Decode(Box::new(e)))?;
-        if event.phase() != Phase::ApplyExtrinsic(location.extrinsic_index())
-            || event.pallet_name() != "System"
-        {
-            continue;
-        }
-        let outcome = match event.variant_name() {
-            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-            _ => continue,
-        };
-        if dispatch.replace(outcome).is_some() {
-            return Err(DeepXDelegateModeVerificationError::Dispatch);
-        }
-    }
-    if dispatch != Some(DeepXDispatchOutcome::Success) {
-        return Err(DeepXDelegateModeVerificationError::Dispatch);
-    }
-    change.ok_or(DeepXDelegateModeVerificationError::Change)
+        DeepXDelegateModeExpected {
+            owner: expected_owner,
+            delegate: expected_delegate,
+            mode: expected_mode,
+        },
+    )
 }
 
 /// Failures observing a delegate change at an exact finalized location.
@@ -1552,39 +917,13 @@ fn decode_finalized_perp_trade_events_with_metadata(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedPerpTrade>, DeepXPerpTradeEventError> {
-    interfaces.event("PerpMarket", "NewTrade")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXPerpTradeEventError::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut trades = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
-    for event in events.iter() {
-        let event = event.map_err(|e| DeepXPerpTradeEventError::Decode(Box::new(e)))?;
-        let event_index = count;
-        count = count
-            .checked_add(1)
-            .ok_or(DeepXPerpTradeEventError::MalformedEventBytes)?;
-        consumed = consumed
-            .checked_add(event.bytes().len())
-            .ok_or(DeepXPerpTradeEventError::MalformedEventBytes)?;
-        if event.pallet_name() != "PerpMarket" || event.variant_name() != "NewTrade" {
-            continue;
-        }
-        let fields = event
-            .field_values()
-            .map_err(|e| DeepXPerpTradeEventError::Decode(Box::new(e)))?;
-        let trade =
-            parse_finalized_perp_trade_fields(&fields, block_hash, block_number, event_index)
-                .ok_or(DeepXPerpTradeEventError::InvalidTrade(event_index))?;
-        trades.push(trade);
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(DeepXPerpTradeEventError::MalformedEventBytes);
-    }
-    Ok(trades)
+    deepx_rust_sdk::rpc::trade_event_decode::decode_finalized_perp_trade_events(
+        interfaces,
+        metadata,
+        block_hash,
+        block_number,
+        event_bytes,
+    )
 }
 
 /// Decodes Spot matches from one complete finalized `System.Events` value.
@@ -1617,39 +956,13 @@ fn decode_finalized_spot_trade_events_with_metadata(
     block_number: u64,
     event_bytes: &[u8],
 ) -> Result<Vec<DeepXFinalizedSpotTrade>, DeepXSpotTradeEventError> {
-    interfaces.event("SpotMarket", "OrderMatched")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXSpotTradeEventError::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut trades = Vec::new();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
-    for event in events.iter() {
-        let event = event.map_err(|e| DeepXSpotTradeEventError::Decode(Box::new(e)))?;
-        let event_index = count;
-        count = count
-            .checked_add(1)
-            .ok_or(DeepXSpotTradeEventError::MalformedEventBytes)?;
-        consumed = consumed
-            .checked_add(event.bytes().len())
-            .ok_or(DeepXSpotTradeEventError::MalformedEventBytes)?;
-        if event.pallet_name() != "SpotMarket" || event.variant_name() != "OrderMatched" {
-            continue;
-        }
-        let fields = event
-            .field_values()
-            .map_err(|e| DeepXSpotTradeEventError::Decode(Box::new(e)))?;
-        let trade =
-            parse_finalized_spot_trade_fields(&fields, block_hash, block_number, event_index)
-                .ok_or(DeepXSpotTradeEventError::InvalidTrade(event_index))?;
-        trades.push(trade);
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(DeepXSpotTradeEventError::MalformedEventBytes);
-    }
-    Ok(trades)
+    deepx_rust_sdk::rpc::trade_event_decode::decode_finalized_spot_trade_events(
+        interfaces,
+        metadata,
+        block_hash,
+        block_number,
+        event_bytes,
+    )
 }
 
 /// Failures observing historical perpetual executions at a finalized block.
@@ -1896,192 +1209,6 @@ pub async fn observe_finalized_spot_trades_at(
     Ok(trades)
 }
 
-fn parse_finalized_perp_trade_fields(
-    fields: &Composite<u32>,
-    block_hash: [u8; 32],
-    block_number: u64,
-    event_index: u32,
-) -> Option<DeepXFinalizedPerpTrade> {
-    let Composite::Named(fields) = fields else {
-        return None;
-    };
-    if fields.len() != 6 {
-        return None;
-    }
-    let field = |name| {
-        fields
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    let ScaleValue {
-        value: ValueDef::Composite(Composite::Named(trade)),
-        ..
-    } = field("trade")?
-    else {
-        return None;
-    };
-    if trade.len() != 11 {
-        return None;
-    }
-    let trade_field = |name| {
-        trade
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    let market_id = u16::try_from(trade_field("market_id")?.as_u128()?).ok()?;
-    let buyer_order_id = u64::try_from(trade_field("buyer_order_id")?.as_u128()?).ok()?;
-    let seller_order_id = u64::try_from(trade_field("seller_order_id")?.as_u128()?).ok()?;
-    let buyer = decode_event_bytes(trade_field("buyer")?)?.try_into().ok()?;
-    let seller = decode_event_bytes(trade_field("seller")?)?
-        .try_into()
-        .ok()?;
-    let price = trade_field("price")?.as_u128()?;
-    let size = trade_field("size")?.as_u128()?;
-    let buyer_leverage = u64::try_from(trade_field("buyer_leverage")?.as_u128()?).ok()?;
-    let seller_leverage = u64::try_from(trade_field("seller_leverage")?.as_u128()?).ok()?;
-    let created_at = u64::try_from(trade_field("created_at")?.as_u128()?).ok()?;
-    let filled_direction =
-        decode_unit_variant(trade_field("filled_direction")?, &["Long", "Short", "Both"])?;
-    let taker = decode_unit_variant(field("taker")?, &["Buyer", "Seller"])?;
-    let taker_fee = field("taker_fee")?.as_i128()?;
-    let maker_fee = field("maker_fee")?.as_i128()?;
-    let fee_asset = decode_event_bytes(field("taker_fee_asset")?)?;
-    if market_id == 0
-        || price == 0
-        || size == 0
-        || buyer_leverage == 0
-        || seller_leverage == 0
-        || created_at != block_number
-        || fee_asset.is_empty()
-        || decode_event_bytes(field("maker_fee_asset")?)? != fee_asset
-    {
-        return None;
-    }
-    Some(DeepXFinalizedPerpTrade {
-        block_hash,
-        block_number,
-        event_index,
-        market_id,
-        buyer_order_id,
-        buyer,
-        seller_order_id,
-        seller,
-        price,
-        size,
-        buyer_leverage,
-        seller_leverage,
-        filled_direction: filled_direction.to_string(),
-        taker: taker.to_string(),
-        taker_fee,
-        maker_fee,
-        fee_asset,
-    })
-}
-
-fn parse_finalized_spot_trade_fields(
-    fields: &Composite<u32>,
-    block_hash: [u8; 32],
-    block_number: u64,
-    event_index: u32,
-) -> Option<DeepXFinalizedSpotTrade> {
-    let Composite::Named(fields) = fields else {
-        return None;
-    };
-    if fields.len() != 13 {
-        return None;
-    }
-    let field = |name| {
-        fields
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    let pair = decode_event_bytes(field("pair")?)?.try_into().ok()?;
-    let buyer = decode_event_bytes(field("buyer")?)?.try_into().ok()?;
-    let seller = decode_event_bytes(field("seller")?)?.try_into().ok()?;
-    let buy_id = u64::try_from(field("buy_id")?.as_u128()?).ok()?;
-    let sell_id = u64::try_from(field("sell_id")?.as_u128()?).ok()?;
-    let trade_amount_u = decode_event_u256_le(field("trade_amount_u")?)?;
-    let trade_amount_b = decode_event_u256_le(field("trade_amount_b")?)?;
-    let price = decode_event_u256_le(field("price")?)?;
-    let taker = decode_unit_variant(field("taker")?, &["Buyer", "Seller"])?;
-    let taker_fee = field("taker_fee")?.as_i128()?;
-    let maker_fee = field("maker_fee")?.as_i128()?;
-    let taker_fee_asset = decode_event_bytes(field("taker_fee_asset")?)?;
-    let maker_fee_asset = decode_event_bytes(field("maker_fee_asset")?)?;
-    if pair == [0; 32]
-        || buyer == [0; 20]
-        || seller == [0; 20]
-        || trade_amount_u == [0; 32]
-        || trade_amount_b == [0; 32]
-        || price == [0; 32]
-        || taker_fee_asset.is_empty()
-        || maker_fee_asset.is_empty()
-    {
-        return None;
-    }
-    Some(DeepXFinalizedSpotTrade {
-        block_hash,
-        block_number,
-        event_index,
-        pair,
-        buyer,
-        buy_id,
-        seller,
-        sell_id,
-        trade_amount_u,
-        trade_amount_b,
-        taker: taker.to_string(),
-        taker_fee,
-        taker_fee_asset,
-        maker_fee,
-        maker_fee_asset,
-        price,
-    })
-}
-
-fn decode_event_u256_le(value: &ScaleValue<u32>) -> Option<[u8; 32]> {
-    let ValueDef::Composite(composite) = &value.value else {
-        return None;
-    };
-    let values: Vec<_> = composite.values().collect();
-    if values.len() == 1 {
-        return decode_event_u256_le(values[0]);
-    }
-    if values.len() != 4 {
-        return None;
-    }
-    let mut bytes = [0; 32];
-    for (index, value) in values.into_iter().enumerate() {
-        let limb = u64::try_from(value.as_u128()?).ok()?;
-        bytes[index * 8..(index + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    Some(bytes)
-}
-
-fn decode_event_bytes(value: &ScaleValue<u32>) -> Option<Vec<u8>> {
-    let ValueDef::Composite(bytes) = &value.value else {
-        return None;
-    };
-    let values: Vec<_> = bytes.values().collect();
-    if values.len() == 1 && values[0].as_u128().is_none() {
-        return decode_event_bytes(values[0]);
-    }
-    values
-        .into_iter()
-        .map(|value| u8::try_from(value.as_u128()?).ok())
-        .collect()
-}
-
-fn decode_unit_variant<'a>(value: &ScaleValue<u32>, allowed: &'a [&str]) -> Option<&'a str> {
-    let ValueDef::Variant(variant) = &value.value else {
-        return None;
-    };
-    allowed
-        .iter()
-        .copied()
-        .find(|name| variant.name == *name && variant.values.values().next().is_none())
-}
-
 /// Failures while binding perpetual placement events to an approved durable operation.
 #[derive(Debug, Error)]
 pub enum DeepXPerpPlaceEventVerificationError {
@@ -2146,7 +1273,19 @@ fn verify_perp_place_inclusion_events_with_runtime(
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
     use DeepXPerpPlaceEventVerificationError as Error;
-    let Some(DeepXTransactionOperation::PerpPlace { is_long, .. }) = identity.operation() else {
+    let Some(DeepXTransactionOperation::PerpPlace {
+        subaccount,
+        market_id,
+        is_long,
+        size,
+        price,
+        order_type,
+        take_profit,
+        stop_loss,
+        reduce_only,
+        post_only,
+    }) = identity.operation()
+    else {
         return Err(Error::UnsupportedOperation);
     };
     if identity.runtime() != &super::DeepXDirectRuntimeIdentity::from(snapshot.identity())
@@ -2165,15 +1304,54 @@ fn verify_perp_place_inclusion_events_with_runtime(
     if identity.order_side() != expected_side {
         return Err(Error::ConflictingEvent);
     }
-    verify_indexed_perp_events(
-        snapshot,
+    let super::DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce()
+    else {
+        return Err(Error::UnsupportedOperation);
+    };
+    let observed = decode_perp_place_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXPerpPlaceExpected {
+            params: crate::signing::DeepXPerpPlaceParams {
+                subaccount: *subaccount,
+                market_id: *market_id,
+                is_long: *is_long,
+                size: *size,
+                price: *price,
+                order_type: *order_type,
+                take_profit: *take_profit,
+                stop_loss: *stop_loss,
+                reduce_only: *reduce_only,
+                post_only: *post_only,
+            },
+            order_id,
+            block_number,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(|e| match e {
+        DeepXPerpPlaceEventError::RuntimeInterface(e) => Error::RuntimeInterface(e),
+        DeepXPerpPlaceEventError::Decode(e) => Error::Decode(e),
+        DeepXPerpPlaceEventError::MalformedEventBytes => Error::MalformedEventBytes,
+        DeepXPerpPlaceEventError::ConflictingEvent => Error::ConflictingEvent,
+        DeepXPerpPlaceEventError::DuplicateEvent => Error::DuplicateEvent,
+        DeepXPerpPlaceEventError::MissingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::MissingBusinessEvent)
+        }
+        DeepXPerpPlaceEventError::ConflictingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::ConflictingBusinessEvent)
+        }
+    })?;
+    Ok(DeepXInclusionEvidence {
         block_hash,
         block_number,
-        extrinsic_index,
-        event_bytes,
-        "OrderPlaced",
-        |fields| perp_place_fields_match(fields, identity, block_number),
-    )
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXPerpPlaceInclusionOutcome::Success => super::DeepXInclusionOutcome::Success,
+            DeepXPerpPlaceInclusionOutcome::Failed => super::DeepXInclusionOutcome::Failed,
+        },
+    })
 }
 
 /// Verifies TP/SL updates against exact durable points, including zero-to-`None` conversion.
@@ -2227,57 +1405,27 @@ fn verify_perp_profit_and_loss_point_inclusion_events_with_runtime(
     {
         return Err(DeepXPerpProfitAndLossPointEventVerificationError::UnsupportedOperation);
     }
-    verify_indexed_perp_events(
-        snapshot,
+    let observed = decode_perp_point_update_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXPerpPointUpdateExpected {
+            params: crate::signing::DeepXPerpProfitAndLossPointParams {
+                subaccount: *subaccount,
+                market_id: *market_id,
+                take_profit_point: *take_profit_point,
+                stop_loss_point: *stop_loss_point,
+            },
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(map_perp_position_event_error)
+    .map_err(DeepXPerpProfitAndLossPointEventVerificationError::IndexedEvents)?;
+    Ok(perp_position_inclusion_evidence(
         block_hash,
         block_number,
-        extrinsic_index,
-        event_bytes,
-        "PositionUpdated",
-        |fields| {
-            let Composite::Named(fields) = fields else {
-                return false;
-            };
-            let field = |name| {
-                fields
-                    .iter()
-                    .find_map(|(key, value)| (key == name).then_some(value))
-            };
-            if fields.len() != 4
-                || !field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
-                || field("market_id").and_then(ScaleValue::as_u128) != Some(u128::from(*market_id))
-                || field("pnl").and_then(ScaleValue::as_i128) != Some(0)
-            {
-                return false;
-            }
-            let Some(ScaleValue {
-                value: ValueDef::Composite(Composite::Named(pos)),
-                ..
-            }) = field("pos")
-            else {
-                return false;
-            };
-            let field = |name| {
-                pos.iter()
-                    .find_map(|(key, value)| (key == name).then_some(value))
-            };
-            field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
-                && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
-                && field("take_profit").is_some_and(|v| {
-                    value_matches_optional_u128(
-                        v,
-                        (*take_profit_point != 0).then_some(*take_profit_point),
-                    )
-                })
-                && field("stop_loss").is_some_and(|v| {
-                    value_matches_optional_u128(
-                        v,
-                        (*stop_loss_point != 0).then_some(*stop_loss_point),
-                    )
-                })
-        },
-    )
-    .map_err(DeepXPerpProfitAndLossPointEventVerificationError::IndexedEvents)
+        observed,
+    ))
 }
 
 /// Failures binding TP/SL position updates to a durable operation.
@@ -2291,167 +1439,37 @@ pub enum DeepXPerpProfitAndLossPointEventVerificationError {
     IndexedEvents(#[source] DeepXPerpPlaceEventVerificationError),
 }
 
-fn verify_indexed_perp_events(
-    snapshot: &impl RuntimeMetadataView,
+fn perp_position_inclusion_evidence(
     block_hash: [u8; 32],
     block_number: u64,
-    extrinsic_index: u32,
-    event_bytes: &[u8],
-    event_name: &str,
-    fields_match: impl Fn(&Composite<u32>) -> bool,
-) -> Result<DeepXInclusionEvidence, DeepXPerpPlaceEventVerificationError> {
-    use DeepXPerpPlaceEventVerificationError as Error;
-    snapshot.interfaces().event("PerpMarket", event_name)?;
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| Error::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut dispatch = None;
-    let mut matched = false;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| Error::Decode(Box::new(e)))?;
-        count += 1;
-        consumed += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
-            continue;
-        }
-        if event.pallet_name() == "System" {
-            let outcome = match event.variant_name() {
-                "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-                "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-                _ => continue,
-            };
-            if dispatch.replace(outcome).is_some() {
-                return Err(Error::DuplicateEvent);
-            }
-        } else if event.pallet_name() == "PerpMarket" && event.variant_name() == event_name {
-            let fields = event
-                .field_values()
-                .map_err(|e| Error::Decode(Box::new(e)))?;
-            if !fields_match(&fields) {
-                return Err(Error::ConflictingEvent);
-            }
-            if matched {
-                return Err(Error::DuplicateEvent);
-            }
-            matched = true;
-        }
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(Error::MalformedEventBytes);
-    }
-    Ok(DeepXInclusionEvidence::from_indexed_observations(
+    observed: deepx_rust_sdk::rpc::perp_position::DeepXPerpPositionInclusionEvidence,
+) -> DeepXInclusionEvidence {
+    DeepXInclusionEvidence {
         block_hash,
         block_number,
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: dispatch.ok_or(Error::MalformedEventBytes)?,
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXPerpPositionInclusionOutcome::Success => super::DeepXInclusionOutcome::Success,
+            DeepXPerpPositionInclusionOutcome::Failed => super::DeepXInclusionOutcome::Failed,
         },
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: if matched {
-                DeepXBusinessEventOutcome::Success
-            } else {
-                DeepXBusinessEventOutcome::NotObserved
-            },
-        },
-    )?)
-}
-
-fn perp_place_fields_match(
-    fields: &Composite<u32>,
-    identity: &DeepXTransactionIdentity,
-    block_number: u64,
-) -> bool {
-    let Some(DeepXTransactionOperation::PerpPlace {
-        subaccount,
-        market_id,
-        is_long,
-        size,
-        price,
-        order_type,
-        take_profit,
-        stop_loss,
-        reduce_only,
-        post_only,
-    }) = identity.operation()
-    else {
-        return false;
-    };
-    let super::DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce()
-    else {
-        return false;
-    };
-    let Composite::Named(fields) = fields else {
-        return false;
-    };
-    let field = |name| {
-        fields
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    if fields.len() != 2
-        || field("order_id").and_then(ScaleValue::as_u128) != Some(u128::from(order_id))
-    {
-        return false;
     }
-    let Some(ScaleValue {
-        value: ValueDef::Composite(Composite::Named(order)),
-        ..
-    }) = field("order")
-    else {
-        return false;
-    };
-    let field = |name| {
-        order
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    let spot_order_type = match order_type {
-        crate::signing::DeepXPerpOrderType::Limit(tif) => {
-            crate::signing::DeepXSpotOrderType::Limit(*tif)
-        }
-        crate::signing::DeepXPerpOrderType::Market(slippage) => {
-            crate::signing::DeepXSpotOrderType::Market(*slippage)
-        }
-        crate::signing::DeepXPerpOrderType::Stop => return false,
-    };
-    order.len() == 16
-        && field("order_id").and_then(ScaleValue::as_u128) == Some(u128::from(order_id))
-        && field("owner").is_some_and(|value| value_matches_bytes(value, subaccount))
-        && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
-        && field("is_long").and_then(ScaleValue::as_bool) == Some(*is_long)
-        && field("size").and_then(ScaleValue::as_u128) == Some(*size)
-        && field("price").and_then(ScaleValue::as_u128).is_some_and(|actual| matches!(order_type, crate::signing::DeepXPerpOrderType::Market(_)) || actual == *price)
-        && field("order_type").is_some_and(|value| value_matches_order_type(value, spot_order_type))
-        && field("take_profit").is_some_and(|value| value_matches_optional_u128(value, *take_profit))
-        && field("stop_loss").is_some_and(|value| value_matches_optional_u128(value, *stop_loss))
-        && field("reduce_only").and_then(ScaleValue::as_bool) == Some(*reduce_only)
-        && field("post_only").is_some_and(|value| value_matches_post_only(value, *post_only))
-        && field("create_time").and_then(ScaleValue::as_u128) == Some(u128::from(block_number))
-        && field("leverage").and_then(ScaleValue::as_u128).is_some()
-        && field("status").is_some_and(|value| matches!(&value.value, ValueDef::Variant(variant) if variant.name == "Open" && variant.values.values().next().is_none()))
-        && field("size_filled").and_then(ScaleValue::as_u128) == Some(0)
-        && field("size_remain").and_then(ScaleValue::as_u128) == Some(*size)
 }
 
-fn value_matches_optional_u128(value: &ScaleValue<u32>, expected: Option<u128>) -> bool {
-    let ValueDef::Variant(variant) = &value.value else {
-        return false;
-    };
-    let values: Vec<_> = variant.values.values().collect();
-    match expected {
-        None => variant.name == "None" && values.is_empty(),
-        Some(expected) => {
-            variant.name == "Some" && values.len() == 1 && values[0].as_u128() == Some(expected)
+fn map_perp_position_event_error(
+    error: DeepXPerpPositionEventError,
+) -> DeepXPerpPlaceEventVerificationError {
+    use DeepXPerpPlaceEventVerificationError as Error;
+    match error {
+        DeepXPerpPositionEventError::RuntimeInterface(e) => Error::RuntimeInterface(e),
+        DeepXPerpPositionEventError::Decode(e) => Error::Decode(e),
+        DeepXPerpPositionEventError::MalformedEventBytes => Error::MalformedEventBytes,
+        DeepXPerpPositionEventError::ConflictingEvent => Error::ConflictingEvent,
+        DeepXPerpPositionEventError::DuplicateEvent => Error::DuplicateEvent,
+        DeepXPerpPositionEventError::MissingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::MissingBusinessEvent)
+        }
+        DeepXPerpPositionEventError::ConflictingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::ConflictingBusinessEvent)
         }
     }
 }
@@ -2508,36 +1526,28 @@ fn verify_perp_close_inclusion_events_with_runtime(
     {
         return Err(DeepXPerpCloseEventVerificationError::UnsupportedOperation);
     }
-    verify_indexed_perp_events(snapshot, block_hash, block_number, extrinsic_index, event_bytes,
-        "OrderPlaced", |fields| {
-            let Composite::Named(outer) = fields else { return false; };
-            let field = |name| outer.iter().find_map(|(key, value)| (key == name).then_some(value));
-            let Some(order_id) = field("order_id").and_then(ScaleValue::as_u128).filter(|id| *id <= u128::from(u64::MAX)) else { return false; };
-            let Some(ScaleValue { value: ValueDef::Composite(Composite::Named(order)), .. }) = field("order") else { return false; };
-            let field = |name| order.iter().find_map(|(key, value)| (key == name).then_some(value));
-            let Some(is_long) = field("is_long").and_then(ScaleValue::as_bool) else { return false; };
-            let Some(size) = field("size").and_then(ScaleValue::as_u128).filter(|size| *size > 0) else { return false; };
-            let Some(leverage) = field("leverage").and_then(ScaleValue::as_u128).filter(|leverage| *leverage > 0) else { return false; };
-            outer.len() == 2 && order.len() == 16
-                && field("order_id").and_then(ScaleValue::as_u128) == Some(order_id)
-                && field("owner").is_some_and(|v| value_matches_bytes(v, subaccount))
-                && field("market_id").and_then(ScaleValue::as_u128) == Some(u128::from(*market_id))
-                && field("is_long").and_then(ScaleValue::as_bool) == Some(is_long)
-                && field("size").and_then(ScaleValue::as_u128) == Some(size)
-                && field("size_remain").and_then(ScaleValue::as_u128) == Some(size)
-                && field("size_filled").and_then(ScaleValue::as_u128) == Some(0)
-                && field("create_time").and_then(ScaleValue::as_u128) == Some(u128::from(block_number))
-                && field("leverage").and_then(ScaleValue::as_u128) == Some(leverage)
-                && field("price").and_then(ScaleValue::as_u128).is_some_and(|actual| *price == 0 || actual == *price)
-                && field("order_type").is_some_and(|v| if *price == 0 {
-                    value_matches_order_type(v, crate::signing::DeepXSpotOrderType::Market(*slippage))
-                } else { matches!(&v.value, ValueDef::Variant(variant) if variant.name == "Stop" && variant.values.values().next().is_none()) })
-                && field("status").is_some_and(|v| matches!(&v.value, ValueDef::Variant(variant) if variant.name == "Open" && variant.values.values().next().is_none()))
-                && field("reduce_only").and_then(ScaleValue::as_bool) == Some(true)
-                && field("post_only").is_some_and(|v| value_matches_post_only(v, crate::signing::DeepXPostOnlyParam::None))
-                && field("take_profit").is_some_and(|v| value_matches_optional_u128(v, None))
-                && field("stop_loss").is_some_and(|v| value_matches_optional_u128(v, None))
-        }).map_err(DeepXPerpCloseEventVerificationError::IndexedEvents)
+    let observed = decode_perp_close_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXPerpCloseExpected {
+            params: crate::signing::DeepXPerpCloseParams {
+                subaccount: *subaccount,
+                market_id: *market_id,
+                price: *price,
+                slippage: *slippage,
+            },
+            block_number,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(map_perp_position_event_error)
+    .map_err(DeepXPerpCloseEventVerificationError::IndexedEvents)?;
+    Ok(perp_position_inclusion_evidence(
+        block_hash,
+        block_number,
+        observed,
+    ))
 }
 
 /// Failures binding a generated close order to durable call terms.
@@ -2635,94 +1645,47 @@ fn verify_spot_place_inclusion_events_with_runtime(
     if identity.order_side() != expected_side {
         return Err(Error::ConflictingEvent);
     }
-    let event_name = if *is_buy {
-        "StateOrderBuy"
-    } else {
-        "StateOrderSell"
-    };
-    snapshot.interfaces().event("SpotMarket", event_name)?;
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| Error::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut dispatch = None;
-    let mut matched = false;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| Error::Decode(Box::new(e)))?;
-        count += 1;
-        consumed += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
-            continue;
+    let observed = decode_spot_place_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXSpotPlaceExpected {
+            params: DeepXSpotPlaceParams {
+                subaccount: *subaccount,
+                pair: *pair,
+                is_buy: *is_buy,
+                quote_amount: *quote_amount,
+                base_amount: *base_amount,
+                order_type: *order_type,
+                post_only: *post_only,
+                reduce_only: *reduce_only,
+            },
+            order_id,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(|e| match e {
+        DeepXSpotPlaceEventError::RuntimeInterface(e) => Error::RuntimeInterface(e),
+        DeepXSpotPlaceEventError::Decode(e) => Error::Decode(e),
+        DeepXSpotPlaceEventError::MalformedEventBytes => Error::MalformedEventBytes,
+        DeepXSpotPlaceEventError::ConflictingEvent => Error::ConflictingEvent,
+        DeepXSpotPlaceEventError::DuplicateEvent => Error::DuplicateEvent,
+        DeepXSpotPlaceEventError::MissingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::MissingBusinessEvent)
         }
-        if event.pallet_name() == "System" {
-            let outcome = match event.variant_name() {
-                "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-                "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-                _ => continue,
-            };
-            if dispatch.replace(outcome).is_some() {
-                return Err(Error::DuplicateEvent);
-            }
-        } else if event.pallet_name() == "SpotMarket" && event.variant_name() == event_name {
-            let fields = event
-                .field_values()
-                .map_err(|e| Error::Decode(Box::new(e)))?;
-            let Composite::Named(fields) = fields else {
-                return Err(Error::ConflictingEvent);
-            };
-            if fields.len() != 1
-                || !fields.iter().any(|(name, order)| {
-                    name == "order"
-                        && spot_place_order_matches(
-                            order,
-                            *subaccount,
-                            *pair,
-                            order_id,
-                            *quote_amount,
-                            *base_amount,
-                            *order_type,
-                            *post_only,
-                            *reduce_only,
-                            *is_buy,
-                        )
-                })
-            {
-                return Err(Error::ConflictingEvent);
-            }
-            if matched {
-                return Err(Error::DuplicateEvent);
-            }
-            matched = true;
+        DeepXSpotPlaceEventError::ConflictingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::ConflictingBusinessEvent)
         }
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(Error::MalformedEventBytes);
-    }
-    Ok(DeepXInclusionEvidence::from_indexed_observations(
+    })?;
+    Ok(DeepXInclusionEvidence {
         block_hash,
         block_number,
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: dispatch.ok_or(Error::MalformedEventBytes)?,
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXSpotPlaceInclusionOutcome::Success => super::DeepXInclusionOutcome::Success,
+            DeepXSpotPlaceInclusionOutcome::Failed => super::DeepXInclusionOutcome::Failed,
         },
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: if matched {
-                DeepXBusinessEventOutcome::Success
-            } else {
-                DeepXBusinessEventOutcome::NotObserved
-            },
-        },
-    )?)
+    })
 }
 
 /// Errors raised while verifying offline Spot cancellation event evidence.
@@ -2799,86 +1762,40 @@ fn verify_spot_cancel_inclusion_events_with_runtime(
     if *fast_cancel {
         return Err(Error::FastCancelUnsupported);
     }
-    snapshot
-        .interfaces()
-        .event("SpotMarket", "OrderCancelled")?;
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| Error::MalformedEventBytes)?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut dispatch = None;
-    let mut matched = false;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event = event.map_err(|e| Error::Decode(Box::new(e)))?;
-        count += 1;
-        consumed += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
-            continue;
+    let observed = decode_spot_cancel_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXSpotCancelExpected {
+            subaccount: *subaccount,
+            pair: *pair,
+            order_id: *order_id,
+            is_buy: *is_buy,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(|e| match e {
+        DeepXSpotCancelEventError::RuntimeInterface(e) => Error::RuntimeInterface(e),
+        DeepXSpotCancelEventError::Decode(e) => Error::Decode(e),
+        DeepXSpotCancelEventError::MalformedEventBytes => Error::MalformedEventBytes,
+        DeepXSpotCancelEventError::ConflictingEvent => Error::ConflictingEvent,
+        DeepXSpotCancelEventError::DuplicateEvent => Error::DuplicateEvent,
+        DeepXSpotCancelEventError::MissingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::MissingBusinessEvent)
         }
-        if event.pallet_name() == "System" {
-            let outcome = match event.variant_name() {
-                "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-                "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-                _ => continue,
-            };
-            if dispatch.replace(outcome).is_some() {
-                return Err(Error::DuplicateEvent);
-            }
-        } else if event.pallet_name() == "SpotMarket" && event.variant_name() == "OrderCancelled" {
-            let fields = event
-                .field_values()
-                .map_err(|e| Error::Decode(Box::new(e)))?;
-            let Composite::Named(fields) = fields else {
-                return Err(Error::ConflictingEvent);
-            };
-            let field = |name| {
-                fields
-                    .iter()
-                    .find_map(|(candidate, value)| (candidate == name).then_some(value))
-            };
-            if fields.len() != 5
-                || !field("pair").is_some_and(|value| value_matches_bytes(value, pair))
-                || !field("maker").is_some_and(|value| value_matches_bytes(value, subaccount))
-                || field("order_id").and_then(ScaleValue::as_u128) != Some(u128::from(*order_id))
-                || field("is_buy").and_then(ScaleValue::as_bool) != Some(*is_buy)
-                || !field("reason").is_some_and(|value| matches!(&value.value,
-                    ValueDef::Variant(reason) if reason.name == "UserCanceled" && reason.values.values().next().is_none()))
-            {
-                return Err(Error::ConflictingEvent);
-            }
-            if matched {
-                return Err(Error::DuplicateEvent);
-            }
-            matched = true;
+        DeepXSpotCancelEventError::ConflictingBusinessEvent => {
+            Error::InclusionEvidence(DeepXInclusionEvidenceError::ConflictingBusinessEvent)
         }
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(Error::MalformedEventBytes);
-    }
-    Ok(DeepXInclusionEvidence::from_indexed_observations(
+    })?;
+    Ok(DeepXInclusionEvidence {
         block_hash,
         block_number,
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: dispatch.ok_or(Error::MalformedEventBytes)?,
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXSpotCancelInclusionOutcome::Success => super::DeepXInclusionOutcome::Success,
+            DeepXSpotCancelInclusionOutcome::Failed => super::DeepXInclusionOutcome::Failed,
         },
-        DeepXIndexedOutcome {
-            extrinsic_index,
-            outcome: if matched {
-                DeepXBusinessEventOutcome::Success
-            } else {
-                DeepXBusinessEventOutcome::NotObserved
-            },
-        },
-    )?)
+    })
 }
 
 /// Errors raised while verifying a perpetual cancellation from runtime event evidence.
@@ -3085,51 +2002,7 @@ fn verify_perp_modify_inclusion_events_with_runtime(
     Ok(cancel_evidence)
 }
 
-pub(crate) fn perp_modify_sizing_event_supported(
-    metadata: &subxt_core::metadata::Metadata,
-) -> bool {
-    let Some(event) = metadata
-        .pallet_by_name("Subaccount")
-        .and_then(|pallet| pallet.event_variants())
-        .and_then(|variants| {
-            variants
-                .iter()
-                .find(|variant| variant.name == "PerpOrderModified")
-        })
-    else {
-        return false;
-    };
-    let expected = [
-        "subaccount",
-        "old_order_id",
-        "filled_size",
-        "target_size",
-        "replacement_size",
-        "new_order_id",
-    ];
-    event.fields.len() == expected.len()
-        && event
-            .fields
-            .iter()
-            .zip(expected)
-            .all(|(field, name)| field.name.as_deref() == Some(name))
-        && event
-            .fields
-            .iter()
-            .enumerate()
-            .skip(1)
-            .all(|(index, field)| {
-                let expected_type = if index == 1 || index == 5 {
-                    TypeDefPrimitive::U64
-                } else {
-                    TypeDefPrimitive::U128
-                };
-                matches!(
-                    metadata.types().resolve(field.ty.id).map(|ty| &ty.type_def),
-                    Some(TypeDef::Primitive(primitive)) if *primitive == expected_type
-                )
-            })
-}
+pub(crate) use deepx_rust_sdk::rpc::perp_modify::perp_modify_sizing_event_supported;
 
 fn verify_perp_modify_sizing_event(
     metadata: &subxt_core::metadata::Metadata,
@@ -3154,57 +2027,23 @@ fn verify_perp_modify_sizing_event(
     else {
         return Err(Error::UnsupportedOperation);
     };
-    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
-    let mut evidence = None;
-    for event in events.iter() {
-        let event = event.map_err(|_| Error::MalformedEventBytes)?;
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
-            || event.pallet_name() != "Subaccount"
-            || event.variant_name() != "PerpOrderModified"
-        {
-            continue;
-        }
-        if evidence.is_some() {
-            return Err(Error::ConflictingEvidence);
-        }
-        let fields = event
-            .field_values()
-            .map_err(|_| Error::MalformedEventBytes)?;
-        let Composite::Named(fields) = fields else {
-            return Err(Error::MalformedEventBytes);
-        };
-        let field = |name| {
-            fields
-                .iter()
-                .find_map(|(candidate, value)| (candidate == name).then_some(value))
-        };
-        let Some(filled_size) = field("filled_size").and_then(ScaleValue::as_u128) else {
-            return Err(Error::MalformedEventBytes);
-        };
-        let Some(event_target_size) = field("target_size").and_then(ScaleValue::as_u128) else {
-            return Err(Error::MalformedEventBytes);
-        };
-        let Some(replacement_size) = field("replacement_size").and_then(ScaleValue::as_u128) else {
-            return Err(Error::MalformedEventBytes);
-        };
-        let Some(old_order_id) = field("old_order_id").and_then(ScaleValue::as_u128) else {
-            return Err(Error::MalformedEventBytes);
-        };
-        let Some(new_order_id) = field("new_order_id").and_then(ScaleValue::as_u128) else {
-            return Err(Error::MalformedEventBytes);
-        };
-        if !field("subaccount").is_some_and(|value| value_matches_bytes(value, subaccount))
-            || old_order_id != u128::from(*cancel_order_id)
-            || event_target_size != *target_size
-            || new_order_id != u128::from(expected_new_order_id)
-            || target_size.checked_sub(filled_size) != Some(replacement_size)
-            || replacement_size == 0
-        {
-            return Err(Error::ConflictingEvidence);
-        }
-        evidence = Some(replacement_size);
-    }
-    evidence.ok_or(Error::ConflictingEvidence)
+    decode_perp_modify_sizing_event(
+        metadata,
+        DeepXPerpModifySizingExpected {
+            subaccount: *subaccount,
+            old_order_id: *cancel_order_id,
+            target_size: *target_size,
+            new_order_id: expected_new_order_id,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map(|evidence| evidence.replacement_size)
+    .map_err(|e| match e {
+        DeepXPerpModifyEventError::UnsupportedRuntime => Error::UnsupportedOperation,
+        DeepXPerpModifyEventError::MalformedEventBytes => Error::MalformedEventBytes,
+        DeepXPerpModifyEventError::ConflictingEvidence => Error::ConflictingEvidence,
+    })
 }
 
 fn perp_modify_events_are_ordered(
@@ -3212,38 +2051,9 @@ fn perp_modify_events_are_ordered(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<bool, DeepXPerpModifyEventVerificationError> {
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    let mut cancel_position = None;
-    let mut place_position = None;
-    let mut modify_position = None;
-    for (position, event) in events.iter().enumerate() {
-        let event =
-            event.map_err(|_| DeepXPerpModifyEventVerificationError::MalformedEventBytes)?;
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index) {
-            continue;
-        }
-        if event.pallet_name() == "Subaccount" && event.variant_name() == "PerpOrderModified" {
-            modify_position = Some(position);
-            continue;
-        }
-        if event.pallet_name() != "PerpMarket" {
-            continue;
-        }
-        match event.variant_name() {
-            "OrderCancelled" => cancel_position = Some(position),
-            "OrderPlaced" => place_position = Some(position),
-            _ => {}
-        }
-    }
-    Ok(cancel_position
-        .zip(place_position)
-        .is_some_and(|(cancel, place)| cancel < place)
-        && place_position
-            .zip(modify_position)
-            .is_some_and(|(place, modify)| place < modify))
+    decode_perp_modify_event_order(snapshot.metadata(), extrinsic_index, event_bytes)
+        .map(|order| order == DeepXPerpModifyEventOrder::Ordered)
+        .map_err(|_| DeepXPerpModifyEventVerificationError::MalformedEventBytes)
 }
 
 /// Verifies the expected business event for one durable perpetual cancel operation.
@@ -3286,53 +2096,42 @@ fn verify_perp_cancel_business_event_with_runtime(
     if *fast_cancel {
         return Err(DeepXPerpCancelEventVerificationError::FastCancelUnsupported);
     }
-
-    let mut remaining = event_bytes;
-    let declared_count = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXPerpCancelEventVerificationError::MalformedEventBytes)?
-        .0;
-    let prefix_len = event_bytes.len() - remaining.len();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    let mut matched = false;
-    let mut decoded_count = 0_u32;
-    let mut consumed_len = prefix_len;
-    for event in events.iter() {
-        let event =
-            event.map_err(|e| DeepXPerpCancelEventVerificationError::Decode(Box::new(e)))?;
-        decoded_count += 1;
-        consumed_len += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
-            || event.pallet_name() != "PerpMarket"
-            || event.variant_name() != "OrderCancelled"
-        {
-            continue;
-        }
-        let fields = event
-            .field_values()
-            .map_err(|e| DeepXPerpCancelEventVerificationError::Decode(Box::new(e)))?;
-        if !perp_cancel_fields_match(&fields, *subaccount, *order_id) {
-            return Err(DeepXPerpCancelEventVerificationError::ConflictingEvent);
-        }
-        if matched {
-            return Err(DeepXPerpCancelEventVerificationError::DuplicateEvent);
-        }
-        matched = true;
-    }
-    if decoded_count != declared_count || consumed_len != event_bytes.len() {
-        return Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes);
-    }
-
+    let observed = decode_perp_cancel_business_event(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXPerpCancelExpected {
+            subaccount: *subaccount,
+            order_id: *order_id,
+            extrinsic_index,
+        },
+        event_bytes,
+    )
+    .map_err(map_perp_cancel_business_error)?;
     Ok(DeepXIndexedOutcome {
-        extrinsic_index,
-        outcome: if matched {
-            DeepXBusinessEventOutcome::Success
-        } else {
-            DeepXBusinessEventOutcome::NotObserved
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXPerpCancelBusinessOutcome::Success => DeepXBusinessEventOutcome::Success,
+            DeepXPerpCancelBusinessOutcome::NotObserved => DeepXBusinessEventOutcome::NotObserved,
         },
     })
+}
+
+fn map_perp_cancel_business_error(
+    e: DeepXPerpCancelEventError,
+) -> DeepXPerpCancelEventVerificationError {
+    match e {
+        DeepXPerpCancelEventError::RuntimeInterface(e) => e.into(),
+        DeepXPerpCancelEventError::Decode(e) => DeepXPerpCancelEventVerificationError::Decode(e),
+        DeepXPerpCancelEventError::MalformedEventBytes => {
+            DeepXPerpCancelEventVerificationError::MalformedEventBytes
+        }
+        DeepXPerpCancelEventError::ConflictingEvent => {
+            DeepXPerpCancelEventVerificationError::ConflictingEvent
+        }
+        DeepXPerpCancelEventError::DuplicateEvent => {
+            DeepXPerpCancelEventVerificationError::DuplicateEvent
+        }
+    }
 }
 
 fn verify_perp_cancel_inclusion_events(
@@ -3361,223 +2160,57 @@ fn verify_perp_cancel_inclusion_events_with_runtime(
     extrinsic_index: u32,
     event_bytes: &[u8],
 ) -> Result<DeepXInclusionEvidence, DeepXPerpCancelEventVerificationError> {
-    let Some(DeepXTransactionOperation::PerpCancel { fast_cancel, .. }) = identity.operation()
+    let Some(DeepXTransactionOperation::PerpCancel {
+        subaccount,
+        order_id,
+        fast_cancel,
+        ..
+    }) = identity.operation()
     else {
         return Err(DeepXPerpCancelEventVerificationError::UnsupportedOperation);
     };
-    snapshot.interfaces().event("System", "ExtrinsicSuccess")?;
-    snapshot.interfaces().event("System", "ExtrinsicFailed")?;
-
-    let mut remaining = event_bytes;
-    let declared_count = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXPerpCancelEventVerificationError::MalformedEventBytes)?
-        .0;
-    let prefix_len = event_bytes.len() - remaining.len();
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    let mut dispatch = None;
-    let mut decoded_count = 0_u32;
-    let mut consumed_len = prefix_len;
-    for event in events.iter() {
-        let event =
-            event.map_err(|e| DeepXPerpCancelEventVerificationError::Decode(Box::new(e)))?;
-        decoded_count += 1;
-        consumed_len += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(extrinsic_index)
-            || event.pallet_name() != "System"
-        {
-            continue;
-        }
-        let outcome = match event.variant_name() {
-            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-            _ => continue,
-        };
-        if dispatch.replace(outcome).is_some() {
-            return Err(DeepXPerpCancelEventVerificationError::DuplicateEvent);
-        }
-    }
-    if decoded_count != declared_count || consumed_len != event_bytes.len() {
-        return Err(DeepXPerpCancelEventVerificationError::MalformedEventBytes);
-    }
-    let dispatch = DeepXIndexedOutcome {
-        extrinsic_index,
-        outcome: dispatch.ok_or(DeepXPerpCancelEventVerificationError::MalformedEventBytes)?,
-    };
-    if *fast_cancel {
-        return Ok(DeepXInclusionEvidence {
-            block_hash,
-            block_number,
+    let observed = decode_perp_cancel_inclusion(
+        snapshot.interfaces(),
+        snapshot.metadata(),
+        DeepXPerpCancelExpected {
+            subaccount: *subaccount,
+            order_id: *order_id,
             extrinsic_index,
-            outcome: match dispatch.outcome {
-                DeepXDispatchOutcome::Success => super::DeepXInclusionOutcome::Success,
-                DeepXDispatchOutcome::Failed => super::DeepXInclusionOutcome::Failed,
-            },
-        });
-    }
-    let business_event = verify_perp_cancel_business_event_with_runtime(
-        snapshot,
-        identity,
-        extrinsic_index,
+        },
+        *fast_cancel,
         event_bytes,
-    )?;
-    Ok(DeepXInclusionEvidence::from_indexed_observations(
+    )
+    .map_err(|e| match e {
+        DeepXPerpCancelInclusionError::RuntimeInterface(e) => e.into(),
+        DeepXPerpCancelInclusionError::Dispatch(e) => match e {
+            DeepXIndexedSystemDispatchError::Decode(e) => {
+                DeepXPerpCancelEventVerificationError::Decode(e)
+            }
+            DeepXIndexedSystemDispatchError::MalformedEventBytes
+            | DeepXIndexedSystemDispatchError::MissingEvent => {
+                DeepXPerpCancelEventVerificationError::MalformedEventBytes
+            }
+            DeepXIndexedSystemDispatchError::DuplicateEvent => {
+                DeepXPerpCancelEventVerificationError::DuplicateEvent
+            }
+        },
+        DeepXPerpCancelInclusionError::BusinessEvent(e) => map_perp_cancel_business_error(e),
+        DeepXPerpCancelInclusionError::MissingBusinessEvent => {
+            DeepXInclusionEvidenceError::MissingBusinessEvent.into()
+        }
+        DeepXPerpCancelInclusionError::ConflictingBusinessEvent => {
+            DeepXInclusionEvidenceError::ConflictingBusinessEvent.into()
+        }
+    })?;
+    Ok(DeepXInclusionEvidence {
         block_hash,
         block_number,
-        dispatch,
-        business_event,
-    )?)
-}
-
-fn perp_cancel_fields_match(
-    fields: &Composite<u32>,
-    expected_subaccount: [u8; 20],
-    expected_order_id: u64,
-) -> bool {
-    let Composite::Named(fields) = fields else {
-        return false;
-    };
-    let field = |name| {
-        fields
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    field("user").is_some_and(|value| value_matches_bytes(value, &expected_subaccount))
-        && field("order_id").and_then(ScaleValue::as_u128) == Some(u128::from(expected_order_id))
-        && field("reason").is_some_and(|value| {
-            matches!(&value.value, ValueDef::Variant(reason) if reason.name == "UserCanceled")
-        })
-}
-
-fn value_matches_bytes(value: &ScaleValue<u32>, expected: &[u8]) -> bool {
-    let ValueDef::Composite(bytes) = &value.value else {
-        return false;
-    };
-    let values: Vec<_> = bytes.values().collect();
-    if values.len() == 1 {
-        return value_matches_bytes(values[0], expected);
-    }
-    values.into_iter().map(ScaleValue::as_u128).eq(expected
-        .iter()
-        .copied()
-        .map(u128::from)
-        .map(Some))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spot_place_order_matches(
-    value: &ScaleValue<u32>,
-    subaccount: [u8; 20],
-    pair: [u8; 32],
-    order_id: u64,
-    quote_amount: [u8; 32],
-    base_amount: [u8; 32],
-    order_type: crate::signing::DeepXSpotOrderType,
-    post_only: crate::signing::DeepXPostOnlyParam,
-    reduce_only: bool,
-    is_buy: bool,
-) -> bool {
-    let ValueDef::Composite(Composite::Named(fields)) = &value.value else {
-        return false;
-    };
-    let field = |name| {
-        fields
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(value))
-    };
-    fields.len() == 12
-        && field("id").and_then(ScaleValue::as_u128) == Some(u128::from(order_id))
-        && field("maker").is_some_and(|value| value_matches_bytes(value, &subaccount))
-        && field("pair").is_some_and(|value| value_matches_bytes(value, &pair))
-        && field("price").is_some()
-        && field("quote_amount").is_some_and(|value| value_matches_u256_le(value, &quote_amount))
-        && field("base_amount").is_some_and(|value| value_matches_u256_le(value, &base_amount))
-        && field("create_time").is_some()
-        && field("status").is_some()
-        && field("order_type").is_some_and(|value| value_matches_order_type(value, order_type))
-        && field("post_only").is_some_and(|value| value_matches_post_only(value, post_only))
-        && field("reduce_only").and_then(ScaleValue::as_bool) == Some(reduce_only)
-        && field("is_buy").and_then(ScaleValue::as_bool) == Some(is_buy)
-}
-
-fn value_matches_u256_le(value: &ScaleValue<u32>, expected: &[u8; 32]) -> bool {
-    let ValueDef::Composite(composite) = &value.value else {
-        return false;
-    };
-    let values: Vec<_> = composite.values().collect();
-    if values.len() == 1 {
-        return value_matches_u256_le(values[0], expected);
-    }
-    values.len() == 4
-        && values.iter().enumerate().all(|(index, value)| {
-            let offset = index * 8;
-            let expected_limb = u64::from_le_bytes(
-                expected[offset..offset + 8]
-                    .try_into()
-                    .expect("fixed U256 limb"),
-            );
-            value.as_u128() == Some(u128::from(expected_limb))
-        })
-}
-
-fn value_matches_order_type(
-    value: &ScaleValue<u32>,
-    expected: crate::signing::DeepXSpotOrderType,
-) -> bool {
-    let ValueDef::Variant(variant) = &value.value else {
-        return false;
-    };
-    match expected {
-        crate::signing::DeepXSpotOrderType::Limit(time_in_force) => {
-            let values: Vec<_> = variant.values.values().collect();
-            variant.name == "Limit"
-                && values.len() == 1
-                && matches!(&values[0].value, ValueDef::Variant(value)
-                    if value.name == match time_in_force {
-                        crate::signing::DeepXTimeInForce::Gtc => "GTC",
-                        crate::signing::DeepXTimeInForce::Ioc => "IOC",
-                        crate::signing::DeepXTimeInForce::Fok => "FOK",
-                    } && value.values.values().next().is_none())
-        }
-        crate::signing::DeepXSpotOrderType::Market(slippage) => {
-            let values: Vec<_> = variant.values.values().collect();
-            if variant.name != "Market" || values.len() != 1 {
-                return false;
-            }
-            let ValueDef::Variant(option) = &values[0].value else {
-                return false;
-            };
-            let option_values: Vec<_> = option.values.values().collect();
-            match slippage {
-                Some(expected) => {
-                    option.name == "Some"
-                        && option_values.len() == 1
-                        && option_values[0].as_u128() == Some(u128::from(expected))
-                }
-                None => option.name == "None" && option_values.is_empty(),
-            }
-        }
-        crate::signing::DeepXSpotOrderType::Stop => {
-            variant.name == "Stop" && variant.values.values().next().is_none()
-        }
-    }
-}
-
-fn value_matches_post_only(
-    value: &ScaleValue<u32>,
-    expected: crate::signing::DeepXPostOnlyParam,
-) -> bool {
-    let ValueDef::Variant(variant) = &value.value else {
-        return false;
-    };
-    let expected = match expected {
-        crate::signing::DeepXPostOnlyParam::None => "None",
-        crate::signing::DeepXPostOnlyParam::MustPostOnly => "MustPostOnly",
-        crate::signing::DeepXPostOnlyParam::Adaptive => "Adaptive",
-    };
-    variant.name == expected && variant.values.values().next().is_none()
+        extrinsic_index: observed.extrinsic_index,
+        outcome: match observed.outcome {
+            DeepXPerpCancelInclusionOutcome::Success => super::DeepXInclusionOutcome::Success,
+            DeepXPerpCancelInclusionOutcome::Failed => super::DeepXInclusionOutcome::Failed,
+        },
+    })
 }
 
 /// Errors raised while observing transaction presence through DeepX RPC endpoints.
@@ -3986,52 +2619,22 @@ fn decode_finalized_system_dispatch(
     event_bytes: &[u8],
 ) -> Result<DeepXDispatchOutcome, DeepXTransactionWatchError> {
     let block_number = location.block_number();
-    let mut remaining = event_bytes;
-    let declared = Compact::<u32>::decode(&mut remaining)
-        .map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?
-        .0;
-    let mut consumed = event_bytes.len() - remaining.len();
-    let mut count = 0_u32;
-    let mut dispatch = None;
-    let events = Events::<DeepXRuntimeConfig>::decode_from(
-        event_bytes.to_vec(),
-        snapshot.metadata().clone(),
-    );
-    for event in events.iter() {
-        let event =
-            event.map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?;
-        count = count
-            .checked_add(1)
-            .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
-                block_number,
-            ))?;
-        consumed += event.bytes().len();
-        if event.phase() != Phase::ApplyExtrinsic(location.extrinsic_index())
-            || event.pallet_name() != "System"
-        {
-            continue;
-        }
-        let outcome = match event.variant_name() {
-            "ExtrinsicSuccess" => DeepXDispatchOutcome::Success,
-            "ExtrinsicFailed" => DeepXDispatchOutcome::Failed,
-            _ => continue,
-        };
-        if dispatch.replace(outcome).is_some() {
-            return Err(DeepXTransactionWatchError::MissingSystemDispatch {
-                block_number,
-                extrinsic_index: location.extrinsic_index(),
-            });
-        }
-    }
-    if count != declared || consumed != event_bytes.len() {
-        return Err(DeepXTransactionWatchError::InvalidEventStorage(
-            block_number,
-        ));
-    }
-    dispatch.ok_or(DeepXTransactionWatchError::MissingSystemDispatch {
-        block_number,
-        extrinsic_index: location.extrinsic_index(),
-    })
+    decode_system_dispatch(snapshot.metadata(), location.extrinsic_index(), event_bytes)
+        .map(|outcome| match outcome {
+            DeepXSystemDispatchOutcome::Success => DeepXDispatchOutcome::Success,
+            DeepXSystemDispatchOutcome::Failed => DeepXDispatchOutcome::Failed,
+        })
+        .map_err(|e| match e {
+            DeepXSystemDispatchError::InvalidEventStorage => {
+                DeepXTransactionWatchError::InvalidEventStorage(block_number)
+            }
+            DeepXSystemDispatchError::MissingSystemDispatch => {
+                DeepXTransactionWatchError::MissingSystemDispatch {
+                    block_number,
+                    extrinsic_index: location.extrinsic_index(),
+                }
+            }
+        })
 }
 
 /// Exact transaction-membership observation from the submission node pool.
@@ -4768,7 +3371,9 @@ async fn fetch_system_events(
     let block_hash = format!("0x{}", hex::encode(block_hash));
     let encoded = fetch_storage_value(&client, SYSTEM_EVENTS_STORAGE_KEY, &block_hash).await?;
     if let Some(encoded) = encoded {
-        return decode_event_storage_value(&encoded, block_number);
+        return decode_event_storage_value(&encoded).ok_or(
+            DeepXTransactionWatchError::InvalidEventStorage(block_number),
+        );
     }
 
     let threads_key = system_threads_storage_key(block_number);
@@ -4777,23 +3382,24 @@ async fn fetch_system_events(
         .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
             block_number,
         ))?;
-    let threads = decode_event_storage_value(&encoded_threads, block_number)?;
-    let [last_thread] = threads.as_slice() else {
-        return Err(DeepXTransactionWatchError::InvalidEventStorage(
-            block_number,
-        ));
-    };
-    let mut batches = Vec::with_capacity(usize::from(*last_thread) + 1);
-    for thread in 0..=*last_thread {
+    let last_thread = decode_event_threads(&encoded_threads).ok_or(
+        DeepXTransactionWatchError::InvalidEventStorage(block_number),
+    )?;
+    let mut batches = Vec::with_capacity(usize::from(last_thread) + 1);
+    for thread in 0..=last_thread {
         let key = system_events_map_storage_key(block_number, thread);
         let encoded = fetch_storage_value(&client, &key, &block_hash)
             .await?
             .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
                 block_number,
             ))?;
-        batches.push(decode_event_storage_value(&encoded, block_number)?);
+        batches.push(decode_event_storage_value(&encoded).ok_or(
+            DeepXTransactionWatchError::InvalidEventStorage(block_number),
+        )?);
     }
-    combine_events_map_batches(&batches, block_number)
+    combine_events_map_batches(&batches).ok_or(DeepXTransactionWatchError::InvalidEventStorage(
+        block_number,
+    ))
 }
 
 async fn fetch_storage_value(
@@ -4808,96 +3414,6 @@ async fn fetch_storage_value(
             method: "state_getStorage",
             source,
         })
-}
-
-fn decode_event_storage_value(
-    encoded: &str,
-    block_number: u64,
-) -> Result<Vec<u8>, DeepXTransactionWatchError> {
-    let value =
-        encoded
-            .strip_prefix("0x")
-            .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
-                block_number,
-            ))?;
-    if value.is_empty() {
-        return Err(DeepXTransactionWatchError::InvalidEventStorage(
-            block_number,
-        ));
-    }
-    hex::decode(value).map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))
-}
-
-const SYSTEM_THREADS_STORAGE_KEY_PREFIX: &str = "System";
-const SYSTEM_THREADS_STORAGE_ITEM: &str = "Threads";
-const SYSTEM_EVENTS_MAP_STORAGE_ITEM: &str = "EventsMap";
-
-fn system_map_storage_key(prefix: &str, item: &str, key: &[u8]) -> String {
-    let mut encoded = Vec::with_capacity(32 + 16);
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(prefix.as_bytes()));
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(item.as_bytes()));
-    encoded.extend_from_slice(key);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn system_threads_storage_key(block_number: u64) -> String {
-    system_map_storage_key(
-        SYSTEM_THREADS_STORAGE_KEY_PREFIX,
-        SYSTEM_THREADS_STORAGE_ITEM,
-        &block_number.to_le_bytes(),
-    )
-}
-
-fn system_events_map_storage_key(block_number: u64, thread: u8) -> String {
-    let block_key = sp_crypto_hashing::blake2_128(&block_number.to_le_bytes());
-    let thread_key = sp_crypto_hashing::blake2_128(&[thread]);
-    let mut encoded = Vec::with_capacity(64);
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(
-        SYSTEM_THREADS_STORAGE_KEY_PREFIX.as_bytes(),
-    ));
-    encoded.extend_from_slice(&sp_crypto_hashing::twox_128(
-        SYSTEM_EVENTS_MAP_STORAGE_ITEM.as_bytes(),
-    ));
-    encoded.extend_from_slice(&block_key);
-    encoded.extend_from_slice(&thread_key);
-    format!("0x{}", hex::encode(encoded))
-}
-
-fn combine_events_map_batches(
-    batches: &[Vec<u8>],
-    block_number: u64,
-) -> Result<Vec<u8>, DeepXTransactionWatchError> {
-    let mut records = Vec::new();
-    for batch in batches {
-        let mut input = batch.as_slice();
-        let count = Compact::<u32>::decode(&mut input)
-            .map_err(|_| DeepXTransactionWatchError::InvalidEventStorage(block_number))?;
-        let count = count.0 as usize;
-        if input.is_empty() && count != 0 {
-            return Err(DeepXTransactionWatchError::InvalidEventStorage(
-                block_number,
-            ));
-        }
-        records.extend_from_slice(input);
-        if !input.is_empty() && count == 0 {
-            return Err(DeepXTransactionWatchError::InvalidEventStorage(
-                block_number,
-            ));
-        }
-    }
-    let count = batches
-        .iter()
-        .try_fold(0u32, |total, batch| {
-            let mut input = batch.as_slice();
-            let count = Compact::<u32>::decode(&mut input).ok()?.0;
-            total.checked_add(count)
-        })
-        .ok_or(DeepXTransactionWatchError::InvalidEventStorage(
-            block_number,
-        ))?;
-    let mut combined = Compact(count).encode();
-    combined.extend_from_slice(&records);
-    Ok(combined)
 }
 
 /// Observes exact transaction membership in the submission endpoint's pending pool.
@@ -4936,66 +3452,29 @@ fn find_extrinsic(
     target_hash: [u8; 32],
     source: &'static str,
 ) -> Result<Option<u32>, DeepXTransactionWatchError> {
-    let mut matched = None;
-    for (index, encoded) in encoded_extrinsics.iter().enumerate() {
-        let bytes = encoded
-            .strip_prefix("0x")
-            .ok_or(DeepXTransactionWatchError::InvalidExtrinsic {
+    find_extrinsic_by_hash(encoded_extrinsics, target_hash).map_err(|e| match e {
+        DeepXExtrinsicLookupError::InvalidEntry { index } => {
+            DeepXTransactionWatchError::InvalidExtrinsic {
                 evidence_source: source,
                 index,
-            })
-            .and_then(|value| {
-                hex::decode(value).map_err(|_| DeepXTransactionWatchError::InvalidExtrinsic {
-                    evidence_source: source,
-                    index,
-                })
-            })?;
-        validate_extrinsic(&bytes).map_err(|()| DeepXTransactionWatchError::InvalidExtrinsic {
-            evidence_source: source,
-            index,
-        })?;
-        if BlakeTwo256.hash(&bytes).0 == target_hash {
-            let index =
-                u32::try_from(index).map_err(|_| DeepXTransactionWatchError::InvalidExtrinsic {
-                    evidence_source: source,
-                    index,
-                })?;
-            if matched.replace(index).is_some() {
-                return Err(DeepXTransactionWatchError::DuplicateExtrinsic {
-                    evidence_source: source,
-                });
             }
         }
-    }
-    Ok(matched)
-}
-
-fn validate_extrinsic(bytes: &[u8]) -> Result<(), ()> {
-    let mut remaining = bytes;
-    let payload_length = Compact::<u32>::decode(&mut remaining).map_err(|_| ())?.0;
-    usize::try_from(payload_length)
-        .ok()
-        .filter(|length| *length == remaining.len())
-        .map(|_| ())
-        .ok_or(())
+        DeepXExtrinsicLookupError::DuplicateTarget => {
+            DeepXTransactionWatchError::DuplicateExtrinsic {
+                evidence_source: source,
+            }
+        }
+    })
 }
 
 fn decode_hash(encoded: &str) -> Result<[u8; 32], DeepXTransactionWatchError> {
-    encoded
-        .strip_prefix("0x")
+    decode_prefixed_hash(encoded)
         .ok_or_else(|| DeepXTransactionWatchError::InvalidBlockHash(encoded.to_string()))
-        .and_then(|value| {
-            hex::decode_array::<32>(value)
-                .map_err(|_| DeepXTransactionWatchError::InvalidBlockHash(encoded.to_string()))
-        })
 }
 
 fn decode_block_number(encoded: &str) -> Result<u64, DeepXTransactionWatchError> {
-    let value = encoded
-        .strip_prefix("0x")
-        .ok_or_else(|| DeepXTransactionWatchError::InvalidBlockNumber(encoded.to_string()))?;
-    u64::from_str_radix(value, 16)
-        .map_err(|_| DeepXTransactionWatchError::InvalidBlockNumber(encoded.to_string()))
+    decode_block_number_u64(encoded)
+        .ok_or_else(|| DeepXTransactionWatchError::InvalidBlockNumber(encoded.to_string()))
 }
 
 #[cfg(test)]
@@ -5009,11 +3488,8 @@ mod tests {
     };
 
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-    use frame_metadata::{META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed};
     use parity_scale_codec::Encode;
     use rstest::rstest;
-    use scale_info::{Field, TypeDef, TypeDefPrimitive, Variant};
-    use serde::Deserialize;
     use serde_json::Value;
     use tokio::net::TcpListener;
 
@@ -5110,26 +3586,6 @@ mod tests {
 
         assert_eq!(value, 42);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
-    }
-
-    #[rstest]
-    fn events_map_batches_combine_compact_counts() {
-        let mut first = Compact(1_u32).encode();
-        first.push(10);
-        let mut second = Compact(2_u32).encode();
-        second.extend_from_slice(&[20, 30]);
-        let combined = combine_events_map_batches(&[first, second], 42).unwrap();
-        assert_eq!(
-            combined,
-            [Compact(3_u32).encode(), vec![10, 20, 30]].concat()
-        );
-    }
-
-    #[rstest]
-    fn events_map_batches_reject_nonempty_zero_count() {
-        let mut batch = Compact(0_u32).encode();
-        batch.push(1);
-        assert!(combine_events_map_batches(&[batch], 42).is_err());
     }
 
     #[rstest]
@@ -5903,198 +4359,6 @@ mod tests {
         ]
     }
 
-    fn synthetic_perp_modify_metadata() -> subxt_core::metadata::Metadata {
-        #[derive(Deserialize)]
-        struct MetadataResponse {
-            result: String,
-        }
-
-        let response: MetadataResponse = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/deepx-rust-sdk/test_data/runtime/testnet/",
-            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
-        )))
-        .unwrap();
-        let bytes = hex::decode(response.result.trim_start_matches("0x")).unwrap();
-        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(mut metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut bytes.as_slice()).unwrap()
-        else {
-            panic!("Expected V14 fixture metadata");
-        };
-
-        let event_type_id = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "Subaccount")
-            .and_then(|pallet| pallet.event.as_ref())
-            .unwrap()
-            .ty
-            .id;
-        let cancel_type = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "PerpMarket")
-            .and_then(|pallet| pallet.event.as_ref())
-            .and_then(|event| metadata.types.resolve(event.ty.id))
-            .and_then(|ty| match &ty.type_def {
-                TypeDef::Variant(variants) => variants
-                    .variants
-                    .iter()
-                    .find(|variant| variant.name == "OrderCancelled"),
-                _ => None,
-            })
-            .and_then(|variant| {
-                variant
-                    .fields
-                    .iter()
-                    .find(|field| field.name.as_deref() == Some("user"))
-            })
-            .unwrap()
-            .ty
-            .id;
-        let primitive_id = |primitive| {
-            metadata
-                .types
-                .types
-                .iter()
-                .find_map(|ty| {
-                    matches!(
-                        &ty.ty.type_def,
-                        TypeDef::Primitive(candidate) if *candidate == primitive
-                    )
-                    .then_some(ty.id)
-                })
-                .unwrap()
-        };
-        let u64_id = primitive_id(TypeDefPrimitive::U64);
-        let u128_id = primitive_id(TypeDefPrimitive::U128);
-        let fields = vec![
-            Field::new(
-                Some("subaccount".into()),
-                cancel_type.into(),
-                None,
-                Vec::new(),
-            ),
-            Field::new(Some("old_order_id".into()), u64_id.into(), None, Vec::new()),
-            Field::new(Some("filled_size".into()), u128_id.into(), None, Vec::new()),
-            Field::new(Some("target_size".into()), u128_id.into(), None, Vec::new()),
-            Field::new(
-                Some("replacement_size".into()),
-                u128_id.into(),
-                None,
-                Vec::new(),
-            ),
-            Field::new(Some("new_order_id".into()), u64_id.into(), None, Vec::new()),
-        ];
-        let event_type = metadata
-            .types
-            .types
-            .iter_mut()
-            .find(|ty| ty.id == event_type_id)
-            .unwrap();
-        let TypeDef::Variant(variants) = &mut event_type.ty.type_def else {
-            panic!("Expected Subaccount event variants");
-        };
-        let event_index = (0..=u8::MAX)
-            .find(|index| {
-                !variants
-                    .variants
-                    .iter()
-                    .any(|variant| variant.index == *index)
-            })
-            .unwrap();
-        variants.variants.push(Variant::new(
-            "PerpOrderModified".into(),
-            fields,
-            event_index,
-            Vec::new(),
-        ));
-
-        let bytes = RuntimeMetadataPrefixed(META_RESERVED, RuntimeMetadata::V14(metadata)).encode();
-        subxt_core::metadata::decode_from(&bytes).unwrap()
-    }
-
-    fn perp_modify_sizing_event_record(
-        metadata: &subxt_core::metadata::Metadata,
-        index: u32,
-        target_size: u128,
-        filled_size: u128,
-        replacement_size: u128,
-        new_order_id: u64,
-    ) -> Vec<u8> {
-        let pallet = metadata.pallet_by_name("Subaccount").unwrap();
-        let event = pallet
-            .event_variants()
-            .unwrap()
-            .iter()
-            .find(|event| event.name == "PerpOrderModified")
-            .unwrap();
-        let values = ScaleValue::named_composite([
-            ("subaccount", ScaleValue::from_bytes([0x11; 20])),
-            ("old_order_id", ScaleValue::u128(7)),
-            ("filled_size", ScaleValue::u128(filled_size)),
-            ("target_size", ScaleValue::u128(target_size)),
-            ("replacement_size", ScaleValue::u128(replacement_size)),
-            ("new_order_id", ScaleValue::u128(u128::from(new_order_id))),
-        ]);
-        let ValueDef::Composite(Composite::Named(fields)) = &values.value else {
-            unreachable!();
-        };
-        let mut record = Phase::ApplyExtrinsic(index).encode();
-        record.extend([pallet.index(), event.index]);
-        for field in &event.fields {
-            let value = fields
-                .iter()
-                .find_map(|(name, value)| (Some(name) == field.name.as_ref()).then_some(value))
-                .unwrap();
-            subxt_core::ext::scale_value::scale::encode_as_type(
-                value,
-                field.ty.id,
-                metadata.types(),
-                &mut record,
-            )
-            .unwrap();
-        }
-        Vec::<[u8; 32]>::new().encode_to(&mut record);
-        system_events(&[record])
-    }
-
-    #[rstest]
-    fn perp_modify_sizing_event_decodes_and_binds_exact_sizes() {
-        let metadata = synthetic_perp_modify_metadata();
-        assert!(perp_modify_sizing_event_supported(&metadata));
-        let mut params = perp_modify_params();
-        params.place.size = 13;
-        let base = cancel_identity([0x11; 20], 7, false);
-        let identity = DeepXTransactionIdentity::new_perp_modify(
-            ClientOrderId::new(base.client_order_id()),
-            base.signer(),
-            base.instrument_id(),
-            OrderSide::Buy,
-            base.nonce(),
-            base.runtime().clone(),
-            params,
-        );
-        let DeepXNonceReservation::TimestampOrderId {
-            value: new_order_id,
-        } = identity.nonce()
-        else {
-            unreachable!();
-        };
-        let valid = perp_modify_sizing_event_record(&metadata, 4, 13, 5, 8, new_order_id);
-
-        assert_eq!(
-            verify_perp_modify_sizing_event(&metadata, &identity, 4, &valid).unwrap(),
-            8,
-        );
-
-        let inconsistent = perp_modify_sizing_event_record(&metadata, 4, 13, 5, 9, new_order_id);
-        assert!(matches!(
-            verify_perp_modify_sizing_event(&metadata, &identity, 4, &inconsistent),
-            Err(DeepXPerpModifyEventVerificationError::ConflictingEvidence),
-        ));
-    }
-
     #[rstest]
     fn perp_modify_inclusion_requires_runtime_sizing_event() {
         let snapshot = runtime_snapshot();
@@ -6864,87 +5128,6 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::trading("PlaceOrCancelOrder", DeepXDelegateMode::PlaceOrCancelOrder)]
-    #[case::deposit("DepositOrWithdraw", DeepXDelegateMode::DepositOrWithdraw)]
-    #[case::subaccount("UpdateSubaccount", DeepXDelegateMode::UpdateSubaccount)]
-    #[case::disabled("Disable", DeepXDelegateMode::Disable)]
-    fn finalized_delegate_mode_changes_decode_complete_approved_events(
-        #[case] variant: &str,
-        #[case] expected_mode: DeepXDelegateMode,
-    ) {
-        let snapshot = read_only_runtime_snapshot();
-        let dispatch = dispatch_event_record(&snapshot, 7, true);
-        let change = delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), variant);
-        let events = system_events(&[dispatch.clone(), change]);
-        let decoded =
-            decode_finalized_delegate_mode_changes_with_runtime(&snapshot, [3; 32], 42, &events)
-                .unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].block_hash, [3; 32]);
-        assert_eq!(decoded[0].block_number, 42);
-        assert_eq!(decoded[0].event_index, 1);
-        assert_eq!(decoded[0].extrinsic_index, 7);
-        assert_eq!(decoded[0].owner, [0x11; 20]);
-        assert_eq!(decoded[0].delegate, [0x22; 20]);
-        assert_eq!(decoded[0].mode, expected_mode);
-        assert!(
-            decode_finalized_delegate_mode_changes_with_runtime(
-                &snapshot,
-                [3; 32],
-                42,
-                &system_events(&[dispatch]),
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[rstest::rstest]
-    fn finalized_delegate_mode_changes_reject_incomplete_or_invalid_events() {
-        let snapshot = runtime_snapshot();
-        let change =
-            delegate_mode_event_record(&snapshot, Phase::ApplyExtrinsic(7), "PlaceOrCancelOrder");
-        let complete = system_events(std::slice::from_ref(&change));
-        let mut trailing = complete.clone();
-        trailing.push(0);
-        let mut wrong_count = complete.clone();
-        wrong_count[0] = Compact(2_u32).encode()[0];
-        let truncated = &complete[..complete.len() - 1];
-        for bytes in [&trailing[..], &wrong_count, truncated] {
-            assert!(
-                decode_finalized_delegate_mode_changes_with_runtime(&snapshot, [3; 32], 42, bytes,)
-                    .is_err()
-            );
-        }
-        let wrong_phase = system_events(&[delegate_mode_event_record(
-            &snapshot,
-            Phase::Initialization,
-            "Disable",
-        )]);
-        assert!(matches!(
-            decode_finalized_delegate_mode_changes_with_runtime(
-                &snapshot,
-                [3; 32],
-                42,
-                &wrong_phase,
-            ),
-            Err(DeepXDelegateModeEventError::InvalidChange(0))
-        ));
-        let mut invalid_mode = change;
-        let phase_length = Phase::ApplyExtrinsic(7).encode().len();
-        invalid_mode[phase_length + 2 + 40] = u8::MAX;
-        assert!(
-            decode_finalized_delegate_mode_changes_with_runtime(
-                &snapshot,
-                [3; 32],
-                42,
-                &system_events(&[invalid_mode]),
-            )
-            .is_err()
-        );
-    }
-
-    #[rstest::rstest]
     fn finalized_delegate_mode_change_binds_successful_dispatch_and_terms() {
         let snapshot = runtime_snapshot();
         let location = DeepXFinalizedTransactionLocation {
@@ -7288,91 +5471,6 @@ mod tests {
                 )
                 .is_err()
             );
-        }
-    }
-
-    #[test]
-    fn spot_place_policy_metadata_matrix() {
-        use crate::signing::{DeepXPostOnlyParam, DeepXSpotOrderType, DeepXTimeInForce};
-
-        let snapshot = runtime_snapshot();
-        for is_buy in [true, false] {
-            for order_type in [
-                DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
-                DeepXSpotOrderType::Limit(DeepXTimeInForce::Ioc),
-                DeepXSpotOrderType::Limit(DeepXTimeInForce::Fok),
-                DeepXSpotOrderType::Market(None),
-                DeepXSpotOrderType::Market(Some(u64::MAX)),
-                DeepXSpotOrderType::Stop,
-            ] {
-                for post_only in [
-                    DeepXPostOnlyParam::None,
-                    DeepXPostOnlyParam::MustPostOnly,
-                    DeepXPostOnlyParam::Adaptive,
-                ] {
-                    let mut wire = serde_json::to_value(spot_place_identity(is_buy)).unwrap();
-                    wire["operation"]["order_type"] = serde_json::to_value(order_type).unwrap();
-                    wire["operation"]["post_only"] = serde_json::to_value(post_only).unwrap();
-                    wire["operation"]["reduce_only"] = json!(true);
-                    let identity = serde_json::from_value(wire.clone()).unwrap();
-                    let events = system_events(&[
-                        dispatch_event_record(&snapshot, 3, true),
-                        spot_place_event_record(&snapshot, 3, &identity),
-                    ]);
-                    assert_eq!(
-                        verify_spot_place_inclusion_events_with_runtime(
-                            &snapshot, &identity, [1; 32], 42, 3, &events
-                        )
-                        .unwrap()
-                        .outcome(),
-                        DeepXInclusionOutcome::Success
-                    );
-                    for name in [
-                        "subaccount",
-                        "pair",
-                        "quote_amount",
-                        "base_amount",
-                        "order_type",
-                        "post_only",
-                        "reduce_only",
-                        "is_buy",
-                    ] {
-                        let mut changed = wire.clone();
-                        match name {
-                            "subaccount" | "pair" | "quote_amount" | "base_amount" => {
-                                changed["operation"][name][0] = json!(255);
-                            }
-                            "order_type" => {
-                                let other = if order_type == DeepXSpotOrderType::Stop {
-                                    DeepXSpotOrderType::Market(None)
-                                } else {
-                                    DeepXSpotOrderType::Stop
-                                };
-                                changed["operation"][name] = serde_json::to_value(other).unwrap();
-                            }
-                            "post_only" => {
-                                let other = if post_only == DeepXPostOnlyParam::None {
-                                    DeepXPostOnlyParam::Adaptive
-                                } else {
-                                    DeepXPostOnlyParam::None
-                                };
-                                changed["operation"][name] = serde_json::to_value(other).unwrap();
-                            }
-                            "reduce_only" => changed["operation"][name] = json!(false),
-                            "is_buy" => changed["operation"][name] = json!(!is_buy),
-                            _ => unreachable!(),
-                        }
-                        let changed = serde_json::from_value(changed).unwrap();
-                        assert!(
-                            verify_spot_place_inclusion_events_with_runtime(
-                                &snapshot, &changed, [1; 32], 42, 3, &events
-                            )
-                            .is_err(),
-                            "{order_type:?} {post_only:?} {name}"
-                        );
-                    }
-                }
-            }
         }
     }
 
@@ -7881,71 +5979,6 @@ mod tests {
         assert_eq!(events.entry_type().key_ty(), None);
         assert!(storage.entry_by_name("Threads").is_none());
         assert!(storage.entry_by_name("EventsMap").is_none());
-    }
-
-    #[rstest]
-    fn finalized_perp_trade_decoder_accepts_first_generated_order_id() {
-        let snapshot = runtime_snapshot();
-        let pallet = snapshot.metadata().pallet_by_name("PerpMarket").unwrap();
-        let event = pallet
-            .event_variants()
-            .unwrap()
-            .iter()
-            .find(|variant| variant.name == "NewTrade")
-            .unwrap();
-        let trade = ScaleValue::named_composite([
-            ("market_id", ScaleValue::u128(3)),
-            ("buyer_order_id", ScaleValue::u128(0)),
-            ("buyer", ScaleValue::from_bytes([0x11; 20])),
-            ("seller_order_id", ScaleValue::u128(7)),
-            ("seller", ScaleValue::from_bytes([0x22; 20])),
-            ("price", ScaleValue::u128(2_000_000_000)),
-            ("size", ScaleValue::u128(1_000_000_000_000_000_000)),
-            ("buyer_leverage", ScaleValue::u128(1_000)),
-            ("seller_leverage", ScaleValue::u128(1_000)),
-            ("created_at", ScaleValue::u128(42)),
-            ("filled_direction", ScaleValue::unnamed_variant("Long", [])),
-        ]);
-        let fields = ScaleValue::named_composite([
-            ("trade", trade),
-            ("taker", ScaleValue::unnamed_variant("Buyer", [])),
-            ("taker_fee", ScaleValue::i128(1_000)),
-            ("taker_fee_asset", ScaleValue::from_bytes(b"USDC")),
-            ("maker_fee", ScaleValue::i128(0)),
-            ("maker_fee_asset", ScaleValue::from_bytes(b"USDC")),
-        ]);
-        let ValueDef::Composite(Composite::Named(values)) = &fields.value else {
-            panic!("expected named NewTrade fields");
-        };
-        let mut record = Phase::ApplyExtrinsic(3).encode();
-        record.extend([pallet.index(), event.index]);
-        for field in &event.fields {
-            let value = &values
-                .iter()
-                .find(|(name, _)| Some(name) == field.name.as_ref())
-                .unwrap()
-                .1;
-            subxt_core::ext::scale_value::scale::encode_as_type(
-                value,
-                field.ty.id,
-                snapshot.metadata().types(),
-                &mut record,
-            )
-            .unwrap();
-        }
-        Vec::<[u8; 32]>::new().encode_to(&mut record);
-
-        let trades = decode_finalized_perp_trade_events_with_metadata(
-            snapshot.interfaces(),
-            snapshot.metadata(),
-            [3; 32],
-            42,
-            &system_events(&[record]),
-        )
-        .unwrap();
-        assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].buyer_order_id, 0);
-        assert_eq!(trades[0].seller_order_id, 7);
     }
 
     #[tokio::test]

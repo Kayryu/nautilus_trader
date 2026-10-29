@@ -24,10 +24,6 @@ pub use deepx_rust_sdk::websocket::open_interest::{
 };
 
 use super::public::{DeepXWsPublicChannel, DeepXWsPublicConnection};
-#[cfg(test)]
-use crate::http::{DeepXOpenInterestPage, DeepXOpenInterestRecord};
-#[cfg(test)]
-use crate::websocket::public::DeepXWsPublicFrame;
 
 const PRE_ACK_BUFFER_CAPACITY: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero capacity");
 
@@ -97,74 +93,5 @@ pub async fn observe_first_open_interest(
             Ok(observation)
         }
         Err(e) => Err(e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    const FRAME: &str = r#"{"type":"data","channel":"open_interest","market":{"type":"perp","id":3,"name":"ETH-USDC"},"data":{"long_position_count":2063,"long_short_ratio":"2.57875","short_position_count":800,"statistic_time":1791632580000,"total_oi":"3323.273"},"timestamp":1791632597660}"#;
-
-    #[rstest]
-    fn parses_observed_exact_open_interest() {
-        let frame = DeepXWsPublicFrame::parse(FRAME).unwrap();
-        let observation = parse_open_interest(frame, 3, "ETH-USDC").unwrap().unwrap();
-        assert_eq!(observation.record.total_oi, "3323.273".parse().unwrap());
-        assert_eq!(
-            observation.record.long_short_ratio,
-            "2.57875".parse().unwrap()
-        );
-        assert_eq!(observation.record.long_position_count, 2063);
-        assert_eq!(observation.record.short_position_count, 800);
-        assert_eq!(observation.record.statistic_time, 1_791_632_580_000);
-        assert!(
-            observation
-                .raw()
-                .get()
-                .contains("\"total_oi\":\"3323.273\"")
-        );
-        match_open_interest_to_rest(
-            &observation,
-            &DeepXOpenInterestPage {
-                pair: "ETH-USDC".to_string(),
-                details: vec![observation.record.clone()],
-            },
-        )
-        .unwrap();
-    }
-
-    #[rstest]
-    #[case("market", FRAME.replace("\"id\":3", "\"id\":4"))]
-    #[case("pair", FRAME.replace("ETH-USDC", "BTC-USDC"))]
-    #[case("bucket", FRAME.replace("1791632580000", "1791632580001"))]
-    #[case("future", FRAME.replace("1791632597660", "1791632579999"))]
-    #[case("negative", FRAME.replace("\"3323.273\"", "\"-1\""))]
-    #[case("precision", FRAME.replace("\"3323.273\"", "\"3323.27399999999999999999999999999\""))]
-    fn rejects_foreign_or_invalid_open_interest(#[case] _scenario: &str, #[case] text: String) {
-        let frame = DeepXWsPublicFrame::parse(&text).unwrap();
-        assert!(parse_open_interest(frame, 3, "ETH-USDC").is_err());
-    }
-
-    #[rstest]
-    fn exact_rest_comparison_rejects_changed_same_bucket() {
-        let frame = DeepXWsPublicFrame::parse(FRAME).unwrap();
-        let observation = parse_open_interest(frame, 3, "ETH-USDC").unwrap().unwrap();
-        let changed: DeepXOpenInterestRecord = serde_json::from_str(
-            r#"{"long_position_count":2064,"long_short_ratio":"2.583229036295369","short_position_count":799,"statistic_time":1791632580000,"total_oi":"3323.493"}"#,
-        )
-        .unwrap();
-        assert!(
-            match_open_interest_to_rest(
-                &observation,
-                &DeepXOpenInterestPage {
-                    pair: "ETH-USDC".to_string(),
-                    details: vec![changed],
-                },
-            )
-            .is_err()
-        );
     }
 }

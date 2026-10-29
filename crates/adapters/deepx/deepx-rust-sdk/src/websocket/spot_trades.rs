@@ -131,6 +131,7 @@ impl DeepXWsSpotTradeFrame {
 #[derive(Clone, Debug)]
 pub struct DeepXWsSpotTradeRequest {
     market_name: String,
+    pair: String,
 }
 
 impl DeepXWsSpotTradeRequest {
@@ -154,7 +155,36 @@ impl DeepXWsSpotTradeRequest {
         );
         Ok(Self {
             market_name: market.name.clone(),
+            pair: market.pair.clone(),
         })
+    }
+
+    /// Returns whether an echoed frame market matches the verified Spot market.
+    #[must_use]
+    pub fn matches_market(&self, market: &DeepXWsSpotMarket) -> bool {
+        market.kind == "spot"
+            && market.name == self.market_name
+            && market
+                .pair
+                .as_deref()
+                .is_some_and(|pair| pair.eq_ignore_ascii_case(&self.pair))
+    }
+
+    /// Validates the market and channels echoed by a subscription acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the acknowledgement differs from this request.
+    pub fn validate_ack(
+        &self,
+        market: &DeepXWsSpotMarket,
+        subscriptions: &[String],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.matches_market(market) && subscriptions == ["trades"],
+            "DeepX Spot trade acknowledgement conflicts with subscription"
+        );
+        Ok(())
     }
 
     /// Serializes the uncompressed public Spot trade subscription.
@@ -173,8 +203,55 @@ impl DeepXWsSpotTradeRequest {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use serde_json::Value;
 
     use super::*;
+
+    fn request() -> DeepXWsSpotTradeRequest {
+        let response: Value = serde_json::from_str(include_str!(
+            "../../test_data/http/testnet/spot_market_eth_usdc_by_pair.json"
+        ))
+        .unwrap();
+        let market: DeepXSpotMarket = serde_json::from_value(response["data"].clone()).unwrap();
+        DeepXWsSpotTradeRequest::subscribe(&market).unwrap()
+    }
+
+    #[rstest]
+    fn acknowledgement_and_data_require_exact_spot_market() {
+        let request = request();
+        let pair = "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37";
+        let market = DeepXWsSpotMarket {
+            kind: "spot".to_string(),
+            name: "ETH/USDC".to_string(),
+            pair: Some(format!("0x{}", pair[2..].to_ascii_uppercase())),
+        };
+        assert!(request.matches_market(&market));
+        assert!(
+            request
+                .validate_ack(&market, &["trades".to_string()])
+                .is_ok()
+        );
+        assert!(request.validate_ack(&market, &[]).is_err());
+        assert!(
+            request
+                .validate_ack(&market, &["trades".to_string(), "trades".to_string()])
+                .is_err()
+        );
+
+        let mut foreign = market.clone();
+        foreign.name = "SOL/USDC".to_string();
+        assert!(!request.matches_market(&foreign));
+        assert!(
+            request
+                .validate_ack(&foreign, &["trades".to_string()])
+                .is_err()
+        );
+        foreign = market;
+        foreign.pair = None;
+        assert!(!request.matches_market(&foreign));
+        foreign.pair = Some(format!("0x{}", "0".repeat(64)));
+        assert!(!request.matches_market(&foreign));
+    }
 
     #[rstest]
     fn data_frame_preserves_numeric_lexemes() {

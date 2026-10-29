@@ -15,15 +15,96 @@
 
 //! Perpetual account trade-history subscription and acknowledgement protocol.
 
-use std::collections::HashSet;
+use std::{borrow::Borrow, collections::HashSet};
 
 use anyhow::{Context, Result, ensure};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use thiserror::Error;
 
 use super::{account::DeepXWsUserBalancesRequest, public::DeepXWsPerpMarket};
-use crate::{decimal::exact_decimal, parse::parse_canonical_order_id, rest::DeepXAccountPage};
+use crate::{
+    decimal::exact_decimal,
+    parse::parse_canonical_order_id,
+    query::DeepXPerpAccountTradesRequest,
+    rest::{DeepXAccountPage, models::DeepXPerpAccountTradeRecord},
+    rpc::{
+        events::DeepXFinalizedPerpTrade,
+        trade_match::{DeepXPerpTradeMatchError, match_finalized_perp_account_trade},
+    },
+};
+
+/// Failures matching a perpetual WebSocket batch to REST account trades.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DeepXWsPerpTradeHistoryRestMatchError {
+    /// The REST request did not bind the exact WebSocket subaccount and market scope.
+    #[error("DeepX trade-history REST request conflicts with WebSocket scope")]
+    RequestScope,
+    /// The WebSocket timestamp could not be compared exactly.
+    #[error("invalid DeepX trade-history timestamp")]
+    InvalidTimestamp,
+    /// No supplied REST record agreed with one WebSocket item.
+    #[error("DeepX incremental trade has no matching REST account record")]
+    NotFound,
+    /// Two supplied REST records agree with one WebSocket item.
+    #[error("DeepX incremental trade matches multiple REST account records")]
+    Ambiguous,
+    /// Two WebSocket items would consume the same REST trade identity.
+    #[error("DeepX incremental trade batch reuses one REST trade identity")]
+    DuplicateTrade,
+}
+
+/// Failures matching one incremental batch through REST to finalized perpetual events.
+#[derive(Debug, Error)]
+pub enum DeepXWsPerpTradeHistoryMatchError {
+    /// The REST request did not bind the exact WebSocket subaccount and market scope.
+    #[error("DeepX trade-history REST request conflicts with WebSocket scope")]
+    RequestScope,
+    /// The WebSocket timestamp could not be compared exactly.
+    #[error("invalid DeepX trade-history timestamp")]
+    InvalidTimestamp,
+    /// No supplied REST record agreed with one WebSocket item.
+    #[error("DeepX incremental trade has no matching REST account record")]
+    NotFound,
+    /// Two supplied REST records agree with one WebSocket item.
+    #[error("DeepX incremental trade matches multiple REST account records")]
+    Ambiguous,
+    /// Two WebSocket items would consume the same REST trade identity.
+    #[error("DeepX incremental trade batch reuses one REST trade identity")]
+    DuplicateTrade,
+    /// The WebSocket batch subaccount cannot be bound to the supplied chain account.
+    #[error("DeepX trade-history subaccount conflicts with finalized account")]
+    FinalizedAccountScope,
+    /// One REST record could not be matched to the supplied finalized event evidence.
+    #[error(transparent)]
+    Finalized(#[from] DeepXPerpTradeMatchError),
+}
+
+impl From<DeepXWsPerpTradeHistoryRestMatchError> for DeepXWsPerpTradeHistoryMatchError {
+    fn from(value: DeepXWsPerpTradeHistoryRestMatchError) -> Self {
+        match value {
+            DeepXWsPerpTradeHistoryRestMatchError::RequestScope => Self::RequestScope,
+            DeepXWsPerpTradeHistoryRestMatchError::InvalidTimestamp => Self::InvalidTimestamp,
+            DeepXWsPerpTradeHistoryRestMatchError::NotFound => Self::NotFound,
+            DeepXWsPerpTradeHistoryRestMatchError::Ambiguous => Self::Ambiguous,
+            DeepXWsPerpTradeHistoryRestMatchError::DuplicateTrade => Self::DuplicateTrade,
+        }
+    }
+}
+
+/// Independently validated account and market units for finalized trade matching.
+#[derive(Clone, Copy, Debug)]
+pub struct DeepXWsPerpFinalizedTradeScope<'a> {
+    /// AccountId20 bound to the WebSocket batch and REST request.
+    pub subaccount: [u8; 20],
+    /// Base asset decimal places used by runtime trade size.
+    pub base_decimal: u8,
+    /// Quote asset decimal places used by runtime trade fee.
+    pub quote_decimal: u8,
+    /// Quote asset symbol carried by the runtime fee asset.
+    pub quote_symbol: &'a str,
+}
 
 /// One market-bound, address-scoped perpetual trade-history subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -322,6 +403,130 @@ impl DeepXWsPerpTradeHistoryBatch {
     }
 }
 
+/// Matches every incremental perpetual trade to one validated REST account record atomically.
+///
+/// The supplied records are mutable candidate evidence. A match does not establish chain finality,
+/// stream continuity, or permission to dispatch a fill.
+///
+/// # Errors
+///
+/// Returns an error for scope conflict, invalid timestamps, missing or ambiguous records, or a
+/// duplicate matched trade identity.
+pub fn match_perp_trade_history_batch_to_rest<'a, R>(
+    batch: &DeepXWsPerpTradeHistoryBatch,
+    request: &DeepXPerpAccountTradesRequest,
+    records: &'a [R],
+) -> Result<Vec<&'a R>, DeepXWsPerpTradeHistoryRestMatchError>
+where
+    R: Borrow<DeepXPerpAccountTradeRecord>,
+{
+    use DeepXWsPerpTradeHistoryRestMatchError as Error;
+
+    if request.validate().is_err()
+        || !request.subaccount.eq_ignore_ascii_case(batch.subaccount())
+        || request
+            .market_id
+            .is_some_and(|market_id| batch.items().iter().any(|item| item.market_id != market_id))
+        || request
+            .order_id
+            .as_ref()
+            .is_some_and(|order_id| batch.items().iter().any(|item| item.order_id != *order_id))
+        || request
+            .is_long
+            .is_some_and(|is_long| batch.items().iter().any(|item| item.is_long != is_long))
+    {
+        return Err(Error::RequestScope);
+    }
+    let mut matched = Vec::with_capacity(batch.items().len());
+    let mut trade_ids = HashSet::with_capacity(batch.items().len());
+
+    for item in batch.items() {
+        let timestamp = item
+            .created_at
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| Error::InvalidTimestamp)?;
+        let timestamp_ms =
+            u64::try_from(timestamp.as_millisecond()).map_err(|_| Error::InvalidTimestamp)?;
+        if request.start_ms.is_some_and(|start| timestamp_ms < start)
+            || request.end_ms.is_some_and(|end| timestamp_ms > end)
+        {
+            return Err(Error::RequestScope);
+        }
+        let mut candidates = records.iter().filter(|candidate| {
+            let record: &DeepXPerpAccountTradeRecord = (*candidate).borrow();
+            record.id != 0
+                && item.id.is_none_or(|id| id == record.id)
+                && record.market_id == item.market_id
+                && record.order_id == item.order_id
+                && record.is_long == item.is_long
+                && record.taker == item.taker
+                && record.price == item.price
+                && record.size == item.size
+                && record.leverage == item.leverage
+                && record.filled_direction == item.filled_direction
+                && record.fee == item.fee
+                && item
+                    .fee_asset
+                    .as_ref()
+                    .is_none_or(|asset| asset.eq_ignore_ascii_case(&record.fee_asset))
+                && record
+                    .created_at
+                    .parse::<jiff::Timestamp>()
+                    .is_ok_and(|value| value == timestamp)
+        });
+        let record = candidates.next().ok_or(Error::NotFound)?;
+        if candidates.next().is_some() {
+            return Err(Error::Ambiguous);
+        }
+        if !trade_ids.insert(<R as Borrow<DeepXPerpAccountTradeRecord>>::borrow(record).id) {
+            return Err(Error::DuplicateTrade);
+        }
+        matched.push(record);
+    }
+    Ok(matched)
+}
+
+/// Matches every WebSocket item through REST to a supplied finalized trade event.
+///
+/// The caller independently validates the REST response, market scales, and canonical finality.
+/// This pure match does not prove stream continuity or REST historical completeness.
+///
+/// # Errors
+///
+/// Returns an error if account scope conflicts or either exact match stage fails.
+pub fn match_perp_trade_history_batch_to_finalized<'a, 'b, R>(
+    batch: &DeepXWsPerpTradeHistoryBatch,
+    request: &DeepXPerpAccountTradesRequest,
+    records: &'a [R],
+    trades: &'b [DeepXFinalizedPerpTrade],
+    scope: DeepXWsPerpFinalizedTradeScope<'_>,
+) -> Result<Vec<(&'a R, &'b DeepXFinalizedPerpTrade)>, DeepXWsPerpTradeHistoryMatchError>
+where
+    R: Borrow<DeepXPerpAccountTradeRecord>,
+{
+    use DeepXWsPerpTradeHistoryMatchError as Error;
+
+    let encoded_subaccount = format!("0x{}", hex::encode(scope.subaccount));
+    if !batch.subaccount().eq_ignore_ascii_case(&encoded_subaccount) {
+        return Err(Error::FinalizedAccountScope);
+    }
+    let records = match_perp_trade_history_batch_to_rest(batch, request, records)?;
+    records
+        .into_iter()
+        .map(|record| {
+            let trade = match_finalized_perp_account_trade(
+                trades,
+                record.borrow(),
+                scope.subaccount,
+                scope.base_decimal,
+                scope.quote_decimal,
+                scope.quote_symbol,
+            )?;
+            Ok((record, trade))
+        })
+        .collect()
+}
+
 /// One frame admitted for an exact perpetual trade-history subscription.
 #[derive(Debug)]
 pub enum DeepXWsPerpTradeHistoryFrame {
@@ -426,9 +631,361 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::query::DeepXAccountSortOrder;
 
     const ADDRESS: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+    const OTHER: &str = "0x977654069311fa41b88f7901dc65fae9a76fd60b";
+    const WALLET: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"perp","id":3,"name":"ETH-USDC"},"subscriptions":[{"channel":"user_perp_trade_history","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"},{"channel":"user_perp_trade_history","address":"0x977654069311fa41b88f7901dc65fae9a76fd60b"}],"message":"Successfully subscribed to 2 channels"}"#;
     const DATA: &str = r#"{"type":"data","channel":"user_perp_trade_history","market":{"type":"perp","id":3},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","trades":{"items":[{"marketId":3,"orderId":"87561","isLong":true,"taker":"Buyer","price":2209.7600,"size":0.01,"leverage":10,"createdAt":"2026-02-06T14:52:25.613Z","filledDirection":"Long","fee":0.02}],"nextCursor":null,"hasNext":false}},"timestamp":1791475653766}"#;
+
+    #[rstest]
+    fn wallet_ack_matches_exact_directory_and_market() {
+        let request = DeepXWsPerpTradeHistoryRequest::for_wallet(
+            3,
+            WALLET,
+            &[ADDRESS.to_string(), OTHER.to_string()],
+        )
+        .unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(&request.to_text().unwrap()).unwrap();
+        assert_eq!(
+            encoded["subscriptions"][0]["channel"],
+            "user_perp_trade_history"
+        );
+        assert_eq!(encoded["subscriptions"][0]["addressType"], "wallet");
+        assert!(request.validate_ack(ACK).is_ok());
+        assert!(request.validate_ack(&ACK.replace(OTHER, ADDRESS)).is_err());
+        assert!(request.validate_ack(&ACK.replace(OTHER, WALLET)).is_err());
+        assert!(
+            request
+                .validate_ack(&ACK.replace("\"id\":3", "\"id\":4"))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_ack(&ACK.replace("user_perp_trade_history", "user_perp_open_orders"))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_ack(&ACK.replace("subscribed", "data"))
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn trade_history_request_rejects_invalid_scope() {
+        assert!(DeepXWsPerpTradeHistoryRequest::new(0, ADDRESS).is_err());
+        assert!(DeepXWsPerpTradeHistoryRequest::new(3, "invalid").is_err());
+        assert!(DeepXWsPerpTradeHistoryRequest::for_wallet(3, WALLET, &[]).is_err());
+        assert!(
+            DeepXWsPerpTradeHistoryRequest::for_wallet(
+                3,
+                WALLET,
+                &[ADDRESS.to_string(), ADDRESS.to_string()],
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    fn documented_incremental_batch_retains_raw_numbers_and_binds_identity() {
+        let request = DeepXWsPerpTradeHistoryRequest::for_wallet(
+            3,
+            WALLET,
+            &[ADDRESS.to_string(), OTHER.to_string()],
+        )
+        .unwrap();
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(batch) =
+            DeepXWsPerpTradeHistoryFrame::parse(DATA, &request).unwrap()
+        else {
+            panic!("expected raw trade batch");
+        };
+        assert_eq!(batch.subaccount(), ADDRESS);
+        assert_eq!(batch.timestamp_ms(), 1_791_475_653_766);
+        assert_eq!(batch.items().len(), 1);
+        assert_eq!(batch.items()[0].price, Decimal::new(220_976, 2));
+        assert_eq!(batch.items()[0].id, None);
+        assert_eq!(batch.items()[0].fee_asset, None);
+        assert!(batch.items()[0].raw().get().contains("2209.7600"));
+        let with_id = DATA.replace(
+            "\"marketId\":3",
+            "\"id\":187071212000014,\"marketId\":3,\"feeAsset\":\"USDC\"",
+        );
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(with_id) =
+            DeepXWsPerpTradeHistoryFrame::parse(&with_id, &request).unwrap()
+        else {
+            panic!("expected trade batch with venue ID");
+        };
+        assert_eq!(with_id.items()[0].id, Some(187_071_212_000_014));
+        assert_eq!(with_id.items()[0].fee_asset.as_deref(), Some("USDC"));
+        let first_generated = DATA.replace("\"orderId\":\"87561\"", "\"orderId\":\"0\"");
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(first_generated) =
+            DeepXWsPerpTradeHistoryFrame::parse(&first_generated, &request).unwrap()
+        else {
+            panic!("expected zero-ID trade batch");
+        };
+        assert_eq!(first_generated.items()[0].order_id, "0");
+        for changed in [
+            DATA.replace(ADDRESS, WALLET),
+            DATA.replace("\"id\":3", "\"id\":4"),
+            DATA.replace("\"marketId\":3", "\"marketId\":4"),
+            DATA.replace("\"orderId\":\"87561\"", "\"orderId\":\"00\""),
+            DATA.replace("\"hasNext\":false", "\"hasNext\":true"),
+            DATA.replace("\"timestamp\":1791475653766", "\"timestamp\":0"),
+            DATA.replace("\"size\":0.01", "\"size\":-0.01"),
+            DATA.replace("\"fee\":0.02", "\"fee\":\"invalid\""),
+            DATA.replace("\"taker\":\"Buyer\"", "\"taker\":\"Other\""),
+            DATA.replace(
+                "\"createdAt\":\"2026-02-06T14:52:25.613Z\"",
+                "\"createdAt\":\"invalid\"",
+            ),
+        ] {
+            assert!(DeepXWsPerpTradeHistoryFrame::parse(&changed, &request).is_err());
+        }
+    }
+
+    #[rstest]
+    fn incremental_batch_matches_only_unique_exact_rest_trades() {
+        let ws_request = DeepXWsPerpTradeHistoryRequest::new(3, ADDRESS).unwrap();
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(batch) =
+            DeepXWsPerpTradeHistoryFrame::parse(DATA, &ws_request).unwrap()
+        else {
+            panic!("expected trade batch");
+        };
+        let mut request = DeepXPerpAccountTradesRequest {
+            subaccount: ADDRESS.to_string(),
+            order_id: None,
+            market_id: Some(3),
+            is_long: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(100),
+        };
+        let record = DeepXPerpAccountTradeRecord {
+            id: 187_071_212_000_014,
+            market_id: 3,
+            order_id: "87561".to_string(),
+            is_long: true,
+            taker: "Buyer".to_string(),
+            price: Decimal::new(220_976, 2),
+            size: Decimal::new(1, 2),
+            leverage: Decimal::TEN,
+            created_at: "2026-02-06T14:52:25.613Z".to_string(),
+            filled_direction: "Long".to_string(),
+            fee: Decimal::new(2, 2),
+            fee_asset: String::new(),
+        };
+        assert_eq!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, std::slice::from_ref(&record))
+                .unwrap()[0]
+                .id,
+            record.id,
+        );
+        let created_ms = u64::try_from(
+            record
+                .created_at
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond(),
+        )
+        .unwrap();
+        request.start_ms = Some(created_ms + 1);
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, std::slice::from_ref(&record)),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::RequestScope),
+        ));
+        request.start_ms = Some(created_ms);
+        request.end_ms = Some(created_ms);
+        assert_eq!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, std::slice::from_ref(&record))
+                .unwrap()[0]
+                .id,
+            record.id,
+        );
+        request.start_ms = None;
+        request.end_ms = Some(created_ms - 1);
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, std::slice::from_ref(&record)),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::RequestScope),
+        ));
+        request.start_ms = Some(created_ms);
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, std::slice::from_ref(&record)),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::RequestScope),
+        ));
+        request.start_ms = None;
+        request.end_ms = None;
+        let mut with_fee_asset = record.clone();
+        with_fee_asset.fee_asset = "USDC".to_string();
+        let with_id = DATA.replace(
+            "\"marketId\":3",
+            "\"id\":187071212000014,\"marketId\":3,\"feeAsset\":\"USDC\"",
+        );
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(with_id_batch) =
+            DeepXWsPerpTradeHistoryFrame::parse(&with_id, &ws_request).unwrap()
+        else {
+            panic!("expected trade batch with venue ID and fee asset");
+        };
+        assert_eq!(
+            match_perp_trade_history_batch_to_rest(
+                &with_id_batch,
+                &request,
+                &[with_fee_asset.clone()],
+            )
+            .unwrap()[0]
+                .id,
+            record.id,
+        );
+        let empty_fee_asset = with_id.replace("\"feeAsset\":\"USDC\"", "\"feeAsset\":\"\"");
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(empty_fee_asset_batch) =
+            DeepXWsPerpTradeHistoryFrame::parse(&empty_fee_asset, &ws_request).unwrap()
+        else {
+            panic!("expected trade batch with empty fee asset");
+        };
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(
+                &empty_fee_asset_batch,
+                &request,
+                &[with_fee_asset.clone()],
+            ),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::NotFound),
+        ));
+        with_fee_asset.id += 1;
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&with_id_batch, &request, &[with_fee_asset]),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::NotFound),
+        ));
+        let mut changed_fee = record.clone();
+        changed_fee.fee += Decimal::new(1, 6);
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, &[changed_fee]),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::NotFound),
+        ));
+        let mut different_id = record.clone();
+        different_id.id += 1;
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(
+                &batch,
+                &request,
+                &[record.clone(), different_id]
+            ),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::Ambiguous),
+        ));
+        let mut repeated: serde_json::Value = serde_json::from_str(DATA).unwrap();
+        let item = repeated["data"]["trades"]["items"][0].clone();
+        repeated["data"]["trades"]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(item);
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(repeated) =
+            DeepXWsPerpTradeHistoryFrame::parse(&repeated.to_string(), &ws_request).unwrap()
+        else {
+            panic!("expected repeated trade batch");
+        };
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(
+                &repeated,
+                &request,
+                std::slice::from_ref(&record)
+            ),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::DuplicateTrade),
+        ));
+        request.subaccount = OTHER.to_string();
+        assert!(matches!(
+            match_perp_trade_history_batch_to_rest(&batch, &request, &[record]),
+            Err(DeepXWsPerpTradeHistoryRestMatchError::RequestScope),
+        ));
+    }
+
+    #[rstest]
+    fn incremental_batch_matches_exact_finalized_trade() {
+        let ws_request = DeepXWsPerpTradeHistoryRequest::new(3, ADDRESS).unwrap();
+        let DeepXWsPerpTradeHistoryFrame::TradeBatch(batch) =
+            DeepXWsPerpTradeHistoryFrame::parse(DATA, &ws_request).unwrap()
+        else {
+            panic!("expected trade batch");
+        };
+        let request = DeepXPerpAccountTradesRequest {
+            subaccount: ADDRESS.to_string(),
+            order_id: None,
+            market_id: Some(3),
+            is_long: None,
+            cursor: None,
+            sort: DeepXAccountSortOrder::Descending,
+            start_ms: None,
+            end_ms: None,
+            page_size: Some(100),
+        };
+        let account: [u8; 20] = hex::decode(&ADDRESS[2..]).unwrap().try_into().unwrap();
+        let record = DeepXPerpAccountTradeRecord {
+            id: 42_000_001,
+            market_id: 3,
+            order_id: "87561".to_string(),
+            is_long: true,
+            taker: "Buyer".to_string(),
+            price: Decimal::new(220_976, 2),
+            size: Decimal::new(1, 2),
+            leverage: Decimal::TEN,
+            created_at: "2026-02-06T14:52:25.613Z".to_string(),
+            filled_direction: "Long".to_string(),
+            fee: Decimal::new(2, 2),
+            fee_asset: String::new(),
+        };
+        let records = [record];
+        let event = DeepXFinalizedPerpTrade {
+            block_hash: [1; 32],
+            block_number: 42,
+            event_index: 1,
+            market_id: 3,
+            buyer_order_id: 87_561,
+            buyer: account,
+            seller_order_id: 1,
+            seller: [2; 20],
+            price: 2_209_760_000,
+            size: 1,
+            buyer_leverage: 10_000,
+            seller_leverage: 1_000,
+            filled_direction: "Long".to_string(),
+            taker: "Buyer".to_string(),
+            taker_fee: -20_000,
+            maker_fee: 0,
+            fee_asset: b"USDC".to_vec(),
+        };
+        let mut trades = [event];
+        let scope = DeepXWsPerpFinalizedTradeScope {
+            subaccount: account,
+            base_decimal: 2,
+            quote_decimal: 6,
+            quote_symbol: "USDC",
+        };
+        let matched =
+            match_perp_trade_history_batch_to_finalized(&batch, &request, &records, &trades, scope)
+                .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, &records[0]);
+        assert_eq!(matched[0].1, &trades[0]);
+
+        let foreign = DeepXWsPerpFinalizedTradeScope {
+            subaccount: [3; 20],
+            ..scope
+        };
+        assert!(matches!(
+            match_perp_trade_history_batch_to_finalized(
+                &batch, &request, &records, &trades, foreign,
+            ),
+            Err(DeepXWsPerpTradeHistoryMatchError::FinalizedAccountScope)
+        ));
+        trades[0].price += 1;
+        assert!(matches!(
+            match_perp_trade_history_batch_to_finalized(&batch, &request, &records, &trades, scope,),
+            Err(DeepXWsPerpTradeHistoryMatchError::Finalized(
+                DeepXPerpTradeMatchError::NotFound
+            ))
+        ));
+    }
 
     #[rstest]
     fn trade_batch_binds_account_and_preserves_numeric_lexemes() {

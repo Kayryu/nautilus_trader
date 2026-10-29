@@ -84,6 +84,27 @@ impl DeepXWsUserBalancesRequest {
         self.subscription.address()
     }
 
+    /// Validates the market and address echoed by a subscription acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the acknowledgement differs from this request.
+    pub fn validate_ack(
+        &self,
+        market: &DeepXWsAllMarket,
+        subscriptions: &[DeepXWsUserBalancesSubscription],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            market.kind == "all"
+                && subscriptions.len() == 1
+                && subscriptions[0]
+                    .address()
+                    .eq_ignore_ascii_case(self.subaccount()),
+            "DeepX account subscription acknowledgement conflicts with pending intent"
+        );
+        Ok(())
+    }
+
     /// Serializes the documented aggregate-market subscription with compression disabled.
     ///
     /// # Errors
@@ -245,6 +266,107 @@ mod tests {
     use super::*;
 
     const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
+    const LETTERED_ACCOUNT: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+    const BALANCES_FRAME: &str =
+        include_str!("../../test_data/websocket/testnet/user_balances.json");
+
+    #[rstest]
+    fn request_binds_documented_aggregate_market_channel_and_address() {
+        let request = DeepXWsUserBalancesRequest::new(SUBACCOUNT).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.to_text().unwrap()).unwrap(),
+            json!({
+                "action": "subscribe",
+                "market": {"type": "all"},
+                "subscriptions": [{"channel": "user_balances", "address": SUBACCOUNT}],
+                "options": {"compress": false}
+            })
+        );
+        assert_eq!(request.subaccount(), SUBACCOUNT);
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("4ded31cb63949b52f9dfc9bcfade4eab7017eadc")]
+    #[case("0x4ded31cb63949b52f9dfc9bcfade4eab7017ead")]
+    #[case("0x4ded31cb63949b52f9dfc9bcfade4eab7017eadcz")]
+    fn request_rejects_non_account_id20_addresses(#[case] address: &str) {
+        assert!(DeepXWsUserBalancesRequest::new(address).is_err());
+    }
+
+    #[rstest]
+    fn captured_balance_frame_decodes_exact_values() {
+        let DeepXWsAccountWireFrame::UserBalances {
+            market,
+            balances,
+            timestamp,
+        } = DeepXWsAccountWireFrame::parse(BALANCES_FRAME).unwrap()
+        else {
+            panic!("expected user balances frame");
+        };
+        assert_eq!(market.kind, "all");
+        assert_eq!(balances.address, SUBACCOUNT);
+        assert_eq!(balances.assets.len(), 3);
+        assert_eq!(balances.assets[0].symbol, "USDC");
+        assert_eq!(balances.assets[0].balance, Decimal::new(999_783_267, 6));
+        assert_eq!(timestamp, 1_789_451_784_924);
+    }
+
+    #[rstest]
+    #[case::unsupported_channel(json!({
+        "type": "data", "channel": "trades", "market": {"type": "all"}, "data": {}, "timestamp": 1
+    }))]
+    #[case::extra_subscription_field(json!({
+        "type": "subscribed", "market": {"type": "all"},
+        "subscriptions": [{
+            "channel": "user_balances", "address": SUBACCOUNT, "addressType": "wallet"
+        }],
+        "message": "ok"
+    }))]
+    fn account_frame_rejects_unsupported_channel_or_subscription_fields(
+        #[case] frame: serde_json::Value,
+    ) {
+        assert!(DeepXWsAccountWireFrame::parse(&frame.to_string()).is_err());
+    }
+
+    #[rstest]
+    #[case::matching(LETTERED_ACCOUNT, false)]
+    #[case::uppercase("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", false)]
+    #[case::foreign(ACCOUNT, true)]
+    fn acknowledgement_requires_exact_requested_address(
+        #[case] address: &str,
+        #[case] foreign: bool,
+    ) {
+        let request = DeepXWsUserBalancesRequest::new(LETTERED_ACCOUNT).unwrap();
+        let text = json!({
+            "type": "subscribed",
+            "market": {"type": "all"},
+            "subscriptions": [{"channel": "user_balances", "address": address}],
+            "message": "ok"
+        });
+        let DeepXWsAccountWireFrame::Subscribed {
+            market,
+            subscriptions,
+            ..
+        } = DeepXWsAccountWireFrame::parse(&text.to_string()).unwrap()
+        else {
+            panic!("expected subscribed frame");
+        };
+        assert_eq!(
+            request.validate_ack(&market, &subscriptions).is_err(),
+            foreign
+        );
+        assert!(request.validate_ack(&market, &[]).is_err());
+        assert!(
+            request
+                .validate_ack(
+                    &market,
+                    &[subscriptions[0].clone(), subscriptions[0].clone()]
+                )
+                .is_err()
+        );
+    }
 
     #[rstest]
     fn balance_frame_preserves_exact_amounts() {

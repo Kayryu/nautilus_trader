@@ -120,6 +120,9 @@ impl From<DeepXRestError> for DeepXHttpError {
             DeepXRestError::Decode(e) => Self::Decode(e),
             DeepXRestError::Api { code, message } => Self::Api { code, message },
             DeepXRestError::InvalidRequest(message) => Self::InvalidRequest(message),
+            DeepXRestError::InvalidTransactionStatus { message } => {
+                Self::InvalidTransactionStatus { message }
+            }
             DeepXRestError::InvalidPaginationLimit => Self::InvalidPaginationLimit,
             DeepXRestError::PaginationLimitExceeded { max_pages } => {
                 Self::PaginationLimitExceeded { max_pages }
@@ -139,6 +142,15 @@ impl From<DeepXRestError> for DeepXHttpError {
             DeepXRestError::InvalidHistoryResponse { endpoint, message } => {
                 Self::InvalidHistoryResponse { endpoint, message }
             }
+            DeepXRestError::ResponseMarketMismatch {
+                endpoint,
+                expected,
+                received,
+            } => Self::ResponseMarketMismatch {
+                endpoint,
+                expected,
+                received,
+            },
             DeepXRestError::InvalidPath(path) => Self::InvalidPath(path),
             DeepXRestError::InvalidBaseUrl(url) => Self::InvalidBaseUrl(url),
         }

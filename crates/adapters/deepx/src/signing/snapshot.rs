@@ -17,16 +17,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use aws_lc_rs::digest::{SHA256, digest};
-pub use deepx_rust_sdk::signing::runtime_interface::{
-    DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
-    DeepXRuntimeVariantIdentity,
+use deepx_rust_sdk::signing::validate_testnet_runtime;
+pub use deepx_rust_sdk::signing::{
+    ApprovedRuntimeIdentity, SnapshotError,
+    runtime_interface::{
+        DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
+        DeepXRuntimeVariantIdentity,
+    },
 };
+#[cfg(test)]
 use nautilus_core::hex;
-use scale_info::TypeDef;
 use subxt_core::{
     client::{ClientState, RuntimeVersion},
-    metadata,
     metadata::Metadata,
     utils::H256,
 };
@@ -35,6 +37,7 @@ use thiserror::Error;
 use super::DeepXRuntimeConfig;
 use crate::common::DeepXEnvironment;
 
+#[cfg(test)]
 const TESTNET_SPEC_376_GENESIS_HASH: &str =
     "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7";
 #[cfg(test)]
@@ -62,49 +65,6 @@ const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
     "ChargeTransactionPayment",
     "CheckPriority",
 ];
-
-/// Runtime identity validated against the DeepX testnet genesis and observed metadata.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApprovedRuntimeIdentity {
-    /// DeepX deployment associated with the observed runtime.
-    pub environment: DeepXEnvironment,
-    /// Testnet genesis hash.
-    pub genesis_hash: [u8; 32],
-    /// SHA-256 of the complete SCALE metadata bytes.
-    pub metadata_sha256: [u8; 32],
-    /// Runtime specification version.
-    pub spec_version: u32,
-    /// Runtime transaction version.
-    pub transaction_version: u32,
-    /// Signed extensions in metadata order.
-    pub signed_extensions: Vec<String>,
-}
-
-/// Errors produced while validating an immutable runtime snapshot.
-#[derive(Debug, Error)]
-pub enum SnapshotError {
-    /// The pinned identity constant could not be decoded.
-    #[error("invalid built-in DeepX runtime identity")]
-    InvalidApprovedIdentity,
-    /// Runtime snapshots are currently approved only for DeepX testnet.
-    #[error("unsupported DeepX runtime deployment: {0}")]
-    UnsupportedDeployment(String),
-    /// The SCALE metadata cannot be decoded by the pinned DeepX Subxt fork.
-    #[error("invalid DeepX runtime metadata: {0}")]
-    InvalidMetadata(#[from] parity_scale_codec::Error),
-    /// The built-in approved metadata fixture cannot be decoded.
-    #[error("invalid built-in DeepX runtime metadata")]
-    InvalidBuiltInMetadata,
-    /// The observed genesis is not testnet or a runtime version is zero.
-    #[error("invalid DeepX genesis or runtime version")]
-    RuntimeIdentityMismatch,
-    /// An unknown non-empty transaction extension would make signing ambiguous.
-    #[error("unsupported non-empty DeepX transaction extension: {0}")]
-    UnsupportedTransactionExtension(String),
-    /// The approved metadata contains an inconsistent pallet, call, event, or error identity.
-    #[error(transparent)]
-    InvalidRuntimeInterface(#[from] DeepXRuntimeInterfaceError),
-}
 
 /// Decision produced after comparing an observed runtime identity with the active snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -537,13 +497,14 @@ impl RuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let (identity, interfaces, metadata) = validate_observed_testnet_runtime(
+        let (identity, interfaces, metadata) = validate_testnet_runtime(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-        )?;
+        )?
+        .into_parts();
         let client_state = ClientState {
             metadata,
             genesis_hash: H256::from(identity.genesis_hash),
@@ -611,13 +572,14 @@ impl DeepXReadOnlyRuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let (identity, interfaces, metadata) = validate_observed_testnet_runtime(
+        let (identity, interfaces, metadata) = validate_testnet_runtime(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-        )?;
+        )?
+        .into_parts();
         Ok(Self {
             identity,
             interfaces,
@@ -681,105 +643,7 @@ impl DeepXReadOnlyRuntimeSnapshot {
     }
 }
 
-fn validate_observed_testnet_runtime(
-    environment: &DeepXEnvironment,
-    observed_genesis_hash: [u8; 32],
-    observed_spec_version: u32,
-    observed_transaction_version: u32,
-    metadata_bytes: &[u8],
-) -> Result<
-    (
-        ApprovedRuntimeIdentity,
-        DeepXRuntimeInterfaceCatalog,
-        Metadata,
-    ),
-    SnapshotError,
-> {
-    if !environment.is_testnet() {
-        return Err(SnapshotError::UnsupportedDeployment(
-            environment.to_string(),
-        ));
-    }
-    if observed_genesis_hash != decode_32(TESTNET_SPEC_376_GENESIS_HASH)?
-        || observed_spec_version == 0
-        || observed_transaction_version == 0
-    {
-        return Err(SnapshotError::RuntimeIdentityMismatch);
-    }
-
-    let metadata = metadata::decode_from(metadata_bytes)?;
-    validate_unknown_extensions(&metadata)?;
-    let signed_extensions = metadata
-        .extrinsic()
-        .transaction_extensions_to_use_for_encoding()
-        .map(|extension| extension.identifier().to_string())
-        .collect();
-    let mut metadata_sha256 = [0; 32];
-    metadata_sha256.copy_from_slice(digest(&SHA256, metadata_bytes).as_ref());
-    let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata)?;
-    let identity = ApprovedRuntimeIdentity {
-        environment: environment.clone(),
-        genesis_hash: observed_genesis_hash,
-        metadata_sha256,
-        spec_version: observed_spec_version,
-        transaction_version: observed_transaction_version,
-        signed_extensions,
-    };
-
-    Ok((identity, interfaces, metadata))
-}
-
-fn validate_unknown_extensions(metadata: &Metadata) -> Result<(), SnapshotError> {
-    const SUPPORTED: &[&str] = &[
-        "CheckSpecVersion",
-        "CheckTxVersion",
-        "CheckNonce",
-        "CheckGenesis",
-        "CheckMortality",
-        "CheckNonceEra",
-        "ChargeAssetTxPayment",
-        "ChargeTransactionPayment",
-        "CheckMetadataHash",
-    ];
-
-    for extension in metadata
-        .extrinsic()
-        .transaction_extensions_to_use_for_encoding()
-    {
-        if !SUPPORTED.contains(&extension.identifier())
-            && (!is_empty_type(extension.extra_ty(), metadata)
-                || !is_empty_type(extension.additional_ty(), metadata))
-        {
-            return Err(SnapshotError::UnsupportedTransactionExtension(
-                extension.identifier().to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn is_empty_type(type_id: u32, metadata: &Metadata) -> bool {
-    let Some(ty) = metadata.types().resolve(type_id) else {
-        return false;
-    };
-    match &ty.type_def {
-        TypeDef::Composite(value) => value
-            .fields
-            .iter()
-            .all(|field| is_empty_type(field.ty.id, metadata)),
-        TypeDef::Array(value) => value.len == 0 || is_empty_type(value.type_param.id, metadata),
-        TypeDef::Tuple(value) => value
-            .fields
-            .iter()
-            .all(|field| is_empty_type(field.id, metadata)),
-        TypeDef::BitSequence(_)
-        | TypeDef::Variant(_)
-        | TypeDef::Sequence(_)
-        | TypeDef::Compact(_)
-        | TypeDef::Primitive(_) => false,
-    }
-}
-
+#[cfg(test)]
 fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
     hex::decode_array(value).map_err(|_| SnapshotError::InvalidApprovedIdentity)
 }
@@ -796,14 +660,12 @@ fn built_in_testnet_metadata() -> Result<Vec<u8>, SnapshotError> {
 
 #[cfg(test)]
 mod tests {
-    use frame_metadata::{
-        META_RESERVED, RuntimeMetadata, RuntimeMetadataPrefixed,
-        v14::{StorageEntryModifier, StorageEntryType, StorageHasher},
-    };
+    use aws_lc_rs::digest::{SHA256, digest};
+    use frame_metadata::{RuntimeMetadata, RuntimeMetadataPrefixed};
     use parity_scale_codec::{Decode, Encode};
     use rstest::rstest;
-    use scale_info::{TypeDefPrimitive, Variant};
     use serde::Deserialize;
+    use subxt_core::metadata;
 
     use super::*;
 
@@ -860,31 +722,6 @@ mod tests {
             interfaces,
             client_state,
         }
-    }
-
-    #[rstest]
-    #[case(365)]
-    #[case(376)]
-    #[case(377)]
-    #[case(u32::MAX)]
-    fn testnet_signing_accepts_observed_runtime_versions(#[case] spec_version: u32) {
-        let metadata = spec_376_metadata_bytes();
-        let genesis = decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap();
-
-        let signing = RuntimeSnapshot::approved_testnet(
-            &DeepXEnvironment::Testnet,
-            genesis,
-            spec_version,
-            TESTNET_TRANSACTION_VERSION,
-            &metadata,
-        )
-        .unwrap();
-        assert_eq!(signing.identity().spec_version, spec_version);
-        assert_eq!(signing.identity().signed_extensions[4], "CheckNonceEra");
-        assert_eq!(
-            hex::encode(signing.identity().metadata_sha256),
-            TESTNET_SPEC_376_METADATA_SHA256,
-        );
     }
 
     #[rstest]
@@ -974,547 +811,6 @@ mod tests {
             ),
             Err(SnapshotError::InvalidMetadata(_)),
         ));
-    }
-
-    #[rstest]
-    fn spec_376_perp_position_storage_metadata_layout_is_exact() {
-        let bytes = spec_376_metadata_bytes();
-        let mut input = bytes.as_slice();
-        let RuntimeMetadataPrefixed(prefix, RuntimeMetadata::V14(metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut input).unwrap()
-        else {
-            panic!("Expected V14 fixture metadata");
-        };
-        assert_eq!(prefix, META_RESERVED);
-        assert!(input.is_empty());
-        let perp_market = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "PerpMarket")
-            .unwrap();
-        let perp_storage = perp_market.storage.as_ref().unwrap();
-        assert_eq!(perp_storage.prefix, "PerpMarket");
-        let positions = perp_storage
-            .entries
-            .iter()
-            .find(|entry| entry.name == "UserPerpPositions")
-            .unwrap();
-        assert_eq!(positions.modifier, StorageEntryModifier::Default);
-        let StorageEntryType::Map {
-            hashers,
-            key,
-            value,
-        } = &positions.ty
-        else {
-            panic!("UserPerpPositions must be a storage map");
-        };
-        assert!(matches!(hashers.as_slice(), [StorageHasher::Identity]));
-        assert_fixed_u8_array(&metadata.types, key.id, 20, Some("H160"));
-        assert_eq!(positions.default, [0]);
-
-        let position_sequence = metadata.types.resolve(value.id).unwrap();
-        let TypeDef::Sequence(position_sequence) = &position_sequence.type_def else {
-            panic!("UserPerpPositions value must be Vec<PerpPosition>");
-        };
-        let position = metadata
-            .types
-            .resolve(position_sequence.type_param.id)
-            .unwrap();
-        assert_eq!(
-            position.path.segments.last().map(String::as_str),
-            Some("PerpPosition")
-        );
-        let TypeDef::Composite(position) = &position.type_def else {
-            panic!("PerpPosition must be a composite type");
-        };
-        let expected_fields = [
-            ("market_id", TypeDefPrimitive::U16),
-            ("is_long", TypeDefPrimitive::Bool),
-            ("base_asset_amount", TypeDefPrimitive::U128),
-            ("entry_price", TypeDefPrimitive::U128),
-            ("leverage", TypeDefPrimitive::U64),
-            ("last_funding_rate", TypeDefPrimitive::I128),
-            ("version", TypeDefPrimitive::U64),
-            ("realized_pnl", TypeDefPrimitive::I128),
-            ("funding_payment", TypeDefPrimitive::I128),
-        ];
-        assert_eq!(position.fields.len(), 13);
-        for (field, (expected_name, expected_type)) in position.fields.iter().zip(expected_fields) {
-            assert_eq!(field.name.as_deref(), Some(expected_name));
-            assert_primitive(&metadata.types, field.ty.id, expected_type);
-        }
-        assert_eq!(position.fields[9].name.as_deref(), Some("owner"));
-        assert_fixed_u8_array(&metadata.types, position.fields[9].ty.id, 20, Some("H160"));
-        assert_eq!(position.fields[10].name.as_deref(), Some("take_profit"));
-        assert_option_primitive(
-            &metadata.types,
-            position.fields[10].ty.id,
-            TypeDefPrimitive::U128,
-        );
-        assert_eq!(position.fields[11].name.as_deref(), Some("stop_loss"));
-        assert_option_primitive(
-            &metadata.types,
-            position.fields[11].ty.id,
-            TypeDefPrimitive::U128,
-        );
-        assert_eq!(
-            position.fields[12].name.as_deref(),
-            Some("last_settle_price")
-        );
-        assert_primitive(
-            &metadata.types,
-            position.fields[12].ty.id,
-            TypeDefPrimitive::U128,
-        );
-
-        let subaccount = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "Subaccount")
-            .unwrap();
-        let subaccount_storage = subaccount.storage.as_ref().unwrap();
-        assert_eq!(subaccount_storage.prefix, "Subaccount");
-        let maximum = subaccount_storage
-            .entries
-            .iter()
-            .find(|entry| entry.name == "MaxPerpPositions")
-            .unwrap();
-        assert_eq!(maximum.modifier, StorageEntryModifier::Default);
-        let StorageEntryType::Plain(maximum_ty) = &maximum.ty else {
-            panic!("MaxPerpPositions must be plain storage");
-        };
-        assert_primitive(&metadata.types, maximum_ty.id, TypeDefPrimitive::U32);
-        assert_eq!(maximum.default, 8_u32.encode());
-    }
-
-    #[rstest]
-    fn spec_376_perp_order_storage_metadata_layout_is_exact() {
-        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut spec_376_metadata_bytes().as_slice()).unwrap()
-        else {
-            panic!("Expected V14 fixture metadata");
-        };
-        let storage = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "PerpMarket")
-            .unwrap()
-            .storage
-            .as_ref()
-            .unwrap();
-
-        let order_info = storage
-            .entries
-            .iter()
-            .find(|entry| entry.name == "OrderInfoForMarket")
-            .unwrap();
-        assert_eq!(order_info.modifier, StorageEntryModifier::Optional);
-        assert_eq!(order_info.default, [0]);
-        let StorageEntryType::Map {
-            hashers,
-            key,
-            value,
-        } = &order_info.ty
-        else {
-            panic!("OrderInfoForMarket must be a storage map");
-        };
-        assert!(matches!(
-            hashers.as_slice(),
-            [StorageHasher::Identity, StorageHasher::Identity]
-        ));
-        let order_key = metadata.types.resolve(key.id).unwrap();
-        let TypeDef::Tuple(order_key) = &order_key.type_def else {
-            panic!("OrderInfoForMarket key must be a tuple");
-        };
-        assert_eq!(order_key.fields.len(), 2);
-        assert_fixed_u8_array(&metadata.types, order_key.fields[0].id, 20, Some("H160"));
-        assert_primitive(
-            &metadata.types,
-            order_key.fields[1].id,
-            TypeDefPrimitive::U16,
-        );
-        let orders = metadata.types.resolve(value.id).unwrap();
-        assert_eq!(
-            orders.path.segments.last().map(String::as_str),
-            Some("BTreeMap")
-        );
-        assert_eq!(orders.type_params.len(), 2);
-        assert_primitive(
-            &metadata.types,
-            orders.type_params[0].ty.as_ref().unwrap().id,
-            TypeDefPrimitive::U64,
-        );
-        let order = metadata
-            .types
-            .resolve(orders.type_params[1].ty.as_ref().unwrap().id)
-            .unwrap();
-        assert_eq!(
-            order.path.segments.last().map(String::as_str),
-            Some("PerpOrder")
-        );
-        let TypeDef::Composite(order) = &order.type_def else {
-            panic!("PerpOrder must be a composite type");
-        };
-        assert_eq!(order.fields.len(), 16);
-        let primitive_fields = [
-            (0, "order_id", TypeDefPrimitive::U64),
-            (2, "market_id", TypeDefPrimitive::U16),
-            (3, "is_long", TypeDefPrimitive::Bool),
-            (4, "size", TypeDefPrimitive::U128),
-            (5, "price", TypeDefPrimitive::U128),
-            (7, "create_time", TypeDefPrimitive::U64),
-            (8, "leverage", TypeDefPrimitive::U64),
-            (10, "size_filled", TypeDefPrimitive::U128),
-            (11, "size_remain", TypeDefPrimitive::U128),
-            (14, "reduce_only", TypeDefPrimitive::Bool),
-        ];
-        for (index, name, primitive) in primitive_fields {
-            assert_eq!(order.fields[index].name.as_deref(), Some(name));
-            assert_primitive(&metadata.types, order.fields[index].ty.id, primitive);
-        }
-        assert_eq!(order.fields[1].name.as_deref(), Some("owner"));
-        assert_fixed_u8_array(&metadata.types, order.fields[1].ty.id, 20, Some("H160"));
-        assert_eq!(order.fields[6].name.as_deref(), Some("order_type"));
-        assert_order_type(&metadata.types, order.fields[6].ty.id);
-        assert_eq!(order.fields[9].name.as_deref(), Some("status"));
-        assert_unit_variants(
-            &metadata.types,
-            order.fields[9].ty.id,
-            &[
-                "Open",
-                "PartiallyFilled",
-                "Filled",
-                "Canceled",
-                "Rejected",
-                "Expired",
-            ],
-        );
-        for (index, name) in [(12, "take_profit"), (13, "stop_loss")] {
-            assert_eq!(order.fields[index].name.as_deref(), Some(name));
-            assert_option_primitive(
-                &metadata.types,
-                order.fields[index].ty.id,
-                TypeDefPrimitive::U128,
-            );
-        }
-        assert_eq!(order.fields[15].name.as_deref(), Some("post_only"));
-        assert_unit_variants(
-            &metadata.types,
-            order.fields[15].ty.id,
-            &["None", "MustPostOnly", "Adaptive"],
-        );
-    }
-
-    fn assert_order_type(types: &scale_info::PortableRegistry, type_id: u32) {
-        let ty = types.resolve(type_id).unwrap();
-        assert_eq!(
-            ty.path.segments.last().map(String::as_str),
-            Some("OrderType")
-        );
-        let TypeDef::Variant(order_type) = &ty.type_def else {
-            panic!("OrderType must be a variant type");
-        };
-        assert_eq!(
-            order_type
-                .variants
-                .iter()
-                .map(|variant| variant.name.as_str())
-                .collect::<Vec<_>>(),
-            ["Limit", "Market", "Stop"],
-        );
-        assert_eq!(order_type.variants[0].fields.len(), 1);
-        assert_unit_variants(
-            types,
-            order_type.variants[0].fields[0].ty.id,
-            &["GTC", "IOC", "FOK"],
-        );
-        assert_eq!(order_type.variants[1].fields.len(), 1);
-        assert_option_primitive(
-            types,
-            order_type.variants[1].fields[0].ty.id,
-            TypeDefPrimitive::U64,
-        );
-        assert!(order_type.variants[2].fields.is_empty());
-    }
-
-    fn assert_unit_variants(
-        types: &scale_info::PortableRegistry,
-        type_id: u32,
-        expected_names: &[&str],
-    ) {
-        let ty = types.resolve(type_id).unwrap();
-        let TypeDef::Variant(variants) = &ty.type_def else {
-            panic!("expected a variant type");
-        };
-        assert_eq!(
-            variants
-                .variants
-                .iter()
-                .map(|variant| variant.name.as_str())
-                .collect::<Vec<_>>(),
-            expected_names,
-        );
-        assert!(
-            variants
-                .variants
-                .iter()
-                .all(|variant| variant.fields.is_empty())
-        );
-    }
-
-    fn assert_primitive(
-        types: &scale_info::PortableRegistry,
-        type_id: u32,
-        expected: TypeDefPrimitive,
-    ) {
-        let ty = types.resolve(type_id).unwrap();
-        assert_eq!(ty.type_def, TypeDef::Primitive(expected));
-    }
-
-    fn assert_fixed_u8_array(
-        types: &scale_info::PortableRegistry,
-        type_id: u32,
-        expected_len: u32,
-        expected_name: Option<&str>,
-    ) {
-        let ty = types.resolve(type_id).unwrap();
-        if let Some(expected_name) = expected_name {
-            assert_eq!(
-                ty.path.segments.last().map(String::as_str),
-                Some(expected_name)
-            );
-        }
-        let TypeDef::Composite(composite) = &ty.type_def else {
-            panic!("fixed byte wrapper must be a composite type");
-        };
-        assert_eq!(composite.fields.len(), 1);
-        let bytes = types.resolve(composite.fields[0].ty.id).unwrap();
-        let TypeDef::Array(bytes) = &bytes.type_def else {
-            panic!("fixed byte wrapper must contain an array");
-        };
-        assert_eq!(bytes.len, expected_len);
-        assert_primitive(types, bytes.type_param.id, TypeDefPrimitive::U8);
-    }
-
-    fn assert_option_primitive(
-        types: &scale_info::PortableRegistry,
-        type_id: u32,
-        expected: TypeDefPrimitive,
-    ) {
-        let ty = types.resolve(type_id).unwrap();
-        assert_eq!(ty.path.segments.last().map(String::as_str), Some("Option"));
-        let TypeDef::Variant(option) = &ty.type_def else {
-            panic!("optional field must use Option");
-        };
-        assert_eq!(option.variants.len(), 2);
-        assert_eq!(option.variants[0].name, "None");
-        assert!(option.variants[0].fields.is_empty());
-        assert_eq!(option.variants[1].name, "Some");
-        assert_eq!(option.variants[1].fields.len(), 1);
-        assert_primitive(types, option.variants[1].fields[0].ty.id, expected);
-    }
-
-    #[rstest]
-    fn runtime_error_identities_match_independently_decoded_fixture() {
-        let bytes = spec_376_metadata_bytes();
-        let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-            &DeepXEnvironment::Testnet,
-            decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
-            376,
-            TESTNET_TRANSACTION_VERSION,
-            &bytes,
-        )
-        .unwrap();
-        let mut input = bytes.as_slice();
-        let RuntimeMetadataPrefixed(prefix, RuntimeMetadata::V14(metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut input).unwrap()
-        else {
-            panic!("Expected V14 fixture metadata");
-        };
-        assert_eq!(prefix, META_RESERVED);
-        assert!(input.is_empty());
-        let catalog = snapshot.interfaces();
-        assert_eq!(catalog.pallets().len(), metadata.pallets.len());
-        let mut error_count = 0;
-
-        for pallet in &metadata.pallets {
-            let actual_pallet = catalog.pallet(&pallet.name).unwrap();
-            assert_eq!(actual_pallet.index(), pallet.index);
-            let Some(errors) = &pallet.error else {
-                assert!(actual_pallet.errors().is_empty());
-                assert_eq!(
-                    catalog.error_by_index(pallet.index, 0),
-                    Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(
-                        pallet.index,
-                        0,
-                    )),
-                );
-                continue;
-            };
-            let TypeDef::Variant(variants) =
-                &metadata.types.resolve(errors.ty.id).unwrap().type_def
-            else {
-                panic!("Expected pallet error variants");
-            };
-            assert_eq!(actual_pallet.errors().len(), variants.variants.len());
-
-            for (actual, expected) in actual_pallet.errors().iter().zip(&variants.variants) {
-                assert_eq!(actual.name(), expected.name);
-                assert_eq!(actual.index(), expected.index);
-                let (found_pallet, found_error) = catalog
-                    .error_by_index(pallet.index, expected.index)
-                    .unwrap();
-                assert!(std::ptr::eq(found_pallet, actual_pallet));
-                assert!(std::ptr::eq(found_error, actual));
-                error_count += 1;
-            }
-
-            let unknown_error = (0..=u8::MAX)
-                .find(|index| {
-                    !variants
-                        .variants
-                        .iter()
-                        .any(|variant| variant.index == *index)
-                })
-                .unwrap();
-            assert_eq!(
-                catalog.error_by_index(pallet.index, unknown_error),
-                Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(
-                    pallet.index,
-                    unknown_error,
-                )),
-            );
-        }
-
-        assert!(error_count > 0, "Fixture must contain pallet errors");
-        let unknown_pallet = (0..=u8::MAX)
-            .find(|index| !metadata.pallets.iter().any(|pallet| pallet.index == *index))
-            .unwrap();
-        assert_eq!(
-            catalog.error_by_index(unknown_pallet, 0),
-            Err(DeepXRuntimeInterfaceError::PalletIndexUnavailable(
-                unknown_pallet,
-            )),
-        );
-    }
-
-    fn synthetic_error_metadata(second_name: &str, second_index: u8) -> Metadata {
-        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(mut metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut spec_376_metadata_bytes().as_slice()).unwrap()
-        else {
-            panic!("Expected V14 fixture metadata");
-        };
-        let mut pallet = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.error.is_some())
-            .unwrap()
-            .clone();
-        let error_type = pallet.error.as_ref().unwrap().ty.id;
-        pallet.name = "SparsePallet".to_string();
-        pallet.index = 71;
-        metadata.pallets = vec![pallet];
-        let ty = metadata
-            .types
-            .types
-            .iter_mut()
-            .find(|ty| ty.id == error_type)
-            .unwrap();
-        let TypeDef::Variant(variants) = &mut ty.ty.type_def else {
-            panic!("Expected pallet error variants");
-        };
-        variants.variants = vec![
-            Variant {
-                name: "FirstError".to_string(),
-                fields: Vec::new(),
-                index: 203,
-                docs: Vec::new(),
-            },
-            Variant {
-                name: second_name.to_string(),
-                fields: Vec::new(),
-                index: second_index,
-                docs: Vec::new(),
-            },
-        ];
-        let bytes = RuntimeMetadataPrefixed(META_RESERVED, RuntimeMetadata::V14(metadata)).encode();
-        metadata::decode_from(&bytes).unwrap()
-    }
-
-    #[rstest]
-    fn runtime_error_lookup_uses_sparse_declared_indices() {
-        let metadata = synthetic_error_metadata("SecondError", 9);
-        let catalog = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata).unwrap();
-
-        for (index, name) in [(203, "FirstError"), (9, "SecondError")] {
-            let (pallet, error) = catalog.error_by_index(71, index).unwrap();
-            assert_eq!(pallet.name(), "SparsePallet");
-            assert_eq!(pallet.index(), 71);
-            assert_eq!(error.name(), name);
-            assert_eq!(error.index(), index);
-        }
-
-        assert_eq!(
-            catalog.error_by_index(0, 203),
-            Err(DeepXRuntimeInterfaceError::PalletIndexUnavailable(0)),
-        );
-
-        for index in [0, 1, 255] {
-            assert_eq!(
-                catalog.error_by_index(71, index),
-                Err(DeepXRuntimeInterfaceError::ErrorIndexUnavailable(71, index)),
-            );
-        }
-    }
-
-    #[rstest]
-    #[case("FirstError", 9)]
-    #[case("SecondError", 203)]
-    fn runtime_interface_rejects_duplicate_error_identity(
-        #[case] second_name: &str,
-        #[case] second_index: u8,
-    ) {
-        let metadata = synthetic_error_metadata(second_name, second_index);
-        assert_eq!(
-            DeepXRuntimeInterfaceCatalog::from_metadata(&metadata),
-            Err(DeepXRuntimeInterfaceError::DuplicateError(
-                "SparsePallet".to_string(),
-                second_name.to_string(),
-            )),
-        );
-    }
-
-    #[rstest]
-    fn runtime_interface_lookups_fail_closed() {
-        let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-            &DeepXEnvironment::Testnet,
-            decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
-            376,
-            TESTNET_TRANSACTION_VERSION,
-            &spec_376_metadata_bytes(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            snapshot.interfaces().pallet("UnknownPallet"),
-            Err(DeepXRuntimeInterfaceError::PalletUnavailable(
-                "UnknownPallet".to_string(),
-            )),
-        );
-        assert_eq!(
-            snapshot.interfaces().call("System", "unknown_call"),
-            Err(DeepXRuntimeInterfaceError::CallUnavailable(
-                "System".to_string(),
-                "unknown_call".to_string(),
-            )),
-        );
-        assert_eq!(
-            snapshot.interfaces().event("System", "UnknownEvent"),
-            Err(DeepXRuntimeInterfaceError::EventUnavailable(
-                "System".to_string(),
-                "UnknownEvent".to_string(),
-            )),
-        );
     }
 
     #[rstest]

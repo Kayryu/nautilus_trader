@@ -17,30 +17,16 @@
 
 use deepx_rust_sdk::{
     deployment::{DEEPX_TESTNET_REST_URL, DEEPX_TESTNET_RPC_URL},
-    pagination::{CursorPagination, PaginationDecision},
     query::{DeepXAccountSortOrder, DeepXPerpHistoryOrdersRequest, DeepXPerpOpenOrdersRequest},
     rest::DeepXRestTransport,
     rpc::DeepXRpcClient,
 };
 use rust_decimal::Decimal;
-use serde::Deserialize;
-use serde_json::value::RawValue;
 
 #[derive(Clone, Copy)]
 enum OrderQuery {
     Open(u64),
     Recent(u64),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RecentOrder {
-    order_id: String,
-    status: String,
-    size_filled: Box<RawValue>,
-    post_only: Option<String>,
-    tx_hash: Option<String>,
-    create_time: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -77,15 +63,17 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("DeepX RPC returned no genesis hash"))?;
 
-    println!("wallet={wallet} subaccounts={}", subaccounts.len());
-    for subaccount in &subaccounts {
+    println!(
+        "wallet={wallet} subaccounts={}",
+        subaccounts.addresses.len()
+    );
+    for subaccount in &subaccounts.addresses {
         println!("subaccount={subaccount}");
     }
     println!("genesis={genesis}");
     if let Some(OrderQuery::Open(market_id)) = order_query {
-        for subaccount in &subaccounts {
-            let mut pagination = CursorPagination::new(20)?;
-            let mut request = DeepXPerpOpenOrdersRequest {
+        for subaccount in &subaccounts.addresses {
+            let request = DeepXPerpOpenOrdersRequest {
                 subaccount: subaccount.clone(),
                 market_id: Some(market_id),
                 is_long: None,
@@ -93,26 +81,14 @@ async fn main() -> anyhow::Result<()> {
                 page_size: Some(100),
                 sort: DeepXAccountSortOrder::Descending,
             };
-            let mut count = 0;
-            loop {
-                let page = transport
-                    .get_perp_open_orders_raw(DEEPX_TESTNET_REST_URL, &request)
-                    .await?;
-                count += page.items.len();
-                match pagination.observe_response_page(
-                    "perp open orders",
-                    page.items.len(),
-                    page.has_next,
-                    page.next_cursor.as_deref(),
-                )? {
-                    PaginationDecision::Complete => break,
-                    PaginationDecision::Continue(cursor) => request.cursor = Some(cursor),
-                }
-            }
+            let pages = transport
+                .get_perp_open_order_pages(DEEPX_TESTNET_REST_URL, &request, 20)
+                .await?;
+            let count: usize = pages.iter().map(|page| page.items.len()).sum();
             println!("subaccount={subaccount} market_id={market_id} open_orders={count}");
         }
     } else if let Some(OrderQuery::Recent(market_id)) = order_query {
-        for subaccount in &subaccounts {
+        for subaccount in &subaccounts.addresses {
             let request = DeepXPerpHistoryOrdersRequest {
                 subaccount: subaccount.clone(),
                 market_id: Some(market_id),
@@ -121,26 +97,20 @@ async fn main() -> anyhow::Result<()> {
                 sort: DeepXAccountSortOrder::Descending,
             };
             let page = transport
-                .get_perp_history_orders_raw(DEEPX_TESTNET_REST_URL, &request)
+                .get_perp_history_orders(DEEPX_TESTNET_REST_URL, &request)
                 .await?;
             println!(
                 "subaccount={subaccount} market_id={market_id} recent_orders={} has_next={}",
                 page.items.len(),
                 page.has_next,
             );
-            for raw in page.items {
-                let order: RecentOrder = serde_json::from_str(raw.get())?;
-                if order.status != "Canceled"
-                    || order.size_filled.get().parse::<Decimal>()? != Decimal::ZERO
-                {
+            for order in page.items {
+                if order.status != "Canceled" || order.size_filled != Decimal::ZERO {
                     continue;
                 }
                 println!(
                     "canceled_unfilled order_id={} post_only={} tx_hash={} created_at={}",
-                    order.order_id,
-                    order.post_only.as_deref().unwrap_or("unreported"),
-                    order.tx_hash.as_deref().unwrap_or("unreported"),
-                    order.create_time.as_deref().unwrap_or("unreported"),
+                    order.order_id, order.post_only, order.tx_hash, order.create_time,
                 );
             }
         }

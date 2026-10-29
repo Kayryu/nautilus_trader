@@ -17,6 +17,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use deepx_rust_sdk::signing::{
+    DeepXDirectRuntimeIdentity, DeepXNonceReservation, DeepXTransactionOperation,
+};
 use nautilus_core::{UUID4, UnixNanos, hex};
 use nautilus_model::{
     enums::OrderSide,
@@ -31,7 +34,9 @@ use super::{
     DeepXAutomaticReplayDecision, DeepXTransactionLifecycle, DeepXTransactionObservation,
     DeepXTransactionRecoveryAction, DeepXTransactionState,
 };
-use crate::signing::{ApprovedRuntimeIdentity, SignedPalletExtrinsic};
+#[cfg(test)]
+use crate::signing::ApprovedRuntimeIdentity;
+use crate::signing::SignedPalletExtrinsic;
 
 /// Version of the durable DeepX transaction record schema.
 pub const DEEPX_TRANSACTION_RECORD_VERSION: u16 = 8;
@@ -430,24 +435,6 @@ impl DeepXSubmissionScanCheckpoint {
     }
 }
 
-/// A reserved nonce in one of DeepX's distinct nonce domains.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "domain", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum DeepXNonceReservation {
-    /// Timestamp-derived order identity used by the signed direct-pallet extrinsic.
-    TimestampOrderId {
-        /// Reserved timestamp nonce.
-        value: u64,
-    },
-    /// Sequential account nonce reserved for protocols which prove that domain.
-    SequentialAccount {
-        /// Venue account index owning the sequence.
-        account_index: u64,
-        /// Reserved sequential nonce.
-        nonce: u64,
-    },
-}
-
 /// Errors raised while allocating timestamp-derived DeepX nonces.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXTimestampNonceError {
@@ -575,204 +562,6 @@ impl DeepXTimestampNonceAllocator {
                 return Ok(DeepXNonceReservation::TimestampOrderId { value: next });
             }
         }
-    }
-}
-
-/// Immutable runtime identity attached to a direct-pallet reservation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeepXDirectRuntimeIdentity {
-    /// Testnet genesis hash.
-    pub genesis_hash: [u8; 32],
-    /// SHA-256 of the complete SCALE metadata bytes.
-    pub metadata_sha256: [u8; 32],
-    /// Runtime specification version.
-    pub spec_version: u32,
-    /// Runtime transaction version.
-    pub transaction_version: u32,
-    /// Signed extensions in metadata order.
-    pub signed_extensions: Vec<String>,
-}
-
-impl From<&ApprovedRuntimeIdentity> for DeepXDirectRuntimeIdentity {
-    fn from(value: &ApprovedRuntimeIdentity) -> Self {
-        Self {
-            genesis_hash: value.genesis_hash,
-            metadata_sha256: value.metadata_sha256,
-            spec_version: value.spec_version,
-            transaction_version: value.transaction_version,
-            signed_extensions: value.signed_extensions.clone(),
-        }
-    }
-}
-
-/// Protocol operation fields retained as part of a durable transaction identity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum DeepXTransactionOperation {
-    /// Direct `PerpMarket.place_order` with all raw runtime arguments.
-    PerpPlace {
-        /// Venue subaccount placing the order.
-        subaccount: [u8; 20],
-        /// Venue perpetual market identifier.
-        market_id: u16,
-        /// Whether the order is long.
-        is_long: bool,
-        /// Exact runtime size without inferred scaling.
-        #[serde(with = "perp_close_price")]
-        size: u128,
-        /// Exact runtime price without inferred scaling.
-        #[serde(with = "perp_close_price")]
-        price: u128,
-        /// Runtime order type and associated data.
-        order_type: crate::signing::DeepXPerpOrderType,
-        /// Optional raw take-profit point.
-        #[serde(with = "optional_perp_point")]
-        take_profit: Option<u128>,
-        /// Optional raw stop-loss point.
-        #[serde(with = "optional_perp_point")]
-        stop_loss: Option<u128>,
-        /// Whether the order may only reduce a position.
-        reduce_only: bool,
-        /// Runtime post-only behavior.
-        post_only: crate::signing::DeepXPostOnlyParam,
-    },
-    /// Direct `SpotMarket.place_order` operation with raw runtime integers.
-    SpotPlace {
-        /// Venue subaccount placing the order.
-        subaccount: [u8; 20],
-        /// Deployment-provided bytes32 pair identifier.
-        pair: [u8; 32],
-        /// Whether the order buys the base asset.
-        is_buy: bool,
-        /// Exact little-endian runtime `U256` quote amount.
-        quote_amount: [u8; 32],
-        /// Exact little-endian runtime `U256` base amount.
-        base_amount: [u8; 32],
-        /// Runtime order type and its exact associated data.
-        order_type: crate::signing::DeepXSpotOrderType,
-        /// Runtime post-only behavior.
-        post_only: crate::signing::DeepXPostOnlyParam,
-        /// Whether the order may only reduce an existing balance or liability.
-        reduce_only: bool,
-    },
-    /// Direct `PerpMarket.close_position` with raw runtime integers.
-    PerpClose {
-        /// Venue subaccount whose position is closed.
-        subaccount: [u8; 20],
-        /// Venue perpetual market identifier.
-        market_id: u16,
-        /// Exact runtime price without inferred scaling.
-        #[serde(with = "perp_close_price")]
-        price: u128,
-        /// Optional raw slippage without inferred units.
-        slippage: Option<u64>,
-    },
-    /// Direct `PerpMarket.set_profit_and_loss_point` with raw runtime integers.
-    PerpProfitAndLossPoint {
-        /// Venue subaccount whose points are configured.
-        subaccount: [u8; 20],
-        /// Venue perpetual market identifier.
-        market_id: u16,
-        /// Exact runtime take-profit point without inferred scaling.
-        #[serde(with = "perp_close_price")]
-        take_profit_point: u128,
-        /// Exact runtime stop-loss point without inferred scaling.
-        #[serde(with = "perp_close_price")]
-        stop_loss_point: u128,
-    },
-    /// Direct `SpotMarket.cancel_order` operation with fixed `UserCanceled` reason.
-    SpotCancel {
-        /// Venue subaccount whose order is canceled.
-        subaccount: [u8; 20],
-        /// Deployment-provided bytes32 pair identifier.
-        pair: [u8; 32],
-        /// Venue order identifier.
-        order_id: u64,
-        /// Whether the canceled order is a buy.
-        is_buy: bool,
-        /// Whether the runtime should use its fast-cancel path.
-        fast_cancel: bool,
-    },
-    /// Direct `PerpMarket.cancel_order` operation.
-    PerpCancel {
-        /// Venue subaccount whose order is canceled.
-        subaccount: [u8; 20],
-        /// Venue order identifier.
-        order_id: u64,
-        /// Venue perpetual market identifier.
-        market_id: u16,
-        /// Whether the runtime should use its fast-cancel path.
-        fast_cancel: bool,
-    },
-    /// Transactional `Subaccount.modify_orders` cancellation and replacement.
-    PerpModify {
-        /// Venue subaccount whose order is canceled and replaced.
-        subaccount: [u8; 20],
-        /// Subaccount specified by the replacement leg.
-        place_subaccount: [u8; 20],
-        /// Existing venue order identifier.
-        cancel_order_id: u64,
-        /// Venue perpetual market identifier.
-        market_id: u16,
-        /// Market specified by the replacement leg.
-        place_market_id: u16,
-        /// Whether the cancellation leg uses the runtime fast-cancel path.
-        fast_cancel: bool,
-        /// Replacement order direction.
-        is_long: bool,
-        /// Exact replacement runtime size.
-        #[serde(with = "perp_close_price")]
-        size: u128,
-        /// Exact replacement runtime price.
-        #[serde(with = "perp_close_price")]
-        price: u128,
-        /// Replacement runtime order type.
-        order_type: crate::signing::DeepXPerpOrderType,
-        /// Optional replacement take-profit point.
-        #[serde(with = "optional_perp_point")]
-        take_profit: Option<u128>,
-        /// Optional replacement stop-loss point.
-        #[serde(with = "optional_perp_point")]
-        stop_loss: Option<u128>,
-        /// Whether the replacement may only reduce a position.
-        reduce_only: bool,
-        /// Replacement runtime post-only behavior.
-        post_only: crate::signing::DeepXPostOnlyParam,
-    },
-}
-
-mod optional_perp_point {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
-
-    pub(super) fn serialize<S: Serializer>(
-        value: &Option<u128>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        value.map(|point| point.to_string()).serialize(serializer)
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<u128>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .map(|point| point.parse().map_err(D::Error::custom))
-            .transpose()
-    }
-}
-
-mod perp_close_price {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
-
-    pub(super) fn serialize<S: Serializer>(price: &u128, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&price.to_string())
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<u128, D::Error> {
-        let price = String::deserialize(deserializer)?;
-        price.parse().map_err(D::Error::custom)
     }
 }
 

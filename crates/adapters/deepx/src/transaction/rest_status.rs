@@ -18,7 +18,7 @@
 use std::{num::NonZeroU32, time::Duration};
 
 pub use deepx_rust_sdk::rest::status::DeepXRestTransactionConfirmation;
-use deepx_rust_sdk::rest::status::parse_transaction_status as parse_sdk_transaction_status;
+use deepx_rust_sdk::rest::status::DeepXRestTransactionStatusData;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +26,7 @@ use crate::http::{
     DeepXHttpClient, DeepXHttpError, Result, models::DeepXResponseCode, should_retry_http_error,
 };
 
-/// Hash-bound backend observation, not canonical inclusion or business-event evidence.
+/// Python-facing view of one SDK-validated backend observation.
 #[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
@@ -36,43 +36,43 @@ use crate::http::{
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deepx")
 )]
-pub struct DeepXRestTransactionStatus {
-    extrinsic_hash: [u8; 32],
-    confirmation: DeepXRestTransactionConfirmation,
-    order_id: Option<u64>,
-    backend_status: Option<String>,
-    data: Box<RawValue>,
+pub struct DeepXRestTransactionStatus(DeepXRestTransactionStatusData);
+
+impl From<DeepXRestTransactionStatusData> for DeepXRestTransactionStatus {
+    fn from(status: DeepXRestTransactionStatusData) -> Self {
+        Self(status)
+    }
 }
 
 impl DeepXRestTransactionStatus {
     /// Returns the hash checked against the queried extrinsic identity.
     #[must_use]
     pub const fn extrinsic_hash(&self) -> [u8; 32] {
-        self.extrinsic_hash
+        self.0.extrinsic_hash
     }
 
     /// Returns the backend confirmation state without promoting it to chain finality.
     #[must_use]
     pub const fn confirmation(&self) -> DeepXRestTransactionConfirmation {
-        self.confirmation
+        self.0.confirmation
     }
 
     /// Returns the exact backend order identifier; an empty or absent result is `None`.
     #[must_use]
     pub const fn order_id(&self) -> Option<u64> {
-        self.order_id
+        self.0.order_id
     }
 
     /// Returns the optional backend status string without inventing additional state semantics.
     #[must_use]
     pub fn backend_status(&self) -> Option<&str> {
-        self.backend_status.as_deref()
+        self.0.backend_status.as_deref()
     }
 
     /// Returns the original payload, including uninterpreted fields and exact numeric lexemes.
     #[must_use]
     pub fn data(&self) -> &RawValue {
-        &self.data
+        &self.0.data
     }
 }
 
@@ -130,10 +130,10 @@ pub async fn get_rest_transaction_status(
     client: &DeepXHttpClient,
     extrinsic_hash: [u8; 32],
 ) -> Result<DeepXRestTransactionStatus> {
-    let data = client
-        .get_transaction_status_once_raw(extrinsic_hash)
-        .await?;
-    parse_transaction_status(data, extrinsic_hash)
+    Ok(client
+        .get_transaction_status_once(extrinsic_hash)
+        .await?
+        .into())
 }
 
 /// Polls status with bounded GET attempts, an overall deadline, and cancellation.
@@ -231,24 +231,6 @@ async fn poll_status_attempts(
     DeepXRestStatusPollTermination::AttemptLimit
 }
 
-fn parse_transaction_status(
-    data: Box<RawValue>,
-    expected_hash: [u8; 32],
-) -> Result<DeepXRestTransactionStatus> {
-    let decoded = parse_sdk_transaction_status(data, expected_hash).map_err(|e| {
-        DeepXHttpError::InvalidTransactionStatus {
-            message: e.to_string(),
-        }
-    })?;
-    Ok(DeepXRestTransactionStatus {
-        extrinsic_hash: decoded.extrinsic_hash,
-        confirmation: decoded.confirmation,
-        order_id: decoded.order_id,
-        backend_status: decoded.backend_status,
-        data: decoded.data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -286,10 +268,6 @@ mod tests {
             "data": status_data(confirmation, order_id),
         })
         .to_string()
-    }
-
-    fn raw(data: &Value) -> Box<RawValue> {
-        RawValue::from_string(data.to_string()).unwrap()
     }
 
     fn policy(attempts: u32) -> DeepXRestStatusPollPolicy {
@@ -368,109 +346,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-
-    #[rstest]
-    #[case("pending", "", DeepXRestTransactionConfirmation::Pending, None)]
-    #[case("best", "", DeepXRestTransactionConfirmation::Best, None)]
-    #[case(
-        "best",
-        "18446744073709551615",
-        DeepXRestTransactionConfirmation::Best,
-        Some(u64::MAX)
-    )]
-    #[case("best", "0", DeepXRestTransactionConfirmation::Best, Some(0))]
-    #[case("best", "00042", DeepXRestTransactionConfirmation::Best, Some(42))]
-    #[case(
-        "decode_failed",
-        "",
-        DeepXRestTransactionConfirmation::DecodeFailed,
-        None
-    )]
-    fn parses_documented_backend_states(
-        #[case] confirmation: &str,
-        #[case] id: &str,
-        #[case] expected: DeepXRestTransactionConfirmation,
-        #[case] order_id: Option<u64>,
-    ) {
-        let status = parse_transaction_status(raw(&status_data(confirmation, id)), HASH).unwrap();
-        assert_eq!(status.extrinsic_hash(), HASH);
-        assert_eq!(status.confirmation(), expected);
-        assert_eq!(status.order_id(), order_id);
-        assert_eq!(status.backend_status(), Some("included"));
-    }
-
-    #[rstest]
-    fn preserves_original_numeric_lexemes_and_optional_status() {
-        let body = format!(
-            r#"{{"tx_hash":"0x{}","confirmation":"best","order_id":"42","extra":0.1234567890123456789012345678}}"#,
-            hex::encode(HASH)
-        );
-        let status =
-            parse_transaction_status(RawValue::from_string(body.clone()).unwrap(), HASH).unwrap();
-        assert_eq!(status.data().get(), body);
-        assert_eq!(status.backend_status(), None);
-    }
-
-    #[rstest]
-    #[case("confirmation", json!("finalized"))]
-    #[case("confirmation", json!("unknown"))]
-    #[case("confirmation", json!("Best"))]
-    #[case("confirmation", json!(null))]
-    #[case("tx_hash", json!("0x1234"))]
-    #[case("tx_hash", json!("abababababababababababababababababababababababababababababababab"))]
-    #[case("tx_hash", json!("0x0000000000000000000000000000000000000000000000000000000000000000"))]
-    #[case("tx_hash", json!(42))]
-    #[case("order_id", json!("18446744073709551616"))]
-    #[case("order_id", json!("-1"))]
-    #[case("order_id", json!("+1"))]
-    #[case("order_id", json!("1.0"))]
-    #[case("order_id", json!(" 1"))]
-    #[case("order_id", json!("1 "))]
-    #[case("order_id", json!(42))]
-    #[case("order_id", json!(null))]
-    #[case("status", json!(42))]
-    fn malformed_observations_fail_closed(#[case] field: &str, #[case] value: Value) {
-        let mut data = status_data("best", "42");
-        data[field] = value;
-        assert!(matches!(
-            parse_transaction_status(raw(&data), HASH),
-            Err(DeepXHttpError::InvalidTransactionStatus { .. })
-        ));
-    }
-
-    #[rstest]
-    #[case("confirmation")]
-    #[case("tx_hash")]
-    fn missing_required_status_fields_fail_closed(#[case] field: &str) {
-        let mut data = status_data("best", "42");
-        data.as_object_mut().unwrap().remove(field);
-        assert!(matches!(
-            parse_transaction_status(raw(&data), HASH),
-            Err(DeepXHttpError::InvalidTransactionStatus { .. })
-        ));
-    }
-
-    #[rstest]
-    #[case("pending")]
-    #[case("best")]
-    #[case("decode_failed")]
-    fn absent_order_id_does_not_invent_an_action_result(#[case] confirmation: &str) {
-        let mut data = status_data(confirmation, "");
-        data.as_object_mut().unwrap().remove("order_id");
-        let status = parse_transaction_status(raw(&data), HASH).unwrap();
-        assert_eq!(status.order_id(), None);
-        assert_eq!(status.data().get(), data.to_string());
-    }
-
-    #[rstest]
-    #[case("pending")]
-    #[case("decode_failed")]
-    fn unresolved_order_result_must_remain_empty(#[case] confirmation: &str) {
-        assert!(matches!(
-            parse_transaction_status(raw(&status_data(confirmation, "42")), HASH),
-            Err(DeepXHttpError::InvalidTransactionStatus { .. })
-        ));
     }
 
     #[rstest]

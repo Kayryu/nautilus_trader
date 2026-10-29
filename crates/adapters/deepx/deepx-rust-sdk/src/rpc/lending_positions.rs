@@ -15,7 +15,9 @@
 
 //! Bounded SCALE decoding for lending position runtime API responses.
 
-use parity_scale_codec::{Compact, Decode};
+use parity_scale_codec::{Compact, Decode, DecodeAll};
+
+use super::storage::DeepXLendingPoolStorage;
 
 const MAX_LENDING_ASSET_SYMBOL_BYTES: usize = 32;
 const MAX_LENDING_POSITION_ASSETS: usize = 64;
@@ -27,6 +29,23 @@ pub struct DeepXRawLendingPosition {
     pub asset: Vec<u8>,
     pub scaled_deposit: u128,
     pub scaled_borrow: u128,
+}
+
+/// Decodes one hex-encoded lending pool response without trailing SCALE data.
+#[must_use]
+pub fn decode_lending_pool_response(encoded: &str) -> Option<Option<DeepXLendingPoolStorage>> {
+    decode_lending_asset_response(encoded)
+}
+
+/// Decodes one hex-encoded effective lending balance without trailing SCALE data.
+#[must_use]
+pub fn decode_lending_amount_response(encoded: &str) -> Option<Option<u128>> {
+    decode_lending_asset_response(encoded)
+}
+
+fn decode_lending_asset_response<T: Decode>(encoded: &str) -> Option<T> {
+    let bytes = hex::decode(encoded.strip_prefix("0x")?).ok()?;
+    T::decode_all(&mut &bytes[..]).ok()
 }
 
 /// Decodes one canonical, account-scoped lending position response.
@@ -110,6 +129,16 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn lending_asset_response_requires_complete_scale_value() {
+        assert_eq!(decode_lending_amount_response("0x00"), Some(None));
+        assert_eq!(decode_lending_amount_response("0x0000"), None);
+        assert_eq!(decode_lending_amount_response("0xzz"), None);
+        assert_eq!(decode_lending_amount_response("00"), None);
+        assert!(matches!(decode_lending_pool_response("0x00"), Some(None)));
+        assert!(decode_lending_pool_response("0x0000").is_none());
+    }
+
+    #[rstest]
     fn lending_positions_decode_exact_scoped_shares() {
         let account = [0x11; 20];
         let encoded = BTreeMap::from([(
@@ -135,6 +164,53 @@ mod tests {
         assert_eq!(
             decode_lending_positions(&format!("{text}00"), account),
             None
+        );
+    }
+
+    #[rstest]
+    #[case("foreign")]
+    #[case("zero")]
+    #[case("overlong")]
+    #[case("trailing")]
+    fn lending_positions_reject_invalid_account_evidence(#[case] scenario: &str) {
+        let account = if scenario == "foreign" {
+            [0x22; 20]
+        } else {
+            [0x11; 20]
+        };
+        let asset = if scenario == "overlong" {
+            vec![b'x'; 33]
+        } else {
+            b"usdc".to_vec()
+        };
+        let amounts = if scenario == "zero" {
+            (0_u128, 0_u128)
+        } else {
+            (1, 0)
+        };
+        let mut encoded = BTreeMap::from([(
+            account,
+            BTreeMap::from([(1_u8, BTreeMap::from([(asset, amounts)]))]),
+        )])
+        .encode();
+        if scenario == "trailing" {
+            encoded.push(0);
+        }
+
+        assert_eq!(
+            decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]),
+            None,
+        );
+    }
+
+    #[rstest]
+    fn lending_positions_accept_canonical_empty_account_evidence() {
+        let encoded =
+            BTreeMap::<[u8; 20], BTreeMap<u8, BTreeMap<Vec<u8>, (u128, u128)>>>::new().encode();
+
+        assert_eq!(
+            decode_lending_positions(&format!("0x{}", hex::encode(encoded)), [0x11; 20]),
+            Some(Vec::new()),
         );
     }
 }

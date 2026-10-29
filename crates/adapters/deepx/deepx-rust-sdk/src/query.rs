@@ -187,6 +187,20 @@ pub struct DeepXHourlyUnsettledFundingCursor {
     pub event_id: String,
 }
 
+impl DeepXHourlyUnsettledFundingCursor {
+    /// Returns a stable identity for repeated-cursor detection.
+    #[must_use]
+    pub fn token(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.boundary_timestamp_ms,
+            self.market_id,
+            self.subaccount.to_ascii_lowercase(),
+            self.event_id,
+        )
+    }
+}
+
 /// Request for complete hourly unsettled-funding boundaries under one account scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeepXHourlyUnsettledFundingRequest {
@@ -621,6 +635,23 @@ pub struct DeepXPerpPositionsRequest {
     /// Opaque venue cursor returned by the preceding page.
     pub cursor: Option<String>,
     /// Optional number of records requested from the venue.
+    pub page_size: Option<u32>,
+}
+
+/// Bounded position lifecycle collection for every subaccount in a wallet directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXWalletPerpPositionsRequest {
+    /// Exact 20-byte hex wallet address.
+    pub wallet: String,
+    /// Maximum number of wallet subaccounts accepted before any position read.
+    pub max_subaccounts: usize,
+    /// Strict page budget for each subaccount.
+    pub max_pages_per_subaccount: usize,
+    /// Optional deployment-provided perpetual market ID.
+    pub market_id: Option<u64>,
+    /// Whether only closed position lifecycles should be returned.
+    pub only_closed: Option<bool>,
+    /// Optional number of records requested on each page.
     pub page_size: Option<u32>,
 }
 
@@ -1704,6 +1735,28 @@ impl DeepXPerpPositionsRequest {
             cursor: self.cursor.as_deref(),
             page_size: self.page_size,
         }
+    }
+}
+
+impl DeepXWalletPerpPositionsRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_subaccounts == 0 {
+            return Err(DeepXHttpError::InvalidRequest(
+                "max_subaccounts must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_pages_per_subaccount == 0 {
+            return Err(DeepXHttpError::InvalidPaginationLimit);
+        }
+        crate::rest::validate_account_address("wallet perp positions", "wallet", &self.wallet)?;
+        DeepXPerpPositionsRequest {
+            subaccount: self.wallet.clone(),
+            market_id: self.market_id,
+            only_closed: self.only_closed,
+            cursor: None,
+            page_size: self.page_size,
+        }
+        .validate()
     }
 }
 
@@ -3272,9 +3325,9 @@ pub struct DeepXOpenInterestQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXPerpTradesQuery<'a> {
-    market_id: u64,
+    pub(crate) market_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    page_size: Option<u32>,
+    pub(crate) page_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3491,6 +3544,11 @@ mod tests {
     fn hourly_unsettled_funding_query_encodes_complete_keyset_cursor() {
         let request = hourly_unsettled_funding_request();
         request.validate().unwrap();
+
+        assert_eq!(
+            request.cursor.as_ref().unwrap().token(),
+            "1789506862596:3:0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc:4846:186852294:event:none:26"
+        );
 
         let encoded = serde_json::to_value(request.as_query()).unwrap();
 

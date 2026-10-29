@@ -46,7 +46,11 @@ async fn main() -> anyhow::Result<()> {
         config.proxy_url.clone(),
     )?;
     let directory = http.get_lending_assets().await?;
-    let request = DeepXWsLendingRatesRequest::new(&directory)?;
+    let request = DeepXWsLendingRatesRequest::new(
+        directory
+            .iter()
+            .map(|asset| (asset.market_id, asset.asset.clone())),
+    )?;
     let batch = observe_first_lending_rates(
         &config.network,
         config.proxy_url.as_deref(),

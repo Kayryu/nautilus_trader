@@ -112,6 +112,9 @@ mod tests {
     }
 
     #[rstest]
+    #[case("", None)]
+    #[case("42", None)]
+    #[case("0x", None)]
     #[case("0x0100000000000000", Some(1))]
     #[case("0x0000000000000000", None)]
     #[case("0x01000000000000", None)]
@@ -142,5 +145,22 @@ mod tests {
         assert_eq!(decode_timestamp_set_inherent(&[inherent(0)]), None);
         assert_eq!(decode_timestamp_set_inherent(&[valid.clone(), valid]), None);
         assert_eq!(decode_timestamp_set_inherent(&["0x00".to_string()]), None);
+    }
+
+    #[rstest]
+    fn captured_timestamp_inherent_decodes_exact_milliseconds() {
+        let captured = "0x280402000bf4a65c1ba101".to_string();
+        assert_eq!(
+            decode_timestamp_set_inherent(std::slice::from_ref(&captured)),
+            Some(1_791_460_419_316),
+        );
+        assert_eq!(
+            decode_timestamp_set_inherent(&[captured.clone(), captured]),
+            None,
+        );
+        assert_eq!(
+            decode_timestamp_set_inherent(&["0x280402000bf4a65c1ba1".to_string()]),
+            None,
+        );
     }
 }

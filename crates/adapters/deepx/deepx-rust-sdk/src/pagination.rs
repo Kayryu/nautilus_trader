@@ -164,6 +164,31 @@ mod tests {
     #[rstest]
     #[case(None)]
     #[case(Some(""))]
+    fn rejects_next_page_without_usable_cursor(#[case] next_cursor: Option<&str>) {
+        let error = validate_cursor_page("perp trades", true, next_cursor).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DeepXHttpError::MissingPaginationCursor {
+                endpoint: "perp trades"
+            }
+        ));
+    }
+
+    #[rstest]
+    #[case(false, None)]
+    #[case(false, Some("unused"))]
+    #[case(true, Some("next-page"))]
+    fn accepts_cursor_pages_that_can_terminate_or_continue(
+        #[case] has_next: bool,
+        #[case] next_cursor: Option<&str>,
+    ) {
+        validate_cursor_page("perp trades", has_next, next_cursor).unwrap();
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(""))]
     fn completes_without_non_empty_cursor(#[case] cursor: Option<&str>) {
         let mut pagination = CursorPagination::new(2).unwrap();
 

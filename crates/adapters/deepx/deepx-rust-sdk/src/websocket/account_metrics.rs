@@ -372,3 +372,124 @@ fn parse_exact_portfolio_margin(
         uni_imr: ratio("uniIMR")?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const ADDRESS: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"all"},"subscriptions":[{"channel":"user_total_deposits","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"},{"channel":"user_net_value","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"},{"channel":"user_equity","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"},{"channel":"user_portfolio_margin_ratio","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}]}"#;
+    const TOTAL: &str = r#"{"type":"data","channel":"user_total_deposits","market":{"type":"all"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","totalBorrowInterestUsd":0.0,"totalBorrowsUsd":0.0,"totalDepositsUsd":970.9600},"timestamp":1791494312743}"#;
+    const NET: &str = r#"{"type":"data","channel":"user_net_value","market":{"type":"all"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","netValueUsd":970.96,"totalBorrowInterestUsd":0.0,"totalBorrowsUsd":0.0,"totalDepositsUsd":970.96,"unrealizedPnlUsd":0.0},"timestamp":1791494312743}"#;
+    const EQUITY: &str = r#"{"type":"data","channel":"user_equity","market":{"type":"all"},"data":{"equityUsd":970.96,"subaccount":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","totalBorrowsUsd":0.0,"totalDepositsUsd":970.96,"unrealizedPnlUsd":0.0},"timestamp":1791494312743}"#;
+    const MARGIN: &str = r#"{"type":"data","channel":"user_portfolio_margin_ratio","market":{"type":"all"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","availableMargin":970.96,"exactMargin":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","availableMargin":"970.963729","initCollateral":"970.963729","initMarginReq":"0","maintMarginReq":"0","marginRatio":null,"totalCollateral":"970.963729","totalMaintenanceMarginRequired":"0","totalMarginRequired":"0","uniIMR":null},"initCollateral":970.96,"initMarginReq":0.0,"maintMarginReq":0.0,"marginRatio":null,"totalCollateral":970.96,"totalMaintenanceMarginRequired":0.0,"totalMarginRequired":0.0,"uniIMR":null},"timestamp":1791494845977}"#;
+
+    fn request() -> DeepXWsAccountMetricsRequest {
+        DeepXWsAccountMetricsRequest::new(ADDRESS).unwrap()
+    }
+
+    #[rstest]
+    fn parses_observed_summary_shapes_without_rounded_numbers() {
+        let request = request();
+        let encoded: Value = serde_json::from_str(&request.to_text()).unwrap();
+        assert_eq!(encoded["market"]["type"], "all");
+        assert_eq!(encoded["subscriptions"].as_array().unwrap().len(), 4);
+        assert!(matches!(
+            DeepXWsAccountMetricsFrame::parse(ACK, &request).unwrap(),
+            DeepXWsAccountMetricsFrame::Subscribed
+        ));
+        let DeepXWsAccountMetricsFrame::Metric(metric) =
+            DeepXWsAccountMetricsFrame::parse(TOTAL, &request).unwrap()
+        else {
+            panic!("expected summary frame");
+        };
+        assert_eq!(metric.channel(), DeepXWsAccountMetricChannel::TotalDeposits);
+        assert!(metric.raw_data().get().contains("970.9600"));
+        assert!(metric.exact_portfolio_margin().is_none());
+        assert_eq!(metric.timestamp_ms(), 1_791_494_312_743);
+        assert!(matches!(
+            DeepXWsAccountMetricsFrame::parse(NET, &request).unwrap(),
+            DeepXWsAccountMetricsFrame::Metric(_)
+        ));
+        assert!(matches!(
+            DeepXWsAccountMetricsFrame::parse(EQUITY, &request).unwrap(),
+            DeepXWsAccountMetricsFrame::Metric(_)
+        ));
+        let DeepXWsAccountMetricsFrame::Metric(margin) =
+            DeepXWsAccountMetricsFrame::parse(MARGIN, &request).unwrap()
+        else {
+            panic!("expected portfolio margin frame");
+        };
+        assert_eq!(
+            margin.channel(),
+            DeepXWsAccountMetricChannel::PortfolioMarginRatio
+        );
+        assert!(margin.raw_data().get().contains("\"970.963729\""));
+        let exact = margin.exact_portfolio_margin().unwrap();
+        assert_eq!(exact.subaccount, ADDRESS);
+        assert_eq!(exact.available_margin.to_string(), "970.963729");
+        assert_eq!(exact.init_collateral.to_string(), "970.963729");
+        assert_eq!(exact.init_margin_req, Decimal::ZERO);
+        assert_eq!(exact.maint_margin_req, Decimal::ZERO);
+        assert_eq!(exact.total_collateral.to_string(), "970.963729");
+        assert_eq!(exact.total_maintenance_margin_required, Decimal::ZERO);
+        assert_eq!(exact.total_margin_required, Decimal::ZERO);
+        assert_eq!(exact.margin_ratio, None);
+        assert_eq!(exact.uni_imr, None);
+    }
+
+    #[rstest]
+    fn parses_populated_exact_ratios_without_using_rounded_outer_numbers() {
+        let mut frame: Value = serde_json::from_str(MARGIN).unwrap();
+        frame["data"]["marginRatio"] = json!(0.12);
+        frame["data"]["uniIMR"] = json!(0.34);
+        frame["data"]["exactMargin"]["marginRatio"] = json!("0.123456789012345678");
+        frame["data"]["exactMargin"]["uniIMR"] = json!("0.345678901234567890");
+        let DeepXWsAccountMetricsFrame::Metric(metric) =
+            DeepXWsAccountMetricsFrame::parse(&frame.to_string(), &request()).unwrap()
+        else {
+            panic!("expected portfolio margin frame");
+        };
+        let exact = metric.exact_portfolio_margin().unwrap();
+        assert_eq!(
+            exact.margin_ratio.unwrap().to_string(),
+            "0.123456789012345678"
+        );
+        assert_eq!(exact.uni_imr.unwrap().to_string(), "0.345678901234567890");
+    }
+
+    #[rstest]
+    fn rejects_wrong_summary_identity_or_numeric_shape() {
+        let foreign = EQUITY.replace(ADDRESS, "0x0000000000000000000000000000000000000000");
+        assert!(DeepXWsAccountMetricsFrame::parse(&foreign, &request()).is_err());
+        let wrong_number = TOTAL.replace("970.9600", "\"970.9600\"");
+        assert!(DeepXWsAccountMetricsFrame::parse(&wrong_number, &request()).is_err());
+        let missing = NET.replace("\"netValueUsd\":970.96,", "");
+        assert!(DeepXWsAccountMetricsFrame::parse(&missing, &request()).is_err());
+        let foreign_market = TOTAL.replace("\"type\":\"all\"", "\"type\":\"perp\"");
+        assert!(DeepXWsAccountMetricsFrame::parse(&foreign_market, &request()).is_err());
+        let mut foreign_exact: Value = serde_json::from_str(MARGIN).unwrap();
+        foreign_exact["data"]["exactMargin"]["address"] =
+            json!("0x0000000000000000000000000000000000000000");
+        assert!(DeepXWsAccountMetricsFrame::parse(&foreign_exact.to_string(), &request()).is_err());
+        let invalid_exact = MARGIN.replace("\"970.963729\"", "\"not-a-decimal\"");
+        assert!(DeepXWsAccountMetricsFrame::parse(&invalid_exact, &request()).is_err());
+        let mut invalid_ratio: Value = serde_json::from_str(MARGIN).unwrap();
+        invalid_ratio["data"]["exactMargin"]["marginRatio"] = json!("not-a-decimal");
+        assert!(DeepXWsAccountMetricsFrame::parse(&invalid_ratio.to_string(), &request()).is_err());
+        let missing_exact = MARGIN.replace("\"exactMargin\":", "\"other\":");
+        assert!(DeepXWsAccountMetricsFrame::parse(&missing_exact, &request()).is_err());
+    }
+
+    #[rstest]
+    #[case("availableMargin")]
+    #[case("marginRatio")]
+    fn rejects_inexact_portfolio_margin_decimals(#[case] field: &str) {
+        let mut frame: Value = serde_json::from_str(MARGIN).unwrap();
+        frame["data"]["exactMargin"][field] = json!("0.12345678901234567890123456789");
+        assert!(DeepXWsAccountMetricsFrame::parse(&frame.to_string(), &request()).is_err());
+    }
+}

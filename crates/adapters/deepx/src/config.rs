@@ -17,17 +17,19 @@
 
 use std::fmt::{Debug, Formatter};
 
+use deepx_rust_sdk::rpc::endpoint_identity::validate_rpc_endpoint_identities as validate_sdk_rpc_endpoint_identities;
+pub use deepx_rust_sdk::rpc::endpoint_identity::{
+    DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
+    DeepXValidatedRpcEndpoints,
+};
 use nautilus_core::hex;
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::retry::RetryConfig;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::common::{
-    DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, Result,
-    consts::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_VENUE},
-    urls,
+    DeepXEnvironment, DeepXKeyScheme, DeepXPrivateKey, Result, consts::DEEPX_VENUE, urls,
 };
 
 const REDACTED: &str = "<redacted>";
@@ -322,114 +324,6 @@ impl DeepXExecutionClientConfig {
     }
 }
 
-/// Role assigned to a DeepX Substrate JSON-RPC endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepXRpcRole {
-    /// Submits signed transaction bytes.
-    Submission,
-    /// Observes best and finalized heads and transaction inclusion.
-    Watch,
-    /// Performs bounded canonical recovery scans and pool checks.
-    Recovery,
-}
-
-/// Identity observed directly from one configured DeepX JSON-RPC endpoint.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DeepXObservedRpcEndpoint {
-    role: DeepXRpcRole,
-    url: String,
-    genesis_hash: [u8; 32],
-}
-
-impl Debug for DeepXObservedRpcEndpoint {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(DeepXObservedRpcEndpoint))
-            .field("role", &self.role)
-            .field("url", &REDACTED)
-            .field("genesis_hash", &self.genesis_hash)
-            .finish()
-    }
-}
-
-impl DeepXObservedRpcEndpoint {
-    /// Creates identity evidence returned by one endpoint assigned to `role`.
-    #[must_use]
-    pub fn new(role: DeepXRpcRole, url: String, genesis_hash: [u8; 32]) -> Self {
-        Self {
-            role,
-            url,
-            genesis_hash,
-        }
-    }
-
-    /// Returns the role assigned to the observed endpoint.
-    #[must_use]
-    pub const fn role(&self) -> DeepXRpcRole {
-        self.role
-    }
-}
-
-/// Errors raised when RPC endpoint identity evidence is incomplete or inconsistent.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum DeepXRpcEndpointValidationError {
-    /// The built-in approved testnet genesis hash is invalid.
-    #[error("invalid built-in DeepX testnet genesis hash")]
-    InvalidApprovedGenesisHash,
-    /// No identity evidence was supplied for a configured role.
-    #[error("missing DeepX RPC endpoint identity for role {0:?}")]
-    MissingRole(DeepXRpcRole),
-    /// More than one identity observation was supplied for a role.
-    #[error("duplicate DeepX RPC endpoint identity for role {0:?}")]
-    DuplicateRole(DeepXRpcRole),
-    /// The observation did not identify the endpoint selected by the configuration.
-    #[error("DeepX RPC endpoint URL does not match configured role {0:?}")]
-    UrlMismatch(DeepXRpcRole),
-    /// The endpoint belongs to a chain other than the approved DeepX testnet.
-    #[error("DeepX RPC endpoint genesis hash is not approved for role {0:?}")]
-    GenesisHashMismatch(DeepXRpcRole),
-    /// The network configuration itself is unsupported.
-    #[error(transparent)]
-    Configuration(#[from] crate::common::DeepXError),
-}
-
-/// Complete identity-validated endpoint selection for every DeepX RPC role.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DeepXValidatedRpcEndpoints {
-    submission_url: String,
-    watch_url: String,
-    recovery_url: String,
-    genesis_hash: [u8; 32],
-}
-
-impl Debug for DeepXValidatedRpcEndpoints {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(DeepXValidatedRpcEndpoints))
-            .field("submission_url", &REDACTED)
-            .field("watch_url", &REDACTED)
-            .field("recovery_url", &REDACTED)
-            .field("genesis_hash", &self.genesis_hash)
-            .finish()
-    }
-}
-
-impl DeepXValidatedRpcEndpoints {
-    /// Returns the identity-validated URL assigned to `role`.
-    #[must_use]
-    pub fn url_for(&self, role: DeepXRpcRole) -> &str {
-        match role {
-            DeepXRpcRole::Submission => &self.submission_url,
-            DeepXRpcRole::Watch => &self.watch_url,
-            DeepXRpcRole::Recovery => &self.recovery_url,
-        }
-    }
-
-    /// Returns the approved genesis hash observed from every role endpoint.
-    #[must_use]
-    pub const fn genesis_hash(&self) -> [u8; 32] {
-        self.genesis_hash
-    }
-}
-
 /// Read-only DeepX network configuration.
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -542,23 +436,7 @@ impl DeepXNetworkConfig {
     ///
     /// Explicit non-root paths and query parameters are preserved without double-appending.
     pub fn ws_connection_url(&self) -> Result<String> {
-        let mut url = reqwest::Url::parse(&self.ws_url()?).map_err(|_| {
-            crate::common::DeepXError::InvalidConfiguration("invalid WebSocket URL".to_string())
-        })?;
-        if !matches!(url.scheme(), "ws" | "wss")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(crate::common::DeepXError::InvalidConfiguration(
-                "WebSocket URL requires ws/wss, a host, and no userinfo or fragment".to_string(),
-            ));
-        }
-        if url.path().is_empty() || url.path() == "/" {
-            url.set_path("/internal/v1/ws");
-        }
-        Ok(url.to_string())
+        urls::ws_connection_url(&self.ws_url()?)
     }
 
     /// Returns the configured Substrate JSON-RPC URL.
@@ -599,58 +477,10 @@ pub fn validate_rpc_endpoint_identities(
     config: &DeepXNetworkConfig,
     observations: impl IntoIterator<Item = DeepXObservedRpcEndpoint>,
 ) -> std::result::Result<DeepXValidatedRpcEndpoints, DeepXRpcEndpointValidationError> {
-    let approved_genesis_hash = hex::decode_array::<32>(
-        DEEPX_TESTNET_GENESIS_HASH
-            .strip_prefix("0x")
-            .unwrap_or(DEEPX_TESTNET_GENESIS_HASH),
-    )
-    .map_err(|_| DeepXRpcEndpointValidationError::InvalidApprovedGenesisHash)?;
-    let mut submission_url = None;
-    let mut watch_url = None;
-    let mut recovery_url = None;
-    let mut observed_genesis_hash = None;
-
-    for observation in observations {
-        let expected_url = config.rpc_url_for(observation.role)?;
-        if observation.url != expected_url {
-            return Err(DeepXRpcEndpointValidationError::UrlMismatch(
-                observation.role,
-            ));
-        }
-        if observation.genesis_hash != approved_genesis_hash
-            || observed_genesis_hash.is_some_and(|hash| hash != observation.genesis_hash)
-        {
-            return Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
-                observation.role,
-            ));
-        }
-        observed_genesis_hash = Some(observation.genesis_hash);
-        let role_url = match observation.role {
-            DeepXRpcRole::Submission => &mut submission_url,
-            DeepXRpcRole::Watch => &mut watch_url,
-            DeepXRpcRole::Recovery => &mut recovery_url,
-        };
-        if role_url.replace(observation.url).is_some() {
-            return Err(DeepXRpcEndpointValidationError::DuplicateRole(
-                observation.role,
-            ));
-        }
-    }
-
-    Ok(DeepXValidatedRpcEndpoints {
-        submission_url: submission_url.ok_or(DeepXRpcEndpointValidationError::MissingRole(
-            DeepXRpcRole::Submission,
-        ))?,
-        watch_url: watch_url.ok_or(DeepXRpcEndpointValidationError::MissingRole(
-            DeepXRpcRole::Watch,
-        ))?,
-        recovery_url: recovery_url.ok_or(DeepXRpcEndpointValidationError::MissingRole(
-            DeepXRpcRole::Recovery,
-        ))?,
-        genesis_hash: observed_genesis_hash.ok_or(DeepXRpcEndpointValidationError::MissingRole(
-            DeepXRpcRole::Submission,
-        ))?,
-    })
+    let submission_url = config.rpc_url_for(DeepXRpcRole::Submission)?;
+    let watch_url = config.rpc_url_for(DeepXRpcRole::Watch)?;
+    let recovery_url = config.rpc_url_for(DeepXRpcRole::Recovery)?;
+    validate_sdk_rpc_endpoint_identities(&submission_url, &watch_url, &recovery_url, observations)
 }
 
 #[cfg(test)]
@@ -698,7 +528,7 @@ mod tests {
         assert_eq!(config.ws_url().unwrap(), DEEPX_TESTNET_WS_URL);
         assert_eq!(
             config.ws_connection_url().unwrap(),
-            "wss://ws-api-testnet.deepx.fi/internal/v1/ws"
+            "wss://ws-testnet.deepx.fi/internal/v1/ws"
         );
         assert_eq!(config.rpc_url().unwrap(), DEEPX_TESTNET_RPC_URL);
         assert_eq!(
@@ -713,29 +543,6 @@ mod tests {
             config.rpc_url_for(DeepXRpcRole::Recovery).unwrap(),
             DEEPX_TESTNET_RPC_URL,
         );
-    }
-
-    #[rstest]
-    #[case("wss://example.invalid", Some("wss://example.invalid/internal/v1/ws"))]
-    #[case("ws://127.0.0.1:1234/", Some("ws://127.0.0.1:1234/internal/v1/ws"))]
-    #[case(
-        "wss://example.invalid/internal/v1/ws?session=opaque",
-        Some("wss://example.invalid/internal/v1/ws?session=opaque")
-    )]
-    #[case("wss://example.invalid/custom", Some("wss://example.invalid/custom"))]
-    #[case("https://example.invalid", None)]
-    #[case("wss://user:secret@example.invalid", None)]
-    #[case("wss://example.invalid/#fragment", None)]
-    #[case("not-a-url", None)]
-    fn ws_connection_endpoint_resolution(#[case] base: &str, #[case] expected: Option<&str>) {
-        let config = DeepXNetworkConfig {
-            base_url_ws: Some(base.to_string()),
-            ..Default::default()
-        };
-        match expected {
-            Some(expected) => assert_eq!(config.ws_connection_url().unwrap(), expected),
-            None => assert!(config.ws_connection_url().is_err()),
-        }
     }
 
     #[rstest]
@@ -1153,16 +960,16 @@ mod tests {
     #[rstest]
     fn testnet_genesis_requires_all_rpc_roles_to_agree() {
         let config = DeepXNetworkConfig::default();
-        let new_genesis = approved_genesis_hash();
         let mut observed_endpoints = observations(&config);
-        for observation in &mut observed_endpoints {
-            observation.genesis_hash = new_genesis;
-        }
         let validated =
             validate_rpc_endpoint_identities(&config, observed_endpoints.clone()).unwrap();
-        assert_eq!(validated.genesis_hash(), new_genesis);
+        assert_eq!(validated.genesis_hash(), approved_genesis_hash());
 
-        observed_endpoints[1].genesis_hash = [0; 32];
+        observed_endpoints[1] = DeepXObservedRpcEndpoint::new(
+            DeepXRpcRole::Watch,
+            config.rpc_url_for(DeepXRpcRole::Watch).unwrap(),
+            [0; 32],
+        );
         assert_eq!(
             validate_rpc_endpoint_identities(&config, observed_endpoints),
             Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
@@ -1196,11 +1003,12 @@ mod tests {
     fn wrong_chain_is_rejected_for_each_rpc_role(#[case] role: DeepXRpcRole) {
         let config = DeepXNetworkConfig::default();
         let mut observations = observations(&config);
-        observations
+        let observation = observations
             .iter_mut()
             .find(|observation| observation.role() == role)
-            .unwrap()
-            .genesis_hash = [9; 32];
+            .unwrap();
+        *observation =
+            DeepXObservedRpcEndpoint::new(role, config.rpc_url_for(role).unwrap(), [9; 32]);
 
         assert_eq!(
             validate_rpc_endpoint_identities(&config, observations),
@@ -1231,7 +1039,11 @@ mod tests {
     fn rpc_endpoint_observation_must_match_configured_url() {
         let config = DeepXNetworkConfig::default();
         let mut observed_endpoints = observations(&config);
-        observed_endpoints[0].url = "https://other.example.invalid/secret".to_string();
+        observed_endpoints[0] = DeepXObservedRpcEndpoint::new(
+            DeepXRpcRole::Submission,
+            "https://other.example.invalid/secret".to_string(),
+            approved_genesis_hash(),
+        );
 
         assert_eq!(
             validate_rpc_endpoint_identities(&config, observed_endpoints),

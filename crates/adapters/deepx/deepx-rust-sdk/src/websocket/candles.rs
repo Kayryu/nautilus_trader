@@ -233,3 +233,136 @@ impl DeepXWsCandleStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const ACK: &str = r#"{"type":"subscribed","market":{"type":"perp","id":3,"name":"ETH-USDC"},"subscriptions":[{"time_frame":"1m"}]}"#;
+
+    fn update(time: u64, volume: &str) -> String {
+        format!(
+            r#"{{"type":"data","channel":"candles","market":{{"type":"perp","id":3}},"interval":"1m","data":{{"details":[{{"close":2434.02,"high":2434.18,"low":2433.67,"open":2433.8,"time":{time},"volume":{volume}}}],"pair":"ETH-USDC"}},"timestamp":{}}}"#,
+            time + 17_000
+        )
+    }
+
+    #[rstest]
+    fn emits_only_after_successor_and_preserves_exact_decimals() {
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stream.subscription_text().unwrap()).unwrap()["subscriptions"]
+                [0],
+            json!({"channel": "candles", "time_frame": "1m"})
+        );
+        stream.apply(ACK).unwrap();
+        assert!(
+            stream
+                .apply(&update(1_791_477_600_000, "12.559"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            stream
+                .apply(&update(1_791_477_600_000, "12.867000000000000001"))
+                .unwrap()
+                .is_none()
+        );
+        let completed = stream
+            .apply(&update(1_791_477_660_000, "1.458"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.candle.volume.to_string(), "12.867000000000000001");
+        assert!(!completed.gap_after);
+        let completed = stream
+            .apply(&update(1_791_477_780_000, "1.459"))
+            .unwrap()
+            .unwrap();
+        assert!(completed.gap_after);
+    }
+
+    #[rstest]
+    fn accepts_exact_scientific_notation_without_floating_point() {
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        stream.apply(ACK).unwrap();
+        stream
+            .apply(&update(1_791_477_600_000, "1.2867e1"))
+            .unwrap();
+        let completed = stream
+            .apply(&update(1_791_477_660_000, "1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.candle.volume, "12.867".parse().unwrap());
+    }
+
+    #[rstest]
+    fn rejects_unconfirmed_foreign_and_backwards_data() {
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        assert!(stream.apply(&update(1_791_477_600_000, "1")).is_err());
+        assert!(stream.apply(ACK).is_err());
+
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        assert!(stream.apply(&ACK.replace("\"id\":3", "\"id\":4")).is_err());
+
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        stream.apply(ACK).unwrap();
+        assert!(
+            stream
+                .apply(
+                    &update(1_791_477_600_000, "1")
+                        .replace("\"interval\":\"1m\"", "\"interval\":\"3m\"")
+                )
+                .is_err()
+        );
+
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        stream.apply(ACK).unwrap();
+        stream.apply(&update(1_791_477_660_000, "1")).unwrap();
+        assert!(stream.apply(&update(1_791_477_600_000, "1")).is_err());
+    }
+
+    #[rstest]
+    fn rejects_out_of_order_updates_within_one_bucket() {
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        stream.apply(ACK).unwrap();
+        let first = update(1_791_477_600_000, "1");
+        let later = first.replace("1791477617000", "1791477618000");
+        stream.apply(&later).unwrap();
+        assert!(stream.apply(&first).is_err());
+        assert!(stream.apply(&update(1_791_477_660_000, "2")).is_err());
+    }
+
+    #[rstest]
+    fn new_connection_does_not_reuse_an_unfinished_bucket() {
+        let mut old = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        old.apply(ACK).unwrap();
+        old.apply(&update(1_791_477_600_000, "12.867")).unwrap();
+
+        let mut fresh = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        fresh.apply(ACK).unwrap();
+        assert!(
+            fresh
+                .apply(&update(1_791_477_720_000, "1.458"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[rstest]
+    #[case("\"channel\":\"candles\"", "\"channel\":\"trades\"")]
+    #[case("\"pair\":\"ETH-USDC\"", "\"pair\":\"BTC-USDC\"")]
+    #[case("\"volume\":12.867", "\"volume\":12.867999999999999999999999999999")]
+    fn rejects_foreign_or_unrepresentable_updates(
+        #[case] original: &str,
+        #[case] replacement: &str,
+    ) {
+        let mut stream = DeepXWsCandleStream::new(3, "ETH-USDC").unwrap();
+        stream.apply(ACK).unwrap();
+        let frame = update(1_791_477_600_000, "12.867").replace(original, replacement);
+        assert!(stream.apply(&frame).is_err());
+        assert!(stream.apply(&update(1_791_477_660_000, "1")).is_err());
+    }
+}

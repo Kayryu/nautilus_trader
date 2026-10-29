@@ -93,6 +93,15 @@ pub fn decode_max_withdraw_return(response: &[u8]) -> Option<u128> {
         .then_some(u128::from_be_bytes(raw))
 }
 
+/// Decodes a hex-encoded canonical maximum-withdrawal return value.
+#[must_use]
+pub fn decode_max_withdraw_hex(encoded: &str) -> Option<u128> {
+    let bytes = encoded
+        .strip_prefix("0x")
+        .and_then(|value| hex::decode(value).ok())?;
+    decode_max_withdraw_return(&bytes)
+}
+
 /// Encodes a perpetual-market precompile query.
 #[must_use]
 pub fn encode_perp_market_call(market_id: u16) -> Vec<u8> {
@@ -142,5 +151,23 @@ mod tests {
         assert_eq!(decode_max_withdraw_return(&response[..31]), None);
         response[0] = 1;
         assert_eq!(decode_max_withdraw_return(&response), None);
+    }
+
+    #[rstest]
+    fn max_withdraw_hex_rejects_noncanonical_envelopes() {
+        let mut valid = [0_u8; 32];
+        valid[31] = 42;
+        assert_eq!(
+            decode_max_withdraw_hex(&format!("0x{}", hex::encode(valid))),
+            Some(42)
+        );
+        for encoded in [
+            "0x".to_string(),
+            "0x01".to_string(),
+            format!("0x01{}", "00".repeat(31)),
+            format!("0x{}00", "00".repeat(32)),
+        ] {
+            assert_eq!(decode_max_withdraw_hex(&encoded), None);
+        }
     }
 }

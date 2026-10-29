@@ -29,6 +29,33 @@ pub fn ws_url(environment: &DeepXEnvironment) -> Result<&'static str> {
     require_testnet(environment, DEEPX_TESTNET_WS_URL)
 }
 
+/// Resolves the DeepX WebSocket upgrade endpoint from a base URL.
+///
+/// Explicit non-root paths and query parameters are preserved without double-appending.
+///
+/// # Errors
+///
+/// Returns an error unless the URL has a WebSocket scheme and host without credentials or a
+/// fragment.
+pub fn ws_connection_url(base_url: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|_| DeepXError::InvalidConfiguration("invalid WebSocket URL".to_string()))?;
+    if !matches!(url.scheme(), "ws" | "wss")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(DeepXError::InvalidConfiguration(
+            "WebSocket URL requires ws/wss, a host, and no userinfo or fragment".to_string(),
+        ));
+    }
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/internal/v1/ws");
+    }
+    Ok(url.to_string())
+}
+
 pub fn rpc_url(environment: &DeepXEnvironment) -> Result<&'static str> {
     require_testnet(environment, DEEPX_TESTNET_RPC_URL)
 }
@@ -77,5 +104,24 @@ mod tests {
             rest_url(&environment),
             Err(DeepXError::UnsupportedEnvironment(expected.to_string())),
         );
+    }
+
+    #[rstest]
+    #[case("wss://example.invalid", Some("wss://example.invalid/internal/v1/ws"))]
+    #[case("ws://127.0.0.1:1234/", Some("ws://127.0.0.1:1234/internal/v1/ws"))]
+    #[case(
+        "wss://example.invalid/internal/v1/ws?session=opaque",
+        Some("wss://example.invalid/internal/v1/ws?session=opaque")
+    )]
+    #[case("wss://example.invalid/custom", Some("wss://example.invalid/custom"))]
+    #[case("https://example.invalid", None)]
+    #[case("wss://user:secret@example.invalid", None)]
+    #[case("wss://example.invalid/#fragment", None)]
+    #[case("not-a-url", None)]
+    fn ws_connection_endpoint_resolution(#[case] base: &str, #[case] expected: Option<&str>) {
+        match expected {
+            Some(expected) => assert_eq!(ws_connection_url(base).unwrap(), expected),
+            None => assert!(ws_connection_url(base).is_err()),
+        }
     }
 }

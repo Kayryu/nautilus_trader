@@ -17,6 +17,11 @@
 
 use std::collections::HashSet;
 
+pub use deepx_rust_sdk::rest::ownership::DeepXAccountOwnershipProof;
+use deepx_rust_sdk::rest::ownership::{
+    DeepXOwnershipEvidenceError, verify_account_ownership_evidence,
+    verify_delegated_account_ownership_evidence,
+};
 use nautilus_core::{UUID4, UnixNanos, hex};
 use nautilus_model::{
     enums::AccountType,
@@ -29,9 +34,8 @@ use thiserror::Error;
 use crate::{
     common::{DeepXPrivateKey, parse::scaled_i128_to_decimal},
     http::{
-        DeepXDelegateMode, DeepXDelegateWallets, DeepXHttpError, DeepXSubaccountBalances,
-        DeepXSubaccountMarginRatio, DeepXSubaccountProfile, DeepXWalletDelegateAccounts,
-        DeepXWalletSubaccounts,
+        DeepXDelegateWallets, DeepXHttpError, DeepXSubaccountBalances, DeepXSubaccountMarginRatio,
+        DeepXSubaccountProfile, DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
     },
     rpc::{
         DeepXCurrentMarginEvidence, DeepXFinalizedAccountEvidence, DeepXFinalizedCheckpoint,
@@ -478,45 +482,26 @@ pub enum DeepXAccountOwnershipError {
     DelegateDirectoryMismatch,
 }
 
-/// Complete REST-backed ownership evidence for one signer and configured subaccount.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXAccountOwnershipProof {
-    signer: [u8; 20],
-    wallet: [u8; 20],
-    subaccount: [u8; 20],
-    profile_height: u64,
-    profile_created_at: u64,
-}
-
-impl DeepXAccountOwnershipProof {
-    /// Returns the signer AccountId20.
-    #[must_use]
-    pub const fn signer(&self) -> [u8; 20] {
-        self.signer
-    }
-
-    /// Returns the wallet that owns the configured subaccount.
-    #[must_use]
-    pub const fn wallet(&self) -> [u8; 20] {
-        self.wallet
-    }
-
-    /// Returns the owned subaccount AccountId20.
-    #[must_use]
-    pub const fn subaccount(&self) -> [u8; 20] {
-        self.subaccount
-    }
-
-    /// Returns the profile observation block height reported by REST.
-    #[must_use]
-    pub const fn profile_height(&self) -> u64 {
-        self.profile_height
-    }
-
-    /// Returns the subaccount creation timestamp in Unix milliseconds.
-    #[must_use]
-    pub const fn profile_created_at(&self) -> u64 {
-        self.profile_created_at
+impl From<DeepXOwnershipEvidenceError> for DeepXAccountOwnershipError {
+    fn from(value: DeepXOwnershipEvidenceError) -> Self {
+        match value {
+            DeepXOwnershipEvidenceError::InvalidAddress { field } => Self::InvalidAddress { field },
+            DeepXOwnershipEvidenceError::DirectoryWalletMismatch => Self::DirectoryWalletMismatch,
+            DeepXOwnershipEvidenceError::DuplicateSubaccount => Self::DuplicateSubaccount,
+            DeepXOwnershipEvidenceError::SubaccountNotOwned => Self::SubaccountNotOwned,
+            DeepXOwnershipEvidenceError::ProfileAddressMismatch => Self::ProfileAddressMismatch,
+            DeepXOwnershipEvidenceError::ProfileAuthorityMismatch => Self::ProfileAuthorityMismatch,
+            DeepXOwnershipEvidenceError::InactiveSubaccount(status) => {
+                Self::InactiveSubaccount(status)
+            }
+            DeepXOwnershipEvidenceError::DelegatorUnavailable => Self::DelegatorUnavailable,
+            DeepXOwnershipEvidenceError::DelegateUnavailable => Self::DelegateUnavailable,
+            DeepXOwnershipEvidenceError::DelegateModeUnsupported => Self::DelegateModeUnsupported,
+            DeepXOwnershipEvidenceError::DelegateInactive => Self::DelegateInactive,
+            DeepXOwnershipEvidenceError::DelegateDirectoryMismatch => {
+                Self::DelegateDirectoryMismatch
+            }
+        }
     }
 }
 
@@ -536,7 +521,12 @@ pub(crate) fn verify_account_ownership(
     profile: &DeepXSubaccountProfile,
 ) -> Result<DeepXAccountOwnershipProof, DeepXAccountOwnershipError> {
     let signer = derive_signer_account_id(key)?;
-    verify_account_ownership_for_wallet(signer, signer, configured_subaccount, directory, profile)
+    Ok(verify_account_ownership_evidence(
+        signer,
+        configured_subaccount,
+        directory,
+        profile,
+    )?)
 }
 
 pub(crate) fn verify_delegated_account_ownership(
@@ -549,98 +539,15 @@ pub(crate) fn verify_delegated_account_ownership(
     now_ms: u64,
 ) -> Result<DeepXAccountOwnershipProof, DeepXAccountOwnershipError> {
     let signer = derive_signer_account_id(key)?;
-    let wallet = parse_account_id20(&profile.authority, "profile authority")?;
-    if parse_account_id20(delegates.wallet(), "delegate directory wallet")? != wallet
-        || parse_account_id20(delegators.delegate(), "delegator directory delegate")? != signer
-    {
-        return Err(DeepXAccountOwnershipError::DelegateDirectoryMismatch);
-    }
-    let mut observed_wallets = HashSet::new();
-    for address in &delegators.wallets {
-        let address = parse_account_id20(address, "delegator wallet")?;
-        if !observed_wallets.insert(address) {
-            return Err(DeepXAccountOwnershipError::DelegateDirectoryMismatch);
-        }
-    }
-    if !observed_wallets.contains(&wallet) {
-        return Err(DeepXAccountOwnershipError::DelegatorUnavailable);
-    }
-    let mut observed_delegates = HashSet::new();
-    let mut delegate = None;
-    for account in &delegates.accounts {
-        let address = parse_account_id20(&account.delegate_address, "delegate address")?;
-        if !observed_delegates.insert(address) {
-            return Err(DeepXAccountOwnershipError::DelegateDirectoryMismatch);
-        }
-        if address == signer {
-            delegate = Some(account);
-        }
-    }
-    let delegate = delegate.ok_or(DeepXAccountOwnershipError::DelegateUnavailable)?;
-    if delegate.mode != DeepXDelegateMode::PlaceOrCancelOrder {
-        return Err(DeepXAccountOwnershipError::DelegateModeUnsupported);
-    }
-    if !delegate.active || (delegate.valid_until != 0 && delegate.valid_until <= now_ms) {
-        return Err(DeepXAccountOwnershipError::DelegateInactive);
-    }
-    verify_account_ownership_for_wallet(signer, wallet, configured_subaccount, directory, profile)
-}
-
-fn verify_account_ownership_for_wallet(
-    signer: [u8; 20],
-    wallet: [u8; 20],
-    configured_subaccount: &str,
-    directory: &DeepXWalletSubaccounts,
-    profile: &DeepXSubaccountProfile,
-) -> Result<DeepXAccountOwnershipProof, DeepXAccountOwnershipError> {
-    let subaccount = parse_account_id20(configured_subaccount, "configured subaccount")?;
-    let directory_wallet = parse_account_id20(directory.wallet(), "account directory wallet")?;
-    if directory_wallet != wallet {
-        return Err(DeepXAccountOwnershipError::DirectoryWalletMismatch);
-    }
-
-    let mut observed = HashSet::new();
-    let mut owns_subaccount = false;
-    for address in &directory.addresses {
-        let address = parse_account_id20(address, "account directory subaccount")?;
-        if !observed.insert(address) {
-            return Err(DeepXAccountOwnershipError::DuplicateSubaccount);
-        }
-        owns_subaccount |= address == subaccount;
-    }
-    if !owns_subaccount {
-        return Err(DeepXAccountOwnershipError::SubaccountNotOwned);
-    }
-
-    if parse_account_id20(&profile.address, "profile subaccount")? != subaccount {
-        return Err(DeepXAccountOwnershipError::ProfileAddressMismatch);
-    }
-    if parse_account_id20(&profile.authority, "profile authority")? != wallet {
-        return Err(DeepXAccountOwnershipError::ProfileAuthorityMismatch);
-    }
-    if profile.status != "Active" {
-        return Err(DeepXAccountOwnershipError::InactiveSubaccount(
-            profile.status.clone(),
-        ));
-    }
-
-    Ok(DeepXAccountOwnershipProof {
+    Ok(verify_delegated_account_ownership_evidence(
         signer,
-        wallet,
-        subaccount,
-        profile_height: profile.height,
-        profile_created_at: profile.created_at,
-    })
-}
-
-fn parse_account_id20(
-    value: &str,
-    field: &'static str,
-) -> Result<[u8; 20], DeepXAccountOwnershipError> {
-    let value = value
-        .strip_prefix("0x")
-        .ok_or(DeepXAccountOwnershipError::InvalidAddress { field })?;
-    hex::decode_array::<20>(value).map_err(|_| DeepXAccountOwnershipError::InvalidAddress { field })
+        configured_subaccount,
+        directory,
+        profile,
+        &delegates.inner,
+        delegators,
+        now_ms,
+    )?)
 }
 
 #[cfg(test)]
@@ -648,25 +555,23 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::{
-        common::DeepXKeyScheme,
-        http::{DeepXDelegateAccount, DeepXSubaccountProfile},
-    };
+    use crate::common::DeepXKeyScheme;
 
-    const PRIVATE_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    fn key() -> DeepXPrivateKey {
-        DeepXPrivateKey::new(PRIVATE_KEY, &DeepXKeyScheme::Secp256k1).unwrap()
-    }
-
-    fn evidence() -> (DeepXWalletSubaccounts, DeepXSubaccountProfile, String) {
-        let signer = derive_signer_account_id(&key()).unwrap();
+    #[rstest]
+    fn adapter_derives_signer_and_maps_ownership_errors() {
+        let key = DeepXPrivateKey::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let signer = derive_signer_account_id(&key).unwrap();
         let wallet = format!("0x{}", hex::encode(signer));
         let subaccount = format!("0x{}", hex::encode([0x11; 20]));
-        let directory = DeepXWalletSubaccounts::new(
-            wallet.clone(),
-            vec![subaccount.clone(), format!("0x{}", hex::encode([0x22; 20]))],
-        );
+        let directory =
+            DeepXWalletSubaccounts(deepx_rust_sdk::rest::models::DeepXWalletSubaccounts::new(
+                wallet.clone(),
+                vec![subaccount.clone()],
+            ));
         let profile =
             DeepXSubaccountProfile(deepx_rust_sdk::rest::models::DeepXSubaccountProfile {
                 authority: wallet,
@@ -680,158 +585,12 @@ mod tests {
                 height: 50_070_126,
                 created_at: 1_779_848_876_302,
             });
-        (directory, profile, subaccount)
-    }
 
-    fn delegated_evidence() -> (
-        DeepXWalletSubaccounts,
-        DeepXSubaccountProfile,
-        DeepXWalletDelegateAccounts,
-        DeepXDelegateWallets,
-        String,
-    ) {
-        let (directory, mut profile, subaccount) = evidence();
-        let wallet = format!("0x{}", hex::encode([0x33; 20]));
-        let signer = format!(
-            "0x{}",
-            hex::encode(derive_signer_account_id(&key()).unwrap())
-        );
-        profile.authority = wallet.clone();
-        let directory = DeepXWalletSubaccounts::new(wallet.clone(), directory.addresses);
-        let delegates = DeepXWalletDelegateAccounts::new(
-            wallet.clone(),
-            vec![DeepXDelegateAccount(
-                deepx_rust_sdk::rest::models::DeepXDelegateAccount {
-                    delegate_address: signer.clone(),
-                    delegate_name: "order bot".to_string(),
-                    valid_until: 2_000,
-                    mode: DeepXDelegateMode::PlaceOrCancelOrder,
-                    create_time: 100,
-                    active: true,
-                },
-            )],
-        );
-        let delegators = DeepXDelegateWallets::new(signer, vec![wallet]);
-        (directory, profile, delegates, delegators, subaccount)
-    }
-
-    #[rstest]
-    fn ownership_proof_binds_signer_directory_and_profile() {
-        let (directory, profile, subaccount) = evidence();
-
-        let proof = verify_account_ownership(&key(), &subaccount, &directory, &profile).unwrap();
-
-        assert_eq!(proof.signer(), derive_signer_account_id(&key()).unwrap());
-        assert_eq!(proof.wallet(), proof.signer());
+        let proof = verify_account_ownership(&key, &subaccount, &directory, &profile).unwrap();
+        assert_eq!(proof.signer(), signer);
         assert_eq!(proof.subaccount(), [0x11; 20]);
-        assert_eq!(proof.profile_height(), profile.height);
-        assert_eq!(proof.profile_created_at(), profile.created_at);
-    }
-
-    #[rstest]
-    fn delegated_ownership_requires_both_directories_and_current_order_permission() {
-        let (directory, profile, mut delegates, mut delegators, subaccount) = delegated_evidence();
-        let verify =
-            |delegates: &DeepXWalletDelegateAccounts, delegators: &DeepXDelegateWallets, now_ms| {
-                verify_delegated_account_ownership(
-                    &key(),
-                    &subaccount,
-                    &directory,
-                    &profile,
-                    delegates,
-                    delegators,
-                    now_ms,
-                )
-            };
-
-        let proof = verify(&delegates, &delegators, 1_999).unwrap();
-        assert_eq!(proof.wallet(), [0x33; 20]);
-        assert_eq!(proof.signer(), derive_signer_account_id(&key()).unwrap());
-        assert_eq!(proof.subaccount(), [0x11; 20]);
-
         assert!(matches!(
-            verify(&delegates, &delegators, 2_000),
-            Err(DeepXAccountOwnershipError::DelegateInactive),
-        ));
-        delegates.accounts[0].mode = DeepXDelegateMode::Disable;
-        assert!(matches!(
-            verify(&delegates, &delegators, 1_999),
-            Err(DeepXAccountOwnershipError::DelegateModeUnsupported),
-        ));
-        delegates.accounts[0].mode = DeepXDelegateMode::PlaceOrCancelOrder;
-        delegators.wallets.clear();
-        assert!(matches!(
-            verify(&delegates, &delegators, 1_999),
-            Err(DeepXAccountOwnershipError::DelegatorUnavailable),
-        ));
-    }
-
-    #[rstest]
-    fn ownership_proof_rejects_foreign_directory_wallet() {
-        let (directory, profile, subaccount) = evidence();
-        let directory = DeepXWalletSubaccounts::new(
-            format!("0x{}", hex::encode([0x33; 20])),
-            directory.addresses,
-        );
-
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &directory, &profile),
-            Err(DeepXAccountOwnershipError::DirectoryWalletMismatch),
-        ));
-    }
-
-    #[rstest]
-    fn ownership_proof_rejects_missing_and_duplicate_subaccounts() {
-        let (directory, profile, subaccount) = evidence();
-        let missing = DeepXWalletSubaccounts::new(
-            directory.wallet().to_string(),
-            vec![format!("0x{}", hex::encode([0x22; 20]))],
-        );
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &missing, &profile),
-            Err(DeepXAccountOwnershipError::SubaccountNotOwned),
-        ));
-
-        let duplicate = DeepXWalletSubaccounts::new(
-            directory.wallet().to_string(),
-            vec![subaccount.clone(), subaccount.clone()],
-        );
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &duplicate, &profile),
-            Err(DeepXAccountOwnershipError::DuplicateSubaccount),
-        ));
-    }
-
-    #[rstest]
-    fn ownership_proof_rejects_profile_identity_and_status_mismatches() {
-        let (directory, mut profile, subaccount) = evidence();
-        profile.address = format!("0x{}", hex::encode([0x44; 20]));
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &directory, &profile),
-            Err(DeepXAccountOwnershipError::ProfileAddressMismatch),
-        ));
-
-        let (_, mut profile, _) = evidence();
-        profile.authority = format!("0x{}", hex::encode([0x44; 20]));
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &directory, &profile),
-            Err(DeepXAccountOwnershipError::ProfileAuthorityMismatch),
-        ));
-
-        let (_, mut profile, _) = evidence();
-        profile.status = "Closed".to_string();
-        assert!(matches!(
-            verify_account_ownership(&key(), &subaccount, &directory, &profile),
-            Err(DeepXAccountOwnershipError::InactiveSubaccount(status)) if status == "Closed",
-        ));
-    }
-
-    #[rstest]
-    fn ownership_proof_rejects_malformed_account_id20() {
-        let (directory, profile, _) = evidence();
-
-        assert!(matches!(
-            verify_account_ownership(&key(), "subaccount", &directory, &profile),
+            verify_account_ownership(&key, "subaccount", &directory, &profile),
             Err(DeepXAccountOwnershipError::InvalidAddress {
                 field: "configured subaccount"
             }),

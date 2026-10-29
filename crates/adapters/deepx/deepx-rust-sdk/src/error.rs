@@ -17,17 +17,17 @@
 
 use thiserror::Error;
 
-/// Result alias for DeepX adapter operations.
+/// Result alias for DeepX SDK operations.
 pub type Result<T> = std::result::Result<T, DeepXError>;
 
-/// Errors surfaced at the DeepX adapter boundary.
+/// Errors surfaced by shared DeepX SDK types and utilities.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeepXError {
-    /// The configured environment is not supported by this adapter release.
+    /// The configured environment is not supported by this SDK release.
     #[error("unsupported DeepX environment: {0}")]
     UnsupportedEnvironment(String),
 
-    /// The configuration violates an adapter invariant.
+    /// The configuration violates an SDK invariant.
     #[error("invalid DeepX configuration: {0}")]
     InvalidConfiguration(String),
 
@@ -39,15 +39,15 @@ pub enum DeepXError {
     #[error("invalid DeepX credential: {0}")]
     InvalidCredential(String),
 
-    /// A key scheme is not supported by this adapter release.
+    /// A key scheme is not supported by this SDK release.
     #[error("unsupported DeepX key scheme: {0}")]
     UnsupportedKeyScheme(String),
 
-    /// A symbol does not satisfy the canonical DeepX adapter format.
+    /// A symbol does not satisfy the canonical DeepX format.
     #[error("invalid DeepX symbol: {0}")]
     InvalidSymbol(String),
 
-    /// A product cannot be mapped to a supported Nautilus instrument identity.
+    /// A product has no supported DeepX symbol representation.
     #[error("unsupported DeepX product type: {0}")]
     UnsupportedProduct(String),
 

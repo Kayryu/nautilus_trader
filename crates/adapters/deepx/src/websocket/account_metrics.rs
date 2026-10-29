@@ -25,9 +25,7 @@ pub use deepx_rust_sdk::websocket::account_metrics::{
 };
 use nautilus_network::transport::Message;
 #[cfg(test)]
-use rust_decimal::Decimal;
-#[cfg(test)]
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::transport::DeepXWsReadConnection;
 use crate::config::DeepXNetworkConfig;
@@ -149,102 +147,6 @@ mod tests {
 
     fn request() -> DeepXWsAccountMetricsRequest {
         DeepXWsAccountMetricsRequest::new(ADDRESS).unwrap()
-    }
-
-    #[rstest]
-    fn parses_observed_summary_shapes_without_rounded_numbers() {
-        let request = request();
-        let encoded: Value = serde_json::from_str(&request.to_text()).unwrap();
-        assert_eq!(encoded["market"]["type"], "all");
-        assert_eq!(encoded["subscriptions"].as_array().unwrap().len(), 4);
-        assert!(matches!(
-            Frame::parse(ACK, &request).unwrap(),
-            Frame::Subscribed
-        ));
-        let Frame::Metric(metric) = Frame::parse(TOTAL, &request).unwrap() else {
-            panic!("expected summary frame");
-        };
-        assert_eq!(metric.channel(), DeepXWsAccountMetricChannel::TotalDeposits);
-        assert!(metric.raw_data().get().contains("970.9600"));
-        assert!(metric.exact_portfolio_margin().is_none());
-        assert_eq!(metric.timestamp_ms(), 1_791_494_312_743);
-        assert!(matches!(
-            Frame::parse(NET, &request).unwrap(),
-            Frame::Metric(_)
-        ));
-        assert!(matches!(
-            Frame::parse(EQUITY, &request).unwrap(),
-            Frame::Metric(_)
-        ));
-        let Frame::Metric(margin) = Frame::parse(MARGIN, &request).unwrap() else {
-            panic!("expected portfolio margin frame");
-        };
-        assert_eq!(
-            margin.channel(),
-            DeepXWsAccountMetricChannel::PortfolioMarginRatio
-        );
-        assert!(margin.raw_data().get().contains("\"970.963729\""));
-        let exact = margin.exact_portfolio_margin().unwrap();
-        assert_eq!(exact.subaccount, ADDRESS);
-        assert_eq!(exact.available_margin.to_string(), "970.963729");
-        assert_eq!(exact.init_collateral.to_string(), "970.963729");
-        assert_eq!(exact.init_margin_req, Decimal::ZERO);
-        assert_eq!(exact.maint_margin_req, Decimal::ZERO);
-        assert_eq!(exact.total_collateral.to_string(), "970.963729");
-        assert_eq!(exact.total_maintenance_margin_required, Decimal::ZERO);
-        assert_eq!(exact.total_margin_required, Decimal::ZERO);
-        assert_eq!(exact.margin_ratio, None);
-        assert_eq!(exact.uni_imr, None);
-    }
-
-    #[rstest]
-    fn parses_populated_exact_ratios_without_using_rounded_outer_numbers() {
-        let mut frame: Value = serde_json::from_str(MARGIN).unwrap();
-        frame["data"]["marginRatio"] = json!(0.12);
-        frame["data"]["uniIMR"] = json!(0.34);
-        frame["data"]["exactMargin"]["marginRatio"] = json!("0.123456789012345678");
-        frame["data"]["exactMargin"]["uniIMR"] = json!("0.345678901234567890");
-        let Frame::Metric(metric) = Frame::parse(&frame.to_string(), &request()).unwrap() else {
-            panic!("expected portfolio margin frame");
-        };
-        let exact = metric.exact_portfolio_margin().unwrap();
-        assert_eq!(
-            exact.margin_ratio.unwrap().to_string(),
-            "0.123456789012345678"
-        );
-        assert_eq!(exact.uni_imr.unwrap().to_string(), "0.345678901234567890");
-    }
-
-    #[rstest]
-    fn rejects_wrong_summary_identity_or_numeric_shape() {
-        let foreign = EQUITY.replace(ADDRESS, "0x0000000000000000000000000000000000000000");
-        assert!(Frame::parse(&foreign, &request()).is_err());
-        let wrong_number = TOTAL.replace("970.9600", "\"970.9600\"");
-        assert!(Frame::parse(&wrong_number, &request()).is_err());
-        let missing = NET.replace("\"netValueUsd\":970.96,", "");
-        assert!(Frame::parse(&missing, &request()).is_err());
-        let foreign_market = TOTAL.replace("\"type\":\"all\"", "\"type\":\"perp\"");
-        assert!(Frame::parse(&foreign_market, &request()).is_err());
-        let mut foreign_exact: Value = serde_json::from_str(MARGIN).unwrap();
-        foreign_exact["data"]["exactMargin"]["address"] =
-            json!("0x0000000000000000000000000000000000000000");
-        assert!(Frame::parse(&foreign_exact.to_string(), &request()).is_err());
-        let invalid_exact = MARGIN.replace("\"970.963729\"", "\"not-a-decimal\"");
-        assert!(Frame::parse(&invalid_exact, &request()).is_err());
-        let mut invalid_ratio: Value = serde_json::from_str(MARGIN).unwrap();
-        invalid_ratio["data"]["exactMargin"]["marginRatio"] = json!("not-a-decimal");
-        assert!(Frame::parse(&invalid_ratio.to_string(), &request()).is_err());
-        let missing_exact = MARGIN.replace("\"exactMargin\":", "\"other\":");
-        assert!(Frame::parse(&missing_exact, &request()).is_err());
-    }
-
-    #[rstest]
-    #[case("availableMargin")]
-    #[case("marginRatio")]
-    fn rejects_inexact_portfolio_margin_decimals(#[case] field: &str) {
-        let mut frame: Value = serde_json::from_str(MARGIN).unwrap();
-        frame["data"]["exactMargin"][field] = json!("0.12345678901234567890123456789");
-        assert!(Frame::parse(&frame.to_string(), &request()).is_err());
     }
 
     #[rstest]

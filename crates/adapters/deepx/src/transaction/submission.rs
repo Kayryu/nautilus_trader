@@ -16,25 +16,20 @@
 
 use std::{future::Future, num::NonZeroU32};
 
-use deepx_rust_sdk::{
-    rest::{DeepXRestAction, decode_transaction_acknowledgement, encode_transaction_request},
-    rpc::{DeepXRpcClient, SUBMIT_EXTRINSIC_METHOD},
+pub use deepx_rust_sdk::rpc::submission::{
+    DeepXRestSubmissionAcknowledgement, DeepXSubmissionError, DeepXSubmittedExtrinsic,
+    verify_submission_hash,
 };
-use nautilus_core::hex;
-use subxt_core::config::{Hasher, substrate::BlakeTwo256};
+use deepx_rust_sdk::{
+    rest::{DeepXRestAction, encode_transaction_request},
+    rpc::{
+        DeepXRpcClient, submission::verify_rest_acknowledgement as sdk_verify_rest_acknowledgement,
+    },
+};
 use thiserror::Error;
 
 use super::{DeepXSubmissionFailure, DeepXSubmissionPermit};
 use crate::signing::{DeepXRuntimeSnapshotPermit, SignedPalletExtrinsic};
-
-/// REST acknowledgement, not verified inclusion, finality, or business success.
-#[derive(Debug)]
-pub struct DeepXRestSubmissionAcknowledgement {
-    /// Hash-verified acceptance of the exact permitted extrinsic.
-    pub submitted: DeepXSubmittedExtrinsic,
-    /// Backend action result retained without inventing confirmation semantics.
-    pub data: serde_json::Value,
-}
 
 /// REST submission failures which never authorize automatic replay or nonce reuse.
 #[derive(Debug, Error)]
@@ -67,19 +62,8 @@ fn verify_rest_acknowledgement(
     bytes: &[u8],
     expected_hash: [u8; 32],
 ) -> Result<DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError> {
-    let uncertain = |e: String| DeepXRestSubmissionError::ReconciliationRequired(e);
-    let response =
-        decode_transaction_acknowledgement(body).map_err(|e| uncertain(e.to_string()))?;
-    let node_hash = decode_node_hash(&response.tx_hash).map_err(|e| uncertain(e.to_string()))?;
-    verify_submission_hash(bytes, expected_hash, node_hash)
-        .map_err(|e| uncertain(e.to_string()))?;
-    Ok(DeepXRestSubmissionAcknowledgement {
-        submitted: DeepXSubmittedExtrinsic {
-            node_hash,
-            extrinsic_hash: expected_hash,
-        },
-        data: response.data,
-    })
+    sdk_verify_rest_acknowledgement(body, bytes, expected_hash)
+        .map_err(|e| DeepXRestSubmissionError::ReconciliationRequired(e.to_string()))
 }
 
 /// Consumes durably prepared submission and sends exactly one REST request to the primary URL.
@@ -136,41 +120,6 @@ pub async fn submit_rest_transaction_once(
     verify_rest_acknowledgement(&response.body, &bytes, expected_hash)
 }
 
-/// Errors raised while submitting one signed DeepX extrinsic.
-#[derive(Debug, Error)]
-pub enum DeepXSubmissionError {
-    /// The request or JSON-RPC response failed.
-    #[error("failed to submit DeepX extrinsic via `{method}`: {source}")]
-    Rpc {
-        /// Method which failed.
-        method: &'static str,
-        /// Underlying request or response error.
-        #[source]
-        source: anyhow::Error,
-    },
-    /// The submission response was not a single hex-encoded hash string.
-    #[error("DeepX submission response was not a 0x-prefixed 32-byte hash: {value}")]
-    InvalidResponse {
-        /// Raw JSON value returned by the node.
-        value: String,
-    },
-    /// The node-returned hash did not match the submitted extrinsic.
-    #[error(
-        "DeepX submission hash mismatch: node {}, extrinsic {}, recomputed {}",
-        hash_to_hex(node_hash),
-        hash_to_hex(extrinsic_hash),
-        hash_to_hex(recomputed_hash)
-    )]
-    HashMismatch {
-        /// Blake2-256 hash returned by the submission node.
-        node_hash: [u8; 32],
-        /// Blake2-256 hash recorded with the signed extrinsic.
-        extrinsic_hash: [u8; 32],
-        /// Blake2-256 hash recomputed from the submitted extrinsic bytes.
-        recomputed_hash: [u8; 32],
-    },
-}
-
 /// Terminal result of a bounded initial-submission attempt sequence.
 #[derive(Debug, Error)]
 pub enum DeepXSubmissionRetryError {
@@ -201,62 +150,6 @@ pub enum DeepXSubmissionRetryError {
     /// Accepted response evidence did not identify the exact permitted payload.
     #[error(transparent)]
     Hash(#[from] DeepXSubmissionError),
-}
-
-/// Renders a 32-byte hash as a fixed-width hex string for error messages.
-fn hash_to_hex(hash: &[u8; 32]) -> String {
-    let mut encoded = String::with_capacity(64);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
-/// Verifies that the submission node's hash matches the submitted extrinsic exactly.
-///
-/// The recomputed hash is derived from the exact submitted bytes, and both the recorded extrinsic
-/// hash and the node-returned hash must equal it. This function performs no network I/O.
-///
-/// # Errors
-///
-/// Returns [`DeepXSubmissionError::HashMismatch`] when any pair of the three hashes differs.
-pub fn verify_submission_hash(
-    extrinsic_bytes: &[u8],
-    expected_hash: [u8; 32],
-    node_hash: [u8; 32],
-) -> Result<(), DeepXSubmissionError> {
-    let recomputed_hash = BlakeTwo256.hash(extrinsic_bytes).0;
-    if recomputed_hash == expected_hash && recomputed_hash == node_hash {
-        Ok(())
-    } else {
-        Err(DeepXSubmissionError::HashMismatch {
-            node_hash,
-            extrinsic_hash: expected_hash,
-            recomputed_hash,
-        })
-    }
-}
-
-/// Evidence produced by one hash-verified extrinsic submission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeepXSubmittedExtrinsic {
-    node_hash: [u8; 32],
-    extrinsic_hash: [u8; 32],
-}
-
-impl DeepXSubmittedExtrinsic {
-    /// Blake2-256 hash returned by the submission node for the accepted extrinsic.
-    #[must_use]
-    pub const fn node_hash(&self) -> [u8; 32] {
-        self.node_hash
-    }
-
-    /// Blake2-256 hash recorded with the signed extrinsic before submission.
-    #[must_use]
-    pub const fn extrinsic_hash(&self) -> [u8; 32] {
-        self.extrinsic_hash
-    }
 }
 
 /// A one-shot submission failure retained with its durable reconciliation context.
@@ -325,19 +218,15 @@ where
 {
     let (bytes, expected_hash) = permit.into_payload();
     match submit(bytes.clone(), expected_hash).await {
-        Ok(node_hash) => match verify_submission_hash(&bytes, expected_hash, node_hash) {
-            Ok(()) => DeepXSubmissionAttemptOutcome::Accepted {
-                context,
-                submitted: DeepXSubmittedExtrinsic {
-                    node_hash,
-                    extrinsic_hash: expected_hash,
+        Ok(node_hash) => {
+            match DeepXSubmittedExtrinsic::verified(&bytes, expected_hash, node_hash) {
+                Ok(submitted) => DeepXSubmissionAttemptOutcome::Accepted { context, submitted },
+                Err(error) => DeepXSubmissionAttemptOutcome::Unresolved {
+                    context,
+                    failure: error.into(),
                 },
-            },
-            Err(error) => DeepXSubmissionAttemptOutcome::Unresolved {
-                context,
-                failure: error.into(),
-            },
-        },
+            }
+        }
         Err(failure) => DeepXSubmissionAttemptOutcome::Unresolved {
             context,
             failure: failure.into(),
@@ -396,11 +285,11 @@ where
     for attempt in 1..=max_attempts.get() {
         match submit(bytes.clone(), extrinsic_hash).await {
             Ok(node_hash) => {
-                verify_submission_hash(&bytes, extrinsic_hash, node_hash)?;
-                return Ok(DeepXSubmittedExtrinsic {
-                    node_hash,
+                return Ok(DeepXSubmittedExtrinsic::verified(
+                    &bytes,
                     extrinsic_hash,
-                });
+                    node_hash,
+                )?);
             }
             Err(DeepXSubmissionFailure::NotSent(reason)) => {
                 return Err(DeepXSubmissionRetryError::NotSent {
@@ -444,13 +333,9 @@ pub async fn submit_extrinsic_once(
     submission_url: &str,
     extrinsic: &SignedPalletExtrinsic,
 ) -> Result<DeepXSubmittedExtrinsic, DeepXSubmissionError> {
-    let node_hash = submit_encoded_extrinsic_hash_once(submission_url, extrinsic.bytes()).await?;
-    verify_submission_hash(extrinsic.bytes(), extrinsic.extrinsic_hash(), node_hash)?;
-
-    Ok(DeepXSubmittedExtrinsic {
-        node_hash,
-        extrinsic_hash: extrinsic.extrinsic_hash(),
-    })
+    DeepXRpcClient::new(submission_url.to_string())
+        .submit_verified_extrinsic_once(extrinsic.bytes(), extrinsic.extrinsic_hash())
+        .await
 }
 
 /// Submits exact prevalidated direct-pallet bytes once with conservative delivery classification.
@@ -477,40 +362,11 @@ pub async fn submit_direct_pallet_once_classified(
     if let Err(error) = verify_submission_hash(&bytes, expected_hash, expected_hash) {
         return Err(DeepXSubmissionFailure::not_sent(error.to_string()));
     }
-    let node_hash = submit_encoded_extrinsic_hash_once(submission_url, &bytes)
+    let submitted = DeepXRpcClient::new(submission_url.to_string())
+        .submit_verified_extrinsic_once(&bytes, expected_hash)
         .await
         .map_err(|error| DeepXSubmissionFailure::ambiguous(error.to_string()))?;
-    verify_submission_hash(&bytes, expected_hash, node_hash)
-        .map_err(|error| DeepXSubmissionFailure::ambiguous(error.to_string()))?;
-    Ok(node_hash)
-}
-
-async fn submit_encoded_extrinsic_hash_once(
-    submission_url: &str,
-    bytes: &[u8],
-) -> Result<[u8; 32], DeepXSubmissionError> {
-    let client = DeepXRpcClient::new(submission_url.to_string());
-    let encoded_hash: String = client
-        .submit_encoded_extrinsic(&format!("0x{}", hex::encode(bytes)))
-        .await
-        .map_err(|source| DeepXSubmissionError::Rpc {
-            method: SUBMIT_EXTRINSIC_METHOD,
-            source,
-        })?;
-    decode_node_hash(&encoded_hash)
-}
-
-fn decode_node_hash(encoded: &str) -> Result<[u8; 32], DeepXSubmissionError> {
-    encoded
-        .strip_prefix("0x")
-        .ok_or_else(|| DeepXSubmissionError::InvalidResponse {
-            value: encoded.to_string(),
-        })
-        .and_then(|value| {
-            hex::decode_array::<32>(value).map_err(|_| DeepXSubmissionError::InvalidResponse {
-                value: encoded.to_string(),
-            })
-        })
+    Ok(submitted.node_hash())
 }
 
 #[cfg(test)]
@@ -525,8 +381,11 @@ mod tests {
     };
 
     use axum::{Json, Router, routing::post};
+    use deepx_rust_sdk::rpc::SUBMIT_EXTRINSIC_METHOD;
+    use nautilus_core::hex;
     use rstest::rstest;
     use serde_json::{Value, json};
+    use subxt_core::config::{Hasher, substrate::BlakeTwo256};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -534,28 +393,6 @@ mod tests {
         DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService, RuntimeSnapshot, SigningError,
         sign_dynamic_pallet_call,
     };
-
-    #[rstest]
-    #[case(None)]
-    #[case(Some("pending"))]
-    #[case(Some("best"))]
-    #[case(Some("decode_failed"))]
-    fn rest_acknowledgement_preserves_backend_data(#[case] confirmation: Option<&str>) {
-        let bytes = b"exact durable extrinsic";
-        let hash = BlakeTwo256.hash(bytes).0;
-        let data = json!({
-            "tx_hash": format!("0x{}", hex::encode(hash)),
-            "order_id": "18446744073709551615",
-            "confirmation": confirmation,
-        });
-        let body = serde_json::to_vec(&json!({
-            "code": 200, "fail": false, "msg": "success", "data": data,
-        }))
-        .unwrap();
-        let acknowledgement = verify_rest_acknowledgement(&body, bytes, hash).unwrap();
-        assert_eq!(acknowledgement.submitted.node_hash(), hash);
-        assert_eq!(acknowledgement.data, data);
-    }
 
     #[rstest]
     #[case(json!(null))]
@@ -1268,32 +1105,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    fn blake2_of(bytes: &[u8]) -> [u8; 32] {
-        BlakeTwo256.hash(bytes).0
-    }
-
-    #[rstest]
-    fn verify_submission_hash_accepts_exact_match() {
-        let bytes = b"deepx-verify-exact";
-        let hash = blake2_of(bytes);
-
-        assert!(verify_submission_hash(bytes, hash, hash).is_ok());
-    }
-
-    #[rstest]
-    #[case::wrong_expected(vec![0xde, 0xad])]
-    #[case::wrong_node(b"bytes".to_vec())]
-    fn verify_submission_hash_rejects_any_mismatch(#[case] bytes: Vec<u8>) {
-        let true_hash = blake2_of(&bytes);
-        let wrong_hash = BlakeTwo256.hash(b"wrong-hash").0;
-
-        assert!(verify_submission_hash(&bytes, wrong_hash, true_hash).is_err());
-        assert!(verify_submission_hash(&bytes, true_hash, wrong_hash).is_err());
-        assert!(
-            verify_submission_hash(&bytes, wrong_hash, wrong_hash).is_err()
-                || wrong_hash == true_hash
-        );
     }
 }

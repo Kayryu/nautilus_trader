@@ -3461,6 +3461,8 @@ version = "0.63.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "aws-lc-rs",
+ "axum",
  "frame-metadata",
  "hex",
  "jiff",
@@ -3474,6 +3476,7 @@ dependencies = [
  "serde_json",
  "sp-crypto-hashing",
  "subxt-core",
+ "subxt-signer",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -4114,9 +4117,9 @@ dependencies = [
 
 [[package]]
 name = "frame-decode"
-version = "0.10.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "641e3739fa708a278d35b008a05244008c221240abc3e1c27138466c13e999ed"
+checksum = "c470df86cf28818dd3cd2fc4667b80dbefe2236c722c3dc1d09e7c6c82d6dfcd"
 dependencies = [
  "frame-metadata",
  "parity-scale-codec",
@@ -10213,7 +10216,8 @@ checksum = "734676eb262c623cec13c3155096e08d1f8f29adce39ba17948b18dad1e54142"
 [[package]]
 name = "subxt-core"
 version = "0.44.0"
-source = "git+https://github.com/deepxfinance/subxt.git?rev=2904b84ff5d6646481875e06749460dc5ebc6bbc#2904b84ff5d6646481875e06749460dc5ebc6bbc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5705c5b420294524e41349bf23c6b11aa474ce731de7317f4153390e1927f702"
 dependencies = [
  "base58",
  "blake2",
@@ -10241,8 +10245,9 @@ dependencies = [
 
 [[package]]
 name = "subxt-metadata"
-version = "0.44.0"
-source = "git+https://github.com/deepxfinance/subxt.git?rev=2904b84ff5d6646481875e06749460dc5ebc6bbc#2904b84ff5d6646481875e06749460dc5ebc6bbc"
+version = "0.44.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b2f2a52d97d7539febc0006d6988081150b1c1a3e4a357ca02ab5cdb34072bc"
 dependencies = [
  "frame-decode",
  "frame-metadata",
@@ -10256,7 +10261,8 @@ dependencies = [
 [[package]]
 name = "subxt-signer"
 version = "0.44.0"
-source = "git+https://github.com/deepxfinance/subxt.git?rev=2904b84ff5d6646481875e06749460dc5ebc6bbc#2904b84ff5d6646481875e06749460dc5ebc6bbc"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fb6463f7f46817043de9f20ba11f485ee474378fcdbe4150aa849274523bd1c"
 dependencies = [
  "base64 0.22.1",
  "bip32",

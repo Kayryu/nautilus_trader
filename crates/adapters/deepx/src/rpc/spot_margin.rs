@@ -180,13 +180,8 @@ async fn observe_spot_margin_with_client(
 #[cfg(test)]
 mod tests {
     use axum::{Json, Router, routing::post};
-    use deepx_rust_sdk::rpc::spot_margin::{decode_spot_margin, subaccount_info_storage_key};
-    use frame_metadata::{
-        RuntimeMetadata, RuntimeMetadataPrefixed,
-        v14::{StorageEntryModifier, StorageEntryType},
-    };
+    use deepx_rust_sdk::rpc::spot_margin::subaccount_info_storage_key;
     use nautilus_core::hex;
-    use parity_scale_codec::Decode;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -205,122 +200,11 @@ mod tests {
     const BLOCK_HASH: &str = "0xbb48406ad92b4a214f64b71b9ac95052df793113ef82b5e7df744dd44546f0e4";
     const BLOCK_NUMBER: u32 = 217_394_490;
 
-    fn metadata_bytes() -> Vec<u8> {
-        let fixture = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/deepx-rust-sdk/test_data/runtime/testnet/",
-            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
-        ));
-        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
-        hex::decode(
-            fixture["result"]
-                .as_str()
-                .unwrap()
-                .strip_prefix("0x")
-                .unwrap(),
-        )
-        .unwrap()
-    }
-
     fn metadata() -> subxt_core::Metadata {
         DeepXReadOnlyRuntimeSnapshot::built_in_testnet()
             .unwrap()
             .metadata()
             .clone()
-    }
-
-    #[rstest::rstest]
-    fn finalized_spot_margin_key_uses_identity_account_id20() {
-        assert_eq!(
-            subaccount_info_storage_key(SUBACCOUNT),
-            "0x7a722acdbb19d1db692588a0209d14499ac3b2b9666a5eaa79e0ca457b2ea3a94ded31cb63949b52f9dfc9bcfade4eab7017eadc"
-        );
-    }
-
-    #[rstest::rstest]
-    fn retained_runtime_uses_identity_subaccount_info_storage() {
-        let bytes = metadata_bytes();
-        let RuntimeMetadataPrefixed(_, RuntimeMetadata::V14(metadata)) =
-            RuntimeMetadataPrefixed::decode(&mut bytes.as_slice()).unwrap()
-        else {
-            panic!("approved runtime metadata must be V14");
-        };
-        let pallet = metadata
-            .pallets
-            .iter()
-            .find(|pallet| pallet.name == "Subaccount")
-            .unwrap();
-        let storage = pallet.storage.as_ref().unwrap();
-        assert_eq!(storage.prefix, "Subaccount");
-        let entry = storage
-            .entries
-            .iter()
-            .find(|entry| entry.name == "SubaccountInfo")
-            .unwrap();
-        assert_eq!(entry.modifier, StorageEntryModifier::Optional);
-        let StorageEntryType::Map {
-            hashers,
-            key,
-            value,
-        } = &entry.ty
-        else {
-            panic!("SubaccountInfo must be a storage map");
-        };
-        assert!(matches!(
-            hashers.as_slice(),
-            [frame_metadata::v14::StorageHasher::Identity]
-        ));
-        let account_id = metadata.types.resolve(key.id).unwrap();
-        assert_eq!(
-            account_id.path.segments.last().map(String::as_str),
-            Some("H160")
-        );
-        let account_info = metadata.types.resolve(value.id).unwrap();
-        assert_eq!(
-            account_info.path.segments.last().map(String::as_str),
-            Some("AccountInfo")
-        );
-    }
-
-    #[rstest::rstest]
-    fn decodes_captured_finalized_subaccount_spot_margin() {
-        let metadata = metadata();
-        assert_eq!(
-            decode_spot_margin(&metadata, STORAGE, SUBACCOUNT, WALLET),
-            Some(false)
-        );
-        let mut enabled = hex::decode(STORAGE.strip_prefix("0x").unwrap()).unwrap();
-        enabled[52] = 1;
-        assert_eq!(
-            decode_spot_margin(
-                &metadata,
-                &format!("0x{}", hex::encode(&enabled)),
-                SUBACCOUNT,
-                WALLET,
-            ),
-            Some(true)
-        );
-    }
-
-    #[rstest::rstest]
-    fn rejects_foreign_or_malformed_subaccount_state() {
-        let metadata = metadata();
-        assert_eq!(
-            decode_spot_margin(&metadata, STORAGE, [0; 20], WALLET),
-            None
-        );
-        assert_eq!(
-            decode_spot_margin(&metadata, STORAGE, SUBACCOUNT, [0; 20]),
-            None
-        );
-        assert_eq!(
-            decode_spot_margin(&metadata, &format!("{STORAGE}00"), SUBACCOUNT, WALLET),
-            None
-        );
-        assert_eq!(
-            decode_spot_margin(&metadata, &STORAGE[..STORAGE.len() - 2], SUBACCOUNT, WALLET),
-            None
-        );
     }
 
     #[rstest::rstest]
