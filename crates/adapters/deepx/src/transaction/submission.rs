@@ -390,8 +390,7 @@ mod tests {
 
     use super::*;
     use crate::signing::{
-        DeepXReadOnlyRuntimeSnapshot, DeepXRuntimeSnapshotService, RuntimeSnapshot, SigningError,
-        sign_dynamic_pallet_call,
+        DeepXRuntimeSnapshotService, RuntimeSnapshot, SigningError, sign_dynamic_pallet_call,
     };
 
     #[rstest]
@@ -488,7 +487,7 @@ mod tests {
                 .trim_start_matches("0x"),
         )
         .unwrap();
-        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+        let snapshot = RuntimeSnapshot::approved_testnet(
             &crate::common::DeepXEnvironment::Testnet,
             hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
                 .unwrap(),
@@ -497,7 +496,7 @@ mod tests {
             &bytes,
         )
         .unwrap();
-        DeepXRuntimeSnapshotService::new(RuntimeSnapshot::from_read_only_for_test(read_only))
+        DeepXRuntimeSnapshotService::new(snapshot)
     }
 
     fn signed_remark() -> Result<SignedPalletExtrinsic, SigningError> {

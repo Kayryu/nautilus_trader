@@ -115,11 +115,11 @@ use crate::{
     },
     signing::{
         ApprovedRuntimeIdentity, DeepXPerpModifyParams, DeepXReadOnlyRuntimeSnapshot,
-        DeepXRemoveDelegateAccountParams, DeepXRuntimeInterfaceCatalog,
-        DeepXRuntimeInterfaceError, DeepXRuntimeSnapshotPermit, DeepXSetDelegateAccountParams,
-        DeepXSpotPlaceParams, DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode,
-        RuntimeSnapshot, SigningError, SnapshotError, sign_remove_delegate_account,
-        sign_set_delegate_account, sign_update_delegate_mode,
+        DeepXRemoveDelegateAccountParams, DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError,
+        DeepXRuntimeSnapshotPermit, DeepXSetDelegateAccountParams, DeepXSpotPlaceParams,
+        DeepXUpdateDelegateModeParams, DeepXWritableDelegateMode, RuntimeSnapshot, SigningError,
+        SnapshotError, sign_remove_delegate_account, sign_set_delegate_account,
+        sign_update_delegate_mode,
     },
 };
 
@@ -151,7 +151,7 @@ async fn observe_historical_read_only_runtime(
         .filter(|value| !value.is_empty())
         .and_then(|value| hex::decode(value).ok())
         .ok_or(DeepXHistoricalRuntimeError::InvalidMetadata)?;
-    DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+    DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         genesis_hash,
         version.spec_version,
@@ -3802,31 +3802,42 @@ mod tests {
         .unwrap()
     }
 
-    fn read_only_runtime_snapshot() -> DeepXReadOnlyRuntimeSnapshot {
+    fn runtime_metadata_bytes() -> Vec<u8> {
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
+        hex::decode(
+            metadata["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap()
+    }
+
+    fn read_only_runtime_snapshot() -> DeepXReadOnlyRuntimeSnapshot {
         DeepXReadOnlyRuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
             376,
             1,
-            &hex::decode(
-                metadata["result"]
-                    .as_str()
-                    .unwrap()
-                    .trim_start_matches("0x"),
-            )
-            .unwrap(),
+            &runtime_metadata_bytes(),
         )
         .unwrap()
     }
 
     fn runtime_snapshot() -> RuntimeSnapshot {
-        RuntimeSnapshot::from_read_only_for_test(read_only_runtime_snapshot())
+        RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
+            376,
+            1,
+            &runtime_metadata_bytes(),
+        )
+        .unwrap()
     }
 
     #[rstest]

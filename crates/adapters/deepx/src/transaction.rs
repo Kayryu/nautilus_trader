@@ -21,6 +21,7 @@ mod persistence;
 mod recovery;
 mod reservation;
 mod rest_status;
+mod signed;
 mod submission;
 mod watch;
 
@@ -89,6 +90,7 @@ pub use rest_status::{
     poll_rest_transaction_status,
 };
 use serde::{Deserialize, Serialize};
+pub use signed::SignedPalletExtrinsic;
 pub(crate) use submission::submit_once_with_runtime_guard;
 pub use submission::{
     DeepXRestSubmissionAcknowledgement, DeepXRestSubmissionError, DeepXSubmissionAttemptFailure,

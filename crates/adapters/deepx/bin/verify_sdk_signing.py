@@ -259,7 +259,9 @@ def verify_evm_vectors(sdk_source: Path):
     from eth_abi import encode as abi_encode
     from eth_utils import keccak
 
-    rust_source = (Path(__file__).resolve().parents[1] / "src/signing/evm.rs").read_text()
+    rust_source = (
+        Path(__file__).resolve().parents[1] / "deepx-rust-sdk/src/signing/evm.rs"
+    ).read_text()
     signature = "setProfitAndLossPoint(address,uint16,uint128,uint128)"
     pnl_calldata = keccak(text=signature)[:4] + abi_encode(
         ["address", "uint16", "uint128", "uint128"],
@@ -320,7 +322,9 @@ def main():
     parser.add_argument("compat_source", type=Path)
     args = parser.parse_args()
     builder = load_sdk_builder(args.sdk_source, args.compat_source)
-    source = (Path(__file__).resolve().parents[1] / "src/signing/mod.rs").read_text()
+    source = (
+        Path(__file__).resolve().parents[1] / "deepx-rust-sdk/src/signing/runtime.rs"
+    ).read_text()
     vectors = [
         ("Subaccount", "no_op", {}, 1_725_000_000_124),
         (

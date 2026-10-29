@@ -1880,7 +1880,7 @@ pub async fn observe_approved_finalized_runtime_snapshot(
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
     let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
-    let snapshot = RuntimeSnapshot::observed_testnet(
+    let snapshot = RuntimeSnapshot::approved_testnet(
         &config.environment,
         genesis_hash,
         version.spec_version,
@@ -1928,7 +1928,7 @@ pub(crate) async fn observe_approved_finalized_runtime_snapshot_for_endpoints(
     let checkpoint = observe_finalized_checkpoint_at(url.clone()).await?;
     let client = DeepXRpcClient::new(url);
     let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
-    let snapshot = RuntimeSnapshot::observed_testnet(
+    let snapshot = RuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -1993,7 +1993,7 @@ async fn observe_current_runtime_snapshot_with_checkpoint(
         return Err(DeepXRuntimeSnapshotObservationError::BlockHashIgnored);
     }
     let (version, metadata) = observe_runtime_metadata_at(&client, block_hash).await?;
-    let snapshot = RuntimeSnapshot::observed_testnet(
+    let snapshot = RuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -2584,7 +2584,7 @@ pub(crate) async fn observe_current_spot_market_spec_batch(
     let header: ObservedBlockHeader = client.get_header_once(&encoded_hash).await?;
     let block_number = decode_block_number(&header.number)?;
     let (version, metadata) = observe_runtime_metadata_at(&client, block_hash).await?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         endpoints.genesis_hash(),
         version.spec_version,
@@ -4223,7 +4223,7 @@ async fn observe_approved_finalized_read_only_runtime_snapshot_at(
     let genesis_hash = decode_prefixed_hash(&encoded_genesis, "genesis hash")?;
     let checkpoint = observe_finalized_checkpoint_at(url).await?;
     let (version, metadata) = observe_runtime_metadata_at(&client, checkpoint.block_hash()).await?;
-    let snapshot = DeepXReadOnlyRuntimeSnapshot::observed_testnet(
+    let snapshot = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
         genesis_hash,
         version.spec_version,
@@ -7530,15 +7530,14 @@ mod tests {
     fn approved_runtime_snapshot() -> RuntimeSnapshot {
         let metadata: Value = serde_json::from_str(SPEC_376_METADATA_FIXTURE).unwrap();
         let encoded_metadata = metadata["result"].as_str().unwrap();
-        let read_only = DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+        RuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             hex::decode_array(DEEPX_TESTNET_GENESIS_HASH.trim_start_matches("0x")).unwrap(),
             DEEPX_SPEC_376_VERSION,
             1,
             &hex::decode(encoded_metadata.trim_start_matches("0x")).unwrap(),
         )
-        .unwrap();
-        RuntimeSnapshot::from_read_only_for_test(read_only)
+        .unwrap()
     }
 
     fn read_only_runtime_rpc_response(request: &Value) -> Option<Value> {

@@ -201,10 +201,32 @@ mod tests {
     const BLOCK_NUMBER: u32 = 217_394_490;
 
     fn metadata() -> subxt_core::Metadata {
-        DeepXReadOnlyRuntimeSnapshot::built_in_testnet()
-            .unwrap()
-            .metadata()
-            .clone()
+        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/deepx-rust-sdk/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+        )))
+        .unwrap();
+        let bytes = nautilus_core::hex::decode(
+            response["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+            &crate::common::DeepXEnvironment::Testnet,
+            nautilus_core::hex::decode_array(
+                "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
+            )
+            .unwrap(),
+            376,
+            1,
+            &bytes,
+        )
+        .unwrap()
+        .metadata()
+        .clone()
     }
 
     #[rstest::rstest]

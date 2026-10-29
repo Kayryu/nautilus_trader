@@ -13,29 +13,17 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Immutable runtime identity and metadata used by offline signing.
+//! Runtime snapshot ownership and signing-permit lifecycle.
 
 use std::sync::{Arc, Mutex};
 
-use deepx_rust_sdk::signing::validate_testnet_runtime;
-pub use deepx_rust_sdk::signing::{
-    ApprovedRuntimeIdentity, SnapshotError,
-    runtime_interface::{
-        DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError, DeepXRuntimePalletInterface,
-        DeepXRuntimeVariantIdentity,
-    },
+use super::{
+    ApprovedRuntimeIdentity, SnapshotError, runtime_interface::DeepXRuntimeInterfaceCatalog,
 };
-#[cfg(test)]
-use nautilus_core::hex;
-use subxt_core::{
-    client::{ClientState, RuntimeVersion},
-    metadata::Metadata,
-    utils::H256,
-};
+use super::{DeepXValidatedRuntime, validate_testnet_runtime};
 use thiserror::Error;
 
-use super::DeepXRuntimeConfig;
-use crate::common::DeepXEnvironment;
+use crate::enums::DeepXEnvironment;
 
 #[cfg(test)]
 const TESTNET_SPEC_376_GENESIS_HASH: &str =
@@ -50,21 +38,9 @@ const TESTNET_TRANSACTION_VERSION: u32 = 1;
 #[cfg(test)]
 const TESTNET_SPEC_376_METADATA_RESPONSE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/deepx-rust-sdk/test_data/runtime/testnet/",
+    "/test_data/runtime/testnet/",
     "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
 ));
-#[cfg(test)]
-const TESTNET_SPEC_376_SIGNED_EXTENSIONS: &[&str] = &[
-    "CheckNonZeroSender",
-    "CheckSpecVersion",
-    "CheckTxVersion",
-    "CheckGenesis",
-    "CheckNonceEra",
-    "CheckNonce",
-    "CheckWeight",
-    "ChargeTransactionPayment",
-    "CheckPriority",
-];
 
 /// Decision produced after comparing an observed runtime identity with the active snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,9 +95,7 @@ pub enum DeepXRuntimeSnapshotServiceError {
 /// An immutable metadata and runtime-version snapshot for deterministic signing.
 #[derive(Clone, Debug)]
 pub struct RuntimeSnapshot {
-    identity: ApprovedRuntimeIdentity,
-    interfaces: DeepXRuntimeInterfaceCatalog,
-    client_state: ClientState<DeepXRuntimeConfig>,
+    validated: DeepXValidatedRuntime,
 }
 
 /// Immutable runtime identity approved only for finalized read operations.
@@ -131,9 +105,7 @@ pub struct RuntimeSnapshot {
 /// authorizing transaction encoding or signing.
 #[derive(Clone, Debug)]
 pub struct DeepXReadOnlyRuntimeSnapshot {
-    identity: ApprovedRuntimeIdentity,
-    interfaces: DeepXRuntimeInterfaceCatalog,
-    metadata: Metadata,
+    validated: DeepXValidatedRuntime,
 }
 
 #[derive(Debug)]
@@ -219,9 +191,11 @@ impl DeepXRuntimeSnapshotService {
     }
 
     /// Invalidates current permits and blocks new signing until the account stream is restored.
-    pub(crate) fn suspend_for_account_disconnect(
-        &self,
-    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client retired or shared state is unavailable.
+    pub fn suspend_for_account_disconnect(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
         let mut state = self
             .state
             .lock()
@@ -238,9 +212,11 @@ impl DeepXRuntimeSnapshotService {
     }
 
     /// Reopens signing after a replacement account stream is fully validated.
-    pub(crate) fn resume_after_account_reconnect(
-        &self,
-    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client retired, evidence is inconsistent, or shared state is unavailable.
+    pub fn resume_after_account_reconnect(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
         let mut state = self
             .state
             .lock()
@@ -256,9 +232,11 @@ impl DeepXRuntimeSnapshotService {
     }
 
     /// Permanently closes new permits after contradictory finalized RPC evidence.
-    pub(crate) fn halt_for_inconsistent_evidence(
-        &self,
-    ) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shared state is unavailable.
+    pub fn halt_for_inconsistent_evidence(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
         let mut state = self
             .state
             .lock()
@@ -268,7 +246,11 @@ impl DeepXRuntimeSnapshotService {
     }
 
     /// Revokes existing and future permits when their execution client retires.
-    pub(crate) fn retire_client(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shared state is unavailable.
+    pub fn retire_client(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
         let mut state = self
             .state
             .lock()
@@ -413,7 +395,7 @@ impl DeepXRuntimeSnapshotPermit {
     /// # Errors
     ///
     /// Returns an error after contradictory RPC evidence or if shared state is unavailable.
-    pub(crate) fn ensure_active(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
+    pub fn ensure_active(&self) -> Result<(), DeepXRuntimeSnapshotServiceError> {
         let state = self
             .service_state
             .lock()
@@ -445,24 +427,6 @@ impl Drop for DeepXRuntimeSnapshotPermit {
 }
 
 impl RuntimeSnapshot {
-    #[cfg(test)]
-    pub(crate) fn from_read_only_for_test(snapshot: DeepXReadOnlyRuntimeSnapshot) -> Self {
-        let client_state = ClientState {
-            metadata: snapshot.metadata,
-            genesis_hash: H256::from(snapshot.identity.genesis_hash),
-            runtime_version: RuntimeVersion {
-                spec_version: snapshot.identity.spec_version,
-                transaction_version: snapshot.identity.transaction_version,
-            },
-        };
-
-        Self {
-            identity: snapshot.identity,
-            interfaces: snapshot.interfaces,
-            client_state,
-        }
-    }
-
     /// Builds a signing runtime from metadata observed on the DeepX testnet chain.
     ///
     /// # Errors
@@ -497,28 +461,15 @@ impl RuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let (identity, interfaces, metadata) = validate_testnet_runtime(
+        let validated = validate_testnet_runtime(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-        )?
-        .into_parts();
-        let client_state = ClientState {
-            metadata,
-            genesis_hash: H256::from(identity.genesis_hash),
-            runtime_version: RuntimeVersion {
-                spec_version: identity.spec_version,
-                transaction_version: identity.transaction_version,
-            },
-        };
+        )?;
 
-        Ok(Self {
-            identity,
-            interfaces,
-            client_state,
-        })
+        Ok(Self { validated })
     }
 
     /// Builds the approved DeepX testnet signing runtime from built-in metadata.
@@ -541,21 +492,25 @@ impl RuntimeSnapshot {
     /// Returns the validated runtime identity associated with this snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
-        &self.identity
+        self.validated.identity()
     }
 
     /// Returns the immutable pallet, call, and event identities for this snapshot.
     #[must_use]
     pub const fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
-        &self.interfaces
+        self.validated.interfaces()
     }
 
-    pub(super) const fn client_state(&self) -> &ClientState<DeepXRuntimeConfig> {
-        &self.client_state
+    /// Returns the SDK-validated runtime used by offline signing.
+    #[must_use]
+    pub const fn validated(&self) -> &DeepXValidatedRuntime {
+        &self.validated
     }
 
-    pub(crate) const fn metadata(&self) -> &Metadata {
-        &self.client_state.metadata
+    /// Returns the decoded metadata for finalized event verification.
+    #[must_use]
+    pub const fn metadata(&self) -> &subxt_core::metadata::Metadata {
+        self.validated.metadata()
     }
 }
 
@@ -572,19 +527,14 @@ impl DeepXReadOnlyRuntimeSnapshot {
         observed_transaction_version: u32,
         metadata_bytes: &[u8],
     ) -> Result<Self, SnapshotError> {
-        let (identity, interfaces, metadata) = validate_testnet_runtime(
+        let validated = validate_testnet_runtime(
             environment,
             observed_genesis_hash,
             observed_spec_version,
             observed_transaction_version,
             metadata_bytes,
-        )?
-        .into_parts();
-        Ok(Self {
-            identity,
-            interfaces,
-            metadata,
-        })
+        )?;
+        Ok(Self { validated })
     }
 
     /// Builds a read-only runtime from observed DeepX testnet metadata.
@@ -629,23 +579,28 @@ impl DeepXReadOnlyRuntimeSnapshot {
     /// Returns the validated runtime identity associated with this read-only snapshot.
     #[must_use]
     pub const fn identity(&self) -> &ApprovedRuntimeIdentity {
-        &self.identity
+        self.validated.identity()
     }
 
     /// Returns the immutable pallet, call, and event identities for this snapshot.
     #[must_use]
     pub const fn interfaces(&self) -> &DeepXRuntimeInterfaceCatalog {
-        &self.interfaces
+        self.validated.interfaces()
     }
 
-    pub(crate) const fn metadata(&self) -> &Metadata {
-        &self.metadata
+    /// Returns the decoded metadata for finalized read operations.
+    #[must_use]
+    pub const fn metadata(&self) -> &subxt_core::metadata::Metadata {
+        self.validated.metadata()
     }
 }
 
 #[cfg(test)]
 fn decode_32(value: &str) -> Result<[u8; 32], SnapshotError> {
-    hex::decode_array(value).map_err(|_| SnapshotError::InvalidApprovedIdentity)
+    let mut decoded = [0; 32];
+    hex::decode_to_slice(value, &mut decoded)
+        .map_err(|_| SnapshotError::InvalidApprovedIdentity)?;
+    Ok(decoded)
 }
 
 #[cfg(test)]
@@ -665,7 +620,6 @@ mod tests {
     use parity_scale_codec::{Decode, Encode};
     use rstest::rstest;
     use serde::Deserialize;
-    use subxt_core::metadata;
 
     use super::*;
 
@@ -695,33 +649,18 @@ mod tests {
     }
 
     fn test_snapshot() -> RuntimeSnapshot {
-        let metadata = metadata::decode_from(&spec_376_metadata_bytes()).unwrap();
-        let identity = ApprovedRuntimeIdentity {
-            environment: DeepXEnvironment::Testnet,
-            genesis_hash: decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
-            metadata_sha256: decode_32(TESTNET_SPEC_376_METADATA_SHA256).unwrap(),
-            spec_version: 376,
-            transaction_version: TESTNET_TRANSACTION_VERSION,
-            signed_extensions: TESTNET_SPEC_376_SIGNED_EXTENSIONS
-                .iter()
-                .map(|extension| (*extension).to_string())
-                .collect(),
-        };
-        let interfaces = DeepXRuntimeInterfaceCatalog::from_metadata(&metadata).unwrap();
-        let client_state = ClientState {
-            metadata,
-            genesis_hash: H256::from(identity.genesis_hash),
-            runtime_version: RuntimeVersion {
-                spec_version: identity.spec_version,
-                transaction_version: identity.transaction_version,
-            },
-        };
+        snapshot_with_versions(376, TESTNET_TRANSACTION_VERSION)
+    }
 
-        RuntimeSnapshot {
-            identity,
-            interfaces,
-            client_state,
-        }
+    fn snapshot_with_versions(spec_version: u32, transaction_version: u32) -> RuntimeSnapshot {
+        RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            decode_32(TESTNET_SPEC_376_GENESIS_HASH).unwrap(),
+            spec_version,
+            transaction_version,
+            &spec_376_metadata_bytes(),
+        )
+        .unwrap()
     }
 
     #[rstest]
@@ -845,9 +784,20 @@ mod tests {
         assert_eq!(snapshot.identity().genesis_hash, genesis);
         assert_eq!(snapshot.identity().spec_version, 377);
         assert_eq!(snapshot.identity().transaction_version, 2);
-        assert_eq!(snapshot.client_state().runtime_version.spec_version, 377);
         assert_eq!(
-            snapshot.client_state().runtime_version.transaction_version,
+            snapshot
+                .validated()
+                .client_state()
+                .runtime_version
+                .spec_version,
+            377
+        );
+        assert_eq!(
+            snapshot
+                .validated()
+                .client_state()
+                .runtime_version
+                .transaction_version,
             2
         );
         assert_eq!(snapshot.identity().metadata_sha256, {
@@ -920,9 +870,7 @@ mod tests {
         changed_identity.spec_version += 1;
 
         assert_eq!(
-            service
-                .observe_runtime_identity(changed_identity.clone())
-                .unwrap(),
+            service.observe_runtime_identity(changed_identity).unwrap(),
             DeepXRuntimeChangeDecision::RefreshRequired,
         );
         assert!(matches!(
@@ -930,8 +878,7 @@ mod tests {
             Err(DeepXRuntimeSnapshotServiceError::RefreshInProgress),
         ));
 
-        let mut replacement = snapshot;
-        replacement.identity = changed_identity;
+        let replacement = snapshot_with_versions(377, TESTNET_TRANSACTION_VERSION);
         assert_eq!(
             service.install(replacement.clone()),
             Err(DeepXRuntimeSnapshotServiceError::InFlightSigningPermits(1)),
@@ -1065,10 +1012,9 @@ mod tests {
     #[rstest]
     fn validated_snapshot_application_waits_for_old_permits() {
         let snapshot = test_snapshot();
-        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
         let permit = service.acquire().unwrap();
-        let mut replacement = snapshot;
-        replacement.identity.spec_version += 1;
+        let replacement = snapshot_with_versions(377, TESTNET_TRANSACTION_VERSION);
 
         assert_eq!(
             service.apply_validated(&replacement),
@@ -1093,12 +1039,10 @@ mod tests {
     #[rstest]
     fn validated_snapshot_application_rejects_conflicting_pending_identity() {
         let snapshot = test_snapshot();
-        let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
         let permit = service.acquire().unwrap();
-        let mut first_replacement = snapshot.clone();
-        first_replacement.identity.spec_version += 1;
-        let mut conflicting_replacement = snapshot;
-        conflicting_replacement.identity.transaction_version += 1;
+        let first_replacement = snapshot_with_versions(377, TESTNET_TRANSACTION_VERSION);
+        let conflicting_replacement = snapshot_with_versions(376, 2);
 
         assert_eq!(
             service.apply_validated(&first_replacement),

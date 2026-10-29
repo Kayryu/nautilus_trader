@@ -26,6 +26,7 @@ use subxt_core::{config::substrate::BlakeTwo256, dynamic::Value, metadata::Metad
 use thiserror::Error;
 
 use super::{
+    DeepXRuntimeSnapshotPermit, SigningError,
     pallet::DeepXPerpProfitAndLossPointParams,
     runtime::DeepXRuntimeConfig,
     runtime_interface::{DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError},
@@ -171,6 +172,33 @@ pub enum DeepXOfflineEvmWrapperSignError {
     /// The runtime metadata could not encode the unsigned wrapper.
     #[error("unable to encode DeepX EVM wrapper: {0}")]
     Encode(#[source] Box<subxt_core::Error>),
+}
+
+/// Errors before a permit-bound offline EVM wrapper is available.
+#[derive(Debug, Error)]
+pub enum DeepXOfflineEvmWrapperError {
+    /// The requested chain ID does not match the approved DeepX testnet EVM deployment.
+    #[error("DeepX testnet EVM chain ID must be 4846")]
+    ChainId,
+    /// The EVM signing inputs or signature were invalid.
+    #[error(transparent)]
+    Evm(#[from] DeepXOfflineEvmSignError),
+    /// The approved runtime permit or SCALE metadata rejected the wrapper.
+    #[error(transparent)]
+    Runtime(#[from] SigningError),
+}
+
+impl From<DeepXOfflineEvmWrapperSignError> for DeepXOfflineEvmWrapperError {
+    fn from(value: DeepXOfflineEvmWrapperSignError) -> Self {
+        match value {
+            DeepXOfflineEvmWrapperSignError::ChainId => Self::ChainId,
+            DeepXOfflineEvmWrapperSignError::Evm(e) => Self::Evm(e),
+            DeepXOfflineEvmWrapperSignError::RuntimeInterface(e) => {
+                Self::Runtime(SigningError::RuntimeInterface(e))
+            }
+            DeepXOfflineEvmWrapperSignError::Encode(e) => Self::Runtime(SigningError::Encode(e)),
+        }
+    }
 }
 
 impl From<subxt_core::Error> for DeepXOfflineEvmWrapperSignError {
@@ -319,6 +347,42 @@ pub fn sign_offline_evm_transact_extrinsic(
     })
 }
 
+/// Signs an EVM envelope and embeds it in an active runtime's unsigned wrapper offline.
+///
+/// # Errors
+///
+/// Returns an error if the chain ID, signer, active permit, or runtime encoding is invalid.
+pub fn sign_permitted_evm_transact_extrinsic(
+    permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: &DeepXOfflineEvmTransactionParams,
+) -> Result<DeepXOfflineEvmExtrinsic, DeepXOfflineEvmWrapperError> {
+    if params.chain_id != u64::from(DEEPX_TESTNET_CHAIN_ID) {
+        return Err(DeepXOfflineEvmWrapperError::ChainId);
+    }
+    permit.ensure_active().map_err(SigningError::from)?;
+    let snapshot = permit.snapshot();
+    Ok(sign_offline_evm_transact_extrinsic(
+        snapshot.metadata(),
+        snapshot.interfaces(),
+        key,
+        params,
+    )?)
+}
+
+/// Signs a testnet Perp profit/loss-point precompile call and its runtime wrapper offline.
+///
+/// # Errors
+///
+/// Returns an error if the active permit, key, or envelope inputs are invalid.
+pub fn sign_permitted_perp_pnl_evm_transact_extrinsic(
+    permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    params: DeepXOfflinePerpPnlEvmParams,
+) -> Result<DeepXOfflineEvmExtrinsic, DeepXOfflineEvmWrapperError> {
+    sign_permitted_evm_transact_extrinsic(permit, key, &params.into_transaction_params())
+}
+
 fn runtime_u256(value: U256) -> Value {
     let limbs = value.into_limbs().map(|limb| Value::u128(u128::from(limb)));
     Value::unnamed_composite([Value::unnamed_composite(limbs)])
@@ -331,7 +395,11 @@ mod tests {
     use subxt_core::metadata;
 
     use super::*;
-    use crate::credential::DeepXKeyScheme;
+    use crate::{
+        credential::DeepXKeyScheme,
+        enums::DeepXEnvironment,
+        signing::{DeepXRuntimeSnapshotService, RuntimeSnapshot},
+    };
 
     const SPEC376_METADATA: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -520,5 +588,57 @@ mod tests {
         );
         assert_eq!(hex::encode(signed.evm.tx_hash), expected_evm_hash);
         assert_eq!(hex::encode(signed.extrinsic_hash), expected_wrapper_hash);
+    }
+
+    #[rstest]
+    fn permitted_wrapper_requires_testnet_chain_and_active_runtime() {
+        let response: RpcResponse = serde_json::from_str(SPEC376_METADATA).unwrap();
+        let metadata = hex::decode(response.result.trim_start_matches("0x")).unwrap();
+        let genesis =
+            hex::decode("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
+                .unwrap();
+        let snapshot = RuntimeSnapshot::approved_testnet(
+            &DeepXEnvironment::Testnet,
+            genesis.try_into().unwrap(),
+            376,
+            1,
+            &metadata,
+        )
+        .unwrap();
+        let service = DeepXRuntimeSnapshotService::new(snapshot);
+        let permit = service.acquire().unwrap();
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let mut params = DeepXOfflineEvmTransactionParams {
+            kind: DeepXEvmTransactionKind::Eip1559,
+            chain_id: 1,
+            nonce: 1_725_000_000_140,
+            gas_limit: 500_000,
+            precompile_address: [0x11; 20],
+            value: U256::ZERO,
+            calldata: vec![0x12, 0x34, 0x56, 0x78],
+        };
+
+        assert!(matches!(
+            sign_permitted_evm_transact_extrinsic(&permit, &key, &params),
+            Err(DeepXOfflineEvmWrapperError::ChainId),
+        ));
+        params.chain_id = u64::from(DEEPX_TESTNET_CHAIN_ID);
+        let baseline = sign_permitted_evm_transact_extrinsic(&permit, &key, &params).unwrap();
+        params.value = U256::from(123_u64);
+        let changed = sign_permitted_evm_transact_extrinsic(&permit, &key, &params).unwrap();
+        assert_ne!(baseline.bytes, changed.bytes);
+        assert_ne!(baseline.extrinsic_hash, changed.extrinsic_hash);
+
+        service.halt_for_inconsistent_evidence().unwrap();
+        assert!(matches!(
+            sign_permitted_evm_transact_extrinsic(&permit, &key, &params),
+            Err(DeepXOfflineEvmWrapperError::Runtime(
+                SigningError::RuntimePermit(_)
+            )),
+        ));
     }
 }

@@ -51,10 +51,11 @@ use crate::{
     signing::{
         DeepXPerpCancelParams, DeepXPerpModifyParams, DeepXPerpPlaceParams, DeepXSpotCancelParams,
         DeepXSpotPlaceParams, RuntimeSnapshot, SignedPalletExtrinsic, SigningError,
-        derive_signer_account_id, sign_dynamic_pallet_call_with_snapshot, sign_perp_cancel,
-        sign_perp_modify_order, sign_spot_place_order,
+        derive_signer_account_id, sign_perp_cancel, sign_perp_modify_order, sign_spot_place_order,
     },
 };
+
+use super::signed::sign_dynamic_pallet_call_with_snapshot;
 
 /// Durable revision assigned to an acknowledged transaction record write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -5219,7 +5220,7 @@ mod tests {
         )))
         .unwrap();
         let bytes = nautilus_core::hex::decode(metadata.result.trim_start_matches("0x")).unwrap();
-        let read_only = crate::signing::DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+        crate::signing::RuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             nautilus_core::hex::decode_array(
                 "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
@@ -5229,8 +5230,7 @@ mod tests {
             1,
             &bytes,
         )
-        .unwrap();
-        crate::signing::RuntimeSnapshot::from_read_only_for_test(read_only)
+        .unwrap()
     }
 
     fn remark_key() -> crate::common::DeepXPrivateKey {

@@ -17,10 +17,18 @@
 
 use aws_lc_rs::digest::{SHA256, digest};
 use scale_info::TypeDef;
-use subxt_core::{metadata, metadata::Metadata};
+use subxt_core::{
+    client::{ClientState, RuntimeVersion},
+    metadata,
+    metadata::Metadata,
+    utils::H256,
+};
 use thiserror::Error;
 
-use super::runtime_interface::{DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError};
+use super::{
+    DeepXRuntimeConfig,
+    runtime_interface::{DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError},
+};
 use crate::enums::DeepXEnvironment;
 
 const TESTNET_SPEC_376_GENESIS_HASH: &str =
@@ -74,7 +82,7 @@ pub enum SnapshotError {
 pub struct DeepXValidatedRuntime {
     identity: ApprovedRuntimeIdentity,
     interfaces: DeepXRuntimeInterfaceCatalog,
-    metadata: Metadata,
+    client_state: ClientState<DeepXRuntimeConfig>,
 }
 
 impl DeepXValidatedRuntime {
@@ -93,7 +101,13 @@ impl DeepXValidatedRuntime {
     /// Returns the decoded runtime metadata.
     #[must_use]
     pub const fn metadata(&self) -> &Metadata {
-        &self.metadata
+        &self.client_state.metadata
+    }
+
+    /// Returns the Subxt client state bound to the validated runtime identity.
+    #[must_use]
+    pub const fn client_state(&self) -> &ClientState<DeepXRuntimeConfig> {
+        &self.client_state
     }
 
     /// Consumes the validated runtime and returns its owned components.
@@ -105,7 +119,7 @@ impl DeepXValidatedRuntime {
         DeepXRuntimeInterfaceCatalog,
         Metadata,
     ) {
-        (self.identity, self.interfaces, self.metadata)
+        (self.identity, self.interfaces, self.client_state.metadata)
     }
 }
 
@@ -154,10 +168,19 @@ pub fn validate_testnet_runtime(
         signed_extensions,
     };
 
+    let client_state = ClientState {
+        metadata,
+        genesis_hash: H256::from(identity.genesis_hash),
+        runtime_version: RuntimeVersion {
+            spec_version: identity.spec_version,
+            transaction_version: identity.transaction_version,
+        },
+    };
+
     Ok(DeepXValidatedRuntime {
         identity,
         interfaces,
-        metadata,
+        client_state,
     })
 }
 
@@ -262,6 +285,12 @@ mod tests {
         );
         assert_eq!(validated.identity().signed_extensions[4], "CheckNonceEra");
         assert!(validated.interfaces().pallet("PerpMarket").is_ok());
+        assert_eq!(validated.client_state().genesis_hash, H256::from(genesis));
+        assert_eq!(validated.client_state().runtime_version.spec_version, 376);
+        assert_eq!(
+            validated.client_state().runtime_version.transaction_version,
+            1
+        );
     }
 
     #[rstest]

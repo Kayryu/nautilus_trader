@@ -31,7 +31,8 @@ use subxt_signer::eth::{Keypair, Signature};
 use thiserror::Error;
 
 use super::{
-    DeepXNonceEra,
+    ApprovedRuntimeIdentity, DeepXNonceEra, DeepXRuntimeSnapshotPermit, DeepXValidatedRuntime,
+    SigningError,
     management::{
         DeepXBuyQuotaParams, DeepXDeleteSubaccountParams, DeepXInitializeSubaccountParams,
         DeepXRemoveDelegateAccountParams, DeepXRenameSubaccountParams,
@@ -148,6 +149,51 @@ impl DeepXEncodedPalletExtrinsic {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+/// A signed pallet extrinsic bound to an approved runtime identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXPermittedPalletExtrinsic {
+    encoded: DeepXEncodedPalletExtrinsic,
+    runtime: ApprovedRuntimeIdentity,
+}
+
+impl DeepXPermittedPalletExtrinsic {
+    /// Returns the complete compact-length-prefixed SCALE extrinsic bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.encoded.bytes()
+    }
+
+    /// Returns the Blake2-256 hash of the complete extrinsic bytes.
+    #[must_use]
+    pub const fn extrinsic_hash(&self) -> [u8; 32] {
+        self.encoded.extrinsic_hash()
+    }
+
+    /// Returns the signing AccountId20.
+    #[must_use]
+    pub const fn signer(&self) -> [u8; 20] {
+        self.encoded.signer()
+    }
+
+    /// Returns the nonce encoded in the signed extensions.
+    #[must_use]
+    pub const fn nonce(&self) -> u64 {
+        self.encoded.nonce()
+    }
+
+    /// Returns the approved runtime identity used for signing.
+    #[must_use]
+    pub const fn runtime(&self) -> &ApprovedRuntimeIdentity {
+        &self.runtime
+    }
+
+    /// Consumes the result and returns the complete SCALE extrinsic bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.encoded.into_bytes()
     }
 }
 
@@ -341,6 +387,47 @@ pub fn sign_pallet_call(
     )
 }
 
+/// Signs one typed pallet operation against one validated runtime snapshot.
+///
+/// # Errors
+///
+/// Returns an error for invalid operation scope or name, an unavailable call, invalid key, or
+/// failed SCALE encoding.
+pub fn sign_validated_pallet_call(
+    runtime: &DeepXValidatedRuntime,
+    key: &DeepXPrivateKey,
+    operation: DeepXOfflinePalletCall,
+    nonce: u64,
+) -> Result<DeepXEncodedPalletExtrinsic, DeepXPalletSigningError> {
+    sign_pallet_call(
+        runtime.interfaces(),
+        runtime.client_state(),
+        key,
+        operation,
+        nonce,
+    )
+}
+
+/// Signs one typed pallet operation under an active runtime snapshot permit.
+///
+/// # Errors
+///
+/// Returns an error if the permit is inactive or the operation cannot be signed.
+pub fn sign_permitted_pallet_call(
+    permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    operation: DeepXOfflinePalletCall,
+    nonce: u64,
+) -> Result<DeepXPermittedPalletExtrinsic, SigningError> {
+    permit.ensure_active()?;
+    let snapshot = permit.snapshot();
+    let encoded = sign_validated_pallet_call(snapshot.validated(), key, operation, nonce)?;
+    Ok(DeepXPermittedPalletExtrinsic {
+        encoded,
+        runtime: snapshot.identity().clone(),
+    })
+}
+
 impl From<subxt_core::Error> for DeepXPalletSigningError {
     fn from(value: subxt_core::Error) -> Self {
         Self::Encode(Box::new(value))
@@ -396,6 +483,59 @@ pub fn sign_dynamic_pallet_call(
     })
 }
 
+/// Signs a metadata-driven pallet call against one validated runtime snapshot.
+///
+/// # Errors
+///
+/// Returns an error for an unavailable call, invalid key, or failed SCALE encoding.
+pub fn sign_validated_dynamic_pallet_call(
+    runtime: &DeepXValidatedRuntime,
+    key: &DeepXPrivateKey,
+    pallet: &str,
+    call: &str,
+    arguments: Vec<Value>,
+    nonce: u64,
+) -> Result<DeepXEncodedPalletExtrinsic, DeepXPalletSigningError> {
+    sign_dynamic_pallet_call(
+        runtime.interfaces(),
+        runtime.client_state(),
+        key,
+        pallet,
+        call,
+        arguments,
+        nonce,
+    )
+}
+
+/// Signs a metadata-driven pallet call under an active runtime snapshot permit.
+///
+/// # Errors
+///
+/// Returns an error if the permit is inactive or the call cannot be signed.
+pub fn sign_permitted_dynamic_pallet_call(
+    permit: &DeepXRuntimeSnapshotPermit,
+    key: &DeepXPrivateKey,
+    pallet: &str,
+    call: &str,
+    arguments: Vec<Value>,
+    nonce: u64,
+) -> Result<DeepXPermittedPalletExtrinsic, SigningError> {
+    permit.ensure_active()?;
+    let snapshot = permit.snapshot();
+    let encoded = sign_validated_dynamic_pallet_call(
+        snapshot.validated(),
+        key,
+        pallet,
+        call,
+        arguments,
+        nonce,
+    )?;
+    Ok(DeepXPermittedPalletExtrinsic {
+        encoded,
+        runtime: snapshot.identity().clone(),
+    })
+}
+
 fn immortal_params(nonce: u64) -> subxt_core::config::ParamsFor<DeepXRuntimeConfig> {
     let (
         signature,
@@ -434,9 +574,11 @@ mod tests {
     use super::*;
     use crate::{
         credential::DeepXKeyScheme,
+        enums::DeepXEnvironment,
         signing::{
-            DeepXPerpOrderType, DeepXPerpPlaceParams, DeepXPostOnlyParam, DeepXSpotCancelParams,
-            DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce,
+            DeepXPerpOrderType, DeepXPerpPlaceParams, DeepXPostOnlyParam,
+            DeepXRuntimeSnapshotService, DeepXSpotCancelParams, DeepXSpotOrderType,
+            DeepXSpotPlaceParams, DeepXTimeInForce, RuntimeSnapshot,
         },
     };
 
@@ -463,6 +605,50 @@ mod tests {
 
         assert_eq!(extra, [0]);
         assert_eq!(implicit, [0xab; 32]);
+    }
+
+    #[rstest]
+    fn permitted_pallet_signing_rejects_revoked_runtime() {
+        let service =
+            DeepXRuntimeSnapshotService::new(RuntimeSnapshot::built_in_testnet().unwrap());
+        let permit = service.acquire().unwrap();
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+
+        let typed =
+            sign_permitted_pallet_call(&permit, &key, DeepXOfflinePalletCall::NoOp, 42).unwrap();
+        let dynamic = sign_permitted_dynamic_pallet_call(
+            &permit,
+            &key,
+            "Subaccount",
+            "no_op",
+            Vec::new(),
+            42,
+        )
+        .unwrap();
+        assert_eq!(typed, dynamic);
+        assert_eq!(typed.runtime(), permit.snapshot().identity());
+        assert_eq!(typed.extrinsic_hash(), BlakeTwo256.hash(typed.bytes()).0);
+
+        service.halt_for_inconsistent_evidence().unwrap();
+        assert!(matches!(
+            sign_permitted_pallet_call(&permit, &key, DeepXOfflinePalletCall::NoOp, 43),
+            Err(SigningError::RuntimePermit(_)),
+        ));
+        assert!(matches!(
+            sign_permitted_dynamic_pallet_call(
+                &permit,
+                &key,
+                "Subaccount",
+                "no_op",
+                Vec::new(),
+                43,
+            ),
+            Err(SigningError::RuntimePermit(_)),
+        ));
     }
 
     #[rstest]
@@ -515,6 +701,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(typed, signed);
+
+        let validated = super::super::validate_testnet_runtime(
+            &DeepXEnvironment::Testnet,
+            genesis.try_into().unwrap(),
+            376,
+            1,
+            &metadata_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            sign_validated_dynamic_pallet_call(
+                &validated,
+                &key,
+                "Subaccount",
+                "no_op",
+                Vec::new(),
+                1_725_000_000_124,
+            )
+            .unwrap(),
+            signed,
+        );
+        assert_eq!(
+            sign_validated_pallet_call(
+                &validated,
+                &key,
+                DeepXOfflinePalletCall::NoOp,
+                1_725_000_000_124,
+            )
+            .unwrap(),
+            signed,
+        );
 
         let invalid_modify = DeepXPerpModifyParams {
             cancel: DeepXPerpCancelParams {

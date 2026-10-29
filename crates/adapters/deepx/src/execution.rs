@@ -13320,7 +13320,7 @@ mod tests {
     }
 
     fn test_runtime_snapshot() -> RuntimeSnapshot {
-        let read_only = crate::signing::DeepXReadOnlyRuntimeSnapshot::approved_testnet(
+        RuntimeSnapshot::approved_testnet(
             &DeepXEnvironment::Testnet,
             hex::decode_array("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
                 .unwrap(),
@@ -13328,8 +13328,7 @@ mod tests {
             1,
             &metadata_fixture_bytes(),
         )
-        .unwrap();
-        RuntimeSnapshot::from_read_only_for_test(read_only)
+        .unwrap()
     }
 
     fn configure_rpc_url(client: &mut DeepXExecutionClient, rpc_url: String) {
