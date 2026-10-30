@@ -23,6 +23,7 @@ use super::models::{
     DeepXDelegateAccount, DeepXDelegateMode, DeepXDelegateWallets, DeepXSubaccountProfile,
     DeepXWalletDelegateAccounts, DeepXWalletSubaccounts,
 };
+use crate::identity::decode_account_id20;
 
 /// Errors raised while checking REST ownership evidence for a signer.
 #[derive(Debug, Error)]
@@ -229,13 +230,7 @@ fn parse_account_id20(
     value: &str,
     field: &'static str,
 ) -> Result<[u8; 20], DeepXOwnershipEvidenceError> {
-    let value = value
-        .strip_prefix("0x")
-        .ok_or(DeepXOwnershipEvidenceError::InvalidAddress { field })?;
-    let mut address = [0; 20];
-    hex::decode_to_slice(value, &mut address)
-        .map_err(|_| DeepXOwnershipEvidenceError::InvalidAddress { field })?;
-    Ok(address)
+    decode_account_id20(value).ok_or(DeepXOwnershipEvidenceError::InvalidAddress { field })
 }
 
 #[cfg(test)]

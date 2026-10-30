@@ -17,7 +17,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::rest::models::{DeepXSubaccountBalances, validate_subaccount_balances};
+use crate::{
+    identity::decode_account_id20,
+    rest::models::{DeepXSubaccountBalances, validate_subaccount_balances},
+};
 
 /// The aggregate market identity required by portfolio channels.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,15 +143,11 @@ impl DeepXWsUserBalancesRequest {
 ///
 /// Returns an error unless the address contains exactly 20 hexadecimal bytes.
 pub fn parse_subaccount_address(address: &str) -> anyhow::Result<[u8; 20]> {
-    anyhow::ensure!(
-        address.len() == 42
-            && address.starts_with("0x")
-            && address.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit),
-        "DeepX user-balances subscription requires a 20-byte hex subaccount address"
-    );
-    let mut bytes = [0; 20];
-    hex::decode_to_slice(&address[2..], &mut bytes)?;
-    Ok(bytes)
+    decode_account_id20(address).ok_or_else(|| {
+        anyhow::anyhow!(
+            "DeepX user-balances subscription requires a 20-byte hex subaccount address"
+        )
+    })
 }
 
 /// Wire-level frames for one DeepX user-balances subscription.

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use deepx_rust_sdk::rpc::spot_market_spec::parse_spot_pair;
 use nautilus_common::providers::{InstrumentProvider, InstrumentStore};
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{identifiers::InstrumentId, instruments::InstrumentAny};
@@ -158,12 +159,7 @@ impl DeepXInstrumentProvider {
                     .map_err(anyhow::Error::from)?;
                 let pairs = spots
                     .iter()
-                    .map(|spot| {
-                        nautilus_core::hex::decode_array::<32>(
-                            spot.pair.strip_prefix("0x").unwrap_or(&spot.pair),
-                        )
-                        .map_err(anyhow::Error::from)
-                    })
+                    .map(|spot| parse_spot_pair(&spot.pair).map_err(anyhow::Error::from))
                     .collect::<Result<Vec<_>>>()?;
                 observe_current_spot_market_spec_batch(
                     &network.environment,
@@ -191,9 +187,7 @@ impl DeepXInstrumentProvider {
             match market {
                 DeepXMarketMetadata::Perpetual(_) => instruments.push(self.convert(market)?),
                 DeepXMarketMetadata::Spot(spot) if self.network.is_some() => {
-                    let pair = nautilus_core::hex::decode_array::<32>(
-                        spot.pair.strip_prefix("0x").unwrap_or(&spot.pair),
-                    )?;
+                    let pair = parse_spot_pair(&spot.pair)?;
                     let evidence = evidence_by_pair
                         .remove(&pair)
                         .ok_or_else(|| anyhow::anyhow!("missing current DeepX Spot spec"))?;

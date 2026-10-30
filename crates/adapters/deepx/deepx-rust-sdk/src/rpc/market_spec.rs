@@ -13,16 +13,67 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Bounded decoding of DeepX market order constraints.
+//! Bounded reads and decoding of DeepX market order constraints.
 
 use subxt_core::{
     Metadata,
     ext::scale_value::{Composite, ValueDef, scale::decode_as_type},
 };
+use thiserror::Error;
 
-use super::{precompile::decode_perp_market_return, spot_market_spec::DeepXSpotMarketSpec};
+use super::{
+    DeepXRpcClient,
+    precompile::{
+        DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS, decode_perp_market_return, encode_perp_market_call,
+    },
+    spot_market_spec::DeepXSpotMarketSpec,
+    storage_decode::{perp_market_storage_key, spot_market_storage_key},
+};
 
 const MAX_MARKET_STORAGE_BYTES: usize = 16_384;
+
+/// Errors while reading a Spot market specification at one block hash.
+#[derive(Debug, Error)]
+pub enum DeepXSpotMarketStorageReadError {
+    /// The storage RPC request failed.
+    #[error("DeepX Spot market storage RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The stored value was absent or did not match the expected pair and layout.
+    #[error("DeepX Spot market storage is invalid")]
+    InvalidStorage,
+    /// Repeated reads at one hash returned different values.
+    #[error("DeepX Spot market storage changed at a fixed hash")]
+    InconsistentStorage,
+}
+
+/// Reads and corroborates one Spot market specification at a fixed block hash.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure, invalid storage, or inconsistent repeated reads.
+pub async fn get_spot_market_storage_spec(
+    client: &DeepXRpcClient,
+    block_hash: &str,
+    metadata: &Metadata,
+    pair: [u8; 32],
+) -> Result<DeepXSpotMarketSpec, DeepXSpotMarketStorageReadError> {
+    let key = spot_market_storage_key(pair);
+    let first: Option<String> = client
+        .get_storage_result(&key, block_hash)
+        .await
+        .map_err(DeepXSpotMarketStorageReadError::Rpc)?;
+    let second: Option<String> = client
+        .get_storage_result(&key, block_hash)
+        .await
+        .map_err(DeepXSpotMarketStorageReadError::Rpc)?;
+    if first != second {
+        return Err(DeepXSpotMarketStorageReadError::InconsistentStorage);
+    }
+    first
+        .as_deref()
+        .and_then(|encoded| decode_spot_market_storage(encoded, metadata, pair))
+        .ok_or(DeepXSpotMarketStorageReadError::InvalidStorage)
+}
 
 /// Raw perpetual order constraints shared by the precompile and runtime storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +88,66 @@ pub struct DeepXPerpOrderSpec {
 pub struct DeepXPerpMarketSpec {
     pub order_spec: DeepXPerpOrderSpec,
     pub min_notional: u128,
+}
+
+/// Errors while corroborating a Perp market precompile response with runtime storage.
+#[derive(Debug, Error)]
+pub enum DeepXPerpMarketSpecReadError {
+    /// The precompile RPC request failed.
+    #[error("DeepX Perp market precompile RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The runtime storage RPC request failed.
+    #[error("DeepX Perp market storage RPC failed: {0}")]
+    StorageRpc(#[source] anyhow::Error),
+    /// The precompile and storage were invalid, inconsistent, or changed between reads.
+    #[error("DeepX Perp market evidence is invalid")]
+    InvalidEvidence,
+}
+
+/// Reads and corroborates one Perp market specification at a selected block.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure, invalid ABI or SCALE data, mismatched market constraints, or
+/// inconsistent repeated storage reads.
+pub async fn get_perp_market_spec_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    block_number: u32,
+    metadata: &Metadata,
+    market_id: u16,
+) -> Result<DeepXPerpMarketSpec, DeepXPerpMarketSpecReadError> {
+    let encoded: String = client
+        .eth_call(
+            &DEEPX_PERP_MARKET_PRECOMPILE_ADDRESS.to_string(),
+            &encode_perp_market_call(market_id),
+            &format!("0x{block_number:x}"),
+        )
+        .await
+        .map_err(DeepXPerpMarketSpecReadError::Rpc)?;
+    let spec = decode_perp_order_spec(&encoded, market_id)
+        .ok_or(DeepXPerpMarketSpecReadError::InvalidEvidence)?;
+    let storage_key = perp_market_storage_key(market_id);
+    let checkpoint_hash = format!("0x{}", hex::encode(block_hash));
+    let stored: Option<String> = client
+        .get_storage_result(&storage_key, &checkpoint_hash)
+        .await
+        .map_err(DeepXPerpMarketSpecReadError::StorageRpc)?;
+    let stored_spec = stored
+        .as_deref()
+        .and_then(|encoded| decode_perp_market_storage(encoded, metadata, market_id))
+        .ok_or(DeepXPerpMarketSpecReadError::InvalidEvidence)?;
+    if spec != stored_spec.order_spec {
+        return Err(DeepXPerpMarketSpecReadError::InvalidEvidence);
+    }
+    let repeated: Option<String> = client
+        .get_storage_result(&storage_key, &checkpoint_hash)
+        .await
+        .map_err(DeepXPerpMarketSpecReadError::StorageRpc)?;
+    if repeated != stored {
+        return Err(DeepXPerpMarketSpecReadError::InvalidEvidence);
+    }
+    Ok(stored_spec)
 }
 
 /// Decodes a matching, positive Spot order specification from SCALE market storage.

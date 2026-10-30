@@ -23,6 +23,7 @@ use alloy::{
 use thiserror::Error;
 
 use super::DeepXRpcClient;
+use crate::symbol::decode_spot_pair_identity;
 
 sol! {
     struct SpotMarketSpec {
@@ -100,10 +101,8 @@ impl DeepXSpotMarketSpecClient {
 ///
 /// Returns an error when the pair is not exactly 32 hexadecimal bytes.
 pub fn parse_spot_pair(pair: &str) -> Result<[u8; 32], DeepXSpotMarketSpecError> {
-    let mut bytes = [0; 32];
-    hex::decode_to_slice(pair.strip_prefix("0x").unwrap_or(pair), &mut bytes)
-        .map_err(|_| DeepXSpotMarketSpecError::InvalidPair(pair.to_string()))?;
-    Ok(bytes)
+    decode_spot_pair_identity(pair)
+        .ok_or_else(|| DeepXSpotMarketSpecError::InvalidPair(pair.to_string()))
 }
 
 impl DeepXRpcClient {

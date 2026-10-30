@@ -16,7 +16,6 @@
 //! Shared DeepX protocol types and deployment constants.
 
 pub mod consts;
-pub mod metadata;
 pub mod symbol;
 
 pub use credential::{DeepXKeyScheme, DeepXPrivateKey, credential_env_var};
@@ -25,7 +24,7 @@ pub use deepx_rust_sdk::{
     enums::{DeepXEnvironment, DeepXProductType},
     error, parse, urls,
 };
+pub use deepx_rust_sdk::metadata::{MetadataError, signed_extension_identifiers};
 pub use error::{DeepXError, Result};
-pub use metadata::{MetadataError, signed_extension_identifiers};
 pub use parse::{decimal_to_scaled_i128, scaled_i128_to_decimal};
 pub use symbol::{format_instrument_id, parse_instrument_id};

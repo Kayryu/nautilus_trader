@@ -28,6 +28,11 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
+use deepx_rust_sdk::{
+    identity::decode_account_id20,
+    rpc::{chain_decode::decode_prefixed_hash, spot_market_spec::parse_spot_pair},
+    symbol::normalize_spot_pair,
+};
 use nautilus_common::{
     cache::{
         Cache,
@@ -242,13 +247,6 @@ fn consume_order_report_pages(remaining_pages: &mut usize, pages: usize) -> anyh
     Ok(())
 }
 
-fn normalize_spot_pair(pair: &str) -> String {
-    pair.strip_prefix("0x")
-        .or_else(|| pair.strip_prefix("0X"))
-        .unwrap_or(pair)
-        .to_ascii_lowercase()
-}
-
 fn spot_limit_amounts(
     quantity: rust_decimal::Decimal,
     price: rust_decimal::Decimal,
@@ -298,24 +296,13 @@ fn verify_backend_spot_order_for_durable_place(
     if record.order_id != order_id.to_string() {
         return Err(Error::Mismatch("order ID"));
     }
-    let owner = record
-        .maker
-        .strip_prefix("0x")
-        .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
-        .ok_or(Error::Mismatch("owner encoding"))?;
+    let owner = decode_account_id20(&record.maker).ok_or(Error::Mismatch("owner encoding"))?;
     if owner != *subaccount {
         return Err(Error::Mismatch("owner"));
     }
-    let record_pair = record
-        .pair
-        .strip_prefix("0x")
-        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
-        .ok_or(Error::Mismatch("pair encoding"))?;
-    let market_pair = market
-        .pair
-        .strip_prefix("0x")
-        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
-        .ok_or(Error::Mismatch("catalog pair encoding"))?;
+    let record_pair = decode_prefixed_hash(&record.pair).ok_or(Error::Mismatch("pair encoding"))?;
+    let market_pair =
+        decode_prefixed_hash(&market.pair).ok_or(Error::Mismatch("catalog pair encoding"))?;
     if record_pair != *pair || market_pair != *pair || record.pair_name != market.name {
         return Err(Error::Mismatch("market"));
     }
@@ -376,10 +363,7 @@ fn verify_backend_spot_order_for_durable_place(
         .signed_extrinsic()
         .ok_or(Error::Mismatch("signed extrinsic"))?;
     let extrinsic_hash = signed.extrinsic_hash();
-    let backend_hash = record
-        .tx_hash
-        .strip_prefix("0x")
-        .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
+    let backend_hash = decode_prefixed_hash(&record.tx_hash)
         .ok_or(Error::Mismatch("transaction hash encoding"))?;
     if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash)
         || backend_hash != extrinsic_hash
@@ -4410,8 +4394,7 @@ impl DeepXExecutionClient {
             .config
             .subaccount_id
             .as_deref()
-            .and_then(|value| value.strip_prefix("0x"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
+            .and_then(decode_account_id20)
             .ok_or(DeepXPerpOrderMappingError::InvalidSubaccount)?;
 
         let order_type = match order.order_type {
@@ -4586,8 +4569,7 @@ impl DeepXExecutionClient {
             .config
             .subaccount_id
             .as_deref()
-            .and_then(|value| value.strip_prefix("0x"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
+            .and_then(decode_account_id20)
             .ok_or(DeepXPerpOrderMappingError::InvalidSubaccount)?;
         if place.subaccount != subaccount {
             return Err(DeepXPerpOrderMappingError::InvalidSubaccount);
@@ -4658,10 +4640,7 @@ impl DeepXExecutionClient {
                 anyhow::anyhow!("DeepX Spot instrument is absent from startup catalog")
             })?;
         anyhow::ensure!(!market.is_paused, "DeepX Spot market is paused");
-        let pair = nautilus_core::hex::decode_array::<32>(
-            market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-        )
-        .map_err(|error| anyhow::anyhow!("invalid DeepX Spot pair identity: {error}"))?;
+        let pair = parse_spot_pair(&market.pair).context("invalid DeepX Spot pair identity")?;
         let cache = self.core.cache();
         let instrument = cache
             .instrument(&cmd.instrument_id)
@@ -4717,8 +4696,7 @@ impl DeepXExecutionClient {
             .config
             .subaccount_id
             .as_deref()
-            .and_then(|value| value.strip_prefix("0x"))
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
+            .and_then(decode_account_id20)
             .ok_or_else(|| anyhow::anyhow!("DeepX Spot subaccount identity is unavailable"))?;
         Ok(DeepXSpotPlaceParams {
             subaccount,
@@ -4834,11 +4812,8 @@ impl DeepXExecutionClient {
             return Err(DeepXPerpOrderEvidenceError::OrderIdMismatch);
         }
 
-        let owner = record
-            .owner
-            .strip_prefix("0x")
-            .and_then(|value| nautilus_core::hex::decode_array::<20>(value).ok())
-            .ok_or(DeepXPerpOrderEvidenceError::InvalidOwner)?;
+        let owner =
+            decode_account_id20(&record.owner).ok_or(DeepXPerpOrderEvidenceError::InvalidOwner)?;
         if owner != *subaccount {
             return Err(DeepXPerpOrderEvidenceError::OwnerMismatch);
         }
@@ -10657,10 +10632,7 @@ impl ExecutionClient for DeepXExecutionClient {
                     && !order.is_reduce_only(),
                 "DeepX Spot cancellation supports tracked non-post-only Limit GTC orders"
             );
-            let pair = nautilus_core::hex::decode_array::<32>(
-                market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-            )
-            .map_err(|error| anyhow::anyhow!("invalid DeepX Spot pair identity: {error}"))?;
+            let pair = parse_spot_pair(&market.pair).context("invalid DeepX Spot pair identity")?;
             let ownership = self
                 .account_ownership
                 .ok_or(DeepXTransactionRuntimeError::AccountIdentityMismatch)?;

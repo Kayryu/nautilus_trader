@@ -95,6 +95,7 @@ pub use wallet_positions::DeepXWalletPerpPositionContinuity;
 pub use wallet_snapshot::DeepXWalletCollectionValidation;
 
 use crate::{
+    identity::decode_account_id20,
     pagination::validate_cursor_page,
     parse::parse_canonical_order_id,
     query::{
@@ -110,6 +111,7 @@ use crate::{
         DeepXPerpOrderRecord, DeepXPerpPositionRecord, DeepXSpotAccountTradeRecord,
         DeepXSpotOrderRecord, DeepXWalletSubaccounts,
     },
+    symbol::decode_spot_pair_identity,
     transport::{install_tls_provider, read_bounded_body},
 };
 
@@ -1081,13 +1083,6 @@ pub fn validate_spot_wallet_trade_record(
         )));
     }
     Ok(created)
-}
-
-fn decode_spot_pair_identity(value: &str) -> Option<[u8; 32]> {
-    hex::decode(value.strip_prefix("0x").unwrap_or(value))
-        .ok()?
-        .try_into()
-        .ok()
 }
 
 /// Validates one Spot order against its account, market, side, and financial invariants.
@@ -2817,9 +2812,7 @@ pub fn validate_account_address(
 }
 
 fn is_account_address(value: &str) -> bool {
-    value.len() == 42
-        && value.starts_with("0x")
-        && value.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+    decode_account_id20(value).is_some()
 }
 
 fn decode_transaction_status_response(

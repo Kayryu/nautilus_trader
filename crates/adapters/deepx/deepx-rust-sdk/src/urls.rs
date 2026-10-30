@@ -38,7 +38,21 @@ pub fn ws_url(environment: &DeepXEnvironment) -> Result<&'static str> {
 /// Returns an error unless the URL has a WebSocket scheme and host without credentials or a
 /// fragment.
 pub fn ws_connection_url(base_url: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(base_url)
+    let mut url = parse_websocket_url(base_url)?;
+    if url.path().is_empty() || url.path() == "/" {
+        url.set_path("/internal/v1/ws");
+    }
+    Ok(url.to_string())
+}
+
+/// Parses an exact WebSocket endpoint without changing its path or query.
+///
+/// # Errors
+///
+/// Returns an error unless the URL has a WebSocket scheme and host without credentials or a
+/// fragment.
+pub fn parse_websocket_url(url: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(url)
         .map_err(|_| DeepXError::InvalidConfiguration("invalid WebSocket URL".to_string()))?;
     if !matches!(url.scheme(), "ws" | "wss")
         || url.host_str().is_none()
@@ -50,10 +64,7 @@ pub fn ws_connection_url(base_url: &str) -> Result<String> {
             "WebSocket URL requires ws/wss, a host, and no userinfo or fragment".to_string(),
         ));
     }
-    if url.path().is_empty() || url.path() == "/" {
-        url.set_path("/internal/v1/ws");
-    }
-    Ok(url.to_string())
+    Ok(url)
 }
 
 pub fn rpc_url(environment: &DeepXEnvironment) -> Result<&'static str> {

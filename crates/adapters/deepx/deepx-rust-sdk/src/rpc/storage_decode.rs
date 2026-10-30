@@ -15,19 +15,335 @@
 
 //! Bounded SCALE decoding of DeepX account order and position storage.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use parity_scale_codec::{Compact, Decode, DecodeAll, Encode};
+use thiserror::Error;
 
-use super::storage::{
-    DeepXActivePerpOrderIndexEntry, DeepXPerpOrderStorage, DeepXPerpPositionStorage,
-    DeepXSpotOrderStorage, DeepXStoredOrderSide, DeepXStoredOrderStatus, DeepXStoredPerpOrderType,
+use super::{
+    DeepXRpcClient, DeepXRpcStorageChangeSet,
+    storage::{
+        DeepXActivePerpOrderIndexEntry, DeepXPerpOrderStorage, DeepXPerpPositionStorage,
+        DeepXSpotOrderStorage, DeepXStoredOrderSide, DeepXStoredOrderStatus,
+        DeepXStoredPerpOrderType,
+    },
 };
 
 const DEFAULT_MAX_PERP_POSITIONS: u32 = 8;
 const ABSOLUTE_MAX_PERP_POSITIONS: u32 = 256;
 const MAX_ACTIVE_ORDER_MARKETS: u32 = 256;
 const MAX_ACTIVE_ORDERS: u32 = 4_096;
+
+/// Errors while reading one account's complete Perp position storage at a block.
+#[derive(Debug, Error)]
+pub enum DeepXPerpPositionsReadError {
+    /// The storage RPC request failed.
+    #[error("DeepX Perp position storage RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The runtime position limit was invalid.
+    #[error("DeepX maximum Perp positions storage is invalid")]
+    InvalidMaximum,
+    /// The returned storage set or position vector was invalid.
+    #[error("DeepX Perp position storage evidence is invalid")]
+    InvalidEvidence,
+}
+
+/// Reads one account's bounded position vector and runtime limit at a fixed block hash.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure, an invalid storage change set, or malformed SCALE values.
+pub async fn get_perp_positions_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    subaccount: [u8; 20],
+) -> Result<(u32, Vec<DeepXPerpPositionStorage>), DeepXPerpPositionsReadError> {
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let maximum_key = subaccount_max_perp_positions_storage_key();
+    let positions_key = user_perp_positions_storage_key(subaccount);
+    let mut change_sets: Vec<DeepXRpcStorageChangeSet> = client
+        .query_storage_at(&[maximum_key.clone(), positions_key.clone()], &block_hash)
+        .await
+        .map_err(DeepXPerpPositionsReadError::Rpc)?;
+    if change_sets.len() != 1 || change_sets[0].block != block_hash {
+        return Err(DeepXPerpPositionsReadError::InvalidEvidence);
+    }
+    let changes = std::mem::take(&mut change_sets[0].changes);
+    if changes.len() != 2 {
+        return Err(DeepXPerpPositionsReadError::InvalidEvidence);
+    }
+    let mut changes = changes.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != 2 {
+        return Err(DeepXPerpPositionsReadError::InvalidEvidence);
+    }
+    let encoded_maximum = changes
+        .remove(&maximum_key)
+        .ok_or(DeepXPerpPositionsReadError::InvalidEvidence)?;
+    let encoded_positions = changes
+        .remove(&positions_key)
+        .ok_or(DeepXPerpPositionsReadError::InvalidEvidence)?;
+    let runtime_max_positions = decode_max_perp_positions(encoded_maximum.as_deref())
+        .ok_or(DeepXPerpPositionsReadError::InvalidMaximum)?;
+    let positions = decode_perp_positions(
+        encoded_positions.as_deref(),
+        subaccount,
+        runtime_max_positions,
+    )
+    .ok_or(DeepXPerpPositionsReadError::InvalidEvidence)?;
+    Ok((runtime_max_positions, positions))
+}
+
+/// Errors while reading all active Perp orders for one account at a block.
+#[derive(Debug, Error)]
+pub enum DeepXActivePerpOrdersReadError {
+    /// The account index or order detail storage RPC request failed.
+    #[error("DeepX Perp order storage {storage} RPC failed: {source}")]
+    Rpc {
+        /// Storage item whose request failed.
+        storage: &'static str,
+        /// Underlying RPC error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The account's active-order index was invalid.
+    #[error("DeepX active Perp order index is invalid")]
+    InvalidIndex,
+    /// The order details were absent, malformed, or inconsistent with the index.
+    #[error("DeepX active Perp order details are invalid")]
+    InvalidOrderEvidence,
+}
+
+/// Reads all active Perp orders and corroborates each against its account index entry.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure, an invalid index, or inconsistent order details.
+pub async fn get_active_perp_orders_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    subaccount: [u8; 20],
+) -> Result<Vec<DeepXPerpOrderStorage>, DeepXActivePerpOrdersReadError> {
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let index_key = active_perp_orders_storage_key(subaccount);
+    let mut index_sets: Vec<DeepXRpcStorageChangeSet> = client
+        .query_storage_at(std::slice::from_ref(&index_key), &block_hash)
+        .await
+        .map_err(|source| DeepXActivePerpOrdersReadError::Rpc {
+            storage: "PerpMarket.ActivePerpOrdersFor",
+            source,
+        })?;
+    if index_sets.len() != 1 || index_sets[0].block != block_hash {
+        return Err(DeepXActivePerpOrdersReadError::InvalidIndex);
+    }
+    let index_changes = std::mem::take(&mut index_sets[0].changes);
+    if index_changes.len() != 1 || index_changes[0].0 != index_key {
+        return Err(DeepXActivePerpOrdersReadError::InvalidIndex);
+    }
+    let encoded_index = index_changes
+        .into_iter()
+        .next()
+        .map(|(_, value)| value)
+        .ok_or(DeepXActivePerpOrdersReadError::InvalidIndex)?;
+    let index = decode_active_perp_order_index(encoded_index.as_deref(), subaccount)
+        .ok_or(DeepXActivePerpOrdersReadError::InvalidIndex)?;
+    if index.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let expected = index
+        .into_iter()
+        .map(|entry| {
+            (
+                perp_order_info_storage_key(subaccount, entry.order_id),
+                entry,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.len() > MAX_ACTIVE_ORDERS as usize {
+        return Err(DeepXActivePerpOrdersReadError::InvalidIndex);
+    }
+    let keys = expected.keys().cloned().collect::<Vec<_>>();
+    let mut order_sets: Vec<DeepXRpcStorageChangeSet> = client
+        .query_storage_at(&keys, &block_hash)
+        .await
+        .map_err(|source| DeepXActivePerpOrdersReadError::Rpc {
+            storage: "PerpMarket.OrderInfo",
+            source,
+        })?;
+    if order_sets.len() != 1 || order_sets[0].block != block_hash {
+        return Err(DeepXActivePerpOrdersReadError::InvalidOrderEvidence);
+    }
+    let changes = std::mem::take(&mut order_sets[0].changes);
+    if changes.len() != expected.len() {
+        return Err(DeepXActivePerpOrdersReadError::InvalidOrderEvidence);
+    }
+    let changes = changes.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != expected.len() || changes.keys().ne(expected.keys()) {
+        return Err(DeepXActivePerpOrdersReadError::InvalidOrderEvidence);
+    }
+
+    let mut orders = Vec::with_capacity(expected.len());
+    for (key, index_entry) in expected {
+        let encoded = changes
+            .get(&key)
+            .and_then(Option::as_deref)
+            .ok_or(DeepXActivePerpOrdersReadError::InvalidOrderEvidence)?;
+        let order = decode_active_perp_order(encoded, &index_entry, subaccount)
+            .ok_or(DeepXActivePerpOrdersReadError::InvalidOrderEvidence)?;
+        orders.push(order);
+    }
+    orders.sort_unstable_by_key(|order| (order.market_id, order.order_id));
+    Ok(orders)
+}
+
+/// Errors while reading orders by ID at a fixed block.
+#[derive(Debug, Error)]
+pub enum DeepXOrdersByIdReadError {
+    /// The storage RPC request failed.
+    #[error("DeepX order storage RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The active-order index was malformed.
+    #[error("DeepX active order index is invalid")]
+    InvalidIndex,
+    /// The storage set or an order was absent or inconsistent.
+    #[error("DeepX order storage evidence is invalid")]
+    InvalidOrderEvidence,
+}
+
+/// Reads perpetual orders by ID and checks each against the active-order index.
+///
+/// # Errors
+///
+/// Returns an error for invalid IDs, RPC failure, or inconsistent storage evidence.
+pub async fn get_perp_orders_by_id_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<Vec<DeepXPerpOrderStorage>, DeepXOrdersByIdReadError> {
+    let expected_ids = validate_order_ids(order_ids)?;
+    if expected_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index_key = active_perp_orders_storage_key(subaccount);
+    let order_keys = expected_ids
+        .iter()
+        .map(|id| (*id, perp_order_info_storage_key(subaccount, *id)))
+        .collect::<BTreeMap<_, _>>();
+    let changes = read_orders_by_id_storage(client, block_hash, &index_key, &order_keys).await?;
+    let index = decode_active_perp_order_index(
+        changes.get(&index_key).and_then(Option::as_deref),
+        subaccount,
+    )
+    .ok_or(DeepXOrdersByIdReadError::InvalidIndex)?;
+    let active_by_id = index
+        .into_iter()
+        .map(|entry| (entry.order_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    expected_ids
+        .into_iter()
+        .map(|id| {
+            let encoded = changes
+                .get(&order_keys[&id])
+                .and_then(Option::as_deref)
+                .ok_or(DeepXOrdersByIdReadError::InvalidOrderEvidence)?;
+            decode_perp_order_by_id(encoded, id, subaccount, active_by_id.get(&id))
+                .ok_or(DeepXOrdersByIdReadError::InvalidOrderEvidence)
+        })
+        .collect()
+}
+
+/// Spot orders and the complete active-order index observed at the same block.
+#[derive(Debug)]
+pub struct DeepXSpotOrdersByIdRead {
+    pub orders: Vec<DeepXSpotOrderStorage>,
+    pub active_order_ids: Vec<u64>,
+    pub active_order_pairs: Vec<(u64, [u8; 32])>,
+}
+
+/// Reads Spot orders by ID and their complete active-order index at a fixed block.
+///
+/// # Errors
+///
+/// Returns an error for invalid IDs, RPC failure, or inconsistent storage evidence.
+pub async fn get_spot_orders_by_id_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    subaccount: [u8; 20],
+    order_ids: &[u64],
+) -> Result<DeepXSpotOrdersByIdRead, DeepXOrdersByIdReadError> {
+    let expected_ids = validate_order_ids(order_ids)?;
+    let index_key = active_spot_orders_storage_key(subaccount);
+    let order_keys = expected_ids
+        .iter()
+        .map(|id| (*id, spot_order_info_storage_key(subaccount, *id)))
+        .collect::<BTreeMap<_, _>>();
+    let changes = read_orders_by_id_storage(client, block_hash, &index_key, &order_keys).await?;
+    let index = decode_active_spot_order_index(changes.get(&index_key).and_then(Option::as_deref))
+        .ok_or(DeepXOrdersByIdReadError::InvalidIndex)?;
+    let active_by_id = index
+        .into_iter()
+        .map(|entry| (entry.order_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let active_order_ids = active_by_id.keys().copied().collect();
+    let active_order_pairs = active_by_id
+        .iter()
+        .map(|(id, entry)| (*id, entry.pair))
+        .collect();
+    let orders = expected_ids
+        .into_iter()
+        .map(|id| {
+            let encoded = changes
+                .get(&order_keys[&id])
+                .and_then(Option::as_deref)
+                .ok_or(DeepXOrdersByIdReadError::InvalidOrderEvidence)?;
+            decode_spot_order_by_id(encoded, id, subaccount, active_by_id.get(&id))
+                .ok_or(DeepXOrdersByIdReadError::InvalidOrderEvidence)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(DeepXSpotOrdersByIdRead {
+        orders,
+        active_order_ids,
+        active_order_pairs,
+    })
+}
+
+fn validate_order_ids(order_ids: &[u64]) -> Result<BTreeSet<u64>, DeepXOrdersByIdReadError> {
+    if order_ids.len() > MAX_ACTIVE_ORDERS as usize || order_ids.contains(&0) {
+        return Err(DeepXOrdersByIdReadError::InvalidOrderEvidence);
+    }
+    let ids = order_ids.iter().copied().collect::<BTreeSet<_>>();
+    (ids.len() == order_ids.len())
+        .then_some(ids)
+        .ok_or(DeepXOrdersByIdReadError::InvalidOrderEvidence)
+}
+
+async fn read_orders_by_id_storage(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+    index_key: &str,
+    order_keys: &BTreeMap<u64, String>,
+) -> Result<BTreeMap<String, Option<String>>, DeepXOrdersByIdReadError> {
+    let mut keys = vec![index_key.to_string()];
+    keys.extend(order_keys.values().cloned());
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let mut sets: Vec<DeepXRpcStorageChangeSet> = client
+        .query_storage_at(&keys, &block_hash)
+        .await
+        .map_err(DeepXOrdersByIdReadError::Rpc)?;
+    if sets.len() != 1 || sets[0].block != block_hash {
+        return Err(DeepXOrdersByIdReadError::InvalidOrderEvidence);
+    }
+    let raw = std::mem::take(&mut sets[0].changes);
+    if raw.len() != keys.len() {
+        return Err(DeepXOrdersByIdReadError::InvalidOrderEvidence);
+    }
+    let changes = raw.into_iter().collect::<BTreeMap<_, _>>();
+    if changes.len() != keys.len() || keys.iter().any(|key| !changes.contains_key(key)) {
+        return Err(DeepXOrdersByIdReadError::InvalidOrderEvidence);
+    }
+    Ok(changes)
+}
 
 /// One active Spot order indexed by its deployment pair and side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,8 +690,10 @@ pub fn perp_order_info_storage_key(subaccount: [u8; 20], order_id: u64) -> Strin
 mod tests {
     use std::collections::BTreeMap;
 
+    use axum::{Json, Router, routing::post};
     use parity_scale_codec::Encode;
     use rstest::rstest;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::rpc::storage::{
@@ -399,6 +717,88 @@ mod tests {
             stop_loss: None,
             last_settle_price: 2_550,
         }
+    }
+
+    #[rstest]
+    #[case::valid(0)]
+    #[case::wrong_block(1)]
+    #[case::duplicate_key(2)]
+    #[case::invalid_maximum(3)]
+    #[case::invalid_positions(4)]
+    #[tokio::test]
+    async fn perp_position_read_rejects_invalid_storage_sets(#[case] scenario: u8) {
+        let account = [0x11; 20];
+        let block_hash = [0x22; 32];
+        let encoded_hash = format!("0x{}", hex::encode(block_hash));
+        let maximum_key = subaccount_max_perp_positions_storage_key();
+        let positions_key = user_perp_positions_storage_key(account);
+        let encoded_positions = format!("0x{}", hex::encode(vec![position(account, 3)].encode()));
+        let expected_hash = encoded_hash.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let maximum_key = maximum_key.clone();
+                let positions_key = positions_key.clone();
+                let encoded_positions = encoded_positions.clone();
+                let expected_hash = expected_hash.clone();
+                async move {
+                    assert_eq!(request["method"], "state_queryStorageAt");
+                    assert_eq!(
+                        request["params"],
+                        json!([[maximum_key, positions_key], expected_hash])
+                    );
+                    let maximum = if scenario == 3 {
+                        json!("0x00")
+                    } else {
+                        Value::Null
+                    };
+                    let positions = if scenario == 4 {
+                        json!("0xzz")
+                    } else {
+                        json!(encoded_positions)
+                    };
+                    let second_key = if scenario == 2 {
+                        maximum_key.clone()
+                    } else {
+                        positions_key
+                    };
+                    let block = if scenario == 1 {
+                        "0x00".to_string()
+                    } else {
+                        expected_hash
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": [{
+                            "block": block,
+                            "changes": [[maximum_key, maximum], [second_key, positions]],
+                        }],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result =
+            get_perp_positions_at_block(&DeepXRpcClient::new(url), block_hash, account).await;
+        match scenario {
+            0 => {
+                let (maximum, positions) = result.unwrap();
+                assert_eq!(maximum, 8);
+                assert_eq!(positions, vec![position(account, 3)]);
+            }
+            3 => assert!(matches!(
+                result,
+                Err(DeepXPerpPositionsReadError::InvalidMaximum)
+            )),
+            _ => assert!(matches!(
+                result,
+                Err(DeepXPerpPositionsReadError::InvalidEvidence)
+            )),
+        }
+        server.abort();
     }
 
     fn index_entry(
@@ -436,6 +836,85 @@ mod tests {
             reduce_only: false,
             post_only: DeepXStoredPostOnlyParam::None,
         }
+    }
+
+    #[rstest]
+    #[case::valid(0)]
+    #[case::wrong_index_block(1)]
+    #[case::malformed_index(2)]
+    #[case::missing_detail(3)]
+    #[case::duplicate_detail(4)]
+    #[case::wrong_detail_block(5)]
+    #[tokio::test]
+    async fn active_perp_order_read_checks_both_storage_sets(#[case] scenario: u8) {
+        let account = [0x11; 20];
+        let block_hash = [0x22; 32];
+        let encoded_hash = format!("0x{}", hex::encode(block_hash));
+        let mut stored_order = order(account, 10);
+        stored_order.status = DeepXStoredOrderStatus::PartiallyFilled;
+        let index = BTreeMap::from([(
+            stored_order.market_id,
+            vec![index_entry_for_order(&stored_order)],
+        )]);
+        let encoded_index = format!("0x{}", hex::encode(index.encode()));
+        let encoded_order = format!("0x{}", hex::encode(stored_order.encode()));
+        let index_key = active_perp_orders_storage_key(account);
+        let order_key = perp_order_info_storage_key(account, stored_order.order_id);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let encoded_hash = encoded_hash.clone();
+                let index_key = index_key.clone();
+                let order_key = order_key.clone();
+                let encoded_index = encoded_index.clone();
+                let encoded_order = encoded_order.clone();
+                async move {
+                    assert_eq!(request["method"], "state_queryStorageAt");
+                    let is_index = request["params"][0] == json!([index_key]);
+                    assert_eq!(request["params"][1], encoded_hash);
+                    let (block, changes) = if is_index {
+                        let block = if scenario == 1 { "0x00" } else { &encoded_hash };
+                        let value = if scenario == 2 {
+                            "0xzz"
+                        } else {
+                            &encoded_index
+                        };
+                        (block.to_string(), json!([[index_key, value]]))
+                    } else {
+                        assert_eq!(request["params"][0], json!([order_key]));
+                        let block = if scenario == 5 { "0x00" } else { &encoded_hash };
+                        let changes = match scenario {
+                            3 => json!([[order_key, null]]),
+                            4 => json!([[order_key, encoded_order], [order_key, encoded_order]]),
+                            _ => json!([[order_key, encoded_order]]),
+                        };
+                        (block.to_string(), changes)
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": [{"block": block, "changes": changes}],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result =
+            get_active_perp_orders_at_block(&DeepXRpcClient::new(url), block_hash, account).await;
+        match scenario {
+            0 => assert_eq!(result.unwrap(), vec![stored_order]),
+            1 | 2 => assert!(matches!(
+                result,
+                Err(DeepXActivePerpOrdersReadError::InvalidIndex)
+            )),
+            _ => assert!(matches!(
+                result,
+                Err(DeepXActivePerpOrdersReadError::InvalidOrderEvidence)
+            )),
+        }
+        server.abort();
     }
 
     #[rstest]

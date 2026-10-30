@@ -16,6 +16,7 @@
 //! Conversion of verified DeepX market metadata into Nautilus instruments.
 
 use anyhow::{Context, Result};
+use deepx_rust_sdk::rpc::spot_market_spec::parse_spot_pair;
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
     identifiers::Symbol,
@@ -98,10 +99,7 @@ pub fn parse_spot_instrument(
     spec: &DeepXFinalizedSpotMarketSpecEvidence,
     ts_init: UnixNanos,
 ) -> Result<InstrumentAny> {
-    let pair = nautilus_core::hex::decode_array::<32>(
-        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-    )
-    .context("invalid DeepX Spot pair identity")?;
+    let pair = parse_spot_pair(&market.pair).context("invalid DeepX Spot pair identity")?;
     anyhow::ensure!(
         pair == spec.pair(),
         "DeepX Spot market pair differs from finalized spec"
@@ -120,10 +118,7 @@ pub(crate) fn parse_current_spot_instrument(
     spec: &DeepXCurrentSpotMarketSpec,
     ts_init: UnixNanos,
 ) -> Result<InstrumentAny> {
-    let pair = nautilus_core::hex::decode_array::<32>(
-        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-    )
-    .context("invalid DeepX Spot pair identity")?;
+    let pair = parse_spot_pair(&market.pair).context("invalid DeepX Spot pair identity")?;
     anyhow::ensure!(
         pair == spec.pair(),
         "DeepX Spot market pair differs from current spec"

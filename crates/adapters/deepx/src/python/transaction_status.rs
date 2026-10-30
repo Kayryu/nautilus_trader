@@ -17,6 +17,7 @@
 
 use std::{num::NonZeroU32, time::Duration};
 
+use deepx_rust_sdk::rpc::chain_decode::decode_prefixed_hash;
 use nautilus_core::{hex, python::to_pyvalue_err};
 use pyo3::prelude::*;
 use tokio_util::sync::CancellationToken;
@@ -207,9 +208,7 @@ pub(super) fn py_get_deepx_rest_transaction_status(
 }
 
 fn parse_hash(tx_hash: &str) -> PyResult<[u8; 32]> {
-    tx_hash
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode_array::<32>(value).ok())
+    decode_prefixed_hash(tx_hash)
         .ok_or_else(|| to_pyvalue_err("tx_hash must be a 0x-prefixed 32-byte hash"))
 }
 

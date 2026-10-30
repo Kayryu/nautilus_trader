@@ -20,6 +20,36 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Encodes a Spot order-book JSON-RPC subscription request.
+#[must_use]
+pub fn encode_subscribe_request(pair: &str, depth: usize, request_id: u64) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "orderbook_subscribe",
+        "params": [[pair], [], depth],
+    })
+    .to_string()
+}
+
+/// Encodes an order-book JSON-RPC unsubscription request.
+#[must_use]
+pub fn encode_unsubscribe_request(subscription_id: &str, request_id: u64) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "orderbook_unsubscribe",
+        "params": [subscription_id],
+    })
+    .to_string()
+}
+
+/// Returns whether the node reports that the requested order-book method is unavailable.
+#[must_use]
+pub fn is_method_unavailable_response(value: &Value, request_id: u64) -> bool {
+    value["jsonrpc"] == "2.0" && value["id"] == request_id && value["error"]["code"] == -32601
+}
+
 /// Converts a Watch RPC endpoint to its WebSocket transport scheme.
 pub fn websocket_url(rpc_url: &str) -> anyhow::Result<String> {
     let mut url =
@@ -116,6 +146,45 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn encodes_spot_orderbook_subscription_and_unsubscription() {
+        let subscribe: Value =
+            serde_json::from_str(&encode_subscribe_request("0xAB12", 10, 1)).unwrap();
+        assert_eq!(
+            subscribe,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "orderbook_subscribe",
+                "params": [["0xAB12"], [], 10],
+            }),
+        );
+
+        let unsubscribe: Value =
+            serde_json::from_str(&encode_unsubscribe_request("book-1", 2)).unwrap();
+        assert_eq!(
+            unsubscribe,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "orderbook_unsubscribe",
+                "params": ["book-1"],
+            }),
+        );
+    }
+
+    #[rstest]
+    #[case(serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601}}), true)]
+    #[case(serde_json::json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601}}), false)]
+    #[case(serde_json::json!({"jsonrpc":"1.0","id":1,"error":{"code":-32601}}), false)]
+    #[case(serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000}}), false)]
+    fn method_unavailable_response_requires_matching_rpc_envelope(
+        #[case] response: Value,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_method_unavailable_response(&response, 1), expected);
+    }
 
     #[rstest]
     #[case("https://rpc1-testnet.deepx.fi", "wss://rpc1-testnet.deepx.fi/")]

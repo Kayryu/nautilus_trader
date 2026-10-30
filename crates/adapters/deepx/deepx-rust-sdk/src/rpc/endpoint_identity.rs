@@ -21,7 +21,7 @@ use std::{
 
 use thiserror::Error;
 
-use super::get_rpc_methods;
+use super::{chain_decode::decode_prefixed_hash, get_genesis_block_hash, get_rpc_methods};
 use crate::{deployment::DEEPX_TESTNET_GENESIS_HASH, error::DeepXError};
 
 const REDACTED: &str = "<redacted>";
@@ -96,6 +96,34 @@ impl DeepXObservedRpcEndpoint {
     pub const fn role(&self) -> DeepXRpcRole {
         self.role
     }
+}
+
+/// Errors while observing one endpoint's reported chain identity.
+#[derive(Debug, Error)]
+pub enum DeepXRpcEndpointObservationError {
+    /// The endpoint request or JSON-RPC response failed.
+    #[error("failed to query DeepX RPC endpoint identity: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The endpoint returned a malformed genesis hash.
+    #[error("DeepX RPC endpoint returned an invalid genesis hash")]
+    InvalidGenesisHash,
+}
+
+/// Observes the genesis hash reported by one RPC role endpoint.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure or a hash that is not exactly one prefixed 32-byte value.
+pub async fn observe_rpc_endpoint_identity(
+    url: String,
+    role: DeepXRpcRole,
+) -> Result<DeepXObservedRpcEndpoint, DeepXRpcEndpointObservationError> {
+    let encoded_hash = get_genesis_block_hash(&url)
+        .await
+        .map_err(DeepXRpcEndpointObservationError::Rpc)?;
+    let hash = decode_prefixed_hash(&encoded_hash)
+        .ok_or(DeepXRpcEndpointObservationError::InvalidGenesisHash)?;
+    Ok(DeepXObservedRpcEndpoint::new(role, url, hash))
 }
 
 /// Errors raised when RPC endpoint identity evidence is incomplete or inconsistent.
@@ -470,6 +498,45 @@ mod tests {
             DeepXObservedRpcEndpoint::new(DeepXRpcRole::Recovery, url.to_string(), approved_hash()),
         ];
         validate_rpc_endpoint_identities(url, url, url, observations).unwrap()
+    }
+
+    #[rstest]
+    #[case::valid(true)]
+    #[case::invalid(false)]
+    #[tokio::test]
+    async fn endpoint_observation_requires_exact_genesis_hash(#[case] valid: bool) {
+        let result = if valid {
+            format!("0x{}", hex::encode(approved_hash()))
+        } else {
+            "0x1234".to_string()
+        };
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let result = result.clone();
+                async move {
+                    assert_eq!(request["method"], "chain_getBlockHash");
+                    assert_eq!(request["params"], json!([0]));
+                    Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observed = observe_rpc_endpoint_identity(url.clone(), DeepXRpcRole::Watch).await;
+        if valid {
+            let observed = observed.unwrap();
+            assert_eq!(observed.role(), DeepXRpcRole::Watch);
+            assert_eq!(observed.url, url);
+            assert_eq!(observed.genesis_hash, approved_hash());
+        } else {
+            assert!(matches!(
+                observed,
+                Err(DeepXRpcEndpointObservationError::InvalidGenesisHash)
+            ));
+        }
+        server.abort();
     }
 
     async fn methods_server(methods: BTreeSet<String>, calls: Arc<AtomicUsize>) -> String {

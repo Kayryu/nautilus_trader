@@ -18,11 +18,15 @@
 use std::collections::HashSet;
 
 #[cfg(test)]
+use deepx_rust_sdk::rpc::event_storage::{
+    SYSTEM_EVENTS_STORAGE_KEY, system_events_map_storage_key, system_threads_storage_key,
+};
+#[cfg(test)]
 use deepx_rust_sdk::rpc::execute_rpc_read_with_retry;
 use deepx_rust_sdk::rpc::{
     DeepXRpcBlockHeader as RpcBlockHeader, DeepXRpcBlockResponse as RpcBlockResponse,
     DeepXRpcClient, DeepXRpcRuntimeVersion as HistoricalRuntimeVersion,
-    chain_decode::{decode_block_number_u64, decode_prefixed_hash},
+    chain_decode::{decode_block_number_u64, decode_prefixed_hash, decode_runtime_metadata},
     event_decode::{
         DeepXDelegateAccountExpected, DeepXDelegateModeExpected, DeepXFinalizedEventLocation,
         DeepXIndexedSystemDispatchError, DeepXPerpCancelBusinessOutcome, DeepXPerpCancelEventError,
@@ -34,10 +38,7 @@ use deepx_rust_sdk::rpc::{
         verify_finalized_delegate_account_change_events as sdk_verify_delegate_account_change,
         verify_finalized_delegate_mode_change_events as sdk_verify_delegate_mode_change,
     },
-    event_storage::{
-        SYSTEM_EVENTS_STORAGE_KEY, combine_events_map_batches, decode_event_storage_value,
-        decode_event_threads, system_events_map_storage_key, system_threads_storage_key,
-    },
+    event_storage::{DeepXEventStorageReadError, get_system_events},
     get_metadata, get_runtime_version,
     perp_modify::{
         DeepXPerpModifyEventError, DeepXPerpModifyEventOrder, DeepXPerpModifySizingExpected,
@@ -102,6 +103,8 @@ use super::{
     DeepXSubmissionPoolEvidence, DeepXTransactionIdentity, DeepXTransactionOperation,
     classify_reorganization, plan_missed_block_scan,
 };
+#[cfg(test)]
+use crate::signing::DeepXRuntimeConfig;
 use crate::{
     common::{DeepXEnvironment, DeepXPrivateKey},
     config::{DeepXRpcRole, DeepXValidatedRpcEndpoints},
@@ -123,9 +126,6 @@ use crate::{
     },
 };
 
-#[cfg(test)]
-use crate::signing::DeepXRuntimeConfig;
-
 async fn observe_historical_read_only_runtime(
     environment: &DeepXEnvironment,
     genesis_hash: [u8; 32],
@@ -146,10 +146,7 @@ async fn observe_historical_read_only_runtime(
             method: "state_getMetadata",
             source,
         })?;
-    let metadata = encoded_metadata
-        .strip_prefix("0x")
-        .filter(|value| !value.is_empty())
-        .and_then(|value| hex::decode(value).ok())
+    let metadata = decode_runtime_metadata(&encoded_metadata)
         .ok_or(DeepXHistoricalRuntimeError::InvalidMetadata)?;
     DeepXReadOnlyRuntimeSnapshot::approved_testnet(
         environment,
@@ -3369,50 +3366,19 @@ async fn fetch_system_events(
 ) -> Result<Vec<u8>, DeepXTransactionWatchError> {
     let client = DeepXRpcClient::new(recovery_url.to_string());
     let block_hash = format!("0x{}", hex::encode(block_hash));
-    let encoded = fetch_storage_value(&client, SYSTEM_EVENTS_STORAGE_KEY, &block_hash).await?;
-    if let Some(encoded) = encoded {
-        return decode_event_storage_value(&encoded).ok_or(
-            DeepXTransactionWatchError::InvalidEventStorage(block_number),
-        );
-    }
-
-    let threads_key = system_threads_storage_key(block_number);
-    let encoded_threads = fetch_storage_value(&client, &threads_key, &block_hash)
-        .await?
-        .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
-            block_number,
-        ))?;
-    let last_thread = decode_event_threads(&encoded_threads).ok_or(
-        DeepXTransactionWatchError::InvalidEventStorage(block_number),
-    )?;
-    let mut batches = Vec::with_capacity(usize::from(last_thread) + 1);
-    for thread in 0..=last_thread {
-        let key = system_events_map_storage_key(block_number, thread);
-        let encoded = fetch_storage_value(&client, &key, &block_hash)
-            .await?
-            .ok_or(DeepXTransactionWatchError::EventStorageUnavailable(
-                block_number,
-            ))?;
-        batches.push(decode_event_storage_value(&encoded).ok_or(
-            DeepXTransactionWatchError::InvalidEventStorage(block_number),
-        )?);
-    }
-    combine_events_map_batches(&batches).ok_or(DeepXTransactionWatchError::InvalidEventStorage(
-        block_number,
-    ))
-}
-
-async fn fetch_storage_value(
-    client: &DeepXRpcClient,
-    storage_key: &str,
-    block_hash: &str,
-) -> Result<Option<String>, DeepXTransactionWatchError> {
-    client
-        .get_storage(storage_key, block_hash)
+    get_system_events(&client, &block_hash, block_number)
         .await
-        .map_err(|source| DeepXTransactionWatchError::Rpc {
-            method: "state_getStorage",
-            source,
+        .map_err(|e| match e {
+            DeepXEventStorageReadError::Rpc(source) => DeepXTransactionWatchError::Rpc {
+                method: "state_getStorage",
+                source,
+            },
+            DeepXEventStorageReadError::Unavailable => {
+                DeepXTransactionWatchError::EventStorageUnavailable(block_number)
+            }
+            DeepXEventStorageReadError::Invalid => {
+                DeepXTransactionWatchError::InvalidEventStorage(block_number)
+            }
         })
 }
 

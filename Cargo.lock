@@ -3464,6 +3464,7 @@ dependencies = [
  "aws-lc-rs",
  "axum",
  "frame-metadata",
+ "futures-util",
  "hex",
  "jiff",
  "parity-scale-codec",
@@ -3479,6 +3480,7 @@ dependencies = [
  "subxt-signer",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
  "zeroize",
 ]

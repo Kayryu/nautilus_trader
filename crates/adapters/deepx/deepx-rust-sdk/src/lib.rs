@@ -20,6 +20,7 @@ pub mod decimal;
 pub mod deployment;
 pub mod enums;
 pub mod error;
+pub mod identity;
 pub mod metadata;
 pub mod pagination;
 pub mod parse;

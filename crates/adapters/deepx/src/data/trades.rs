@@ -16,6 +16,7 @@
 //! Strict conversion of public perpetual execution records, not position fill directions.
 
 use anyhow::{Context, Result, ensure};
+use deepx_rust_sdk::rpc::spot_market_spec::parse_spot_pair;
 use nautilus_core::{UnixNanos, datetime::try_datetime_to_unix_nanos};
 use nautilus_model::{
     data::TradeTick,
@@ -96,14 +97,8 @@ pub(crate) fn parse_spot_trade_tick(
         trade.pair_name == market.name,
         "DeepX Spot trade name mismatch"
     );
-    let expected_pair = nautilus_core::hex::decode_array::<32>(
-        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-    )
-    .context("invalid DeepX Spot market pair")?;
-    let observed_pair = nautilus_core::hex::decode_array::<32>(
-        trade.pair.strip_prefix("0x").unwrap_or(&trade.pair),
-    )
-    .context("invalid DeepX Spot trade pair")?;
+    let expected_pair = parse_spot_pair(&market.pair).context("invalid DeepX Spot market pair")?;
+    let observed_pair = parse_spot_pair(&trade.pair).context("invalid DeepX Spot trade pair")?;
     ensure!(
         expected_pair == observed_pair,
         "DeepX Spot trade pair mismatch"

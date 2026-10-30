@@ -22,6 +22,9 @@ use std::{
 };
 
 use anyhow::Context;
+use deepx_rust_sdk::websocket::orderbook_rpc::{
+    encode_subscribe_request, encode_unsubscribe_request, is_method_unavailable_response,
+};
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
@@ -30,7 +33,9 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::transport::Message;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -72,13 +77,8 @@ pub(super) async fn request_spot_book_depth10(
     let mut connection =
         DeepXWsReadConnection::connect_url(&url, proxy_url.as_deref(), timeout).await?;
     let result = async {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": SUBSCRIBE_REQUEST_ID,
-            "method": "orderbook_subscribe",
-            "params": [[market.pair], [], depth.get()],
-        });
-        connection.send_json_rpc_text(request.to_string()).await?;
+        let request = encode_subscribe_request(&market.pair, depth.get(), SUBSCRIBE_REQUEST_ID);
+        connection.send_json_rpc_text(request).await?;
         tokio::time::timeout(timeout, async {
             let mut subscription_id = None;
             loop {
@@ -207,13 +207,9 @@ impl SpotBookTask {
             .pair
             .strip_prefix("0x")
             .unwrap_or(&self.market.pair);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": SUBSCRIBE_REQUEST_ID,
-            "method": "orderbook_subscribe",
-            "params": [[format!("0x{pair}")], [], self.depth.get()],
-        });
-        connection.send_json_rpc_text(request.to_string()).await?;
+        let request =
+            encode_subscribe_request(&format!("0x{pair}"), self.depth.get(), SUBSCRIBE_REQUEST_ID);
+        connection.send_json_rpc_text(request).await?;
 
         let result = self.read_subscription(&mut connection, cancellation).await;
         let close = connection.close().await;
@@ -259,10 +255,7 @@ impl SpotBookTask {
                 serde_json::from_str(text).context("invalid DeepX Spot book RPC JSON")?;
             if subscription_id.is_none() {
                 if value.get("id").is_some() {
-                    if value["jsonrpc"] == "2.0"
-                        && value["id"] == SUBSCRIBE_REQUEST_ID
-                        && value["error"]["code"] == -32601
-                    {
+                    if is_method_unavailable_response(&value, SUBSCRIBE_REQUEST_ID) {
                         return Ok(SubscriptionEnd::MethodUnavailable);
                     }
                     subscription_id = Some(orderbook_rpc::parse_subscribe_ack(
@@ -382,13 +375,8 @@ impl SpotBookTask {
     }
 
     async fn unsubscribe(&self, connection: &mut DeepXWsReadConnection, subscription: &str) {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": UNSUBSCRIBE_REQUEST_ID,
-            "method": "orderbook_unsubscribe",
-            "params": [subscription],
-        });
-        if let Err(e) = connection.send_json_rpc_text(request.to_string()).await {
+        let request = encode_unsubscribe_request(subscription, UNSUBSCRIBE_REQUEST_ID);
+        if let Err(e) = connection.send_json_rpc_text(request).await {
             log::debug!("DeepX Spot book unsubscribe failed during retirement: {e}");
         }
     }

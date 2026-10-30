@@ -40,9 +40,31 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+futures-util = { workspace = true }
 rstest = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [[example]]
 name = "deepx-sdk-query-account"
 path = "examples/query_account.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-verify-rest"
+path = "examples/verify_rest.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-verify-account"
+path = "examples/verify_account.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-verify-ws"
+path = "examples/verify_ws.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-verify-rpc"
+path = "examples/verify_rpc.rs"
 doc = false

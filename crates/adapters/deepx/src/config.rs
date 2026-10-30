@@ -17,11 +17,15 @@
 
 use std::fmt::{Debug, Formatter};
 
-use deepx_rust_sdk::rpc::endpoint_identity::validate_rpc_endpoint_identities as validate_sdk_rpc_endpoint_identities;
 pub use deepx_rust_sdk::rpc::endpoint_identity::{
     DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError, DeepXRpcRole,
     DeepXValidatedRpcEndpoints,
 };
+use deepx_rust_sdk::{
+    identity::decode_account_id20,
+    rpc::endpoint_identity::validate_rpc_endpoint_identities as validate_sdk_rpc_endpoint_identities,
+};
+#[cfg(test)]
 use nautilus_core::hex;
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::identifiers::AccountId;
@@ -296,13 +300,7 @@ impl DeepXExecutionClientConfig {
             ));
         }
         match self.subaccount_id.as_deref() {
-            Some(value)
-                if value
-                    .strip_prefix("0x")
-                    .is_some_and(|value| hex::decode_array::<20>(value).is_ok()) =>
-            {
-                Ok(())
-            }
+            Some(value) if decode_account_id20(value).is_some() => Ok(()),
             Some(_) => Err(crate::common::DeepXError::InvalidConfiguration(
                 "DeepX subaccount identity must be a 0x-prefixed AccountId20".to_string(),
             )),

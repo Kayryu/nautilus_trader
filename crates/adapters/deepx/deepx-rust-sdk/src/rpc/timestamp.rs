@@ -19,7 +19,7 @@ use parity_scale_codec::{Compact, Decode};
 use serde_json::json;
 use thiserror::Error;
 
-use super::DeepXRpcClient;
+use super::{DeepXRpcClient, DeepXRpcStorageChangeSet};
 
 /// Errors from a hash-pinned `Timestamp.Now` read.
 #[derive(Debug, Error)]
@@ -50,6 +50,36 @@ pub async fn get_timestamp_now(
         }))
         .await
         .map_err(DeepXTimestampReadError::Rpc)?;
+    decode_timestamp_now(&encoded).ok_or(DeepXTimestampReadError::InvalidStorage)
+}
+
+/// Reads and validates one `Timestamp.Now` storage change at a fixed block hash.
+///
+/// # Errors
+///
+/// Returns an RPC error or an invalid-storage error for a mismatched or malformed change set.
+pub async fn query_timestamp_now_at_block(
+    client: &DeepXRpcClient,
+    block_hash: [u8; 32],
+) -> Result<u64, DeepXTimestampReadError> {
+    let block_hash = format!("0x{}", hex::encode(block_hash));
+    let key = timestamp_now_storage_key();
+    let mut sets: Vec<DeepXRpcStorageChangeSet> = client
+        .query_storage_at(std::slice::from_ref(&key), &block_hash)
+        .await
+        .map_err(DeepXTimestampReadError::Rpc)?;
+    if sets.len() != 1 || sets[0].block != block_hash {
+        return Err(DeepXTimestampReadError::InvalidStorage);
+    }
+    let changes = std::mem::take(&mut sets[0].changes);
+    let [(returned_key, Some(encoded))] = <[(String, Option<String>); 1]>::try_from(changes)
+        .map_err(|_| DeepXTimestampReadError::InvalidStorage)?
+    else {
+        return Err(DeepXTimestampReadError::InvalidStorage);
+    };
+    if returned_key != key {
+        return Err(DeepXTimestampReadError::InvalidStorage);
+    }
     decode_timestamp_now(&encoded).ok_or(DeepXTimestampReadError::InvalidStorage)
 }
 
@@ -98,10 +128,68 @@ pub fn decode_timestamp_set_inherent(extrinsics: &[String]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use axum::{Json, Router, routing::post};
     use parity_scale_codec::{Compact, Encode};
     use rstest::rstest;
+    use serde_json::{Value, json};
 
-    use super::{decode_timestamp_now, decode_timestamp_set_inherent, timestamp_now_storage_key};
+    use super::{
+        DeepXRpcClient, DeepXTimestampReadError, decode_timestamp_now,
+        decode_timestamp_set_inherent, query_timestamp_now_at_block, timestamp_now_storage_key,
+    };
+
+    #[rstest]
+    #[case::valid(0)]
+    #[case::wrong_block(1)]
+    #[case::duplicate_key(2)]
+    #[case::missing_value(3)]
+    #[case::malformed_value(4)]
+    #[tokio::test]
+    async fn timestamp_query_requires_exact_change_set(#[case] scenario: u8) {
+        let block_hash = [0x22; 32];
+        let encoded_hash = format!("0x{}", hex::encode(block_hash));
+        let key = timestamp_now_storage_key();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let key = key.clone();
+                let encoded_hash = encoded_hash.clone();
+                async move {
+                    assert_eq!(request["method"], "state_queryStorageAt");
+                    assert_eq!(request["params"], json!([[key], encoded_hash]));
+                    let block = if scenario == 1 { "0x00" } else { &encoded_hash };
+                    let value = match scenario {
+                        3 => Value::Null,
+                        4 => json!("0xzz"),
+                        _ => json!("0x0100000000000000"),
+                    };
+                    let changes = if scenario == 2 {
+                        json!([[key, value], [key, value]])
+                    } else {
+                        json!([[key, value]])
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": [{"block": block, "changes": changes}],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = query_timestamp_now_at_block(&DeepXRpcClient::new(url), block_hash).await;
+        if scenario == 0 {
+            assert_eq!(result.unwrap(), 1);
+        } else {
+            assert!(matches!(
+                result,
+                Err(DeepXTimestampReadError::InvalidStorage)
+            ));
+        }
+        server.abort();
+    }
 
     #[rstest]
     fn timestamp_key_matches_twox_storage_prefix() {

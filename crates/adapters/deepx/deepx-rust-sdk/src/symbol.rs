@@ -49,6 +49,24 @@ pub fn parse_product_symbol(symbol: &str) -> Result<(String, DeepXProductType)> 
     Ok((canonical_pair(pair)?, product_type))
 }
 
+/// Normalizes a Spot pair for comparing REST records with market metadata.
+///
+/// This does not validate the pair identity.
+#[must_use]
+pub fn normalize_spot_pair(pair: &str) -> String {
+    pair.strip_prefix("0x")
+        .or_else(|| pair.strip_prefix("0X"))
+        .unwrap_or(pair)
+        .to_ascii_lowercase()
+}
+
+/// Decodes a deployment-provided Spot pair as an exact bytes32 identity.
+pub(crate) fn decode_spot_pair_identity(pair: &str) -> Option<[u8; 32]> {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(pair.strip_prefix("0x").unwrap_or(pair), &mut bytes).ok()?;
+    Some(bytes)
+}
+
 fn canonical_pair(value: &str) -> Result<String> {
     let pair = value.trim().to_ascii_uppercase();
     let mut components = pair.split('-');
@@ -96,5 +114,35 @@ mod tests {
             format_product_symbol("ETH-USDC", &DeepXProductType::Unknown("option".to_string())),
             Err(DeepXError::UnsupportedProduct("option".to_string())),
         );
+    }
+
+    #[rstest]
+    #[case("0xAB12", "ab12")]
+    #[case("0XAB12", "ab12")]
+    #[case("AB12", "ab12")]
+    #[case("not-a-pair", "not-a-pair")]
+    fn spot_pair_normalization_preserves_comparison_semantics(
+        #[case] pair: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(normalize_spot_pair(pair), expected);
+    }
+
+    #[rstest]
+    #[case(
+        "0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+        true
+    )]
+    #[case(
+        "9068D4AC891A14784C17877EB74BD8489B3367C71D72766DBFA4DFBFB662FA37",
+        true
+    )]
+    #[case("0x00", false)]
+    #[case(
+        "0X9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37",
+        false
+    )]
+    fn spot_pair_identity_requires_exact_hex_bytes(#[case] pair: &str, #[case] valid: bool) {
+        assert_eq!(decode_spot_pair_identity(pair).is_some(), valid);
     }
 }

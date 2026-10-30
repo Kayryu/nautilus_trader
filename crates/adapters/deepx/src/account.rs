@@ -18,11 +18,16 @@
 use std::collections::HashSet;
 
 pub use deepx_rust_sdk::rest::ownership::DeepXAccountOwnershipProof;
-use deepx_rust_sdk::rest::ownership::{
-    DeepXOwnershipEvidenceError, verify_account_ownership_evidence,
-    verify_delegated_account_ownership_evidence,
+use deepx_rust_sdk::{
+    identity::decode_account_id20,
+    rest::ownership::{
+        DeepXOwnershipEvidenceError, verify_account_ownership_evidence,
+        verify_delegated_account_ownership_evidence,
+    },
 };
-use nautilus_core::{UUID4, UnixNanos, hex};
+#[cfg(test)]
+use nautilus_core::hex;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::AccountType,
     events::AccountState,
@@ -51,10 +56,7 @@ pub(crate) fn map_current_flat_usdc_balance(
     margin: &DeepXSubaccountMarginRatio,
     current: &DeepXCurrentMarginEvidence,
 ) -> anyhow::Result<AccountBalance> {
-    let observed = balances
-        .address
-        .strip_prefix("0x")
-        .and_then(|value| hex::decode_array::<20>(value).ok())
+    let observed = decode_account_id20(&balances.address)
         .ok_or_else(|| anyhow::anyhow!("invalid DeepX backend balance account address"))?;
     anyhow::ensure!(
         observed == current.subaccount(),

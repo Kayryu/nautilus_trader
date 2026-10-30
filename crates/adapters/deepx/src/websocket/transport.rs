@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use deepx_rust_sdk::urls::parse_websocket_url;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use nautilus_network::{
     transport::{BoxedWsTransport, Message},
@@ -226,16 +227,7 @@ impl DeepXWsReadConnection {
             !timeout.is_zero(),
             "DeepX WebSocket timeout must be positive"
         );
-        let parsed_url =
-            reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid DeepX WebSocket URL"))?;
-        anyhow::ensure!(
-            matches!(parsed_url.scheme(), "ws" | "wss")
-                && parsed_url.host_str().is_some()
-                && parsed_url.username().is_empty()
-                && parsed_url.password().is_none()
-                && parsed_url.fragment().is_none(),
-            "invalid DeepX WebSocket URL"
-        );
+        parse_websocket_url(url).map_err(|_| anyhow::anyhow!("invalid DeepX WebSocket URL"))?;
         nautilus_cryptography::providers::install_cryptographic_provider();
         let (writer, reader) = tokio::time::timeout(
             timeout,

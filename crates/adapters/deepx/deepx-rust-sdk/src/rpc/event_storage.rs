@@ -16,6 +16,23 @@
 //! DeepX runtime event storage keys and complete batch assembly.
 
 use parity_scale_codec::{Compact, Decode, Encode};
+use thiserror::Error;
+
+use super::DeepXRpcClient;
+
+/// Errors while reading a block's complete event storage value.
+#[derive(Debug, Error)]
+pub enum DeepXEventStorageReadError {
+    /// The storage RPC request failed.
+    #[error("event storage RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// A required storage value was absent.
+    #[error("event storage is unavailable")]
+    Unavailable,
+    /// A storage value or shard assembly was malformed.
+    #[error("event storage is invalid")]
+    Invalid,
+}
 
 /// Storage key for the runtime's unsharded `System.Events` value.
 pub const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
@@ -26,6 +43,46 @@ pub const SYSTEM_EVENTS_STORAGE_KEY: &str = concat!(
 const SYSTEM_STORAGE_PREFIX: &str = "System";
 const SYSTEM_THREADS_STORAGE_ITEM: &str = "Threads";
 const SYSTEM_EVENTS_MAP_STORAGE_ITEM: &str = "EventsMap";
+
+/// Reads complete runtime events using the unsharded or sharded storage layout.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure, missing shards, or malformed storage values.
+pub async fn get_system_events(
+    client: &DeepXRpcClient,
+    block_hash: &str,
+    block_number: u64,
+) -> Result<Vec<u8>, DeepXEventStorageReadError> {
+    let encoded = client
+        .get_storage(SYSTEM_EVENTS_STORAGE_KEY, block_hash)
+        .await
+        .map_err(DeepXEventStorageReadError::Rpc)?;
+    if let Some(encoded) = encoded {
+        return decode_event_storage_value(&encoded).ok_or(DeepXEventStorageReadError::Invalid);
+    }
+
+    let threads_key = system_threads_storage_key(block_number);
+    let encoded_threads = client
+        .get_storage(&threads_key, block_hash)
+        .await
+        .map_err(DeepXEventStorageReadError::Rpc)?
+        .ok_or(DeepXEventStorageReadError::Unavailable)?;
+    let last_thread =
+        decode_event_threads(&encoded_threads).ok_or(DeepXEventStorageReadError::Invalid)?;
+    let mut batches = Vec::with_capacity(usize::from(last_thread) + 1);
+    for thread in 0..=last_thread {
+        let key = system_events_map_storage_key(block_number, thread);
+        let encoded = client
+            .get_storage(&key, block_hash)
+            .await
+            .map_err(DeepXEventStorageReadError::Rpc)?
+            .ok_or(DeepXEventStorageReadError::Unavailable)?;
+        batches
+            .push(decode_event_storage_value(&encoded).ok_or(DeepXEventStorageReadError::Invalid)?);
+    }
+    combine_events_map_batches(&batches).ok_or(DeepXEventStorageReadError::Invalid)
+}
 
 /// Decodes one nonempty 0x-prefixed event storage value.
 #[must_use]

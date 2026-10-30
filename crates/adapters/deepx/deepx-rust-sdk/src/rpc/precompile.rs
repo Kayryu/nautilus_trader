@@ -20,6 +20,9 @@ use alloy::{
     sol,
     sol_types::{SolCall, SolValue},
 };
+use thiserror::Error;
+
+use super::DeepXRpcClient;
 
 /// Lending V2 precompile deployed by DeepX.
 pub const DEEPX_LENDING_PRECOMPILE_ADDRESS: Address = Address::new([
@@ -100,6 +103,40 @@ pub fn decode_max_withdraw_hex(encoded: &str) -> Option<u128> {
         .strip_prefix("0x")
         .and_then(|value| hex::decode(value).ok())?;
     decode_max_withdraw_return(&bytes)
+}
+
+/// Errors while reading the lending maximum-withdrawal precompile.
+#[derive(Debug, Error)]
+pub enum DeepXMaxWithdrawReadError {
+    /// The EVM RPC request failed.
+    #[error("DeepX maximum-withdrawal RPC failed: {0}")]
+    Rpc(#[source] anyhow::Error),
+    /// The precompile response was not one canonical `uint128`.
+    #[error("DeepX maximum-withdrawal response is invalid")]
+    InvalidResponse,
+}
+
+/// Reads one lending asset's maximum withdrawal at a selected EVM block number.
+///
+/// # Errors
+///
+/// Returns an error for RPC failure or a malformed ABI response.
+pub async fn get_max_withdrawal_at_block_number(
+    client: &DeepXRpcClient,
+    block_number: u32,
+    subaccount: [u8; 20],
+    market_id: u8,
+    asset: &[u8],
+) -> Result<u128, DeepXMaxWithdrawReadError> {
+    let encoded: String = client
+        .eth_call(
+            &DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string(),
+            &encode_max_withdraw_call(subaccount, market_id, asset),
+            &format!("0x{block_number:x}"),
+        )
+        .await
+        .map_err(DeepXMaxWithdrawReadError::Rpc)?;
+    decode_max_withdraw_hex(&encoded).ok_or(DeepXMaxWithdrawReadError::InvalidResponse)
 }
 
 /// Encodes a perpetual-market precompile query.

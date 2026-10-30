@@ -17,6 +17,10 @@
 
 use std::{num::NonZeroUsize, time::Duration};
 
+use deepx_rust_sdk::rpc::{
+    chain_decode::{DeepXRpcHexIntegerError, decode_prefixed_u128},
+    spot_market_spec::parse_spot_pair,
+};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{BookOrder, DEPTH10_LEN, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick},
@@ -174,12 +178,8 @@ pub(super) fn parse_spot_order_book_deltas(
         snapshot.pair_name == market.name,
         "DeepX Spot book name does not match instrument metadata"
     );
-    let expected_pair = nautilus_core::hex::decode_array::<32>(
-        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-    )?;
-    let observed_pair = nautilus_core::hex::decode_array::<32>(
-        snapshot.pair.strip_prefix("0x").unwrap_or(&snapshot.pair),
-    )?;
+    let expected_pair = parse_spot_pair(&market.pair)?;
+    let observed_pair = parse_spot_pair(&snapshot.pair)?;
     anyhow::ensure!(
         expected_pair == observed_pair,
         "DeepX Spot book pair does not match instrument metadata"
@@ -406,13 +406,10 @@ pub(super) fn spot_rpc_pair<'a>(
     snapshot: &'a DeepXOrderbookRpcSnapshot,
     market: &DeepXSpotMarket,
 ) -> anyhow::Result<&'a crate::websocket::orderbook_rpc::DeepXOrderbookRpcSide> {
-    let expected_pair = nautilus_core::hex::decode_array::<32>(
-        market.pair.strip_prefix("0x").unwrap_or(&market.pair),
-    )?;
+    let expected_pair = parse_spot_pair(&market.pair)?;
     let mut pair_book = None;
     for (pair, book) in &snapshot.spot {
-        let observed_pair =
-            nautilus_core::hex::decode_array::<32>(pair.strip_prefix("0x").unwrap_or(pair))?;
+        let observed_pair = parse_spot_pair(pair)?;
         anyhow::ensure!(
             observed_pair == expected_pair,
             "DeepX Spot RPC snapshot contains an unexpected pair"
@@ -449,13 +446,15 @@ fn parse_spot_rpc_level(
 }
 
 fn rpc_atomic_decimal(value: &str, scale: u8) -> anyhow::Result<rust_decimal::Decimal> {
-    let value = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-        .ok_or_else(|| anyhow::anyhow!("DeepX Spot RPC integer lacks hexadecimal prefix"))?;
-    anyhow::ensure!(!value.is_empty(), "DeepX Spot RPC integer is empty");
-    let value = u128::from_str_radix(value, 16)
-        .map_err(|e| anyhow::anyhow!("invalid DeepX Spot RPC integer: {e}"))?;
+    let value = decode_prefixed_u128(value).map_err(|e| match e {
+        DeepXRpcHexIntegerError::MissingPrefix => {
+            anyhow::anyhow!("DeepX Spot RPC integer lacks hexadecimal prefix")
+        }
+        DeepXRpcHexIntegerError::Empty => anyhow::anyhow!("DeepX Spot RPC integer is empty"),
+        DeepXRpcHexIntegerError::Invalid(e) => {
+            anyhow::anyhow!("invalid DeepX Spot RPC integer: {e}")
+        }
+    })?;
     let value = i128::try_from(value)
         .map_err(|_| anyhow::anyhow!("DeepX Spot RPC integer exceeds Decimal range"))?;
     Ok(rust_decimal::Decimal::from_i128_with_scale(value, u32::from(scale)).normalize())

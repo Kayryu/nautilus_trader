@@ -20,8 +20,8 @@ mod instrument;
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
+use deepx_rust_sdk::rpc::spot_market_spec::parse_spot_pair;
 pub use instrument::{DeepXInstrumentProvider, DeepXSpotInstrumentUnsupported};
-use nautilus_core::hex;
 use nautilus_model::identifiers::InstrumentId;
 
 use crate::{
@@ -136,7 +136,7 @@ impl DeepXMarketProvider {
     /// Returns the canonical Spot instrument identity for a deployment pair ID.
     #[must_use]
     pub fn spot_instrument_id(&self, pair: &str) -> Option<InstrumentId> {
-        let pair = decode_spot_pair_id(pair).ok()?;
+        let pair = parse_spot_pair(pair).ok()?;
         self.spot_instrument_ids.get(&pair).copied()
     }
 
@@ -163,7 +163,7 @@ impl DeepXMarketProvider {
         let mut spot_instrument_ids = BTreeMap::new();
         let mut perpetual_instrument_ids = BTreeMap::new();
         for market in spot {
-            let pair = decode_spot_pair_id(&market.pair)?;
+            let pair = parse_spot_pair(&market.pair)?;
             let instrument_id = format_instrument_id(
                 &format!("{}-{}", market.base_symbol, market.quote_symbol),
                 &DeepXProductType::Spot,
@@ -238,12 +238,6 @@ impl DeepXMarketProvider {
     pub fn replace_client(&mut self, client: DeepXHttpClient) -> DeepXHttpClient {
         std::mem::replace(&mut self.client, client)
     }
-}
-
-fn decode_spot_pair_id(pair: &str) -> Result<[u8; 32]> {
-    hex::decode_array::<32>(pair.strip_prefix("0x").unwrap_or(pair)).with_context(|| {
-        format!("invalid DeepX Spot pair '{pair}': expected 32-byte hexadecimal identity")
-    })
 }
 
 fn insert_perpetuals(
@@ -380,8 +374,18 @@ mod tests {
     #[case("0x00")]
     #[case("not-hex")]
     #[case("000000000000000000000000000000000000000000000000000000000000000000")]
-    fn rejects_invalid_spot_pair_id(#[case] pair: &str) {
-        assert!(decode_spot_pair_id(pair).is_err());
+    #[tokio::test]
+    async fn rejects_invalid_spot_pair_id(#[case] pair: &str) {
+        let mut provider = provider(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        provider.load_all().await.unwrap();
+
+        assert_eq!(provider.spot_instrument_id(pair), None);
     }
 
     #[tokio::test]

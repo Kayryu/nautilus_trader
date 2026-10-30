@@ -42,6 +42,7 @@ use crate::{
         DeepXSpotCandlesPage, DeepXSpotLastPrice, DeepXSpotMarket, DeepXSpotOrderBook,
         DeepXSpotOrderBookLevel, DeepXSpotTrade, DeepXSpotTradesPage, DeepXSpotVolume,
     },
+    symbol::decode_spot_pair_identity,
 };
 
 const SPOT_MARKETS_PATH: &str = "/internal/v1/market/spot/markets";
@@ -199,7 +200,7 @@ impl DeepXRestTransport {
         let raw = self.get_spot_market_by_pair_raw(base_url, &pair).await?;
         let market = serde_json::from_str(raw.get())?;
         validate_spot_market("spot market by pair", &market)?;
-        if decode_bytes32_identity(&market.pair) != decode_bytes32_identity(&pair) {
+        if decode_spot_pair_identity(&market.pair) != decode_spot_pair_identity(&pair) {
             return Err(DeepXRestError::InvalidHistoryResponse {
                 endpoint: "spot market by pair",
                 message: "response does not match the requested pair identity".to_string(),
@@ -1038,18 +1039,8 @@ impl DeepXRestTransport {
     }
 }
 
-fn decode_bytes32_identity(identity: &str) -> Option<[u8; 32]> {
-    let mut decoded = [0u8; 32];
-    hex::decode_to_slice(
-        identity.strip_prefix("0x").unwrap_or(identity),
-        &mut decoded,
-    )
-    .ok()?;
-    Some(decoded)
-}
-
 fn normalize_spot_pair_identity(pair: &str) -> Result<String, DeepXRestError> {
-    let identity = decode_bytes32_identity(pair).ok_or_else(|| {
+    let identity = decode_spot_pair_identity(pair).ok_or_else(|| {
         DeepXRestError::InvalidRequest(
             "spot-market-by-pair requires a 32-byte hex pair identity".to_string(),
         )
@@ -1162,7 +1153,7 @@ fn validate_spot_trade_record(
     }
     if trade.pair_name.trim().is_empty()
         || !trade.pair.starts_with("0x")
-        || decode_bytes32_identity(&trade.pair).is_none()
+        || decode_spot_pair_identity(&trade.pair).is_none()
         || request
             .name
             .as_deref()
@@ -1222,7 +1213,7 @@ fn validate_spot_markets(markets: &[DeepXSpotMarket]) -> Result<(), DeepXRestErr
         if !names.insert(market.name.to_ascii_lowercase()) {
             return Err(invalid(format!("market {index} repeats a market name")));
         }
-        let pair = decode_bytes32_identity(&market.pair)
+        let pair = decode_spot_pair_identity(&market.pair)
             .ok_or_else(|| invalid(format!("market {index} has an invalid pair identity")))?;
         if !pairs.insert(pair) {
             return Err(invalid(format!("market {index} repeats a pair identity")));
@@ -1246,7 +1237,7 @@ fn validate_spot_market(
         || market.quote_symbol.trim().is_empty()
         || !name_base.eq_ignore_ascii_case(&market.base_symbol)
         || !name_quote.eq_ignore_ascii_case(&market.quote_symbol)
-        || decode_bytes32_identity(&market.pair).is_none()
+        || decode_spot_pair_identity(&market.pair).is_none()
         || !is_account_address(&market.base_address)
         || !is_account_address(&market.quote_address)
         || market
@@ -1754,7 +1745,7 @@ fn validate_spot_order_book(
     if book
         .pair
         .strip_prefix("0x")
-        .and_then(decode_bytes32_identity)
+        .and_then(decode_spot_pair_identity)
         .is_none()
         || book.pair_name.trim().is_empty()
         || request
