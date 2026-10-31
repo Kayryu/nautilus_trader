@@ -17,11 +17,63 @@
 
 use parity_scale_codec::{Compact, Decode};
 use serde_json::Value;
-use subxt_core::config::{Hasher, substrate::BlakeTwo256};
+use subxt_core::{
+    blocks::Extrinsics,
+    config::{Hasher, substrate::BlakeTwo256},
+    metadata::Metadata,
+};
 use thiserror::Error;
 
 use super::{DeepXRpcClient, SUBMIT_EXTRINSIC_METHOD};
-use crate::rest::decode_transaction_acknowledgement;
+use crate::{rest::decode_transaction_acknowledgement, signing::DeepXRuntimeConfig};
+
+/// Signer and nonce decoded from one complete signed runtime extrinsic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXSignedExtrinsicIdentity {
+    /// AccountId20 encoded in the signature payload.
+    pub signer: [u8; 20],
+    /// Nonce encoded by `CheckNonce`.
+    pub nonce: u64,
+}
+
+/// Errors while decoding a signed extrinsic's identity and nonce.
+#[derive(Debug, Error)]
+pub enum DeepXSignedExtrinsicDecodeError {
+    /// The extrinsic cannot be decoded against the supplied metadata.
+    #[error("unable to decode DeepX signed extrinsic: {0}")]
+    Decode(#[source] Box<subxt_core::Error>),
+    /// The decoded extrinsic does not contain a signed AccountId20 and nonce.
+    #[error("DeepX extrinsic lacks a signed AccountId20 and CheckNonce value")]
+    MissingIdentity,
+}
+
+/// Decodes the signer and nonce of a complete length-prefixed runtime extrinsic.
+///
+/// This checks SCALE structure only. It does not verify the signature or runtime acceptance.
+///
+/// # Errors
+///
+/// Returns an error for malformed bytes or missing signed identity fields.
+pub fn decode_signed_extrinsic_identity(
+    metadata: &Metadata,
+    bytes: &[u8],
+) -> Result<DeepXSignedExtrinsicIdentity, DeepXSignedExtrinsicDecodeError> {
+    use DeepXSignedExtrinsicDecodeError as Error;
+
+    let extrinsics =
+        Extrinsics::<DeepXRuntimeConfig>::decode_from(vec![bytes.to_vec()], metadata.clone())
+            .map_err(|e| Error::Decode(Box::new(e)))?;
+    let details = extrinsics.iter().next().ok_or(Error::MissingIdentity)?;
+    let signer = details
+        .address_bytes()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(Error::MissingIdentity)?;
+    let nonce = details
+        .transaction_extensions()
+        .and_then(|extensions| extensions.nonce())
+        .ok_or(Error::MissingIdentity)?;
+    Ok(DeepXSignedExtrinsicIdentity { signer, nonce })
+}
 
 /// Errors raised while submitting one signed DeepX extrinsic.
 #[derive(Debug, Error)]
@@ -239,9 +291,60 @@ impl DeepXRpcClient {
 mod tests {
     use parity_scale_codec::Encode;
     use rstest::rstest;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
+    use crate::{enums::DeepXEnvironment, signing::validate_testnet_runtime};
+
+    #[rstest]
+    fn captured_no_op_identity_and_nonce_decode() {
+        let response: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/runtime/testnet/",
+            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
+        )))
+        .unwrap();
+        let metadata = hex::decode(
+            response["result"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let runtime = validate_testnet_runtime(
+            &DeepXEnvironment::Testnet,
+            hex::decode("87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            376,
+            1,
+            &metadata,
+        )
+        .unwrap();
+        let bytes = hex::decode(concat!(
+            "850184fcad0b19bb29d4674531d6f115237e16afce377c",
+            "cd76f6b9583b6dfd829576bc6888f00fa985b12eb69488d9215ad76133b8792113e341e9f2dc4a0e073af90495f8926c9d4c9e817f29ee384e83fb3dd18d78f600000b7c2203a2910100131c",
+        ))
+        .unwrap();
+        let identity = decode_signed_extrinsic_identity(runtime.metadata(), &bytes).unwrap();
+        let expected_signer: [u8; 20] = hex::decode("fcad0b19bb29d4674531d6f115237e16afce377c")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(identity.signer, expected_signer);
+        assert_eq!(identity.nonce, 1_725_000_000_124);
+        assert!(
+            decode_signed_extrinsic_identity(runtime.metadata(), &bytes[..bytes.len() - 1])
+                .is_err()
+        );
+        let unsigned = encoded_extrinsic(&[4, 19, 28]);
+        let unsigned = hex::decode(unsigned.trim_start_matches("0x")).unwrap();
+        assert!(matches!(
+            decode_signed_extrinsic_identity(runtime.metadata(), &unsigned),
+            Err(DeepXSignedExtrinsicDecodeError::MissingIdentity)
+        ));
+    }
 
     fn encoded_extrinsic(payload: &[u8]) -> String {
         let mut bytes = Compact(u32::try_from(payload.len()).unwrap()).encode();

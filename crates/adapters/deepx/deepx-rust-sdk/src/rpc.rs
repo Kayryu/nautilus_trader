@@ -15,25 +15,32 @@
 
 //! Bounded reads from a DeepX JSON-RPC endpoint.
 
+pub mod bridge;
 pub mod chain_decode;
 pub mod endpoint_identity;
 pub mod event_decode;
 pub mod event_storage;
 pub mod events;
 pub mod lending_positions;
+pub mod leverage;
 pub mod margin;
 pub mod market_spec;
+pub mod onboarding;
+pub mod order_ticket;
 pub mod perp_modify;
 pub mod perp_place;
 pub mod perp_position;
 pub mod precompile;
+pub mod quota_purchase;
 pub mod spot_cancel;
 pub mod spot_margin;
 pub mod spot_market_spec;
+pub mod spot_modify;
 pub mod spot_place;
 pub mod storage;
 pub mod storage_decode;
 pub mod submission;
+pub mod system_account;
 pub mod timestamp;
 pub mod trade_event_decode;
 pub mod trade_match;
@@ -166,6 +173,24 @@ impl Debug for DeepXRpcClient {
 }
 
 impl DeepXRpcClient {
+    /// Queries the current sequential account nonce once.
+    ///
+    /// The result is not block-pinned. Callers must reconcile concurrent transactions before
+    /// signing or submitting a nonce-based pallet call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, decoding, or JSON-RPC error.
+    pub async fn get_account_next_index(&self, account: [u8; 20]) -> anyhow::Result<u64> {
+        self.execute_rpc_call(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "system_accountNextIndex",
+            "params": [format!("0x{}", hex::encode(account))],
+        }))
+        .await
+    }
+
     /// Queries the current best block hash once.
     ///
     /// # Errors

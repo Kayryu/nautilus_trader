@@ -40,6 +40,9 @@ pub enum SigningError {
     /// The cancel and place legs of a perpetual modify target different runtime scopes.
     #[error("DeepX perpetual modify legs must target the same subaccount and market")]
     ModifyScopeMismatch,
+    /// The cancel and place legs of a Spot modify target different runtime scopes.
+    #[error("DeepX Spot modify legs must target the same subaccount, pair, and side")]
+    SpotModifyScopeMismatch,
     /// The runtime accepts at most 32 subaccount name bytes.
     #[error("DeepX subaccount name exceeds the runtime limit of 32 bytes: {length}")]
     SubaccountNameTooLong { length: usize },
@@ -57,6 +60,7 @@ impl From<DeepXPalletSigningError> for SigningError {
             DeepXPalletSigningError::InvalidKey => Self::InvalidKey,
             DeepXPalletSigningError::RuntimeInterface(e) => Self::RuntimeInterface(e),
             DeepXPalletSigningError::ModifyScopeMismatch => Self::ModifyScopeMismatch,
+            DeepXPalletSigningError::SpotModifyScopeMismatch => Self::SpotModifyScopeMismatch,
             DeepXPalletSigningError::SubaccountNameTooLong { length } => {
                 Self::SubaccountNameTooLong { length }
             }

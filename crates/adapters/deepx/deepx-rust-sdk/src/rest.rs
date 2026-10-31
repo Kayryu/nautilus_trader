@@ -13,8 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Read-only DeepX REST transport.
+//! DeepX REST transport for queries and explicitly invoked one-shot submissions.
 
+pub mod bridge_authorizer;
 pub mod models;
 pub mod ownership;
 pub mod status;
@@ -157,6 +158,12 @@ pub enum DeepXRestError {
     /// Request parameters violate a DeepX endpoint requirement.
     #[error("invalid DeepX REST request: {0}")]
     InvalidRequest(String),
+    /// An asynchronous quota claim failed at the venue.
+    #[error("DeepX quota claim {claim_id} failed: {message}")]
+    QuotaClaimFailed { claim_id: u64, message: String },
+    /// An asynchronous quota claim did not reach a terminal state before the deadline.
+    #[error("DeepX quota claim {claim_id} timed out (last status: {last_status})")]
+    QuotaClaimTimeout { claim_id: u64, last_status: String },
     /// A page budget must be positive.
     #[error("DeepX HTTP pagination max_pages must be greater than zero")]
     InvalidPaginationLimit,
@@ -242,7 +249,7 @@ pub struct DeepXApiResponse<T> {
 
 type ApiEnvelope = DeepXApiResponse<Box<RawValue>>;
 
-/// Performs one unauthenticated DeepX REST read at a time.
+/// Performs DeepX REST reads and explicitly invoked one-shot submissions.
 #[derive(Clone, Debug)]
 pub struct DeepXRestTransport {
     client: Client,
@@ -250,7 +257,7 @@ pub struct DeepXRestTransport {
     timeout_secs: Option<u64>,
 }
 
-/// HTTP status and exact response bytes for a one-shot transaction request.
+/// HTTP status and exact response bytes for a one-shot submission or status request.
 #[derive(Debug)]
 pub struct DeepXRestResponse {
     pub status: StatusCode,

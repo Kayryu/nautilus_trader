@@ -19,11 +19,11 @@ use super::{
     DeepXBuyQuotaParams, DeepXDeleteSubaccountParams, DeepXInitializeSubaccountParams,
     DeepXOfflinePalletCall, DeepXPermittedPalletExtrinsic, DeepXPerpCancelParams,
     DeepXPerpCloseParams, DeepXPerpModifyParams, DeepXPerpPlaceParams,
-    DeepXPerpProfitAndLossPointParams, DeepXRemoveDelegateAccountParams,
+    DeepXPerpProfitAndLossPointParams, DeepXPerpSettlePnlParams, DeepXRemoveDelegateAccountParams,
     DeepXRenameSubaccountParams, DeepXRuntimeSnapshotPermit, DeepXSetDelegateAccountParams,
     DeepXSetGlobalLeverageParams, DeepXSetPerMarketLeverageParams, DeepXSetSpotMarginParams,
-    DeepXSpotCancelParams, DeepXSpotPlaceParams, DeepXUpdateDelegateModeParams, SigningError,
-    sign_permitted_pallet_call,
+    DeepXSpotCancelParams, DeepXSpotModifyParams, DeepXSpotPlaceParams,
+    DeepXUpdateDelegateModeParams, SigningError, sign_permitted_pallet_call,
 };
 use crate::credential::DeepXPrivateKey;
 
@@ -98,6 +98,16 @@ named_signer! {
     /// runtime snapshot cannot encode `Subaccount.modify_orders`.
     sign_perp_modify_order(DeepXPerpModifyParams) => PerpModifyOrder;
 
+    /// Signs an atomic Spot order cancellation and replacement.
+    ///
+    /// The two legs must target the same subaccount, pair, and side. The supplied nonce becomes
+    /// the replacement order ID. This offline signer does not submit or establish success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for conflicting scopes or a failed approved-runtime encoding.
+    sign_spot_modify_order(DeepXSpotModifyParams) => SpotModifyOrder;
+
     /// Signs a Spot order cancellation without submitting it.
     ///
     /// The pair is the deployment's bytes32 identity, not a symbol or perpetual market ID.
@@ -130,6 +140,16 @@ named_signer! {
     ///
     /// Returns an error if the key or permitted snapshot cannot encode the management call.
     sign_perp_set_profit_and_loss_point(DeepXPerpProfitAndLossPointParams) => PerpSetProfitAndLossPoint;
+
+    /// Signs permissionless settlement of one or all perpetual markets without submitting it.
+    ///
+    /// The caller owns nonce reservation, submission, finality, and `SettlePnl` event verification.
+    /// A second settlement can succeed without emitting a nonzero settlement event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key or permitted runtime cannot encode the call.
+    sign_perp_settle_pnl(DeepXPerpSettlePnlParams) => PerpSettlePnl;
 
     /// Signs a global perpetual leverage setting without submitting it.
     ///
@@ -294,5 +314,49 @@ mod tests {
             sign_perp_cancel(&permit, &key, params, 1_725_000_000_126),
             Err(SigningError::RuntimePermit(_)),
         ));
+    }
+
+    #[rstest]
+    fn settle_pnl_signs_one_market_and_all_markets_with_exact_scale_arguments() {
+        let service =
+            DeepXRuntimeSnapshotService::new(RuntimeSnapshot::built_in_testnet().unwrap());
+        let permit = service.acquire().unwrap();
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let account = [0x11; 20];
+        let nonce = 1_725_000_000_125;
+        let one = sign_perp_settle_pnl(
+            &permit,
+            &key,
+            DeepXPerpSettlePnlParams {
+                subaccount: account,
+                market_id: Some(3),
+            },
+            nonce,
+        )
+        .unwrap();
+        let all = sign_perp_settle_pnl(
+            &permit,
+            &key,
+            DeepXPerpSettlePnlParams {
+                subaccount: account,
+                market_id: None,
+            },
+            nonce,
+        )
+        .unwrap();
+
+        let mut one_call = vec![22, 45];
+        one_call.extend_from_slice(&account);
+        one_call.extend_from_slice(&[1, 3, 0]);
+        let mut all_call = vec![22, 45];
+        all_call.extend_from_slice(&account);
+        all_call.push(0);
+        assert!(one.bytes().ends_with(&one_call));
+        assert!(all.bytes().ends_with(&all_call));
+        assert_ne!(one.extrinsic_hash(), all.extrinsic_hash());
     }
 }

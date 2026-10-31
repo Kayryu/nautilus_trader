@@ -41,7 +41,8 @@ use super::{
     },
     pallet::{
         DeepXPerpCancelParams, DeepXPerpCloseParams, DeepXPerpModifyParams, DeepXPerpPlaceParams,
-        DeepXPerpProfitAndLossPointParams, DeepXSpotCancelParams, DeepXSpotPlaceParams,
+        DeepXPerpProfitAndLossPointParams, DeepXPerpSettlePnlParams, DeepXSpotCancelParams,
+        DeepXSpotModifyParams, DeepXSpotPlaceParams,
     },
     runtime_interface::{DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError},
 };
@@ -209,6 +210,9 @@ pub enum DeepXPalletSigningError {
     /// The cancel and place legs of a perpetual modify target different runtime scopes.
     #[error("DeepX perpetual modify legs must target the same subaccount and market")]
     ModifyScopeMismatch,
+    /// The two Spot modify legs target different runtime scopes.
+    #[error("DeepX Spot modify legs must target the same subaccount, pair, and side")]
+    SpotModifyScopeMismatch,
     /// The runtime accepts at most 32 subaccount name bytes.
     #[error("DeepX subaccount name exceeds the runtime limit of 32 bytes: {length}")]
     SubaccountNameTooLong { length: usize },
@@ -228,12 +232,16 @@ pub enum DeepXOfflinePalletCall {
     PerpCancel(DeepXPerpCancelParams),
     /// Modifies a perpetual order atomically.
     PerpModifyOrder(DeepXPerpModifyParams),
+    /// Modifies a Spot order atomically.
+    SpotModifyOrder(DeepXSpotModifyParams),
     /// Cancels a Spot order.
     SpotCancel(DeepXSpotCancelParams),
     /// Closes a perpetual position.
     PerpClose(DeepXPerpCloseParams),
     /// Sets perpetual profit and loss points.
     PerpSetProfitAndLossPoint(DeepXPerpProfitAndLossPointParams),
+    /// Settles perpetual PnL and funding for one or all markets.
+    PerpSettlePnl(DeepXPerpSettlePnlParams),
     /// Sets global perpetual leverage.
     SetGlobalLeverage(DeepXSetGlobalLeverageParams),
     /// Sets per-market perpetual leverage.
@@ -297,6 +305,19 @@ pub fn sign_pallet_call(
                 params.into_dynamic_arguments(),
             )
         }
+        DeepXOfflinePalletCall::SpotModifyOrder(params) => {
+            if params.cancel.subaccount != params.place.subaccount
+                || params.cancel.pair != params.place.pair
+                || params.cancel.is_buy != params.place.is_buy
+            {
+                return Err(DeepXPalletSigningError::SpotModifyScopeMismatch);
+            }
+            (
+                "Subaccount",
+                "modify_orders",
+                params.into_dynamic_arguments(),
+            )
+        }
         DeepXOfflinePalletCall::SpotCancel(params) => (
             "SpotMarket",
             "cancel_order",
@@ -312,6 +333,9 @@ pub fn sign_pallet_call(
             "set_profit_and_loss_point",
             params.into_dynamic_arguments(),
         ),
+        DeepXOfflinePalletCall::PerpSettlePnl(params) => {
+            ("PerpMarket", "settle_pnl", params.into_dynamic_arguments())
+        }
         DeepXOfflinePalletCall::SetGlobalLeverage(params) => (
             "PerpMarket",
             "set_global_leverage",
@@ -577,8 +601,8 @@ mod tests {
         enums::DeepXEnvironment,
         signing::{
             DeepXPerpOrderType, DeepXPerpPlaceParams, DeepXPostOnlyParam,
-            DeepXRuntimeSnapshotService, DeepXSpotCancelParams, DeepXSpotOrderType,
-            DeepXSpotPlaceParams, DeepXTimeInForce, RuntimeSnapshot,
+            DeepXRuntimeSnapshotService, DeepXSpotCancelParams, DeepXSpotModifyParams,
+            DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce, RuntimeSnapshot,
         },
     };
 
@@ -836,6 +860,15 @@ mod tests {
         cancel_expected.extend_from_slice(&spot_cancel.order_id.to_le_bytes());
         cancel_expected.extend_from_slice(&[1, 0, 1]);
 
+        let spot_modify = DeepXSpotModifyParams {
+            cancel: spot_cancel,
+            place: spot_place,
+        };
+        let mut modify_expected = vec![19, 30, 8, 1, 0];
+        modify_expected.extend_from_slice(&cancel_expected[2..]);
+        modify_expected.extend_from_slice(&[0, 0]);
+        modify_expected.extend_from_slice(&spot_expected[2..]);
+
         let cases = [
             (
                 "PerpMarket",
@@ -854,6 +887,12 @@ mod tests {
                 "cancel_order",
                 spot_cancel.into_dynamic_arguments(),
                 cancel_expected,
+            ),
+            (
+                "Subaccount",
+                "modify_orders",
+                spot_modify.into_dynamic_arguments(),
+                modify_expected,
             ),
         ];
         for (pallet, call, arguments, expected) in cases {
@@ -889,6 +928,58 @@ mod tests {
         )
         .unwrap();
         (interfaces, client_state, key)
+    }
+
+    #[rstest]
+    fn spec376_spot_modify_signing_checks_scope() {
+        let (interfaces, state, key) = spec376_signing_context();
+        let params = DeepXSpotModifyParams {
+            cancel: DeepXSpotCancelParams {
+                subaccount: [0x11; 20],
+                pair: [0x22; 32],
+                order_id: 42,
+                is_buy: true,
+                fast_cancel: false,
+            },
+            place: DeepXSpotPlaceParams {
+                subaccount: [0x11; 20],
+                pair: [0x22; 32],
+                is_buy: true,
+                quote_amount: [0x33; 32],
+                base_amount: [0x44; 32],
+                order_type: DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc),
+                post_only: DeepXPostOnlyParam::None,
+                reduce_only: false,
+            },
+        };
+        let signed = sign_pallet_call(
+            &interfaces,
+            &state,
+            &key,
+            DeepXOfflinePalletCall::SpotModifyOrder(params),
+            43,
+        )
+        .unwrap();
+        assert_eq!(signed.signer(), derive_signer_account_id(&key).unwrap());
+
+        let mut wrong_subaccount = params;
+        wrong_subaccount.place.subaccount = [0x12; 20];
+        let mut wrong_pair = params;
+        wrong_pair.place.pair = [0x23; 32];
+        let mut wrong_side = params;
+        wrong_side.place.is_buy = false;
+        for invalid in [wrong_subaccount, wrong_pair, wrong_side] {
+            assert!(matches!(
+                sign_pallet_call(
+                    &interfaces,
+                    &state,
+                    &key,
+                    DeepXOfflinePalletCall::SpotModifyOrder(invalid),
+                    43,
+                ),
+                Err(DeepXPalletSigningError::SpotModifyScopeMismatch)
+            ));
+        }
     }
 
     #[rstest]

@@ -140,21 +140,41 @@ async fn main() -> anyhow::Result<()> {
         "delegate-order" => {
             let wallet = args.next().context("missing wallet address")?;
             let subaccount = args.next().context("missing subaccount address")?;
-            let (submit, recovery) = match args.next().as_deref() {
-                None => (false, None),
-                Some("--submit") => (true, None),
+            let (submit, recovery, requested_nonce) = match args.next().as_deref() {
+                None => (false, None, None),
+                Some("--submit") => (true, None, None),
+                Some("--nonce-ms") => {
+                    let nonce = args
+                        .next()
+                        .context("missing timestamp nonce")?
+                        .parse::<u64>()?;
+                    let submit = match args.next().as_deref() {
+                        None => false,
+                        Some("--submit") => true,
+                        Some(_) => anyhow::bail!("expected --submit after timestamp nonce"),
+                    };
+                    (submit, None, Some(nonce))
+                }
                 Some("--cancel-existing") => (
                     false,
                     Some((
                         args.next().context("missing existing order ID")?,
                         args.next().context("missing existing extrinsic hash")?,
                     )),
+                    None,
                 ),
-                Some(_) => anyhow::bail!("expected --submit or --cancel-existing"),
+                Some(_) => anyhow::bail!("expected --submit, --nonce-ms, or --cancel-existing"),
             };
             ensure!(args.next().is_none(), "unexpected argument");
-            verify_delegate_order(&transport, &wallet, &subaccount, submit, recovery.as_ref())
-                .await?;
+            verify_delegate_order(
+                &transport,
+                &wallet,
+                &subaccount,
+                submit,
+                recovery.as_ref(),
+                requested_nonce,
+            )
+            .await?;
         }
         "quota" => {
             let wallet = args.next().context("quota requires a wallet address")?;
@@ -552,6 +572,7 @@ async fn verify_delegate_order(
     subaccount: &str,
     submit: bool,
     recovery: Option<&(String, String)>,
+    requested_nonce: Option<u64>,
 ) -> anyhow::Result<()> {
     decode_account_id20(wallet).context("invalid wallet AccountId20")?;
     let subaccount_id =
@@ -669,7 +690,8 @@ async fn verify_delegate_order(
         std::env::var("DEEPX_PROXY_URL").ok().as_deref(),
     )?;
     verify_delegate_rpc_endpoints(&rpc).await?;
-    let (nonce, block_hash) = observe_delegate_nonce(&rpc, 0).await?;
+    let (suggested_nonce, block_hash) = observe_delegate_nonce(&rpc, 0).await?;
+    let nonce = requested_nonce.unwrap_or(suggested_nonce);
     let snapshot = observe_delegate_runtime(&rpc, &block_hash).await?;
     let service = DeepXRuntimeSnapshotService::new(snapshot.clone());
     let permit = service.acquire()?;

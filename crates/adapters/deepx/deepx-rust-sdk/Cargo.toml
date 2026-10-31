@@ -45,8 +45,78 @@ rstest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
 [[example]]
+name = "deepx-sdk-async-order-monitoring"
+path = "examples/async_order_monitoring.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-async-orders"
+path = "examples/async_orders.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-bridge-evm"
+path = "examples/bridge_evm.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-delegate"
+path = "examples/delegate.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-ioc-orders"
+path = "examples/ioc_orders.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-leverage"
+path = "examples/leverage.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-modify-order"
+path = "examples/modify_order.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-onboarding"
+path = "examples/onboarding.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-noop"
+path = "examples/noop.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-noop-replace-pending"
+path = "examples/noop_replace_pending.rs"
+doc = false
+
+[[example]]
 name = "deepx-sdk-query-account"
 path = "examples/query_account.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-quota"
+path = "examples/quota.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-settle-pnl"
+path = "examples/settle_pnl.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-sync-orders"
+path = "examples/sync_orders.rs"
+doc = false
+
+[[example]]
+name = "deepx-sdk-timestamp-nonce-orders"
+path = "examples/timestamp_nonce_orders.rs"
 doc = false
 
 [[example]]

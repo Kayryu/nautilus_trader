@@ -384,6 +384,7 @@ mod tests {
     #[case("PerpMarket", "close_position", 22, 14, &["subaccount", "market_id", "price", "slippage"])]
     #[case("PerpMarket", "set_global_leverage", 22, 43, &["subaccount", "max_leverage"])]
     #[case("PerpMarket", "set_per_market_leverage", 22, 44, &["subaccount", "market_id", "max_leverage"])]
+    #[case("PerpMarket", "settle_pnl", 22, 45, &["subaccount", "market_id"])]
     #[case("Lending", "buy_quota", 24, 12, &["address", "quota", "from_subaccount"])]
     fn spec376_metadata_call_contracts(
         #[case] pallet_name: &str,

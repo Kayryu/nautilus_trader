@@ -76,6 +76,27 @@ pub struct DeepXOfflineEvmTransactionParams {
     pub calldata: Vec<u8>,
 }
 
+/// Explicit EIP-1559 envelope for a bridge contract on a selected EVM chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepXBridgeEvmTransactionParams {
+    /// Chain ID independently verified against the source RPC endpoint.
+    pub chain_id: u64,
+    /// Sequential EVM account nonce reserved by the caller.
+    pub nonce: u64,
+    /// Explicit gas limit.
+    pub gas_limit: u64,
+    /// Maximum fee per gas in wei.
+    pub max_fee_per_gas: u128,
+    /// Maximum priority fee per gas in wei.
+    pub max_priority_fee_per_gas: u128,
+    /// Verified token or bridge contract address.
+    pub contract_address: [u8; 20],
+    /// Wei sent with the contract call.
+    pub value: U256,
+    /// Complete ABI calldata for approval or bridge-out.
+    pub calldata: Vec<u8>,
+}
+
 /// Explicit envelope and call inputs for offline perpetual profit/loss-point management.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeepXOfflinePerpPnlEvmParams {
@@ -263,6 +284,53 @@ pub fn sign_offline_evm_transaction(
             signature
         }
     };
+    Ok(DeepXOfflineEvmTransaction {
+        tx_hash: keccak256(&bytes).0,
+        signer: signer.address().into_array(),
+        bytes,
+        signature,
+    })
+}
+
+/// Signs a fee-aware bridge EVM transaction without submitting it.
+///
+/// The caller verifies the chain ID, contract address, gas estimate, account nonce, and
+/// authorization before signing. The returned hash identifies the raw EVM transaction.
+///
+/// # Errors
+///
+/// Returns an error for invalid envelope inputs or a failed secp256k1 signature.
+pub fn sign_bridge_evm_transaction(
+    key: &DeepXPrivateKey,
+    params: &DeepXBridgeEvmTransactionParams,
+) -> Result<DeepXOfflineEvmTransaction, DeepXOfflineEvmSignError> {
+    if params.chain_id == 0
+        || params.gas_limit == 0
+        || params.contract_address == [0; 20]
+        || params.max_priority_fee_per_gas > params.max_fee_per_gas
+    {
+        return Err(DeepXOfflineEvmSignError::InvalidParams);
+    }
+    let signer = PrivateKeySigner::from_slice(key.as_bytes())
+        .map_err(|_| DeepXOfflineEvmSignError::InvalidKey)?;
+    let transaction = TxEip1559 {
+        chain_id: params.chain_id,
+        nonce: params.nonce,
+        gas_limit: params.gas_limit,
+        max_fee_per_gas: params.max_fee_per_gas,
+        max_priority_fee_per_gas: params.max_priority_fee_per_gas,
+        to: TxKind::Call(params.contract_address.into()),
+        value: params.value,
+        input: Bytes::copy_from_slice(&params.calldata),
+        ..Default::default()
+    };
+    let signature = signer
+        .sign_hash_sync(&transaction.signature_hash())
+        .map_err(|_| DeepXOfflineEvmSignError::Sign)?;
+    let mut bytes = Vec::new();
+    transaction
+        .into_signed(signature)
+        .eip2718_encode(&mut bytes);
     Ok(DeepXOfflineEvmTransaction {
         tx_hash: keccak256(&bytes).0,
         signer: signer.address().into_array(),
@@ -639,6 +707,56 @@ mod tests {
             Err(DeepXOfflineEvmWrapperError::Runtime(
                 SigningError::RuntimePermit(_)
             )),
+        ));
+    }
+
+    #[rstest]
+    fn bridge_signer_binds_chain_nonce_fees_and_calldata() {
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let mut params = DeepXBridgeEvmTransactionParams {
+            chain_id: 4856,
+            nonce: 7,
+            gas_limit: 200_000,
+            max_fee_per_gas: 20_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            contract_address: [0x11; 20],
+            value: U256::from(123_u64),
+            calldata: vec![0x12, 0x34],
+        };
+        let baseline = sign_bridge_evm_transaction(&key, &params).unwrap();
+        assert_eq!(baseline.tx_hash, keccak256(&baseline.bytes).0);
+        assert_eq!(baseline.bytes[0], 0x02);
+        params.max_fee_per_gas += 1;
+        assert_ne!(
+            sign_bridge_evm_transaction(&key, &params).unwrap().tx_hash,
+            baseline.tx_hash
+        );
+        params.max_fee_per_gas -= 1;
+        params.nonce += 1;
+        assert_ne!(
+            sign_bridge_evm_transaction(&key, &params).unwrap().tx_hash,
+            baseline.tx_hash
+        );
+        params.nonce -= 1;
+        params.chain_id += 1;
+        assert_ne!(
+            sign_bridge_evm_transaction(&key, &params).unwrap().tx_hash,
+            baseline.tx_hash
+        );
+        params.chain_id -= 1;
+        params.calldata.push(0x56);
+        assert_ne!(
+            sign_bridge_evm_transaction(&key, &params).unwrap().tx_hash,
+            baseline.tx_hash
+        );
+        params.max_priority_fee_per_gas = params.max_fee_per_gas + 1;
+        assert!(matches!(
+            sign_bridge_evm_transaction(&key, &params),
+            Err(DeepXOfflineEvmSignError::InvalidParams)
         ));
     }
 }

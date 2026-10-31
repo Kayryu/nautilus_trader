@@ -16,7 +16,8 @@
 //! Read-only account and chain query using the standalone DeepX SDK.
 
 use deepx_rust_sdk::{
-    deployment::{DEEPX_TESTNET_REST_URL, DEEPX_TESTNET_RPC_URL},
+    deployment::{DEEPX_TESTNET_GENESIS_HASH, DEEPX_TESTNET_REST_URL, DEEPX_TESTNET_RPC_URL},
+    identity::decode_account_id20,
     query::{DeepXAccountSortOrder, DeepXPerpHistoryOrdersRequest, DeepXPerpOpenOrdersRequest},
     rest::DeepXRestTransport,
     rpc::DeepXRpcClient,
@@ -56,12 +57,23 @@ async fn main() -> anyhow::Result<()> {
     let subaccounts = transport
         .get_wallet_subaccounts(DEEPX_TESTNET_REST_URL, &wallet)
         .await?;
-    let rpc =
-        DeepXRpcClient::new_with_proxy(DEEPX_TESTNET_RPC_URL.to_string(), proxy_url.as_deref())?;
+    let rpc_url = std::env::var("DEEPX_TESTNET_RPC_URL")
+        .unwrap_or_else(|_| DEEPX_TESTNET_RPC_URL.to_string());
+    let rpc = DeepXRpcClient::new_with_proxy(rpc_url, proxy_url.as_deref())?;
     let genesis = rpc
         .get_block_hash(0)
         .await?
         .ok_or_else(|| anyhow::anyhow!("DeepX RPC returned no genesis hash"))?;
+    anyhow::ensure!(
+        genesis.eq_ignore_ascii_case(DEEPX_TESTNET_GENESIS_HASH),
+        "RPC endpoint is not the approved DeepX testnet"
+    );
+    let wallet_nonce = rpc
+        .get_account_next_index(
+            decode_account_id20(&wallet)
+                .ok_or_else(|| anyhow::anyhow!("invalid wallet AccountId20"))?,
+        )
+        .await?;
 
     println!(
         "wallet={wallet} subaccounts={}",
@@ -71,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         println!("subaccount={subaccount}");
     }
     println!("genesis={genesis}");
+    println!("wallet_sequential_nonce={wallet_nonce}");
     if let Some(OrderQuery::Open(market_id)) = order_query {
         for subaccount in &subaccounts.addresses {
             let request = DeepXPerpOpenOrdersRequest {

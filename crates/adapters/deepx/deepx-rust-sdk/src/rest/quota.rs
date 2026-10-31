@@ -13,23 +13,27 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Typed and raw wallet quota REST queries.
+//! Typed and raw wallet quota REST queries and claim submission.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tokio::time::{Instant, sleep};
 
 use super::{
-    DeepXAccountPage, DeepXRawAccountPage, DeepXRestError, DeepXRestTransport,
-    decode_account_history_page, is_account_address,
+    DeepXAccountPage, DeepXRawAccountPage, DeepXRestError, DeepXRestResponse, DeepXRestTransport,
+    decode_account_history_page, decode_response, is_account_address, normalize_base_url,
+    send_request, with_timeout,
 };
 use crate::{
     query::{DeepXQuotaHistoryRequest, DeepXQuotaHistoryType},
     rest::models::{
-        DeepXQuotaClaim, DeepXQuotaClaimIdentity, DeepXQuotaHistoryRecord, DeepXQuotaSummary,
+        DeepXQuotaClaim, DeepXQuotaClaimIdentity, DeepXQuotaClaimSubmission,
+        DeepXQuotaHistoryRecord, DeepXQuotaSummary, DeepXWalletQuota,
     },
+    signing::DeepXQuotaClaimSignature,
 };
 
 const QUOTA_SUMMARY_PATH: &str = "/internal/v1/account/quota/summary";
@@ -46,7 +50,83 @@ struct ClaimQuery {
     id: u64,
 }
 
+#[derive(Deserialize)]
+struct QuotaClaimSubmissionWire {
+    status: String,
+    created: bool,
+    claim: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaClaimTaskState {
+    status: String,
+    last_error: Option<String>,
+}
+
 impl DeepXRestTransport {
+    /// Returns the public wallet quota amounts without an API envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a request, transport, HTTP, or decoding error.
+    pub async fn get_wallet_quota(
+        &self,
+        base_url: &str,
+        wallet: &str,
+    ) -> Result<DeepXWalletQuota, DeepXRestError> {
+        if !is_account_address(wallet) {
+            return Err(DeepXRestError::InvalidRequest(
+                "wallet quota requires a 20-byte hex wallet address".to_string(),
+            ));
+        }
+        self.get_json(base_url, &format!("/v1/account/wallets/{wallet}/quota"))
+            .await
+    }
+
+    /// Submits one signed quota claim and decodes the public response.
+    ///
+    /// A transport error leaves delivery uncertain. The caller retains the idempotency key
+    /// and reconciles the outcome before another submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a URL, transport, HTTP, decoding, or invalid-response error.
+    pub async fn post_quota_claim(
+        &self,
+        base_url: &str,
+        signed: &DeepXQuotaClaimSignature,
+    ) -> Result<DeepXQuotaClaimSubmission, DeepXRestError> {
+        let response = self.post_quota_claim_once(base_url, signed).await?;
+        let raw = decode_response(response.status.as_u16(), &response.body)?;
+        decode_quota_claim_submission(raw)
+    }
+
+    /// Submits one signed wallet quota claim without redirects or automatic retries.
+    ///
+    /// The response retains its HTTP status and body because a transport failure can leave
+    /// submission uncertain. The caller owns the idempotency key and claim reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a URL, serialization, or transport error; the caller must reconcile uncertain
+    /// delivery before issuing another claim.
+    pub async fn post_quota_claim_once(
+        &self,
+        base_url: &str,
+        signed: &DeepXQuotaClaimSignature,
+    ) -> Result<DeepXRestResponse, DeepXRestError> {
+        let base_url = normalize_base_url(base_url.to_string())?;
+        let path = format!("/v1/account/wallets/{}/quota/claims", signed.wallet());
+        let body = serde_json::to_vec(signed)?;
+        let request = self
+            .transaction_client
+            .post(format!("{base_url}{path}"))
+            .header("Content-Type", "application/json")
+            .body(body);
+        send_request(with_timeout(request, self.timeout_secs)).await
+    }
+
     /// Returns the exact quota summary for a wallet.
     ///
     /// # Errors
@@ -96,6 +176,70 @@ impl DeepXRestTransport {
     ) -> Result<DeepXQuotaClaim, DeepXRestError> {
         let raw = self.get_quota_claim_raw(base_url, claim_id).await?;
         decode_quota_claim(raw, claim_id)
+    }
+
+    /// Polls one claim until it is confirmed, fails, or exceeds the total deadline.
+    ///
+    /// Transport errors, rate limits, and server errors are retried within the deadline.
+    /// Other HTTP, API, or decoding failures stop polling. No new claim is submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request, claim-failed, timeout, or non-transient REST error.
+    pub async fn wait_quota_claim(
+        &self,
+        base_url: &str,
+        claim_id: u64,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<DeepXQuotaClaim, DeepXRestError> {
+        if claim_id == 0 || timeout.is_zero() || interval.is_zero() {
+            return Err(DeepXRestError::InvalidRequest(
+                "quota claim polling requires a positive ID, timeout, and interval".to_string(),
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        let mut last_status = "unknown".to_string();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DeepXRestError::QuotaClaimTimeout {
+                    claim_id,
+                    last_status,
+                });
+            }
+            match tokio::time::timeout(remaining, self.get_quota_claim(base_url, claim_id)).await {
+                Ok(Ok(claim)) => {
+                    let state: QuotaClaimTaskState = serde_json::from_str(claim.data().get())?;
+                    let status = state.status.to_ascii_lowercase();
+                    match status.as_str() {
+                        "confirmed" => return Ok(claim),
+                        "failed" => {
+                            return Err(DeepXRestError::QuotaClaimFailed {
+                                claim_id,
+                                message: state.last_error.unwrap_or_default(),
+                            });
+                        }
+                        _ => last_status = status,
+                    }
+                }
+                Ok(Err(
+                    DeepXRestError::Transport(_)
+                    | DeepXRestError::Http {
+                        status: 429 | 500..=599,
+                        ..
+                    },
+                )) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(DeepXRestError::QuotaClaimTimeout {
+                        claim_id,
+                        last_status,
+                    });
+                }
+            }
+            sleep(interval.min(deadline.saturating_duration_since(Instant::now()))).await;
+        }
     }
 
     /// Returns the uninterpreted quota summary for a wallet.
@@ -172,6 +316,41 @@ fn decode_quota_claim(
         });
     }
     Ok(DeepXQuotaClaim::new(identity.id, raw))
+}
+
+fn decode_quota_claim_submission(
+    raw: Box<RawValue>,
+) -> Result<DeepXQuotaClaimSubmission, DeepXRestError> {
+    let wire: QuotaClaimSubmissionWire = serde_json::from_str(raw.get())?;
+    let claim = wire
+        .claim
+        .map(|claim| {
+            let identity: DeepXQuotaClaimIdentity = serde_json::from_str(claim.get())?;
+            if identity.id == 0 {
+                return Err(DeepXRestError::InvalidAccountResponse {
+                    endpoint: "quota claim submission",
+                    message: "claim ID must be greater than zero".to_string(),
+                });
+            }
+            Ok(DeepXQuotaClaim::new(identity.id, claim))
+        })
+        .transpose()?;
+    let noop = wire.status.eq_ignore_ascii_case("noop");
+    if wire.status.is_empty()
+        || (noop && (wire.created || claim.is_some()))
+        || (!noop && claim.is_none())
+    {
+        return Err(DeepXRestError::InvalidAccountResponse {
+            endpoint: "quota claim submission",
+            message: "claim status and task are inconsistent".to_string(),
+        });
+    }
+    Ok(DeepXQuotaClaimSubmission::new(
+        wire.status,
+        wire.created,
+        claim,
+        raw,
+    ))
 }
 
 fn validate_quota_history_page(
@@ -372,11 +551,27 @@ fn validate_quota_summary(summary: &DeepXQuotaSummary, wallet: &str) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        routing::{get, post},
+    };
     use rstest::rstest;
     use serde_json::{Value, json};
+    use tokio::net::TcpListener;
 
     use super::*;
-    use crate::rest::DeepXApiResponse;
+    use crate::{
+        credential::{DeepXKeyScheme, DeepXPrivateKey},
+        rest::DeepXApiResponse,
+        signing::sign_quota_claim,
+    };
 
     const WALLET: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e50";
     const RESPONSE: &str = include_str!("../../test_data/http/testnet/wallet_quota_summary.json");
@@ -391,6 +586,183 @@ mod tests {
             cursor: None,
             limit: Some(5),
         }
+    }
+
+    #[tokio::test]
+    async fn quota_claim_posts_signed_fields_once_and_preserves_response() {
+        let key = DeepXPrivateKey::new(
+            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            &DeepXKeyScheme::Secp256k1,
+        )
+        .unwrap();
+        let signed = sign_quota_claim(&key, WALLET, "claim-1").unwrap();
+        let expected = serde_json::to_value(&signed).unwrap();
+        let path = format!("/v1/account/wallets/{WALLET}/quota/claims");
+        let router = Router::new().route(
+            &path,
+            post(move |Json(body): Json<Value>| {
+                let expected = expected.clone();
+                async move {
+                    assert_eq!(body, expected);
+                    (
+                        StatusCode::ACCEPTED,
+                        r#"{"status":"pending","created":true,"claim":{"id":42,"quotaAmount":5}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let transport = DeepXRestTransport::new(Some(5), None).unwrap();
+        let response = transport
+            .post_quota_claim_once(&format!("http://{address}"), &signed)
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        assert_eq!(
+            response.body,
+            br#"{"status":"pending","created":true,"claim":{"id":42,"quotaAmount":5}}"#
+        );
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(r#"{"status":"noop","created":false,"claim":null}"#, true)]
+    #[case(
+        r#"{"status":"pending","created":true,"claim":{"id":42,"quotaAmount":5}}"#,
+        true
+    )]
+    #[case(r#"{"status":"noop","created":true,"claim":null}"#, false)]
+    #[case(r#"{"status":"pending","created":true,"claim":null}"#, false)]
+    #[case(r#"{"status":"pending","created":true,"claim":{"id":0}}"#, false)]
+    fn quota_claim_submission_decodes_documented_outcomes(
+        #[case] payload: &str,
+        #[case] valid: bool,
+    ) {
+        let raw: Box<RawValue> = serde_json::from_str(payload).unwrap();
+        let result = decode_quota_claim_submission(raw);
+        assert_eq!(result.is_ok(), valid);
+        if let Ok(submission) = result {
+            assert_eq!(submission.data().get(), payload);
+            if let Some(claim) = submission.claim {
+                assert_eq!(claim.id, 42);
+                assert_eq!(claim.data().get(), r#"{"id":42,"quotaAmount":5}"#);
+            }
+        }
+    }
+
+    #[rstest]
+    fn wallet_quota_decodes_live_public_shape() {
+        let quota: DeepXWalletQuota =
+            serde_json::from_str(r#"{"pendingGrant":0,"remaining":9832,"unclaimed":157155}"#)
+                .unwrap();
+        assert_eq!(quota.pending_grant, 0);
+        assert_eq!(quota.remaining, 9832);
+        assert_eq!(quota.unclaimed, 157155);
+    }
+
+    #[tokio::test]
+    async fn quota_claim_poll_recovers_from_rate_limit_and_waits_for_confirmation() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                QUOTA_CLAIM_PATH,
+                get(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    match requests.fetch_add(1, Ordering::SeqCst) {
+                        0 => (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": "rate limit"}))),
+                        1 => (StatusCode::OK, Json(json!({"code":200,"msg":"success","fail":false,"data":{"id":42,"status":"pending"}}))),
+                        _ => (StatusCode::OK, Json(json!({"code":200,"msg":"success","fail":false,"data":{"id":42,"status":"confirmed","txHash":"0xabc"}}))),
+                    }
+                }),
+            )
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let transport = DeepXRestTransport::new(Some(5), None).unwrap();
+        let claim = transport
+            .wait_quota_claim(
+                &format!("http://{address}"),
+                42,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim.id, 42);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quota_claim_poll_reports_terminal_failure() {
+        let router = Router::new().route(
+            QUOTA_CLAIM_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "fail": false,
+                    "data": {"id": 42, "status": "failed", "lastError": "grant rejected"}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let transport = DeepXRestTransport::new(Some(5), None).unwrap();
+        let result = transport
+            .wait_quota_claim(
+                &format!("http://{address}"),
+                42,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(DeepXRestError::QuotaClaimFailed { claim_id: 42, message })
+                if message == "grant rejected"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quota_claim_poll_times_out_with_last_status() {
+        let router = Router::new().route(
+            QUOTA_CLAIM_PATH,
+            get(|| async {
+                Json(json!({
+                    "code": 200,
+                    "msg": "success",
+                    "fail": false,
+                    "data": {"id": 42, "status": "submitted"}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let transport = DeepXRestTransport::new(Some(5), None).unwrap();
+        let result = transport
+            .wait_quota_claim(
+                &format!("http://{address}"),
+                42,
+                Duration::from_millis(30),
+                Duration::from_millis(2),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(DeepXRestError::QuotaClaimTimeout { claim_id: 42, last_status })
+                if last_status == "submitted"
+        ));
+        server.abort();
     }
 
     #[rstest]

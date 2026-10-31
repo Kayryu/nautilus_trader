@@ -32,10 +32,10 @@ mod snapshot;
 
 pub use error::SigningError;
 pub use evm::{
-    DeepXEvmTransactionKind, DeepXOfflineEvmExtrinsic, DeepXOfflineEvmSignError,
-    DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams, DeepXOfflineEvmWrapperError,
-    DeepXOfflineEvmWrapperSignError, DeepXOfflinePerpPnlEvmParams,
-    sign_offline_evm_transact_extrinsic, sign_offline_evm_transaction,
+    DeepXBridgeEvmTransactionParams, DeepXEvmTransactionKind, DeepXOfflineEvmExtrinsic,
+    DeepXOfflineEvmSignError, DeepXOfflineEvmTransaction, DeepXOfflineEvmTransactionParams,
+    DeepXOfflineEvmWrapperError, DeepXOfflineEvmWrapperSignError, DeepXOfflinePerpPnlEvmParams,
+    sign_bridge_evm_transaction, sign_offline_evm_transact_extrinsic, sign_offline_evm_transaction,
     sign_permitted_evm_transact_extrinsic, sign_permitted_perp_pnl_evm_transact_extrinsic,
 };
 pub use guard::{
@@ -52,15 +52,17 @@ pub use management::{
 pub use named::{
     sign_buy_quota, sign_delete_subaccount, sign_initialize_subaccount, sign_no_op,
     sign_perp_cancel, sign_perp_close, sign_perp_modify_order, sign_perp_place_order,
-    sign_perp_set_profit_and_loss_point, sign_remove_delegate_account, sign_rename_subaccount,
-    sign_set_delegate_account, sign_set_global_leverage, sign_set_per_market_leverage,
-    sign_set_spot_margin, sign_spot_cancel, sign_spot_place_order, sign_update_delegate_mode,
+    sign_perp_set_profit_and_loss_point, sign_perp_settle_pnl, sign_remove_delegate_account,
+    sign_rename_subaccount, sign_set_delegate_account, sign_set_global_leverage,
+    sign_set_per_market_leverage, sign_set_spot_margin, sign_spot_cancel, sign_spot_modify_order,
+    sign_spot_place_order, sign_update_delegate_mode,
 };
 pub use operation::{DeepXDirectRuntimeIdentity, DeepXNonceReservation, DeepXTransactionOperation};
 pub use pallet::{
     DeepXPerpCancelParams, DeepXPerpCloseParams, DeepXPerpModifyParams, DeepXPerpOrderType,
-    DeepXPerpPlaceParams, DeepXPerpProfitAndLossPointParams, DeepXPostOnlyParam,
-    DeepXSpotCancelParams, DeepXSpotOrderType, DeepXSpotPlaceParams, DeepXTimeInForce,
+    DeepXPerpPlaceParams, DeepXPerpProfitAndLossPointParams, DeepXPerpSettlePnlParams,
+    DeepXPostOnlyParam, DeepXSpotCancelParams, DeepXSpotModifyParams, DeepXSpotOrderType,
+    DeepXSpotPlaceParams, DeepXTimeInForce,
 };
 pub use quota::{DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError, sign_quota_claim};
 pub use runtime::{

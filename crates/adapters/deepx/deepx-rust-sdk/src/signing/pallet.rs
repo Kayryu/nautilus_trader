@@ -195,10 +195,8 @@ pub struct DeepXSpotPlaceParams {
 }
 
 impl DeepXSpotPlaceParams {
-    /// Returns the encoded DeepX runtime call arguments.
-    #[must_use]
-    pub fn into_dynamic_arguments(self) -> Vec<Value> {
-        vec![Value::named_composite([
+    fn into_dynamic_value(self) -> Value {
+        Value::named_composite([
             ("subaccount", Value::from_bytes(self.subaccount)),
             ("pair", Value::from_bytes(self.pair)),
             ("is_buy", Value::bool(self.is_buy)),
@@ -211,7 +209,13 @@ impl DeepXSpotPlaceParams {
                 "stp_mode",
                 Value::unnamed_variant("None", Vec::<Value>::new()),
             ),
-        ])]
+        ])
+    }
+
+    /// Returns the encoded DeepX runtime call arguments.
+    #[must_use]
+    pub fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![self.into_dynamic_value()]
     }
 }
 
@@ -238,6 +242,31 @@ impl DeepXPerpCloseParams {
             Value::u128(self.price),
             match self.slippage {
                 Some(value) => Value::unnamed_variant("Some", [Value::u128(u128::from(value))]),
+                None => Value::unnamed_variant("None", Vec::<Value>::new()),
+            },
+        ]
+    }
+}
+
+/// Exact raw arguments for permissionless perpetual PnL settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpSettlePnlParams {
+    /// Subaccount whose position PnL and funding are settled.
+    pub subaccount: [u8; 20],
+    /// One market, or `None` to settle all open perpetual markets.
+    pub market_id: Option<u16>,
+}
+
+impl DeepXPerpSettlePnlParams {
+    /// Returns the encoded DeepX runtime call arguments.
+    #[must_use]
+    pub fn into_dynamic_arguments(self) -> Vec<Value> {
+        vec![
+            Value::from_bytes(self.subaccount),
+            match self.market_id {
+                Some(market_id) => {
+                    Value::unnamed_variant("Some", [Value::u128(u128::from(market_id))])
+                }
                 None => Value::unnamed_variant("None", Vec::<Value>::new()),
             },
         ]
@@ -354,22 +383,57 @@ pub struct DeepXSpotCancelParams {
 }
 
 impl DeepXSpotCancelParams {
+    fn into_dynamic_value(self) -> Value {
+        Value::named_composite([
+            ("subaccount", Value::from_bytes(self.subaccount)),
+            ("pair", Value::from_bytes(self.pair)),
+            ("order_id", Value::u128(u128::from(self.order_id))),
+            ("is_buy", Value::bool(self.is_buy)),
+            (
+                "cancel_reason",
+                Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
+            ),
+            ("fast_cancel", Value::bool(self.fast_cancel)),
+        ])
+    }
+
     /// Returns the encoded DeepX runtime call arguments.
     #[must_use]
     pub fn into_dynamic_arguments(self) -> Vec<Value> {
         vec![Value::named_composite([(
             "params",
-            Value::named_composite([
-                ("subaccount", Value::from_bytes(self.subaccount)),
-                ("pair", Value::from_bytes(self.pair)),
-                ("order_id", Value::u128(u128::from(self.order_id))),
-                ("is_buy", Value::bool(self.is_buy)),
-                (
-                    "cancel_reason",
-                    Value::unnamed_variant("UserCanceled", Vec::<Value>::new()),
-                ),
-                ("fast_cancel", Value::bool(self.fast_cancel)),
-            ]),
+            self.into_dynamic_value(),
         )])]
+    }
+}
+
+/// Exact arguments for a transactional Spot cancel-and-place modification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXSpotModifyParams {
+    /// Existing Spot order to cancel.
+    pub cancel: DeepXSpotCancelParams,
+    /// Explicit replacement order; its ID is the modify extrinsic nonce.
+    pub place: DeepXSpotPlaceParams,
+}
+
+impl DeepXSpotModifyParams {
+    /// Returns the encoded `Subaccount.modify_orders` arguments.
+    #[must_use]
+    pub fn into_dynamic_arguments(self) -> Vec<Value> {
+        let cancel = Value::unnamed_variant(
+            "Cancel",
+            [Value::unnamed_variant(
+                "Spot",
+                [self.cancel.into_dynamic_value()],
+            )],
+        );
+        let place = Value::unnamed_variant(
+            "Place",
+            [Value::unnamed_variant(
+                "Spot",
+                [self.place.into_dynamic_value()],
+            )],
+        );
+        vec![Value::unnamed_composite([cancel, place])]
     }
 }

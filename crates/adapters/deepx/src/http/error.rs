@@ -45,6 +45,12 @@ pub enum DeepXHttpError {
     /// Typed endpoint parameters violate a local request invariant.
     #[error("invalid DeepX HTTP request: {0}")]
     InvalidRequest(String),
+    /// An asynchronous quota claim failed at the venue.
+    #[error("DeepX quota claim {claim_id} failed: {message}")]
+    QuotaClaimFailed { claim_id: u64, message: String },
+    /// An asynchronous quota claim exceeded its polling deadline.
+    #[error("DeepX quota claim {claim_id} timed out (last status: {last_status})")]
+    QuotaClaimTimeout { claim_id: u64, last_status: String },
     /// A decoded history page violates the requested ordering or financial invariants.
     #[error("invalid DeepX HTTP {endpoint} response: {message}")]
     InvalidHistoryResponse {
@@ -120,6 +126,16 @@ impl From<DeepXRestError> for DeepXHttpError {
             DeepXRestError::Decode(e) => Self::Decode(e),
             DeepXRestError::Api { code, message } => Self::Api { code, message },
             DeepXRestError::InvalidRequest(message) => Self::InvalidRequest(message),
+            DeepXRestError::QuotaClaimFailed { claim_id, message } => {
+                Self::QuotaClaimFailed { claim_id, message }
+            }
+            DeepXRestError::QuotaClaimTimeout {
+                claim_id,
+                last_status,
+            } => Self::QuotaClaimTimeout {
+                claim_id,
+                last_status,
+            },
             DeepXRestError::InvalidTransactionStatus { message } => {
                 Self::InvalidTransactionStatus { message }
             }
@@ -188,5 +204,30 @@ mod tests {
         };
 
         assert!(!error.is_transport_error());
+    }
+
+    #[rstest]
+    fn quota_claim_outcomes_keep_identity_when_mapped() {
+        let failed: DeepXHttpError = DeepXRestError::QuotaClaimFailed {
+            claim_id: 42,
+            message: "grant rejected".to_string(),
+        }
+        .into();
+        assert!(matches!(
+            failed,
+            DeepXHttpError::QuotaClaimFailed { claim_id: 42, message }
+                if message == "grant rejected"
+        ));
+
+        let timed_out: DeepXHttpError = DeepXRestError::QuotaClaimTimeout {
+            claim_id: 42,
+            last_status: "submitted".to_string(),
+        }
+        .into();
+        assert!(matches!(
+            timed_out,
+            DeepXHttpError::QuotaClaimTimeout { claim_id: 42, last_status }
+                if last_status == "submitted"
+        ));
     }
 }

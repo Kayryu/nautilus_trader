@@ -1908,6 +1908,52 @@ pub struct DeepXQuotaClaimIdentity {
     pub id: u64,
 }
 
+/// Wallet quota amounts returned by the public quota endpoint.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeepXWalletQuota {
+    /// Quota awaiting an on-chain grant.
+    pub pending_grant: u64,
+    /// Quota available for transactions.
+    pub remaining: u64,
+    /// Earned quota that has not been claimed.
+    pub unclaimed: u64,
+}
+
+/// Outcome of a public wallet quota claim request.
+#[derive(Clone, Debug)]
+pub struct DeepXQuotaClaimSubmission {
+    /// Venue status, including `noop` when no quota is claimable.
+    pub status: String,
+    /// Whether this request created a new claim task.
+    pub created: bool,
+    /// Existing or newly created task, if one was returned.
+    pub claim: Option<DeepXQuotaClaim>,
+    data: Box<RawValue>,
+}
+
+impl DeepXQuotaClaimSubmission {
+    pub(crate) fn new(
+        status: String,
+        created: bool,
+        claim: Option<DeepXQuotaClaim>,
+        data: Box<RawValue>,
+    ) -> Self {
+        Self {
+            status,
+            created,
+            claim,
+            data,
+        }
+    }
+
+    /// Returns the original response without changing numeric lexemes.
+    #[must_use]
+    pub fn data(&self) -> &RawValue {
+        &self.data
+    }
+}
+
 /// Claim identity and exact backend payload for an asynchronous quota task.
 #[derive(Clone, Debug)]
 pub struct DeepXQuotaClaim {

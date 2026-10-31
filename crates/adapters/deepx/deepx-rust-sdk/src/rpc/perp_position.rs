@@ -15,6 +15,8 @@
 
 //! Indexed perpetual position update and close-order evidence.
 
+use std::collections::BTreeSet;
+
 use parity_scale_codec::{Compact, Decode};
 use subxt_core::{
     events::{Events, Phase},
@@ -28,8 +30,8 @@ use super::{
     spot_place::{value_matches_order_type, value_matches_post_only},
 };
 use crate::signing::{
-    DeepXPerpCloseParams, DeepXPerpProfitAndLossPointParams, DeepXPostOnlyParam,
-    DeepXRuntimeConfig, DeepXSpotOrderType,
+    DeepXPerpCloseParams, DeepXPerpProfitAndLossPointParams, DeepXPerpSettlePnlParams,
+    DeepXPostOnlyParam, DeepXRuntimeConfig, DeepXSpotOrderType,
     runtime_interface::{DeepXRuntimeInterfaceCatalog, DeepXRuntimeInterfaceError},
 };
 
@@ -51,6 +53,37 @@ pub struct DeepXPerpCloseExpected {
     pub block_number: u64,
     /// Index of the signed extrinsic in the block.
     pub extrinsic_index: u32,
+}
+
+/// Expected terms for one permissionless perpetual PnL settlement call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpSettleExpected {
+    /// Exact runtime call arguments.
+    pub params: DeepXPerpSettlePnlParams,
+    /// Index of the signed extrinsic in the finalized block.
+    pub extrinsic_index: u32,
+}
+
+/// Exact signed quote-unit amounts emitted by one `PerpMarket.SettlePnl` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepXPerpSettlement {
+    /// Runtime perpetual market identifier.
+    pub market_id: u16,
+    /// Signed unrealized PnL in quote-token base units.
+    pub unrealized: i128,
+    /// Signed pending funding in quote-token base units.
+    pub funding: i128,
+    /// Saturating sum of unrealized PnL and funding in quote-token base units.
+    pub total: i128,
+}
+
+/// Indexed dispatch and settlement events for one finalized call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXPerpSettleInclusionEvidence {
+    /// Runtime dispatch outcome for the indexed extrinsic.
+    pub outcome: DeepXPerpPositionInclusionOutcome,
+    /// Unique settlement events emitted by a successful call.
+    pub settlements: Vec<DeepXPerpSettlement>,
 }
 
 /// Outcome established from indexed dispatch and perpetual business events.
@@ -145,6 +178,143 @@ pub fn decode_perp_close_inclusion(
         "OrderPlaced",
         |fields| close_order_fields_match(fields, expected),
     )
+}
+
+/// Verifies one settlement call against complete finalized runtime events.
+///
+/// Single-market success requires exactly one matching event, including a zero settlement.
+/// All-market success may emit no event when every settlement is zero. The caller verifies
+/// the signed call, its block inclusion, and block canonicality separately.
+///
+/// # Errors
+///
+/// Returns an error for incomplete, duplicate, or conflicting indexed events.
+pub fn decode_perp_settle_inclusion(
+    interfaces: &DeepXRuntimeInterfaceCatalog,
+    metadata: &Metadata,
+    expected: DeepXPerpSettleExpected,
+    event_bytes: &[u8],
+) -> Result<DeepXPerpSettleInclusionEvidence, DeepXPerpPositionEventError> {
+    use DeepXPerpPositionEventError as Error;
+
+    interfaces.event("PerpMarket", "SettlePnl")?;
+    interfaces.event("System", "ExtrinsicSuccess")?;
+    interfaces.event("System", "ExtrinsicFailed")?;
+    let mut remaining = event_bytes;
+    let declared = Compact::<u32>::decode(&mut remaining)
+        .map_err(|_| Error::MalformedEventBytes)?
+        .0;
+    let mut consumed = event_bytes.len() - remaining.len();
+    let mut count = 0_u32;
+    let mut dispatch = None;
+    let mut settlements = Vec::new();
+    let mut market_ids = BTreeSet::new();
+    let events = Events::<DeepXRuntimeConfig>::decode_from(event_bytes.to_vec(), metadata.clone());
+    for event in events.iter() {
+        let event = event.map_err(|e| Error::Decode(Box::new(e)))?;
+        count = count.checked_add(1).ok_or(Error::MalformedEventBytes)?;
+        consumed = consumed
+            .checked_add(event.bytes().len())
+            .ok_or(Error::MalformedEventBytes)?;
+        if event.phase() != Phase::ApplyExtrinsic(expected.extrinsic_index) {
+            continue;
+        }
+        if event.pallet_name() == "System" {
+            let outcome = match event.variant_name() {
+                "ExtrinsicSuccess" => DeepXPerpPositionInclusionOutcome::Success,
+                "ExtrinsicFailed" => DeepXPerpPositionInclusionOutcome::Failed,
+                _ => continue,
+            };
+            if dispatch.replace(outcome).is_some() {
+                return Err(Error::DuplicateEvent);
+            }
+        } else if event.pallet_name() == "PerpMarket" && event.variant_name() == "SettlePnl" {
+            let fields = event
+                .field_values()
+                .map_err(|e| Error::Decode(Box::new(e)))?;
+            let settlement = decode_settlement_fields(&fields, expected.params)
+                .ok_or(Error::ConflictingEvent)?;
+            if !market_ids.insert(settlement.market_id) {
+                return Err(Error::DuplicateEvent);
+            }
+            if settlements.len() >= 256 {
+                return Err(Error::ConflictingEvent);
+            }
+            settlements.push(settlement);
+        }
+    }
+    if count != declared || consumed != event_bytes.len() {
+        return Err(Error::MalformedEventBytes);
+    }
+    let outcome = dispatch.ok_or(Error::MalformedEventBytes)?;
+    if outcome == DeepXPerpPositionInclusionOutcome::Failed && !settlements.is_empty() {
+        return Err(Error::ConflictingBusinessEvent);
+    }
+    if outcome == DeepXPerpPositionInclusionOutcome::Success
+        && expected.params.market_id.is_some()
+        && settlements.len() != 1
+    {
+        return Err(Error::MissingBusinessEvent);
+    }
+    Ok(DeepXPerpSettleInclusionEvidence {
+        outcome,
+        settlements,
+    })
+}
+
+fn decode_settlement_fields(
+    fields: &Composite<u32>,
+    expected: DeepXPerpSettlePnlParams,
+) -> Option<DeepXPerpSettlement> {
+    let Composite::Named(fields) = fields else {
+        return None;
+    };
+    if fields.len() != 6 {
+        return None;
+    }
+    let field = |name| {
+        fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value)
+    };
+    let market_id = u16::try_from(field("market_id")?.as_u128()?).ok()?;
+    if expected
+        .market_id
+        .is_some_and(|expected_id| expected_id != market_id)
+        || field("owner").and_then(decode_event_bytes).as_deref()
+            != Some(expected.subaccount.as_slice())
+    {
+        return None;
+    }
+    let position = field("position")?;
+    let ValueDef::Composite(Composite::Named(position_fields)) = &position.value else {
+        return None;
+    };
+    let position_field = |name| {
+        position_fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value)
+    };
+    if position_field("owner")
+        .and_then(decode_event_bytes)
+        .as_deref()
+        != Some(expected.subaccount.as_slice())
+        || position_field("market_id")?.as_u128()? != u128::from(market_id)
+        || position_field("base_asset_amount")?.as_u128()? == 0
+    {
+        return None;
+    }
+    let unrealized = field("unrealized")?.as_i128()?;
+    let funding = field("funding")?.as_i128()?;
+    let total = field("total")?.as_i128()?;
+    (total == unrealized.saturating_add(funding)).then_some(DeepXPerpSettlement {
+        market_id,
+        unrealized,
+        funding,
+        total,
+    })
 }
 
 fn decode_indexed_perp_inclusion(
@@ -645,5 +815,140 @@ mod tests {
             ),
             Err(DeepXPerpPositionEventError::ConflictingEvent),
         ));
+    }
+
+    fn settlement_record(
+        runtime: &crate::signing::DeepXValidatedRuntime,
+        market_id: u16,
+        owner: [u8; 20],
+        total: i128,
+    ) -> Vec<u8> {
+        let position = ScaleValue::named_composite([
+            ("market_id", ScaleValue::u128(u128::from(market_id))),
+            ("is_long", ScaleValue::bool(true)),
+            ("base_asset_amount", ScaleValue::u128(1)),
+            ("entry_price", ScaleValue::u128(2)),
+            ("leverage", ScaleValue::u128(3)),
+            ("last_funding_rate", ScaleValue::i128(-4)),
+            ("version", ScaleValue::u128(5)),
+            ("realized_pnl", ScaleValue::i128(-6)),
+            ("funding_payment", ScaleValue::i128(7)),
+            ("owner", ScaleValue::from_bytes(owner)),
+            ("take_profit", ScaleValue::unnamed_variant("None", [])),
+            ("stop_loss", ScaleValue::unnamed_variant("None", [])),
+            ("last_settle_price", ScaleValue::u128(8)),
+        ]);
+        let fields = ScaleValue::named_composite([
+            ("owner", ScaleValue::from_bytes(owner)),
+            ("market_id", ScaleValue::u128(u128::from(market_id))),
+            ("unrealized", ScaleValue::i128(10)),
+            ("funding", ScaleValue::i128(-3)),
+            ("total", ScaleValue::i128(total)),
+            ("position", position),
+        ]);
+        business_record(runtime, "SettlePnl", 4, &fields)
+    }
+
+    #[rstest]
+    fn settle_pnl_binds_dispatch_account_market_and_exact_amounts() {
+        let runtime = runtime();
+        let one = DeepXPerpSettleExpected {
+            params: DeepXPerpSettlePnlParams {
+                subaccount: [0x11; 20],
+                market_id: Some(3),
+            },
+            extrinsic_index: 4,
+        };
+        let business = settlement_record(&runtime, 3, [0x11; 20], 7);
+        let success = dispatch_record(&runtime, true);
+        let decode = |expected, bytes: &[u8]| {
+            decode_perp_settle_inclusion(runtime.interfaces(), runtime.metadata(), expected, bytes)
+        };
+        let evidence = decode(one, &events(&[business.clone(), success.clone()])).unwrap();
+        assert_eq!(evidence.outcome, DeepXPerpPositionInclusionOutcome::Success);
+        assert_eq!(
+            evidence.settlements,
+            vec![DeepXPerpSettlement {
+                market_id: 3,
+                unrealized: 10,
+                funding: -3,
+                total: 7,
+            }],
+        );
+        assert!(matches!(
+            decode(one, &events(std::slice::from_ref(&success))),
+            Err(DeepXPerpPositionEventError::MissingBusinessEvent),
+        ));
+        assert!(matches!(
+            decode(
+                one,
+                &events(&[business.clone(), success.clone(), success.clone()])
+            ),
+            Err(DeepXPerpPositionEventError::DuplicateEvent),
+        ));
+        let mut truncated = events(&[business.clone(), success.clone()]);
+        truncated.pop();
+        assert!(decode(one, &truncated).is_err());
+        assert!(matches!(
+            decode(
+                one,
+                &events(&[business.clone(), business.clone(), success.clone()])
+            ),
+            Err(DeepXPerpPositionEventError::DuplicateEvent),
+        ));
+        assert!(matches!(
+            decode(
+                one,
+                &events(&[
+                    settlement_record(&runtime, 3, [0x22; 20], 7),
+                    success.clone()
+                ]),
+            ),
+            Err(DeepXPerpPositionEventError::ConflictingEvent),
+        ));
+        assert!(matches!(
+            decode(
+                one,
+                &events(&[
+                    settlement_record(&runtime, 3, [0x11; 20], 8),
+                    success.clone()
+                ]),
+            ),
+            Err(DeepXPerpPositionEventError::ConflictingEvent),
+        ));
+        assert!(matches!(
+            decode(one, &events(&[business, dispatch_record(&runtime, false)])),
+            Err(DeepXPerpPositionEventError::ConflictingBusinessEvent),
+        ));
+        assert_eq!(
+            decode(one, &events(&[dispatch_record(&runtime, false)]))
+                .unwrap()
+                .outcome,
+            DeepXPerpPositionInclusionOutcome::Failed,
+        );
+        let all = DeepXPerpSettleExpected {
+            params: DeepXPerpSettlePnlParams {
+                market_id: None,
+                ..one.params
+            },
+            ..one
+        };
+        assert!(
+            decode(all, &events(std::slice::from_ref(&success)))
+                .unwrap()
+                .settlements
+                .is_empty()
+        );
+        let settlements = decode(
+            all,
+            &events(&[
+                settlement_record(&runtime, 3, [0x11; 20], 7),
+                settlement_record(&runtime, 4, [0x11; 20], 7),
+                success,
+            ]),
+        )
+        .unwrap()
+        .settlements;
+        assert_eq!(settlements.len(), 2);
     }
 }

@@ -27,7 +27,7 @@ use crate::credential::DeepXPrivateKey;
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeepXQuotaClaimSignature {
-    /// Lowercase wallet address used in the signed message.
+    /// Exact wallet address used in the signed message.
     wallet: String,
     /// Caller-owned retry key, retained byte-for-byte.
     idempotency_key: String,
@@ -38,7 +38,7 @@ pub struct DeepXQuotaClaimSignature {
 }
 
 impl DeepXQuotaClaimSignature {
-    /// Returns the normalized wallet address.
+    /// Returns the wallet address exactly as signed.
     #[must_use]
     pub fn wallet(&self) -> &str {
         &self.wallet
@@ -88,7 +88,7 @@ pub enum DeepXQuotaClaimSigningError {
     SigningFailed,
 }
 
-/// Signs a quota-claim request offline with the wallet or an authorized delegate key.
+/// Signs a quota-claim request offline with a caller-supplied key.
 ///
 /// This only creates request fields. The caller owns durable idempotency and must establish
 /// signer authorization independently; no claim is sent or treated as granted.
@@ -101,11 +101,11 @@ pub fn sign_quota_claim(
     wallet: &str,
     idempotency_key: &str,
 ) -> Result<DeepXQuotaClaimSignature, DeepXQuotaClaimSigningError> {
-    let wallet = wallet
+    let wallet_hex = wallet
         .strip_prefix("0x")
         .ok_or(DeepXQuotaClaimSigningError::InvalidWallet)?;
     let mut wallet_bytes = [0_u8; 20];
-    hex::decode_to_slice(wallet, &mut wallet_bytes)
+    hex::decode_to_slice(wallet_hex, &mut wallet_bytes)
         .map_err(|_| DeepXQuotaClaimSigningError::InvalidWallet)?;
     if idempotency_key.is_empty()
         || idempotency_key.len() > 160
@@ -114,7 +114,6 @@ pub fn sign_quota_claim(
         return Err(DeepXQuotaClaimSigningError::InvalidIdempotencyKey);
     }
 
-    let wallet = format!("0x{}", hex::encode(wallet_bytes));
     let message =
         format!("DeepX quota claim\nWallet: {wallet}\nIdempotency-Key: {idempotency_key}");
     let signer = PrivateKeySigner::from_slice(key.as_bytes())
@@ -124,7 +123,7 @@ pub fn sign_quota_claim(
         .map_err(|_| DeepXQuotaClaimSigningError::SigningFailed)?;
 
     Ok(DeepXQuotaClaimSignature {
-        wallet,
+        wallet: wallet.to_string(),
         idempotency_key: idempotency_key.to_string(),
         message,
         signature: format!("0x{}", hex::encode(signature.as_bytes())),
@@ -151,7 +150,7 @@ mod tests {
     fn signs_exact_documented_message_with_independent_vector() {
         let signed = sign_quota_claim(
             &test_key(),
-            "0xFCAD0B19BB29D4674531D6F115237E16AFCE377C",
+            "0xfcad0b19bb29d4674531d6f115237e16afce377c",
             "018f52bc-0f0b-7cc4-b356-a91f62c72e3f",
         )
         .unwrap();
@@ -185,6 +184,30 @@ mod tests {
         assert_eq!(
             recovered.as_slice(),
             hex::decode(&signed.wallet()[2..]).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn preserves_explicit_wallet_case_in_signed_message() {
+        let wallet = "0xFCAD0B19BB29D4674531D6F115237E16AFCE377C";
+        let signed = sign_quota_claim(&test_key(), wallet, "claim-1").unwrap();
+        assert_eq!(signed.wallet(), wallet);
+        assert_eq!(
+            signed.message(),
+            "DeepX quota claim\nWallet: 0xFCAD0B19BB29D4674531D6F115237E16AFCE377C\nIdempotency-Key: claim-1"
+        );
+        let signature = Signature::try_from(
+            hex::decode(signed.signature().trim_start_matches("0x"))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let recovered = signature
+            .recover_address_from_prehash(&eip191_hash_message(signed.message().as_bytes()))
+            .unwrap();
+        assert_eq!(
+            recovered.as_slice(),
+            hex::decode(&wallet[2..]).unwrap().as_slice()
         );
     }
 

@@ -52,6 +52,8 @@ pub fn should_retry_http_error(error: &DeepXHttpError) -> bool {
         }
         | DeepXHttpError::Decode(_)
         | DeepXHttpError::InvalidRequest(_)
+        | DeepXHttpError::QuotaClaimFailed { .. }
+        | DeepXHttpError::QuotaClaimTimeout { .. }
         | DeepXHttpError::InvalidHistoryResponse { .. }
         | DeepXHttpError::InvalidAccountResponse { .. }
         | DeepXHttpError::InvalidTransactionStatus { .. }
@@ -96,6 +98,18 @@ mod tests {
         assert!(should_retry_http_error(&DeepXHttpError::Transport(
             "connection reset".to_string(),
         )));
+    }
+
+    #[rstest]
+    fn does_not_retry_quota_claim_outcomes() {
+        assert!(!should_retry_http_error(&DeepXHttpError::QuotaClaimFailed {
+            claim_id: 42,
+            message: "grant rejected".to_string(),
+        }));
+        assert!(!should_retry_http_error(&DeepXHttpError::QuotaClaimTimeout {
+            claim_id: 42,
+            last_status: "submitted".to_string(),
+        }));
     }
 
     #[rstest]
