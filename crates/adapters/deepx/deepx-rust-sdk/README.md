@@ -1,7 +1,28 @@
 # DeepX Rust SDK
 
 Rust types and transport for DeepX REST, JSON-RPC, WebSocket protocol messages, and offline
-transaction encoding. The crate does not depend on NautilusTrader runtime crates.
+transaction encoding.
+
+The crate requires Rust 1.98 or newer. To use a local checkout, add a path dependency to your
+application's `Cargo.toml`:
+
+```toml
+[dependencies]
+deepx-rust-sdk = { path = "/path/to/deepx-rust-sdk" }
+```
+
+To check a standalone checkout and its publishable archive, run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo package --allow-dirty
+```
+
+The package includes the LGPL-3.0-only license. The manifest owns its version and dependency
+versions, so these checks do not need a parent Cargo workspace. Publishing to a registry is a
+separate maintainer action.
 
 ```rust,no_run
 use deepx_rust_sdk::{
@@ -152,9 +173,6 @@ destination `BridgeIn`. `BRIDGE_EXPECTED_AUTHORIZER` verifies a returned signatu
 reported digest; `BRIDGE_EXPECTED_TX_ID` links a destination event to a known bridge protocol ID.
 Without that ID, the destination observation is only a matching recipient, token, and amount
 candidate. The SDK does not derive the bridge ID from the source transaction yet.
-The [Python example coverage checklist](python_example_coverage.md) tracks the remaining upstream
-example workflows.
-
 ## Live verification examples
 
 The verification examples target DeepX testnet. Most modes are read-only; `delegate-order
@@ -173,8 +191,7 @@ to the testnet endpoint. These examples require live network access and, for acc
 account with relevant testnet history.
 `deepx-sdk-query-account` also accepts `DEEPX_TESTNET_RPC_URL` for an alternate testnet RPC
 endpoint and checks its genesis hash before querying account state.
-The example modes below cover SDK-owned protocol checks. Adapter-specific framework checks remain
-in the programs under `../bin`.
+The example modes below cover SDK-owned protocol checks.
 
 - `deepx-sdk-verify-rest` covers public `verify_rest_*` market, trade, lending, book and
   open-interest programs. Modes are `instruments`, `perp-market`, `spot-market`, `lending`,
@@ -246,16 +263,13 @@ in the programs under `../bin`.
   `signing-vectors` runs offline against captured spec-376 metadata and verifies complete no-op,
   System remark, and perpetual placement extrinsic bytes, EIP-1559 and legacy EVM envelope and
   runtime wrapper bytes, perpetual profit/loss-point precompile hashes, and the runtime/genesis
-  binding of a finalized Perp cancel signature. The external Python SDK comparison in
-  `bin/verify_sdk_signing.py` still requires its pinned Python source inputs.
+  binding of a finalized Perp cancel signature.
 
 The SDK examples use SDK models and protocol operations. The finalized account modes validate
 the read-only runtime at the pinned block and verify block-pinned raw reads; `finalized-wallet`
 also checks the current REST subaccount directory before and after those reads. `finalized-account`
 and `finalized-wallet` check block-selected `eth_call` and agree storage, storage-query, and block
 inherent timestamps at that checkpoint. They check endpoint identity and advertised capabilities,
-but do not establish historical wallet ownership or the
-adapter's complete account and framework mapping evidence. Adapter programs that also
-verify NautilusTrader instruments, data client responses, unsubscribe behavior, and shutdown retain
-those checks in the adapter crate. The SDK `public` and `spot-live-trades` modes verify their
-underlying trade and book protocols without asserting framework event mapping.
+but do not establish historical wallet ownership or application-specific event mapping. The SDK
+`public` and `spot-live-trades` modes verify their underlying trade and book protocols without
+asserting downstream event mapping.

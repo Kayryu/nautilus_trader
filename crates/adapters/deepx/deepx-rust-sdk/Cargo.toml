@@ -1,48 +1,89 @@
 [package]
 name = "deepx-rust-sdk"
 readme = "README.md"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+license = "LGPL-3.0-only"
 description = "Rust SDK for DeepX REST and RPC access"
-categories.workspace = true
-keywords.workspace = true
-documentation.workspace = true
-repository.workspace = true
-homepage.workspace = true
-
-[lints]
-workspace = true
+categories = ["api-bindings", "asynchronous", "finance"]
+keywords = ["deepx", "trading", "exchange", "sdk", "blockchain"]
+documentation = "https://docs.rs/deepx-rust-sdk"
 
 [dependencies]
-alloy = { workspace = true }
-anyhow = { workspace = true }
-aws-lc-rs = { workspace = true }
-frame-metadata = { workspace = true }
+alloy = { version = "=2.4.1", default-features = false, features = [
+  "sol-types",
+  "contract",
+  "signers",
+  "signer-local",
+  "consensus",
+  "eips",
+] }
+anyhow = "1.0.104"
+aws-lc-rs = { version = "1.18.0", default-features = false, features = ["non-fips"] }
+frame-metadata = { version = "23.0.1", default-features = false, features = ["current", "decode"] }
 hex = "0.4"
-jiff = { workspace = true }
-parity-scale-codec = { workspace = true }
-reqwest = { workspace = true }
-rust_decimal = { workspace = true }
-rustls = { workspace = true }
-scale-info = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sp-crypto-hashing = { workspace = true }
-subxt-core = { workspace = true }
-subxt-signer = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
-zeroize = { workspace = true }
+jiff = { version = "0.2.35", default-features = false, features = [
+  "perf-inline",
+  "serde",
+  "std",
+  "tz-fat",
+  "tzdb-bundle-always",
+] }
+parity-scale-codec = { version = "3.7.5", default-features = false, features = ["std"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "http2",
+  "json",
+  "query",
+  "rustls",
+  "stream",
+] }
+rust_decimal = { version = "1.42.1", features = ["serde-with-float"] }
+rustls = { version = "0.23.43", default-features = false, features = [
+  "aws-lc-rs",
+  "logging",
+  "std",
+  "tls12",
+] }
+scale-info = { version = "2.11.6", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std", "rc"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["raw_value", "std"] }
+sp-crypto-hashing = "0.1.0"
+subxt-core = { version = "=0.44.0", default-features = false, features = ["std"] }
+subxt-signer = { version = "=0.44.0", default-features = false, features = [
+  "std",
+  "subxt",
+  "unstable-eth",
+] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false, features = [
+  "rt-multi-thread",
+  "sync",
+  "fs",
+  "io-util",
+  "net",
+  "time",
+  "macros",
+  "signal",
+] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
+zeroize = { version = "1.9.0", features = ["alloc", "zeroize_derive"] }
 
 [dev-dependencies]
-axum = { workspace = true }
-futures-util = { workspace = true }
-rstest = { workspace = true }
-tokio-tungstenite = { workspace = true }
+axum = { version = "0.8.9", default-features = false, features = [
+  "tokio",
+  "http1",
+  "json",
+  "query",
+  "ws",
+] }
+futures-util = { version = "0.3.34", default-features = false, features = [
+  "std",
+  "async-await",
+  "sink",
+] }
+rstest = "0.26.1"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 
 [[example]]
 name = "deepx-sdk-async-order-monitoring"

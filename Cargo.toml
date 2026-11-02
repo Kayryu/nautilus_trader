@@ -99,7 +99,6 @@ nautilus-trading = { path = "crates/trading", version = "0.63.0" }
 #
 # Note: default-features = false keeps high-precision selection explicit
 # -----------------------------------------------------------------------------
-deepx-rust-sdk = { path = "crates/adapters/deepx/deepx-rust-sdk", version = "0.63.0" }
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.63.0" }
 nautilus-betfair = { path = "crates/adapters/betfair", version = "0.63.0", default-features = false }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.63.0", default-features = false }
@@ -403,6 +402,7 @@ rcgen = { version = "0.14.9", default-features = false, features = [
 rstest = "0.26.1"
 tempfile = "3.27.0"
 turmoil = "0.7.2"
+deepx-rust-sdk = { path = "crates/adapters/deepx/deepx-rust-sdk" }
 
 # -----------------------------------------------------------------------------
 # Build dependencies

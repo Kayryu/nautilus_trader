@@ -33,6 +33,6 @@
     "The REST response is not pinned to a block hash.",
     "Equity and unrealized PnL are mutable point-in-time observations.",
     "The fixture proves observed response shape and exact decimal representation only.",
-    "It does not authorize trading or construct a Nautilus account-state event."
+    "It does not authorize trading or construct a downstream account-state event."
   ]
 }

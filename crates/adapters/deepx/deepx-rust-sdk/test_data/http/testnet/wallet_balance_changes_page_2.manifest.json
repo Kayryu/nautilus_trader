@@ -33,6 +33,6 @@
     "The REST response is not pinned to a block hash.",
     "The page is a mutable wallet-scoped point-in-time observation.",
     "The fixture proves only the captured first-page fields, cursor metadata, and exact numeric representations.",
-    "It does not prove complete wallet history or construct Nautilus account balances."
+    "It does not prove complete wallet history or construct downstream account balances."
   ]
 }

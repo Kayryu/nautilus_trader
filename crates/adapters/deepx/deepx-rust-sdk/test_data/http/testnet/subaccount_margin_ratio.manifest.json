@@ -34,6 +34,6 @@
     "Collateral and margin requirement are mutable point-in-time observations.",
     "The endpoint does not identify whether marginRequired uses initial or maintenance weights.",
     "The fixture proves observed response shape and exact decimal representation only.",
-    "It does not authorize trading or construct a Nautilus margin balance."
+    "It does not authorize trading or construct a downstream margin balance."
   ]
 }
