@@ -11,7 +11,6 @@ members = [
   "crates/adapters/coinbase",
   "crates/adapters/databento",
   "crates/adapters/deepx",
-  "crates/adapters/deepx/deepx-rust-sdk",
   "crates/adapters/deribit",
   "crates/adapters/derive",
   "crates/adapters/dydx",
@@ -402,7 +401,7 @@ rcgen = { version = "0.14.9", default-features = false, features = [
 rstest = "0.26.1"
 tempfile = "3.27.0"
 turmoil = "0.7.2"
-deepx-rust-sdk = { path = "crates/adapters/deepx/deepx-rust-sdk" }
+deepx-rust-sdk = { path = "./deepx-rust-sdk" }
 
 # -----------------------------------------------------------------------------
 # Build dependencies
