@@ -30,7 +30,15 @@ use anyhow::Context;
 use async_trait::async_trait;
 use deepx_rust_sdk::{
     identity::decode_account_id20,
-    rpc::{chain_decode::decode_prefixed_hash, spot_market_spec::parse_spot_pair},
+    rest::{
+        perp_order_match::{
+            DeepXPerpOrderMatchError, DeepXPerpOrderMatchExpected, verify_perp_order_match,
+        },
+        spot_order_match::{
+            DeepXSpotOrderMatchError, DeepXSpotOrderMatchExpected, verify_spot_order_match,
+        },
+    },
+    rpc::{spot_market_spec::parse_spot_pair, spot_place::spot_limit_amounts},
     symbol::normalize_spot_pair,
 };
 use nautilus_common::{
@@ -77,9 +85,7 @@ use crate::{
         map_finalized_flat_account_balances, map_finalized_margin_balance_with_evidence,
     },
     common::{
-        DeepXEnvironment, DeepXPrivateKey,
-        consts::DEEPX_VENUE,
-        parse::{decimal_to_scaled_i128, scaled_i128_to_decimal},
+        DeepXEnvironment, DeepXPrivateKey, consts::DEEPX_VENUE, parse::decimal_to_scaled_i128,
     },
     config::{
         DeepXExecutionBackend, DeepXExecutionClientConfig, DeepXRpcRole, DeepXValidatedRpcEndpoints,
@@ -247,28 +253,6 @@ fn consume_order_report_pages(remaining_pages: &mut usize, pages: usize) -> anyh
     Ok(())
 }
 
-fn spot_limit_amounts(
-    quantity: rust_decimal::Decimal,
-    price: rust_decimal::Decimal,
-    base_precision: u8,
-    quote_precision: u8,
-) -> anyhow::Result<(u128, u128)> {
-    anyhow::ensure!(
-        quote_precision == 6,
-        "DeepX Spot limit mapping requires six-decimal quote precision"
-    );
-    let base_amount = u128::try_from(decimal_to_scaled_i128(quantity, u32::from(base_precision))?)?;
-    let quote_value = quantity
-        .checked_mul(price)
-        .ok_or_else(|| anyhow::anyhow!("DeepX Spot notional exceeds Decimal"))?;
-    let quote_amount = u128::try_from(decimal_to_scaled_i128(
-        quote_value,
-        u32::from(quote_precision),
-    )?)?;
-    anyhow::ensure!(base_amount > 0 && quote_amount > 0);
-    Ok((base_amount, quote_amount))
-}
-
 fn verify_backend_spot_order_for_durable_place(
     record: &DeepXSpotOrderRecord,
     transaction: &DeepXTransactionRecord,
@@ -293,87 +277,41 @@ fn verify_backend_spot_order_for_durable_place(
     let DeepXNonceReservation::TimestampOrderId { value: order_id } = identity.nonce() else {
         return Err(Error::Mismatch("nonce domain"));
     };
-    if record.order_id != order_id.to_string() {
-        return Err(Error::Mismatch("order ID"));
-    }
-    let owner = decode_account_id20(&record.maker).ok_or(Error::Mismatch("owner encoding"))?;
-    if owner != *subaccount {
-        return Err(Error::Mismatch("owner"));
-    }
-    let record_pair = decode_prefixed_hash(&record.pair).ok_or(Error::Mismatch("pair encoding"))?;
-    let market_pair =
-        decode_prefixed_hash(&market.pair).ok_or(Error::Mismatch("catalog pair encoding"))?;
-    if record_pair != *pair || market_pair != *pair || record.pair_name != market.name {
-        return Err(Error::Mismatch("market"));
-    }
-    if *is_buy != (identity.order_side() == OrderSide::Buy)
-        || record.order_side != if *is_buy { "Buy" } else { "Sell" }
-    {
+    if *is_buy != (identity.order_side() == OrderSide::Buy) {
         return Err(Error::Mismatch("direction"));
-    }
-    if !matches!(
-        order_type,
-        DeepXSpotOrderType::Limit(DeepXTimeInForce::Gtc | DeepXTimeInForce::Ioc)
-    ) || record.price_type != "Limit"
-    {
-        return Err(Error::Mismatch("order type"));
-    }
-    if *post_only != DeepXPostOnlyParam::None
-        || *reduce_only
-        || record.post_only != "None"
-        || record.reduce_only
-    {
-        return Err(Error::Mismatch("order flags"));
-    }
-
-    let exact_amount = |bytes: &[u8; 32], scale: u8| {
-        if bytes[16..].iter().any(|byte| *byte != 0) {
-            return Err(Error::AmountConversion("amount exceeds u128".to_string()));
-        }
-        let mut low_bytes = [0_u8; 16];
-        low_bytes.copy_from_slice(&bytes[..16]);
-        let raw = u128::from_le_bytes(low_bytes);
-        let signed = i128::try_from(raw).map_err(|e| Error::AmountConversion(e.to_string()))?;
-        scaled_i128_to_decimal(signed, u32::from(scale))
-            .map_err(|e| Error::AmountConversion(e.to_string()))
-    };
-    let expected_base = exact_amount(base_amount, market.base_decimal)?;
-    let expected_quote = exact_amount(quote_amount, market.quote_decimal)?;
-    if expected_base <= rust_decimal::Decimal::ZERO
-        || expected_quote <= rust_decimal::Decimal::ZERO
-        || record.price <= rust_decimal::Decimal::ZERO
-        || expected_base.checked_mul(record.price) != Some(expected_quote)
-    {
-        return Err(Error::Mismatch("price or signed amount"));
-    }
-    let improved_buy_fill =
-        *is_buy && record.status == "Filled" && record.base_amount > expected_base;
-    if (record.base_amount != expected_base && !improved_buy_fill)
-        || (*is_buy && record.quote_amount > expected_quote)
-        || (record.base_remaining_amount == record.base_amount
-            && record.quote_amount != expected_quote)
-        || record.base_remaining_amount < rust_decimal::Decimal::ZERO
-        || record.base_remaining_amount > record.base_amount
-        || record.quote_remaining_amount < rust_decimal::Decimal::ZERO
-        || record.quote_remaining_amount > record.quote_amount
-    {
-        return Err(Error::Mismatch("execution amounts"));
     }
     let signed = transaction
         .signed_extrinsic()
         .ok_or(Error::Mismatch("signed extrinsic"))?;
     let extrinsic_hash = signed.extrinsic_hash();
-    let backend_hash = decode_prefixed_hash(&record.tx_hash)
-        .ok_or(Error::Mismatch("transaction hash encoding"))?;
-    if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash)
-        || backend_hash != extrinsic_hash
-        || record.tx_hash_type != "EXTRINSIC_HASH"
-    {
+    if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash) {
         return Err(Error::Mismatch("transaction hash"));
     }
-    if record.block_number == 0 {
-        return Err(Error::Mismatch("block number"));
-    }
+    verify_spot_order_match(
+        record,
+        DeepXSpotOrderMatchExpected {
+            params: DeepXSpotPlaceParams {
+                subaccount: *subaccount,
+                pair: *pair,
+                is_buy: *is_buy,
+                quote_amount: *quote_amount,
+                base_amount: *base_amount,
+                order_type: *order_type,
+                post_only: *post_only,
+                reduce_only: *reduce_only,
+            },
+            order_id,
+            market_name: &market.name,
+            market_pair: &market.pair,
+            base_decimal: market.base_decimal,
+            quote_decimal: market.quote_decimal,
+            extrinsic_hash,
+        },
+    )
+    .map_err(|e| match e {
+        DeepXSpotOrderMatchError::Mismatch(field) => Error::Mismatch(field),
+        DeepXSpotOrderMatchError::AmountConversion(message) => Error::AmountConversion(message),
+    })?;
     Ok(DeepXBackendOrderEvidence::new(
         extrinsic_hash,
         order_id,
@@ -1425,6 +1363,36 @@ pub enum DeepXPerpOrderEvidenceError {
     /// The REST execution quantities are internally invalid.
     #[error("DeepX REST order has inconsistent execution quantities")]
     InvalidExecutionQuantities,
+}
+
+impl From<DeepXPerpOrderMatchError> for DeepXPerpOrderEvidenceError {
+    fn from(error: DeepXPerpOrderMatchError) -> Self {
+        use DeepXPerpOrderEvidenceError as Evidence;
+        use DeepXPerpOrderMatchError as Match;
+
+        match error {
+            Match::OrderIdMismatch => Evidence::OrderIdMismatch,
+            Match::InvalidOwner => Evidence::InvalidOwner,
+            Match::OwnerMismatch => Evidence::OwnerMismatch,
+            Match::MarketMismatch => Evidence::MarketMismatch,
+            Match::DirectionMismatch => Evidence::DirectionMismatch,
+            Match::FinancialConversion(message) => Evidence::FinancialConversion(message),
+            Match::SizeMismatch => Evidence::SizeMismatch,
+            Match::PriceMismatch => Evidence::PriceMismatch,
+            Match::UnsupportedOrderType => Evidence::UnsupportedOrderType,
+            Match::OrderTypeMismatch => Evidence::OrderTypeMismatch,
+            Match::TakeProfitMismatch => Evidence::TakeProfitMismatch,
+            Match::StopLossMismatch => Evidence::StopLossMismatch,
+            Match::ReduceOnlyMismatch => Evidence::ReduceOnlyMismatch,
+            Match::UnsupportedPostOnly => Evidence::UnsupportedPostOnly,
+            Match::PostOnlyMismatch => Evidence::PostOnlyMismatch,
+            Match::HashTypeMismatch => Evidence::HashTypeMismatch,
+            Match::InvalidTransactionHash => Evidence::InvalidTransactionHash,
+            Match::TransactionHashMismatch => Evidence::TransactionHashMismatch,
+            Match::InvalidBlockNumber => Evidence::InvalidBlockNumber,
+            Match::InvalidExecutionQuantities => Evidence::InvalidExecutionQuantities,
+        }
+    }
 }
 
 /// Errors while querying and binding one backend perpetual order to a durable placement.
@@ -4808,77 +4776,9 @@ impl DeepXExecutionClient {
         else {
             return Err(DeepXPerpOrderEvidenceError::NonceDomainMismatch);
         };
-        if record.order_id != order_id.to_string() {
-            return Err(DeepXPerpOrderEvidenceError::OrderIdMismatch);
-        }
-
-        let owner =
-            decode_account_id20(&record.owner).ok_or(DeepXPerpOrderEvidenceError::InvalidOwner)?;
-        if owner != *subaccount {
-            return Err(DeepXPerpOrderEvidenceError::OwnerMismatch);
-        }
-
-        if catalog_market_id != u64::from(*market_id) || record.market_id != catalog_market_id {
-            return Err(DeepXPerpOrderEvidenceError::MarketMismatch);
-        }
-        if *is_long != (identity.order_side() == OrderSide::Buy) || record.is_long != *is_long {
+        if *is_long != (identity.order_side() == OrderSide::Buy) {
             return Err(DeepXPerpOrderEvidenceError::DirectionMismatch);
         }
-
-        let runtime_decimal = |value: u128, scale: u32| {
-            let value = i128::try_from(value)
-                .map_err(|e| DeepXPerpOrderEvidenceError::FinancialConversion(e.to_string()))?;
-            scaled_i128_to_decimal(value, scale)
-                .map_err(|e| DeepXPerpOrderEvidenceError::FinancialConversion(e.to_string()))
-        };
-        if record.size != runtime_decimal(*size, u32::from(metadata.base_decimal))? {
-            return Err(DeepXPerpOrderEvidenceError::SizeMismatch);
-        }
-        let expected_record_order_type = match order_type {
-            DeepXPerpOrderType::Limit(DeepXTimeInForce::Gtc | DeepXTimeInForce::Ioc) => {
-                if record.price != runtime_decimal(*price, 6)? {
-                    return Err(DeepXPerpOrderEvidenceError::PriceMismatch);
-                }
-                "Limit"
-            }
-            DeepXPerpOrderType::Market(None) if *price == 0 => {
-                if record.price <= rust_decimal::Decimal::ZERO {
-                    return Err(DeepXPerpOrderEvidenceError::PriceMismatch);
-                }
-                "Market"
-            }
-            _ => return Err(DeepXPerpOrderEvidenceError::UnsupportedOrderType),
-        };
-        if record.order_type != expected_record_order_type {
-            return Err(DeepXPerpOrderEvidenceError::OrderTypeMismatch);
-        }
-
-        let take_profit = take_profit
-            .map(|value| runtime_decimal(value, 6))
-            .transpose()?;
-        if record.take_profit != take_profit {
-            return Err(DeepXPerpOrderEvidenceError::TakeProfitMismatch);
-        }
-        let stop_loss = stop_loss
-            .map(|value| runtime_decimal(value, 6))
-            .transpose()?;
-        if record.stop_loss != stop_loss {
-            return Err(DeepXPerpOrderEvidenceError::StopLossMismatch);
-        }
-        if record.reduce_only != *reduce_only {
-            return Err(DeepXPerpOrderEvidenceError::ReduceOnlyMismatch);
-        }
-        let expected_post_only = match post_only {
-            DeepXPostOnlyParam::None => "None",
-            DeepXPostOnlyParam::MustPostOnly => "MustPostOnly",
-            DeepXPostOnlyParam::Adaptive => {
-                return Err(DeepXPerpOrderEvidenceError::UnsupportedPostOnly);
-            }
-        };
-        if record.post_only != expected_post_only {
-            return Err(DeepXPerpOrderEvidenceError::PostOnlyMismatch);
-        }
-
         let signed = transaction
             .signed_extrinsic()
             .ok_or(DeepXPerpOrderEvidenceError::MissingSignedExtrinsic)?;
@@ -4886,27 +4786,28 @@ impl DeepXExecutionClient {
         if transaction.lifecycle().extrinsic_hash() != Some(extrinsic_hash) {
             return Err(DeepXPerpOrderEvidenceError::DurableHashMismatch);
         }
-        if record.tx_hash_type != "EXTRINSIC_HASH" {
-            return Err(DeepXPerpOrderEvidenceError::HashTypeMismatch);
-        }
-        let rest_hash = record
-            .tx_hash
-            .strip_prefix("0x")
-            .and_then(|value| nautilus_core::hex::decode_array::<32>(value).ok())
-            .ok_or(DeepXPerpOrderEvidenceError::InvalidTransactionHash)?;
-        if rest_hash != extrinsic_hash {
-            return Err(DeepXPerpOrderEvidenceError::TransactionHashMismatch);
-        }
-        if record.height == 0 {
-            return Err(DeepXPerpOrderEvidenceError::InvalidBlockNumber);
-        }
-        if record.size_filled.is_sign_negative()
-            || record.size_remain.is_sign_negative()
-            || record.size_filled > record.size
-            || record.size_remain > record.size
-        {
-            return Err(DeepXPerpOrderEvidenceError::InvalidExecutionQuantities);
-        }
+        verify_perp_order_match(
+            record,
+            DeepXPerpOrderMatchExpected {
+                params: DeepXPerpPlaceParams {
+                    subaccount: *subaccount,
+                    market_id: *market_id,
+                    is_long: *is_long,
+                    size: *size,
+                    price: *price,
+                    order_type: *order_type,
+                    take_profit: *take_profit,
+                    stop_loss: *stop_loss,
+                    reduce_only: *reduce_only,
+                    post_only: *post_only,
+                },
+                order_id,
+                catalog_market_id,
+                base_decimal: metadata.base_decimal,
+                extrinsic_hash,
+            },
+        )
+        .map_err(DeepXPerpOrderEvidenceError::from)?;
 
         Ok(DeepXPerpOrderEvidence {
             extrinsic_hash,
@@ -11974,28 +11875,28 @@ mod tests {
     }
 
     const GENESIS_FIXTURE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/runtime/testnet/\
+        "../../../../deepx-rust-sdk/test_data/runtime/testnet/\
          genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          genesis_hash.json"
     );
     const FINALIZED_HEAD_FIXTURE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/runtime/testnet/\
+        "../../../../deepx-rust-sdk/test_data/runtime/testnet/\
          genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          finalized_head.json"
     );
     const METADATA_FIXTURE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/runtime/testnet/\
+        "../../../../deepx-rust-sdk/test_data/runtime/testnet/\
             genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/\
          metadata.json"
     );
     const PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/http/testnet/perp_history_orders_account_market_3.json"
+        "../../../../deepx-rust-sdk/test_data/http/testnet/perp_history_orders_account_market_3.json"
     );
     const PERP_POSITIONS_ACCOUNT_RESPONSE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/http/testnet/perp_positions_account_market_3.json"
+        "../../../../deepx-rust-sdk/test_data/http/testnet/perp_positions_account_market_3.json"
     );
     const PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE: &str = include_str!(
-        "../deepx-rust-sdk/test_data/http/testnet/perp_account_trades_account_market_3.json"
+        "../../../../deepx-rust-sdk/test_data/http/testnet/perp_account_trades_account_market_3.json"
     );
     const EMPTY_SPOT_MARKETS_RESPONSE: &str =
         r#"{"code":200,"msg":"success","data":[],"fail":false}"#;
@@ -12329,7 +12230,7 @@ mod tests {
 
     async fn report_test_client(path: &'static str, mut response: Value) -> DeepXExecutionClient {
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         for item in response["data"]["items"].as_array_mut().unwrap() {
             item["owner"] = TEST_SUBACCOUNT.into();
         }
@@ -12398,7 +12299,7 @@ mod tests {
         mut history_response: Value,
     ) -> DeepXExecutionClient {
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         for response in [&mut open_response, &mut history_response] {
             for item in response["data"]["items"].as_array_mut().unwrap() {
                 item["owner"] = TEST_SUBACCOUNT.into();
@@ -12467,7 +12368,7 @@ mod tests {
         mut position_response: Value,
     ) -> DeepXExecutionClient {
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         trade_response["data"]["items"]
             .as_array_mut()
             .unwrap()
@@ -12545,7 +12446,7 @@ mod tests {
 
     fn commission_test_client() -> (DeepXExecutionClient, InstrumentAny) {
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let response: Value = serde_json::from_str(PERP_RESPONSE).unwrap();
         let market: DeepXPerpMarket = serde_json::from_value(
             response["data"]
@@ -14738,9 +14639,9 @@ mod tests {
     #[tokio::test]
     async fn instrument_startup_accepts_complete_market_catalog() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -14902,7 +14803,7 @@ mod tests {
         DeepXSpotReportMarket,
     ) {
         let response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record: DeepXSpotOrderRecord =
@@ -15015,7 +14916,7 @@ mod tests {
     async fn live_spot_backend_order_lookup_waits_for_indexing() {
         let (record, transaction, market) = backend_spot_order_fixture();
         let mut response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["txHash"] = json!(record.tx_hash);
@@ -15578,140 +15479,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perp_rest_order_evidence_rejects_each_rest_identity_mismatch() {
-        let client = perp_order_mapping_test_client().await;
-        let mut rest_order = tracked_limit_order_record();
-        rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
-        let transaction = durable_record_for_rest_order(
-            &mut rest_order,
-            fixture_perp_place_params(),
-            OrderSide::Buy,
-        );
-        let verify = |candidate: &DeepXPerpOrderRecord| {
-            client.verify_perp_order_record_for_durable_place(candidate, &transaction)
-        };
-
-        let mut candidate = rest_order.clone();
-        candidate.order_id = format!("0{}", candidate.order_id);
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::OrderIdMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.owner = candidate.owner.trim_start_matches("0x").to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::InvalidOwner)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.owner = "0x2222222222222222222222222222222222222222".to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::OwnerMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.market_id = 4;
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::MarketMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.is_long = false;
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::DirectionMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.size += rust_decimal::Decimal::new(1, 1);
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::SizeMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.price += rust_decimal::Decimal::new(1, 6);
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::PriceMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.order_type = "Market".to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::OrderTypeMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.take_profit = Some(rust_decimal::Decimal::ONE);
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::TakeProfitMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.stop_loss = Some(rust_decimal::Decimal::ONE);
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::StopLossMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.reduce_only = true;
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::ReduceOnlyMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.post_only = "MustPostOnly".to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::PostOnlyMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.tx_hash_type = "BLOCK_HASH".to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::HashTypeMismatch)
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.tx_hash = "invalid".to_string();
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::InvalidTransactionHash),
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.tx_hash = format!("0x{}", hex::encode([0x55; 32]));
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::TransactionHashMismatch),
-        );
-
-        let mut candidate = rest_order.clone();
-        candidate.height = 0;
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::InvalidBlockNumber)
-        );
-
-        let mut candidate = rest_order;
-        candidate.size_filled = candidate.size + rust_decimal::Decimal::ONE;
-        assert_eq!(
-            verify(&candidate),
-            Err(DeepXPerpOrderEvidenceError::InvalidExecutionQuantities),
-        );
-    }
-
-    #[tokio::test]
     async fn finalized_perp_order_evidence_requires_matching_chain_location() {
         let client = perp_order_mapping_test_client().await;
         let mut rest_order = tracked_limit_order_record();
@@ -15788,23 +15555,6 @@ mod tests {
         let client = perp_order_mapping_test_client().await;
         let mut rest_order = tracked_limit_order_record();
         rest_order.owner = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc".to_string();
-
-        let mut params = fixture_perp_place_params();
-        params.order_type = DeepXPerpOrderType::Limit(DeepXTimeInForce::Fok);
-        let transaction = durable_record_for_rest_order(&mut rest_order, params, OrderSide::Buy);
-        assert_eq!(
-            client.verify_perp_order_record_for_durable_place(&rest_order, &transaction),
-            Err(DeepXPerpOrderEvidenceError::UnsupportedOrderType),
-        );
-
-        let mut params = fixture_perp_place_params();
-        params.post_only = DeepXPostOnlyParam::Adaptive;
-        let transaction = durable_record_for_rest_order(&mut rest_order, params, OrderSide::Buy);
-        assert_eq!(
-            client.verify_perp_order_record_for_durable_place(&rest_order, &transaction),
-            Err(DeepXPerpOrderEvidenceError::UnsupportedPostOnly),
-        );
-
         let transaction = durable_record_for_rest_order(
             &mut rest_order,
             fixture_perp_place_params(),
@@ -15814,61 +15564,6 @@ mod tests {
             client.verify_perp_order_record_for_durable_place(&rest_order, &transaction),
             Err(DeepXPerpOrderEvidenceError::DirectionMismatch),
         );
-
-        macro_rules! assert_params_error {
-            ($params:expr, $expected:expr) => {{
-                let transaction =
-                    durable_record_for_rest_order(&mut rest_order, $params, OrderSide::Buy);
-                assert_eq!(
-                    client.verify_perp_order_record_for_durable_place(&rest_order, &transaction),
-                    Err($expected),
-                );
-            }};
-        }
-
-        let mut params = fixture_perp_place_params();
-        params.subaccount = [0x22; 20];
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::OwnerMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.market_id = 4;
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::MarketMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.size += 1;
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::SizeMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.price += 1;
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::PriceMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.take_profit = Some(2_600_000_000);
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::TakeProfitMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.stop_loss = Some(2_400_000_000);
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::StopLossMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.reduce_only = true;
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::ReduceOnlyMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.post_only = DeepXPostOnlyParam::MustPostOnly;
-        assert_params_error!(params, DeepXPerpOrderEvidenceError::PostOnlyMismatch);
-
-        let mut params = fixture_perp_place_params();
-        params.size = u128::MAX;
-        assert!(matches!(
-            {
-                let transaction =
-                    durable_record_for_rest_order(&mut rest_order, params, OrderSide::Buy);
-                client.verify_perp_order_record_for_durable_place(&rest_order, &transaction)
-            },
-            Err(DeepXPerpOrderEvidenceError::FinancialConversion(_)),
-        ));
-
         let identity = transaction.identity();
         let unsigned = DeepXTransactionRecord::created(DeepXTransactionIdentity::new_perp_place(
             ClientOrderId::new("O-DEEPX-REST-EVIDENCE-UNSIGNED"),
@@ -15942,18 +15637,6 @@ mod tests {
                 .route_execution_update(Some(order.client_order_id()))
                 .unwrap(),
             DeepXExecutionUpdateRoute::External,
-        );
-    }
-
-    #[test]
-    fn spot_limit_amounts_use_exact_runtime_currency_scales() {
-        let (base, quote) =
-            spot_limit_amounts("0.01".parse().unwrap(), "2500".parse().unwrap(), 18, 6).unwrap();
-
-        assert_eq!(base, 10_000_000_000_000_000);
-        assert_eq!(quote, 25_000_000);
-        assert!(
-            spot_limit_amounts("0.01".parse().unwrap(), "2500".parse().unwrap(), 18, 18,).is_err()
         );
     }
 
@@ -16227,9 +15910,9 @@ mod tests {
     #[tokio::test]
     async fn instrument_catalog_snapshot_is_cleared_on_startup_reset() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16265,9 +15948,9 @@ mod tests {
     #[tokio::test]
     async fn instrument_startup_coordinator_loads_complete_configured_catalog() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16302,7 +15985,7 @@ mod tests {
     #[tokio::test]
     async fn instrument_startup_coordinator_keeps_gate_after_partial_load_failure() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         let router = Router::new().route(
             "/internal/v1/market/spot/markets",
             get(|| async { SPOT_RESPONSE }),
@@ -16331,9 +16014,9 @@ mod tests {
     #[tokio::test]
     async fn account_state_preparation_failure_resets_prior_startup_evidence() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16412,9 +16095,9 @@ mod tests {
     #[tokio::test]
     async fn instrument_startup_rejects_unconfigured_rest_endpoint_without_advancing() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -16451,9 +16134,9 @@ mod tests {
     #[tokio::test]
     async fn instrument_startup_rejects_unconfigured_failover_endpoint() {
         const SPOT_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let router = Router::new()
             .route(
                 "/internal/v1/market/spot/markets",
@@ -18940,7 +18623,7 @@ mod tests {
     #[tokio::test]
     async fn direct_pallet_tracked_order_report_uses_validated_rest_record() {
         const PERP_RESPONSE: &str =
-            include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+            include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
         let mut fixture: Value =
             serde_json::from_str(PERP_HISTORY_ORDERS_ACCOUNT_RESPONSE).unwrap();
         let mut order = fixture["data"]["items"][2].take();
@@ -19094,7 +18777,7 @@ mod tests {
         let context = OrderContext::from(&order);
         let venue_order_id = VenueOrderId::from("1789627379350");
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19153,7 +18836,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_spot_order_status_command_queries_and_maps_rest_record() {
         let mut response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["maker"] = TEST_SUBACCOUNT.into();
@@ -19254,7 +18937,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_spot_order_reports_include_only_tracked_open_orders() {
         let mut response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         response["data"]["maker"] = TEST_SUBACCOUNT.into();
@@ -19351,7 +19034,7 @@ mod tests {
         let order = test_order_with_instrument("O-DEEPX-SPOT-STATUS", "0.8849", "ETH-USDC.DEEPX");
         let context = OrderContext::from(&order);
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19405,7 +19088,7 @@ mod tests {
         #[case] filled_at_better_price: bool,
     ) {
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19546,7 +19229,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let http = DeepXHttpClient::new(format!("http://{address}"), Some(2), None).unwrap();
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -19718,7 +19401,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let response: DeepXApiResponse<DeepXSpotOrderRecord> = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_by_id_canceled.json"
         ))
         .unwrap();
         let mut record = response.data;
@@ -20858,7 +20541,7 @@ mod tests {
         #[case] expected_spot_requests: usize,
     ) {
         let spot_response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
         ))
         .unwrap();
         let spot_requests = Arc::new(AtomicUsize::new(0));
@@ -20975,7 +20658,7 @@ mod tests {
         #[case] all_markets: bool,
     ) {
         let response: Value = serde_json::from_str(include_str!(
-            "../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
         ))
         .unwrap();
         let item = response["data"]["items"][2].clone();

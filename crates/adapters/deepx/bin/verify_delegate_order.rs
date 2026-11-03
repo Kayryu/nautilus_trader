@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 use deepx_rust_sdk::rpc::{
-    DeepXRpcClient, get_finalized_head, get_header,
+    DeepXRpcBlockHeader, DeepXRpcBlockResponse, DeepXRpcClient,
+    chain_decode::{decode_block_number_u32, decode_prefixed_hash},
+    get_finalized_head, get_header,
     timestamp::{decode_timestamp_set_inherent, get_timestamp_now},
 };
 use nautilus_core::hex;
@@ -42,29 +44,12 @@ use nautilus_deepx::{
     },
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use serde::Deserialize;
 use serde_json::json;
 
 const MAX_CLOCK_DRIFT_MS: u64 = 10_000;
 const FINALITY_TIMEOUT: Duration = Duration::from_secs(120);
 const FINALITY_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const MARKET_ID: u16 = 3;
-
-#[derive(Deserialize)]
-struct BlockResponse {
-    block: Block,
-}
-
-#[derive(Deserialize)]
-struct Block {
-    header: Header,
-    extrinsics: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct Header {
-    number: String,
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -402,13 +387,9 @@ async fn observe_nonce(watch: &DeepXRpcClient, minimum: u64) -> anyhow::Result<(
             "jsonrpc": "2.0", "id": 1, "method": "chain_getBlockHash", "params": [],
         }))
         .await?;
-    let decoded_hash = hex::decode_array::<32>(
-        block_hash
-            .strip_prefix("0x")
-            .context("current block hash lacks 0x prefix")?,
-    )
-    .context("current block hash is not 32 bytes")?;
-    let block: BlockResponse = watch.get_block(&block_hash).await?;
+    let decoded_hash = decode_prefixed_hash(&block_hash)
+        .context("current block hash is not 0x-prefixed 32-byte hex")?;
+    let block: DeepXRpcBlockResponse = watch.get_block(&block_hash).await?;
     let block_number = parse_block_number(&block.block.header.number)?;
     let storage_ms = get_timestamp_now(watch, decoded_hash).await?;
     ensure!(
@@ -460,7 +441,7 @@ async fn submit_and_verify(
 ) -> anyhow::Result<()> {
     let encoded = format!("0x{}", hex::encode(signed.bytes()));
     let finalized_before = get_finalized_head(watch).await?;
-    let finalized_header: Header = get_header(watch, &finalized_before).await?;
+    let finalized_header: DeepXRpcBlockHeader = get_header(watch, &finalized_before).await?;
     let mut next_height = parse_block_number(&finalized_header.number)?
         .checked_add(1)
         .context("finalized block height overflow")?;
@@ -473,14 +454,14 @@ async fn submit_and_verify(
     let deadline = Instant::now() + FINALITY_TIMEOUT;
     loop {
         let finalized_hash = get_finalized_head(watch).await?;
-        let finalized_header: Header = get_header(watch, &finalized_hash).await?;
+        let finalized_header: DeepXRpcBlockHeader = get_header(watch, &finalized_hash).await?;
         let finalized_height = parse_block_number(&finalized_header.number)?;
         for height in next_height..=finalized_height {
             let hash = watch
                 .get_block_hash(height)
                 .await?
                 .context("finalized block has no canonical hash")?;
-            let candidate: BlockResponse = watch.get_block(&hash).await?;
+            let candidate: DeepXRpcBlockResponse = watch.get_block(&hash).await?;
             ensure!(
                 parse_block_number(&candidate.block.header.number)? == height,
                 "finalized block height mismatch",
@@ -529,11 +510,5 @@ async fn submit_and_verify(
 }
 
 fn parse_block_number(encoded: &str) -> anyhow::Result<u32> {
-    u32::from_str_radix(
-        encoded
-            .strip_prefix("0x")
-            .context("block number lacks 0x prefix")?,
-        16,
-    )
-    .context("block number is invalid or exceeds u32")
+    decode_block_number_u32(encoded).context("block number is invalid or exceeds u32")
 }

@@ -298,9 +298,9 @@ mod tests {
     };
 
     const SPOT_RESPONSE: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
     const PERP_RESPONSE: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
 
     async fn catalog_router() -> Router {
         Router::new()

@@ -14,13 +14,13 @@
 
 //! Address-scoped, read-only DeepX account subscriptions.
 
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
 
-use deepx_rust_sdk::websocket::account::parse_subaccount_address;
 pub use deepx_rust_sdk::websocket::account::{
     DeepXWsAccountWireFrame as DeepXWsAccountFrame, DeepXWsAllMarket, DeepXWsUserBalancesRequest,
     DeepXWsUserBalancesSubscription,
 };
+use deepx_rust_sdk::websocket::account::{DeepXWsUserBalancesSession, parse_subaccount_address};
 use nautilus_core::UUID4;
 
 use crate::http::DeepXSubaccountBalances;
@@ -73,10 +73,8 @@ impl DeepXWsConfirmedBalancesFrame {
 pub struct DeepXWsAccountConnection {
     owner_id: UUID4,
     transport: super::transport::DeepXWsReadConnection,
-    confirmed_subaccount: Option<String>,
+    session: DeepXWsUserBalancesSession,
     confirmed_subscription: Option<DeepXWsConfirmedAccountSubscription>,
-    buffered: VecDeque<DeepXWsAccountFrame>,
-    buffer_capacity: NonZeroUsize,
     timeout: Duration,
     poisoned: bool,
 }
@@ -99,10 +97,8 @@ impl DeepXWsAccountConnection {
                 network, proxy_url, timeout,
             )
             .await?,
-            confirmed_subaccount: None,
+            session: DeepXWsUserBalancesSession::new(buffer_capacity),
             confirmed_subscription: None,
-            buffered: VecDeque::new(),
-            buffer_capacity,
             timeout,
             poisoned: false,
         })
@@ -122,7 +118,7 @@ impl DeepXWsAccountConnection {
     ) -> anyhow::Result<DeepXWsConfirmedAccountSubscription> {
         anyhow::ensure!(!self.poisoned, "DeepX account connection is terminal");
         let request = DeepXWsUserBalancesRequest::new(subaccount)?;
-        if let Some(confirmed) = self.confirmed_subaccount.as_deref() {
+        if let Some(confirmed) = self.session.confirmed_subaccount() {
             anyhow::ensure!(
                 confirmed == request.subaccount(),
                 "DeepX account connection is already bound to another subaccount"
@@ -132,29 +128,24 @@ impl DeepXWsAccountConnection {
             });
         }
         let expected = request.subaccount().to_string();
-        let result = tokio::time::timeout(
-            self.timeout,
-            self.subscribe_inner(&request, expected.as_str()),
-        )
-        .await;
+        let result = tokio::time::timeout(self.timeout, self.subscribe_inner(&request)).await;
         match result {
             Ok(Ok(())) => {
                 let subscription = DeepXWsConfirmedAccountSubscription {
                     owner_id: self.owner_id,
                     subaccount: parse_subaccount_address(&expected)?,
                 };
-                self.confirmed_subaccount = Some(expected);
                 self.confirmed_subscription = Some(subscription);
                 Ok(subscription)
             }
             Ok(Err(e)) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.session.clear();
                 Err(e)
             }
             Err(_) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.session.clear();
                 anyhow::bail!("DeepX account subscription acknowledgement timed out");
             }
         }
@@ -174,32 +165,12 @@ impl DeepXWsAccountConnection {
     async fn subscribe_inner(
         &mut self,
         request: &DeepXWsUserBalancesRequest,
-        expected: &str,
     ) -> anyhow::Result<()> {
         self.transport.send_account_request(request).await?;
         loop {
             let frame = self.read_frame().await?;
-            match &frame {
-                DeepXWsAccountFrame::Subscribed {
-                    market,
-                    subscriptions,
-                    ..
-                } => return request.validate_ack(market, subscriptions),
-                DeepXWsAccountFrame::UserBalances { balances, .. } => {
-                    anyhow::ensure!(
-                        balances.address.eq_ignore_ascii_case(expected),
-                        "DeepX account data does not match subscription intent"
-                    );
-                    anyhow::ensure!(
-                        self.buffered.len() < self.buffer_capacity.get(),
-                        "DeepX account pre-ack buffer overflow"
-                    );
-                    self.buffered.push_back(frame);
-                }
-                DeepXWsAccountFrame::Pong { .. } => {}
-                DeepXWsAccountFrame::Error { code, message } => {
-                    anyhow::bail!("DeepX account subscription failed ({code}): {message}")
-                }
+            if self.session.accept_before_ack(request, frame)? {
+                return Ok(());
             }
         }
     }
@@ -211,11 +182,11 @@ impl DeepXWsAccountConnection {
     /// Returns an error for an unconfirmed, terminal, malformed, or foreign frame.
     async fn next_frame(&mut self) -> anyhow::Result<DeepXWsAccountFrame> {
         anyhow::ensure!(!self.poisoned, "DeepX account connection is terminal");
-        let expected = self
-            .confirmed_subaccount
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DeepX account subscription is not confirmed"))?;
-        if let Some(frame) = self.buffered.pop_front() {
+        anyhow::ensure!(
+            self.session.confirmed_subaccount().is_some(),
+            "DeepX account subscription is not confirmed"
+        );
+        if let Some(frame) = self.session.pop_buffered() {
             return Ok(frame);
         }
         let result = tokio::time::timeout(self.timeout, self.read_frame()).await;
@@ -232,16 +203,9 @@ impl DeepXWsAccountConnection {
             }
             Err(_) => return Err(super::DeepXWsError::ReceiveTimeout.into()),
         };
-        let valid = match &frame {
-            DeepXWsAccountFrame::UserBalances { balances, .. } => {
-                balances.address.eq_ignore_ascii_case(&expected)
-            }
-            DeepXWsAccountFrame::Pong { .. } => true,
-            DeepXWsAccountFrame::Subscribed { .. } | DeepXWsAccountFrame::Error { .. } => false,
-        };
-        if !valid {
+        if let Err(e) = self.session.validate_live_frame(&frame) {
             self.poisoned = true;
-            anyhow::bail!("unexpected or foreign DeepX account frame");
+            return Err(e);
         }
         Ok(frame)
     }
@@ -307,9 +271,8 @@ impl DeepXWsAccountConnection {
     /// Returns an error if the bounded transport close fails.
     pub async fn close(&mut self) -> anyhow::Result<()> {
         self.poisoned = true;
-        self.confirmed_subaccount = None;
         self.confirmed_subscription = None;
-        self.buffered.clear();
+        self.session.clear();
         self.transport.close().await
     }
 }
@@ -327,8 +290,9 @@ mod tests {
     use super::*;
 
     const SUBACCOUNT: &str = "0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc";
-    const BALANCES_FRAME: &str =
-        include_str!("../../deepx-rust-sdk/test_data/websocket/testnet/user_balances.json");
+    const BALANCES_FRAME: &str = include_str!(
+        "../../../../../deepx-rust-sdk/test_data/websocket/testnet/user_balances.json"
+    );
 
     struct Server(tokio::task::JoinHandle<()>);
 

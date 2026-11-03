@@ -23,7 +23,8 @@ use std::{
 
 use anyhow::Context;
 use deepx_rust_sdk::websocket::orderbook_rpc::{
-    encode_subscribe_request, encode_unsubscribe_request, is_method_unavailable_response,
+    DeepXOrderbookRpcMessage, encode_subscribe_request, encode_unsubscribe_request,
+    parse_subscription_message,
 };
 use nautilus_common::messages::DataEvent;
 use nautilus_core::time::get_atomic_clock_realtime;
@@ -33,9 +34,8 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::transport::Message;
-use serde_json::Value;
 #[cfg(test)]
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -99,23 +99,24 @@ pub(super) async fn request_spot_book_depth10(
                 let text = message
                     .as_text()
                     .ok_or_else(|| anyhow::anyhow!("DeepX Spot depth received non-text data"))?;
-                let value: Value = serde_json::from_str(text)?;
-                if subscription_id.is_none() {
-                    anyhow::ensure!(
-                        value.get("id").is_some(),
-                        "DeepX Spot depth notification preceded its acknowledgement"
-                    );
-                    subscription_id = Some(orderbook_rpc::parse_subscribe_ack(
-                        &value,
-                        SUBSCRIBE_REQUEST_ID,
-                    )?);
-                    continue;
-                }
-                let snapshot = orderbook_rpc::parse_notification(
-                    &value,
-                    subscription_id.as_deref().expect("acknowledged above"),
-                )?;
-                let pair = book::spot_rpc_pair(&snapshot, &market)?;
+                let snapshot = match parse_subscription_message(
+                    text,
+                    SUBSCRIBE_REQUEST_ID,
+                    subscription_id.as_deref(),
+                )? {
+                    DeepXOrderbookRpcMessage::Subscribed(id) => {
+                        subscription_id = Some(id);
+                        continue;
+                    }
+                    DeepXOrderbookRpcMessage::Snapshot(snapshot) => snapshot,
+                    DeepXOrderbookRpcMessage::MethodUnavailable => {
+                        anyhow::bail!("DeepX Spot depth RPC method is unavailable")
+                    }
+                    DeepXOrderbookRpcMessage::Ignored => {
+                        anyhow::bail!("DeepX Spot depth received an unexpected RPC frame")
+                    }
+                };
+                let pair = snapshot.spot_pair(&market.pair)?;
                 anyhow::ensure!(
                     pair.bids.len() <= depth.get() && pair.asks.len() <= depth.get(),
                     "DeepX Spot depth snapshot exceeds requested depth"
@@ -251,29 +252,23 @@ impl SpotBookTask {
             let Some(text) = message.as_text() else {
                 continue;
             };
-            let value: Value =
-                serde_json::from_str(text).context("invalid DeepX Spot book RPC JSON")?;
-            if subscription_id.is_none() {
-                if value.get("id").is_some() {
-                    if is_method_unavailable_response(&value, SUBSCRIBE_REQUEST_ID) {
-                        return Ok(SubscriptionEnd::MethodUnavailable);
-                    }
-                    subscription_id = Some(orderbook_rpc::parse_subscribe_ack(
-                        &value,
-                        SUBSCRIBE_REQUEST_ID,
-                    )?);
+            let snapshot = match parse_subscription_message(
+                text,
+                SUBSCRIBE_REQUEST_ID,
+                subscription_id.as_deref(),
+            )
+            .context("invalid DeepX Spot book RPC frame")?
+            {
+                DeepXOrderbookRpcMessage::Subscribed(id) => {
+                    subscription_id = Some(id);
+                    continue;
                 }
-                continue;
-            }
-            if value.get("method").is_none() {
-                continue;
-            }
-            let snapshot = orderbook_rpc::parse_notification(
-                &value,
-                subscription_id
-                    .as_deref()
-                    .expect("subscription acknowledged"),
-            )?;
+                DeepXOrderbookRpcMessage::MethodUnavailable => {
+                    return Ok(SubscriptionEnd::MethodUnavailable);
+                }
+                DeepXOrderbookRpcMessage::Snapshot(snapshot) => snapshot,
+                DeepXOrderbookRpcMessage::Ignored => continue,
+            };
             let sequence = self.subscription.next_book_sequence()?;
             let ts_init = get_atomic_clock_realtime().get_time_ns();
             let events = match self.output {
@@ -420,9 +415,9 @@ mod tests {
     use super::*;
 
     const SPOT_MARKETS: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
     const SPOT_BOOK: &str = include_str!(
-        "../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
+        "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
     );
 
     struct Server(tokio::task::JoinHandle<()>);

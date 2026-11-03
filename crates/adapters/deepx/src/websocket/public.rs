@@ -14,13 +14,9 @@
 
 //! Adapter-owned public perpetual WebSocket connection lifecycle.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    num::NonZeroUsize,
-    time::Duration,
-};
+use std::{collections::BTreeSet, num::NonZeroUsize, time::Duration};
 
-use deepx_rust_sdk::websocket::public::validate_ack;
+use deepx_rust_sdk::websocket::public::DeepXWsPublicSubscriptionState;
 pub use deepx_rust_sdk::websocket::public::{
     DeepXWsPerpMarket, DeepXWsPublicChannel, DeepXWsPublicFrame, DeepXWsPublicRequest,
 };
@@ -31,9 +27,7 @@ use serde_json::json;
 #[derive(Debug)]
 pub struct DeepXWsPublicConnection {
     transport: super::transport::DeepXWsReadConnection,
-    confirmed: BTreeMap<u16, BTreeSet<DeepXWsPublicChannel>>,
-    buffered: VecDeque<DeepXWsPublicFrame>,
-    buffer_capacity: NonZeroUsize,
+    subscriptions: DeepXWsPublicSubscriptionState,
     timeout: Duration,
     poisoned: bool,
 }
@@ -55,9 +49,7 @@ impl DeepXWsPublicConnection {
                 network, proxy_url, timeout,
             )
             .await?,
-            confirmed: BTreeMap::new(),
-            buffered: VecDeque::new(),
-            buffer_capacity,
+            subscriptions: DeepXWsPublicSubscriptionState::new(buffer_capacity),
             timeout,
             poisoned: false,
         })
@@ -123,21 +115,15 @@ impl DeepXWsPublicConnection {
         )
         .await;
         match result {
-            Ok(Ok(())) => {
-                self.confirmed
-                    .entry(market_id)
-                    .or_default()
-                    .extend(expected);
-                Ok(())
-            }
+            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.subscriptions.clear();
                 Err(e)
             }
             Err(_) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.subscriptions.clear();
                 anyhow::bail!("DeepX public subscription acknowledgement timed out");
             }
         }
@@ -152,29 +138,11 @@ impl DeepXWsPublicConnection {
         self.transport.send_public_request(request).await?;
         loop {
             let frame = self.read_frame().await?;
-            match &frame {
-                DeepXWsPublicFrame::Subscribed { .. } => {
-                    return validate_ack(&frame, market_id, expected);
-                }
-                DeepXWsPublicFrame::Data {
-                    market, channel, ..
-                } => {
-                    anyhow::ensure!(
-                        (market.id == market_id && expected.contains(channel))
-                            || self
-                                .confirmed
-                                .get(&market.id)
-                                .is_some_and(|set| set.contains(channel)),
-                        "DeepX public data does not match subscription intent"
-                    );
-                    anyhow::ensure!(
-                        self.buffered.len() < self.buffer_capacity.get(),
-                        "DeepX public pre-ack buffer overflow"
-                    );
-                    self.buffered.push_back(frame);
-                }
-                DeepXWsPublicFrame::Pong { .. } => {}
-                _ => anyhow::bail!("unexpected DeepX public subscription response"),
+            if self
+                .subscriptions
+                .accept_before_ack(frame, market_id, expected)?
+            {
+                return Ok(());
             }
         }
     }
@@ -186,7 +154,7 @@ impl DeepXWsPublicConnection {
     /// Returns an error for terminal connection, malformed/foreign data or bounded read failure.
     pub async fn next_frame(&mut self) -> anyhow::Result<DeepXWsPublicFrame> {
         anyhow::ensure!(!self.poisoned, "DeepX public connection is terminal");
-        if let Some(frame) = self.buffered.pop_front() {
+        if let Some(frame) = self.subscriptions.pop_buffered() {
             return Ok(frame);
         }
         let result = tokio::time::timeout(self.timeout, self.read_frame()).await;
@@ -203,19 +171,9 @@ impl DeepXWsPublicConnection {
             }
             Err(_) => return Err(super::DeepXWsError::ReceiveTimeout.into()),
         };
-        let valid = match &frame {
-            DeepXWsPublicFrame::Data {
-                market, channel, ..
-            } => self
-                .confirmed
-                .get(&market.id)
-                .is_some_and(|set| set.contains(channel)),
-            DeepXWsPublicFrame::Pong { .. } => true,
-            _ => false,
-        };
-        if !valid {
+        if let Err(e) = self.subscriptions.validate_live_frame(&frame) {
             self.poisoned = true;
-            anyhow::bail!("unexpected or unconfirmed DeepX public frame");
+            return Err(e);
         }
         Ok(frame)
     }
@@ -261,8 +219,7 @@ impl DeepXWsPublicConnection {
     /// Returns an error if the bounded transport close fails.
     pub async fn close(&mut self) -> anyhow::Result<()> {
         self.poisoned = true;
-        self.confirmed.clear();
-        self.buffered.clear();
+        self.subscriptions.clear();
         self.transport.close().await
     }
 }

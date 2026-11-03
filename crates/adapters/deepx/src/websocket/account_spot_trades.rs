@@ -17,10 +17,11 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use deepx_rust_sdk::websocket::account_spot_trade_history::{
     DeepXWsMappedSpotTradeHistoryFrame as SdkSpotTradeHistoryFrame,
     DeepXWsSpotTradeHistoryBatch as SdkSpotTradeHistoryBatch,
+    DeepXWsSpotTradeHistoryCollector as SdkSpotTradeHistoryCollector,
     DeepXWsSpotTradeHistoryItem as SdkSpotTradeHistoryItem,
     match_spot_trade_history_batch_to_finalized as sdk_match_finalized,
     match_spot_trade_history_batch_to_rest as sdk_match_rest,
@@ -110,21 +111,12 @@ pub async fn observe_spot_trade_history_batches(
         !window.is_zero(),
         "DeepX Spot trade-history window must be positive"
     );
-    ensure!(
-        max_batches > 0,
-        "DeepX Spot trade-history batch limit must be positive"
-    );
-    ensure!(
-        max_items > 0,
-        "DeepX Spot trade-history item limit must be positive"
-    );
+    let mut collector =
+        SdkSpotTradeHistoryCollector::<DeepXSpotAccountTradeRecord>::new(max_batches, max_items)?;
     let mut connection = DeepXWsReadConnection::connect(network, proxy_url, window).await?;
     connection.send_spot_trade_history_request(request).await?;
     let deadline = tokio::time::Instant::now() + window;
     let result = async {
-        let mut acknowledged = false;
-        let mut batches = Vec::new();
-        let mut item_count = 0_usize;
         loop {
             let message = match tokio::time::timeout_at(deadline, connection.receive()).await {
                 Ok(Ok(Some(message))) => message,
@@ -138,13 +130,7 @@ pub async fn observe_spot_trade_history_batches(
                     continue;
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    ensure!(
-                        acknowledged,
-                        "DeepX Spot trade-history acknowledgement timed out"
-                    );
-                    return Ok(batches);
-                }
+                Err(_) => return collector.finish(),
             };
             let Message::Text(bytes) = message else {
                 if matches!(message, Message::Ping(_) | Message::Pong(_)) {
@@ -152,32 +138,9 @@ pub async fn observe_spot_trade_history_batches(
                 }
                 anyhow::bail!("unsupported DeepX Spot trade-history stream message");
             };
-            match DeepXWsSpotTradeHistoryFrame::parse(std::str::from_utf8(&bytes)?, request)? {
-                DeepXWsSpotTradeHistoryFrame::Subscribed => {
-                    ensure!(
-                        !acknowledged,
-                        "duplicate DeepX Spot trade-history acknowledgement"
-                    );
-                    acknowledged = true;
-                }
-                DeepXWsSpotTradeHistoryFrame::TradeBatch(batch) => {
-                    ensure!(
-                        acknowledged,
-                        "DeepX Spot trade data preceded acknowledgement"
-                    );
-                    item_count = item_count
-                        .checked_add(batch.items().len())
-                        .context("DeepX Spot trade-history item count overflowed")?;
-                    ensure!(
-                        item_count <= max_items,
-                        "DeepX Spot trade-history item limit exceeded"
-                    );
-                    batches.push(batch);
-                    if batches.len() == max_batches {
-                        return Ok(batches);
-                    }
-                }
-                DeepXWsSpotTradeHistoryFrame::Pong => {}
+            let frame = DeepXWsSpotTradeHistoryFrame::parse(std::str::from_utf8(&bytes)?, request)?;
+            if let Some(batches) = collector.accept(frame)? {
+                return Ok(batches);
             }
         }
     }

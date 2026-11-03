@@ -17,10 +17,8 @@
 
 use std::{num::NonZeroUsize, time::Duration};
 
-use deepx_rust_sdk::rpc::{
-    chain_decode::{DeepXRpcHexIntegerError, decode_prefixed_u128},
-    spot_market_spec::parse_spot_pair,
-};
+use deepx_rust_sdk::rpc::spot_market_spec::parse_spot_pair;
+use deepx_rust_sdk::websocket::orderbook_rpc::decode_atomic_decimal;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{BookOrder, DEPTH10_LEN, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick},
@@ -299,7 +297,7 @@ pub(super) fn parse_spot_rpc_book_deltas(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
     anyhow::ensure!(sequence > 0, "DeepX Spot book sequence must be nonzero");
-    let book = spot_rpc_pair(snapshot, market)?;
+    let book = snapshot.spot_pair(&market.pair)?;
     let ts_event = ts_init;
     let mut deltas = vec![OrderBookDelta::clear(
         instrument.id(),
@@ -335,7 +333,7 @@ pub(super) fn parse_spot_rpc_book_depth10(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDepth10> {
     anyhow::ensure!(sequence > 0, "DeepX Spot book sequence must be nonzero");
-    let book = spot_rpc_pair(snapshot, market)?;
+    let book = snapshot.spot_pair(&market.pair)?;
     let mut bids = [BookOrder::default(); DEPTH10_LEN];
     let mut asks = [BookOrder::default(); DEPTH10_LEN];
     let mut bid_counts = [0; DEPTH10_LEN];
@@ -385,7 +383,7 @@ pub(super) fn parse_spot_rpc_quote_tick(
     instrument: &InstrumentAny,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<QuoteTick>> {
-    let book = spot_rpc_pair(snapshot, market)?;
+    let book = snapshot.spot_pair(&market.pair)?;
     let (Some(bid), Some(ask)) = (book.bids.first(), book.asks.first()) else {
         return Ok(None);
     };
@@ -402,33 +400,13 @@ pub(super) fn parse_spot_rpc_quote_tick(
     )?))
 }
 
-pub(super) fn spot_rpc_pair<'a>(
-    snapshot: &'a DeepXOrderbookRpcSnapshot,
-    market: &DeepXSpotMarket,
-) -> anyhow::Result<&'a crate::websocket::orderbook_rpc::DeepXOrderbookRpcSide> {
-    let expected_pair = parse_spot_pair(&market.pair)?;
-    let mut pair_book = None;
-    for (pair, book) in &snapshot.spot {
-        let observed_pair = parse_spot_pair(pair)?;
-        anyhow::ensure!(
-            observed_pair == expected_pair,
-            "DeepX Spot RPC snapshot contains an unexpected pair"
-        );
-        anyhow::ensure!(
-            pair_book.replace(book).is_none(),
-            "duplicate DeepX Spot pair book"
-        );
-    }
-    pair_book.ok_or_else(|| anyhow::anyhow!("DeepX Spot RPC snapshot is missing pair"))
-}
-
 fn parse_spot_rpc_level(
     level: &crate::websocket::orderbook_rpc::DeepXOrderbookRpcLevel,
     market: &DeepXSpotMarket,
     instrument: &InstrumentAny,
 ) -> anyhow::Result<(Price, Quantity)> {
-    let raw_price = rpc_atomic_decimal(&level.price, 6)?;
-    let raw_size = rpc_atomic_decimal(&level.amount, market.base_decimal)?;
+    let raw_price = decode_atomic_decimal(&level.price, 6)?;
+    let raw_size = decode_atomic_decimal(&level.amount, market.base_decimal)?;
     let price = Price::from_decimal_dp(raw_price, instrument.price_precision())?;
     let size = Quantity::from_decimal_dp(raw_size, instrument.size_precision())?;
     anyhow::ensure!(
@@ -443,21 +421,6 @@ fn parse_spot_rpc_level(
         "DeepX Spot RPC level is invalid or outside the instrument grid"
     );
     Ok((price, size))
-}
-
-fn rpc_atomic_decimal(value: &str, scale: u8) -> anyhow::Result<rust_decimal::Decimal> {
-    let value = decode_prefixed_u128(value).map_err(|e| match e {
-        DeepXRpcHexIntegerError::MissingPrefix => {
-            anyhow::anyhow!("DeepX Spot RPC integer lacks hexadecimal prefix")
-        }
-        DeepXRpcHexIntegerError::Empty => anyhow::anyhow!("DeepX Spot RPC integer is empty"),
-        DeepXRpcHexIntegerError::Invalid(e) => {
-            anyhow::anyhow!("invalid DeepX Spot RPC integer: {e}")
-        }
-    })?;
-    let value = i128::try_from(value)
-        .map_err(|_| anyhow::anyhow!("DeepX Spot RPC integer exceeds Decimal range"))?;
-    Ok(rust_decimal::Decimal::from_i128_with_scale(value, u32::from(scale)).normalize())
 }
 
 pub(super) fn parse_book_deltas(
@@ -673,9 +636,9 @@ mod tests {
     };
 
     const SPOT_MARKETS: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
     const SPOT_BOOK: &str = include_str!(
-        "../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
+        "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_order_book_eth_usdc_tick_001.json"
     );
 
     fn spot_fixture() -> (

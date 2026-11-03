@@ -15,16 +15,17 @@
 
 //! Adapter integration tests for SDK signing compatibility.
 
-use super::*;
-use crate::common::{DeepXEnvironment, DeepXKeyScheme};
 use nautilus_core::hex;
 use rstest::rstest;
 use serde::Deserialize;
 use subxt_core::config::{Hasher, substrate::BlakeTwo256};
 
+use super::*;
+use crate::common::{DeepXEnvironment, DeepXKeyScheme};
+
 const SPEC376_METADATA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/deepx-rust-sdk/test_data/runtime/testnet/",
+    "/../../../deepx-rust-sdk/test_data/runtime/testnet/",
     "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
 ));
 

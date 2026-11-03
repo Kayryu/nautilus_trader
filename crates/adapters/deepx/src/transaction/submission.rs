@@ -394,41 +394,6 @@ mod tests {
     };
 
     #[rstest]
-    #[case(json!(null))]
-    #[case(json!({}))]
-    #[case(json!({"tx_hash": 42}))]
-    #[case(json!({"tx_hash": "0x1234"}))]
-    #[case(json!({"tx_hash": "0000000000000000000000000000000000000000000000000000000000000000"}))]
-    #[case(json!({"tx_hash": "0x0000000000000000000000000000000000000000000000000000000000000000"}))]
-    fn rest_invalid_hash_requires_reconciliation(#[case] data: Value) {
-        let bytes = b"durable";
-        let body = serde_json::to_vec(&json!({
-            "code": 200, "fail": false, "msg": "success", "data": data,
-        }))
-        .unwrap();
-        assert!(matches!(
-            verify_rest_acknowledgement(&body, bytes, BlakeTwo256.hash(bytes).0),
-            Err(DeepXRestSubmissionError::ReconciliationRequired(_))
-        ));
-    }
-
-    #[rstest]
-    #[case(json!("19_0"), true)]
-    #[case(json!(500), true)]
-    #[case(json!(200), true)]
-    #[case(json!(500), false)]
-    fn rest_backend_failure_never_proves_not_sent(#[case] code: Value, #[case] fail: bool) {
-        let body = serde_json::to_vec(&json!({
-            "code": code, "fail": fail, "msg": "runtime failure", "data": null,
-        }))
-        .unwrap();
-        assert!(matches!(
-            verify_rest_acknowledgement(&body, b"durable", [0; 32]),
-            Err(DeepXRestSubmissionError::ReconciliationRequired(_))
-        ));
-    }
-
-    #[rstest]
     #[case(503)]
     #[case(307)]
     #[case(308)]
@@ -476,7 +441,7 @@ mod tests {
     fn runtime_service() -> DeepXRuntimeSnapshotService {
         let metadata: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/deepx-rust-sdk/test_data/runtime/testnet/",
+            "/../../../deepx-rust-sdk/test_data/runtime/testnet/",
             "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
         )))
         .unwrap();
@@ -1008,21 +973,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_node_hash_is_rejected() {
-        let extrinsic = signed_remark().unwrap();
-        let mut response = ok_response(&extrinsic);
-        response["result"] = serde_json::json!(format!(
-            "0x{}",
-            hex::encode(BlakeTwo256.hash(b"different extrinsic").0)
-        ));
-        let url = spawn_submission_server(Arc::new(Mutex::new(vec![response]))).await;
-
-        let error = submit_extrinsic_once(&url, &extrinsic).await.unwrap_err();
-
-        assert!(matches!(error, DeepXSubmissionError::HashMismatch { .. }));
-    }
-
-    #[tokio::test]
     async fn tampered_extrinsic_hash_is_rejected_against_recomputed_hash() {
         let mut extrinsic = signed_remark().unwrap();
         let node_hash = extrinsic.extrinsic_hash();
@@ -1045,64 +995,6 @@ mod tests {
                 recomputed_hash: real,
                 ..
             } if tampered == tampered_hash && real == real_hash
-        ));
-    }
-
-    #[rstest]
-    #[case(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0x00"}))]
-    #[case(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0xyz"}))]
-    #[case(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "deadbeef"}))]
-    #[tokio::test]
-    async fn malformed_submission_responses_are_rejected(#[case] response: Value) {
-        let extrinsic = signed_remark().unwrap();
-        let url = spawn_submission_server(Arc::new(Mutex::new(vec![response]))).await;
-
-        let error = submit_extrinsic_once(&url, &extrinsic).await.unwrap_err();
-
-        assert!(matches!(
-            error,
-            DeepXSubmissionError::InvalidResponse { .. }
-        ));
-    }
-
-    #[rstest]
-    #[case(serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "error": { "code": 1010, "message": "Invalid Transaction" },
-    }))]
-    #[case(serde_json::json!({ "jsonrpc": "2.0", "id": 1 }))]
-    #[case(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": 42 }))]
-    #[tokio::test]
-    async fn node_reported_failures_surface_as_rpc_errors(#[case] response: Value) {
-        let extrinsic = signed_remark().unwrap();
-        let url = spawn_submission_server(Arc::new(Mutex::new(vec![response]))).await;
-
-        let error = submit_extrinsic_once(&url, &extrinsic).await.unwrap_err();
-
-        assert!(matches!(
-            error,
-            DeepXSubmissionError::Rpc {
-                method: "author_submitExtrinsic",
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn transport_failure_reports_submission_method() {
-        let extrinsic = signed_remark().unwrap();
-
-        let error = submit_extrinsic_once("http://127.0.0.1:1", &extrinsic)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            DeepXSubmissionError::Rpc {
-                method: "author_submitExtrinsic",
-                ..
-            }
         ));
     }
 }

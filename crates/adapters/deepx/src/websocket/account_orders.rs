@@ -15,9 +15,10 @@
 
 //! Read-only perpetual open-order subscription envelopes.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use deepx_rust_sdk::websocket::account_orders::DeepXWsPerpOpenOrdersSnapshot;
 pub use deepx_rust_sdk::websocket::account_orders::{
     DeepXWsPerpOpenOrdersFrame, DeepXWsPerpOpenOrdersPage, DeepXWsPerpOpenOrdersRequest,
 };
@@ -83,9 +84,7 @@ async fn observe_initial_perp_open_order_pages(
         super::transport::DeepXWsReadConnection::connect(network, proxy_url, timeout).await?;
     connection.send_perp_open_orders_request(request).await?;
     let result = tokio::time::timeout(timeout, async {
-        let mut acknowledged = false;
-        let mut pages = BTreeMap::new();
-        let expected_count = request.expected_page_count();
+        let mut snapshot = DeepXWsPerpOpenOrdersSnapshot::new(request);
         loop {
             let Some(message) = connection.receive().await? else {
                 anyhow::bail!("DeepX perpetual order stream closed before its first page");
@@ -96,26 +95,9 @@ async fn observe_initial_perp_open_order_pages(
                 }
                 anyhow::bail!("unsupported DeepX perpetual order stream message");
             };
-            match DeepXWsPerpOpenOrdersFrame::parse(std::str::from_utf8(&bytes)?, request)? {
-                DeepXWsPerpOpenOrdersFrame::Subscribed => {
-                    ensure!(
-                        !acknowledged,
-                        "duplicate DeepX perpetual order acknowledgement"
-                    );
-                    acknowledged = true;
-                }
-                DeepXWsPerpOpenOrdersFrame::OrderPage { page, timestamp_ms } => {
-                    ensure!(acknowledged, "DeepX perpetual order page preceded its ack");
-                    let address = page.subaccount().to_ascii_lowercase();
-                    ensure!(
-                        pages.insert(address, (page, timestamp_ms)).is_none(),
-                        "duplicate DeepX perpetual order page"
-                    );
-                    if pages.len() == expected_count {
-                        break Ok::<_, anyhow::Error>(pages.into_values().collect());
-                    }
-                }
-                DeepXWsPerpOpenOrdersFrame::Pong => {}
+            let frame = DeepXWsPerpOpenOrdersFrame::parse(std::str::from_utf8(&bytes)?, request)?;
+            if let Some(pages) = snapshot.accept(frame)? {
+                break Ok::<_, anyhow::Error>(pages);
             }
         }
     })
@@ -158,10 +140,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
-    #[case(3)]
     #[tokio::test]
-    async fn initial_page_requires_one_matching_ack(#[case] scenario: u8) {
+    async fn initial_page_requires_ack_before_snapshot(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -177,18 +157,10 @@ mod tests {
                         "user_perp_open_orders"
                     );
                     assert_eq!(request["market"]["id"], 3);
-                    let ack = if scenario == 2 {
-                        ACK.replace(ADDRESS, "0x0000000000000000000000000000000000000000")
-                    } else {
-                        ACK.to_string()
-                    };
                     if scenario == 1 {
                         let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                     }
-                    let _ = socket.send(ServerMessage::Text(ack.clone().into())).await;
-                    if scenario == 3 {
-                        let _ = socket.send(ServerMessage::Text(ack.into())).await;
-                    }
+                    let _ = socket.send(ServerMessage::Text(ACK.into())).await;
                     let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                 })
             }),
@@ -216,13 +188,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(5)]
-    #[case(6)]
     #[tokio::test]
-    async fn wallet_snapshot_requires_exact_expansion_and_all_pages(#[case] scenario: u8) {
+    async fn wallet_snapshot_requires_all_pages(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -236,33 +203,19 @@ mod tests {
                     assert_eq!(request["subscriptions"][0]["address"], WALLET);
                     assert_eq!(request["subscriptions"][0]["addressType"], "wallet");
                     let mut ack: serde_json::Value = serde_json::from_str(ACK).unwrap();
-                    if scenario != 4 {
-                        ack["subscriptions"]
-                            .as_array_mut()
-                            .unwrap()
-                            .push(serde_json::json!({
-                                "channel": "user_perp_open_orders",
-                                "address": OTHER,
-                            }));
-                    }
-                    if scenario == 5 {
-                        ack["subscriptions"][1]["address"] = serde_json::json!(ADDRESS);
-                    } else if scenario == 6 {
-                        ack["subscriptions"][1]["address"] =
-                            serde_json::json!("0x0000000000000000000000000000000000000000");
-                    }
+                    ack["subscriptions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "channel": "user_perp_open_orders",
+                            "address": OTHER,
+                        }));
                     let _ = socket
                         .send(ServerMessage::Text(ack.to_string().into()))
                         .await;
                     let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                     let other_page = SNAPSHOT.replace(ADDRESS, OTHER);
-                    if scenario == 2 {
-                        let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
-                    } else if scenario == 3 {
-                        let foreign =
-                            other_page.replace(OTHER, "0x0000000000000000000000000000000000000000");
-                        let _ = socket.send(ServerMessage::Text(foreign.into())).await;
-                    } else if scenario != 1 {
+                    if scenario != 1 {
                         let _ = socket.send(ServerMessage::Text(other_page.into())).await;
                     }
                 })

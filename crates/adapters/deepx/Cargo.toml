@@ -44,7 +44,6 @@ python = [
 
 [dependencies]
 deepx-rust-sdk = { workspace = true }
-nautilus-blockchain = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-cryptography = { workspace = true }
@@ -54,29 +53,21 @@ nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
 
-alloy = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-aws-lc-rs = { workspace = true }
 bon = { workspace = true }
-frame-metadata = { workspace = true }
 futures-util = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parity-scale-codec = { workspace = true }
-reqwest = { workspace = true }
 rust_decimal = { workspace = true }
-scale-info = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
-sp-crypto-hashing = { workspace = true }
 subxt-core = { workspace = true }
-subxt-signer = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
@@ -84,14 +75,11 @@ pyo3-stub-gen = { workspace = true, optional = true }
 [dev-dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 
+alloy = { workspace = true }
+aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-
-[[bin]]
-name = "deepx-capture-finalized-events"
-path = "bin/capture_finalized_events.rs"
-doc = false
 
 [[bin]]
 name = "deepx-verify-rest-instruments"
@@ -135,16 +123,6 @@ path = "bin/verify_spot_trade_history.rs"
 doc = false
 
 [[bin]]
-name = "deepx-verify-rest-account-order"
-path = "bin/verify_rest_account_order.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-account-snapshot"
-path = "bin/verify_rest_account_snapshot.rs"
-doc = false
-
-[[bin]]
 name = "deepx-verify-finalized-margin"
 path = "bin/verify_finalized_margin.rs"
 doc = false
@@ -178,124 +156,6 @@ doc = false
 name = "deepx-verify-finalized-wallet"
 path = "bin/verify_finalized_wallet.rs"
 doc = false
-
-[[bin]]
-name = "deepx-verify-rest-subaccount-directory"
-path = "bin/verify_rest_subaccount_directory.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-quota-summary"
-path = "bin/verify_rest_quota_summary.rs"
-doc = false
-test = false
-
-[[bin]]
-name = "deepx-verify-rest-quota-history"
-path = "bin/verify_rest_quota_history.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-funding-fees"
-path = "bin/verify_rest_funding_fees.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-hourly-unsettled-funding"
-path = "bin/verify_rest_hourly_unsettled_funding.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-balance-changes"
-path = "bin/verify_rest_balance_changes.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-liquidation-records"
-path = "bin/verify_rest_liquidation_records.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-liquidation-keeper-state"
-path = "bin/verify_rest_liquidation_keeper_state.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-liquidation-execution-records"
-path = "bin/verify_rest_liquidation_execution_records.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-invitation-codes"
-path = "bin/verify_rest_invitation_codes.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-perp-order-book"
-path = "bin/verify_rest_perp_order_book.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-orders"
-path = "bin/verify_rest_spot_orders.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-account-trades"
-path = "bin/verify_rest_spot_account_trades.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-order-lookup"
-path = "bin/verify_rest_spot_order_lookup.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-wallet"
-path = "bin/verify_rest_spot_wallet.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-trades"
-path = "bin/verify_rest_spot_trades.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-market"
-path = "bin/verify_rest_spot_market.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-spot-adl-candidates"
-path = "bin/verify_rest_spot_adl_candidates.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-wallet-trades"
-path = "bin/verify_rest_wallet_trades.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-wallet-orders"
-path = "bin/verify_rest_wallet_orders.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-wallet-open-orders"
-path = "bin/verify_rest_wallet_open_orders.rs"
-doc = false
-test = false
-
-[[bin]]
-name = "deepx-verify-rest-lending-markets"
-path = "bin/verify_rest_lending_markets.rs"
-doc = false
-
-[[bin]]
-name = "deepx-verify-rest-open-interest-history"
-path = "bin/verify_rest_open_interest_history.rs"
-doc = false
-test = false
 
 [[bin]]
 name = "deepx-verify-ws-connection"

@@ -956,27 +956,6 @@ mod tests {
     }
 
     #[rstest]
-    fn testnet_genesis_requires_all_rpc_roles_to_agree() {
-        let config = DeepXNetworkConfig::default();
-        let mut observed_endpoints = observations(&config);
-        let validated =
-            validate_rpc_endpoint_identities(&config, observed_endpoints.clone()).unwrap();
-        assert_eq!(validated.genesis_hash(), approved_genesis_hash());
-
-        observed_endpoints[1] = DeepXObservedRpcEndpoint::new(
-            DeepXRpcRole::Watch,
-            config.rpc_url_for(DeepXRpcRole::Watch).unwrap(),
-            [0; 32],
-        );
-        assert_eq!(
-            validate_rpc_endpoint_identities(&config, observed_endpoints),
-            Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(
-                observations(&config)[1].role(),
-            )),
-        );
-    }
-
-    #[rstest]
     fn common_rpc_fallback_is_validated_for_every_role() {
         let config = DeepXNetworkConfig {
             base_url_rpc: Some("https://common.example.invalid".to_string()),
@@ -992,63 +971,5 @@ mod tests {
         ] {
             assert_eq!(validated.url_for(role), "https://common.example.invalid");
         }
-    }
-
-    #[rstest]
-    #[case::submission(DeepXRpcRole::Submission)]
-    #[case::watch(DeepXRpcRole::Watch)]
-    #[case::recovery(DeepXRpcRole::Recovery)]
-    fn wrong_chain_is_rejected_for_each_rpc_role(#[case] role: DeepXRpcRole) {
-        let config = DeepXNetworkConfig::default();
-        let mut observations = observations(&config);
-        let observation = observations
-            .iter_mut()
-            .find(|observation| observation.role() == role)
-            .unwrap();
-        *observation =
-            DeepXObservedRpcEndpoint::new(role, config.rpc_url_for(role).unwrap(), [9; 32]);
-
-        assert_eq!(
-            validate_rpc_endpoint_identities(&config, observations),
-            Err(DeepXRpcEndpointValidationError::GenesisHashMismatch(role)),
-        );
-    }
-
-    #[rstest]
-    fn missing_or_duplicate_rpc_role_is_rejected() {
-        let config = DeepXNetworkConfig::default();
-        let [submission, watch, recovery] = observations(&config);
-
-        assert_eq!(
-            validate_rpc_endpoint_identities(&config, [submission.clone(), recovery]),
-            Err(DeepXRpcEndpointValidationError::MissingRole(
-                DeepXRpcRole::Watch
-            )),
-        );
-        assert_eq!(
-            validate_rpc_endpoint_identities(&config, [submission.clone(), submission, watch]),
-            Err(DeepXRpcEndpointValidationError::DuplicateRole(
-                DeepXRpcRole::Submission
-            )),
-        );
-    }
-
-    #[rstest]
-    fn rpc_endpoint_observation_must_match_configured_url() {
-        let config = DeepXNetworkConfig::default();
-        let mut observed_endpoints = observations(&config);
-        observed_endpoints[0] = DeepXObservedRpcEndpoint::new(
-            DeepXRpcRole::Submission,
-            "https://other.example.invalid/secret".to_string(),
-            approved_genesis_hash(),
-        );
-
-        assert_eq!(
-            validate_rpc_endpoint_identities(&config, observed_endpoints),
-            Err(DeepXRpcEndpointValidationError::UrlMismatch(
-                DeepXRpcRole::Submission
-            )),
-        );
-        assert!(!format!("{:?}", observations(&config)[0]).contains(DEEPX_TESTNET_RPC_URL));
     }
 }

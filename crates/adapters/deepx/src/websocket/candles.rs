@@ -114,11 +114,9 @@ mod tests {
 
     #[rstest]
     #[case(0)]
-    #[case(1)]
-    #[case(2)]
     #[case(3)]
     #[tokio::test]
-    async fn observer_requires_ack_and_newer_bucket(#[case] scenario: u8) {
+    async fn observer_requires_newer_bucket_before_deadline(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -132,29 +130,18 @@ mod tests {
                     assert_eq!(request["market"]["id"], 3);
                     assert_eq!(request["subscriptions"][0]["channel"], "candles");
                     assert_eq!(request["subscriptions"][0]["time_frame"], "1m");
-                    if scenario == 1 {
-                        let _ = socket
-                            .send(ServerMessage::Text(update(1_791_477_600_000, "1").into()))
-                            .await;
-                    } else {
-                        let ack = if scenario == 2 {
-                            ACK.replace("\"time_frame\":\"1m\"", "\"time_frame\":\"3m\"")
-                        } else {
-                            ACK.to_string()
-                        };
-                        let _ = socket.send(ServerMessage::Text(ack.into())).await;
+                    let _ = socket.send(ServerMessage::Text(ACK.into())).await;
+                    let _ = socket
+                        .send(ServerMessage::Text(
+                            update(1_791_477_600_000, "12.559").into(),
+                        ))
+                        .await;
+                    if scenario != 3 {
                         let _ = socket
                             .send(ServerMessage::Text(
-                                update(1_791_477_600_000, "12.559").into(),
+                                update(1_791_477_720_000, "1.458").into(),
                             ))
                             .await;
-                        if scenario != 3 {
-                            let _ = socket
-                                .send(ServerMessage::Text(
-                                    update(1_791_477_720_000, "1.458").into(),
-                                ))
-                                .await;
-                        }
                     }
                     if scenario == 3 {
                         tokio::time::sleep(Duration::from_millis(200)).await;

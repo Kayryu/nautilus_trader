@@ -166,9 +166,9 @@ mod tests {
     use crate::http::{DeepXApiResponse, DeepXSpotMarket};
 
     const SPOT_MARKETS: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
     const SPOT_TRADES: &str = include_str!(
-        "../../deepx-rust-sdk/test_data/http/testnet/spot_trades_eth_usdc_page_1.json"
+        "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_trades_eth_usdc_page_1.json"
     );
 
     fn spot_instrument() -> InstrumentAny {

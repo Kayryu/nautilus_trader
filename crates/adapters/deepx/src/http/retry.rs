@@ -15,9 +15,10 @@
 
 //! Retry policy for DeepX HTTP reads.
 
+use deepx_rust_sdk::rest::should_retry_read_http_status;
 use nautilus_network::retry::RetryConfig;
 
-use super::{DeepXHttpError, models::DeepXResponseCode};
+use super::DeepXHttpError;
 
 /// Builds the default bounded retry configuration for idempotent DeepX HTTP reads.
 #[must_use]
@@ -39,18 +40,9 @@ pub const fn deepx_http_retry_config() -> RetryConfig {
 pub fn should_retry_http_error(error: &DeepXHttpError) -> bool {
     match error {
         DeepXHttpError::Transport(_) => true,
-        DeepXHttpError::Http { status, .. } => {
-            matches!(*status, 408 | 429) || (500..600).contains(status)
-        }
-        DeepXHttpError::Api {
-            code: DeepXResponseCode::Api(code),
-            ..
-        } => matches!(*code, 10010 | 10012),
-        DeepXHttpError::Api {
-            code: DeepXResponseCode::Pallet(_),
-            ..
-        }
-        | DeepXHttpError::Decode(_)
+        DeepXHttpError::Http { status, .. } => should_retry_read_http_status(*status),
+        DeepXHttpError::Api { code, .. } => code.is_retryable_read_failure(),
+        DeepXHttpError::Decode(_)
         | DeepXHttpError::InvalidRequest(_)
         | DeepXHttpError::QuotaClaimFailed { .. }
         | DeepXHttpError::QuotaClaimTimeout { .. }
@@ -77,23 +69,6 @@ mod tests {
     use super::*;
 
     #[rstest]
-    #[case(408, true)]
-    #[case(429, true)]
-    #[case(500, true)]
-    #[case(503, true)]
-    #[case(400, false)]
-    #[case(401, false)]
-    #[case(404, false)]
-    fn classifies_http_status(#[case] status: u16, #[case] expected: bool) {
-        let error = DeepXHttpError::Http {
-            status,
-            message: String::new(),
-        };
-
-        assert_eq!(should_retry_http_error(&error), expected);
-    }
-
-    #[rstest]
     fn retries_transport_failures() {
         assert!(should_retry_http_error(&DeepXHttpError::Transport(
             "connection reset".to_string(),
@@ -102,38 +77,18 @@ mod tests {
 
     #[rstest]
     fn does_not_retry_quota_claim_outcomes() {
-        assert!(!should_retry_http_error(&DeepXHttpError::QuotaClaimFailed {
-            claim_id: 42,
-            message: "grant rejected".to_string(),
-        }));
-        assert!(!should_retry_http_error(&DeepXHttpError::QuotaClaimTimeout {
-            claim_id: 42,
-            last_status: "submitted".to_string(),
-        }));
-    }
-
-    #[rstest]
-    #[case(10010, true)]
-    #[case(10012, true)]
-    #[case(10011, false)]
-    #[case(10001, false)]
-    fn classifies_api_code(#[case] code: u16, #[case] expected: bool) {
-        let error = DeepXHttpError::Api {
-            code: DeepXResponseCode::Api(code),
-            message: String::new(),
-        };
-
-        assert_eq!(should_retry_http_error(&error), expected);
-    }
-
-    #[rstest]
-    fn does_not_retry_pallet_failure() {
-        let error = DeepXHttpError::Api {
-            code: DeepXResponseCode::Pallet("19_0".to_string()),
-            message: String::new(),
-        };
-
-        assert!(!should_retry_http_error(&error));
+        assert!(!should_retry_http_error(
+            &DeepXHttpError::QuotaClaimFailed {
+                claim_id: 42,
+                message: "grant rejected".to_string(),
+            }
+        ));
+        assert!(!should_retry_http_error(
+            &DeepXHttpError::QuotaClaimTimeout {
+                claim_id: 42,
+                last_status: "submitted".to_string(),
+            }
+        ));
     }
 
     #[rstest]

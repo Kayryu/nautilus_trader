@@ -18,11 +18,30 @@
 pub mod client;
 pub mod error;
 pub mod models;
-pub mod pagination;
-pub mod query;
 pub mod retry;
 
 pub use client::DeepXHttpClient;
+pub use deepx_rust_sdk::pagination::{CursorPagination, PaginationDecision};
+pub use deepx_rust_sdk::query::{
+    DeepXAccountSortOrder, DeepXAllSubaccountsRequest, DeepXBalanceChangeType,
+    DeepXBalanceChangesRequest, DeepXFundingRateRequest, DeepXHourlyUnsettledFundingCursor,
+    DeepXHourlyUnsettledFundingRequest, DeepXLendingHistoryInterval, DeepXLendingHistoryRequest,
+    DeepXLendingMarketRequest, DeepXLiquidationAdlRecordsRequest,
+    DeepXLiquidationExecutionRecordsRequest, DeepXLiquidationRecordsRequest, DeepXLiquidationType,
+    DeepXLongShortRatioRequest, DeepXOpenInterestRequest, DeepXPerpAccountTradesRequest,
+    DeepXPerpCandleInterval, DeepXPerpCandlesRequest, DeepXPerpFundingFeeRequest,
+    DeepXPerpHistoryOrdersRequest, DeepXPerpLastPriceRequest, DeepXPerpLiquidationPriceRequest,
+    DeepXPerpMarkPriceRequest, DeepXPerpOpenOrdersRequest, DeepXPerpOraclePriceRequest,
+    DeepXPerpOrderBookRequest, DeepXPerpPositionsRequest, DeepXPerpTradesHistoryRequest,
+    DeepXPerpTradesRequest, DeepXPerpVolumePeriod, DeepXPerpVolumeRequest,
+    DeepXPerpWalletOrdersRequest, DeepXPerpWalletTradesRequest, DeepXQuotaBuyerType,
+    DeepXQuotaHistoryRequest, DeepXQuotaHistoryType, DeepXSpotAccountTradesRequest,
+    DeepXSpotAdlCandidatesRequest, DeepXSpotCandleInterval, DeepXSpotCandlesRequest,
+    DeepXSpotHistoryOrdersRequest, DeepXSpotLastPriceRequest, DeepXSpotOpenOrdersRequest,
+    DeepXSpotOrderBookRequest, DeepXSpotOrderByIdRequest, DeepXSpotOrderSide,
+    DeepXSpotTradesRequest, DeepXSpotVolumePeriod, DeepXSpotVolumeRequest,
+    DeepXSpotWalletOrdersRequest, DeepXSpotWalletTradesRequest, DeepXWalletFundingFeeRequest,
+};
 pub use error::{DeepXHttpError, Result};
 pub use models::{
     DeepXAccountPage, DeepXApiResponse, DeepXBalanceChangePosition, DeepXBalanceChangeRecord,
@@ -47,26 +66,5 @@ pub use models::{
     DeepXSubaccountEquity, DeepXSubaccountMarginRatio, DeepXSubaccountPerpPositions,
     DeepXSubaccountProfile, DeepXSubaccountSnapshot, DeepXUserStats, DeepXWalletAccountSnapshot,
     DeepXWalletDelegateAccounts, DeepXWalletPerpPositions, DeepXWalletSubaccounts,
-};
-pub use pagination::{CursorPagination, PaginationDecision};
-pub use query::{
-    DeepXAccountSortOrder, DeepXAllSubaccountsRequest, DeepXBalanceChangeType,
-    DeepXBalanceChangesRequest, DeepXFundingRateRequest, DeepXHourlyUnsettledFundingCursor,
-    DeepXHourlyUnsettledFundingRequest, DeepXLendingHistoryInterval, DeepXLendingHistoryRequest,
-    DeepXLendingMarketRequest, DeepXLiquidationAdlRecordsRequest,
-    DeepXLiquidationExecutionRecordsRequest, DeepXLiquidationRecordsRequest, DeepXLiquidationType,
-    DeepXLongShortRatioRequest, DeepXOpenInterestRequest, DeepXPerpAccountTradesRequest,
-    DeepXPerpCandleInterval, DeepXPerpCandlesRequest, DeepXPerpFundingFeeRequest,
-    DeepXPerpHistoryOrdersRequest, DeepXPerpLastPriceRequest, DeepXPerpLiquidationPriceRequest,
-    DeepXPerpMarkPriceRequest, DeepXPerpOpenOrdersRequest, DeepXPerpOraclePriceRequest,
-    DeepXPerpOrderBookRequest, DeepXPerpPositionsRequest, DeepXPerpTradesHistoryRequest,
-    DeepXPerpTradesRequest, DeepXPerpVolumePeriod, DeepXPerpVolumeRequest,
-    DeepXPerpWalletOrdersRequest, DeepXPerpWalletTradesRequest, DeepXQuotaBuyerType,
-    DeepXQuotaHistoryRequest, DeepXQuotaHistoryType, DeepXSpotAccountTradesRequest,
-    DeepXSpotAdlCandidatesRequest, DeepXSpotCandleInterval, DeepXSpotCandlesRequest,
-    DeepXSpotHistoryOrdersRequest, DeepXSpotLastPriceRequest, DeepXSpotOpenOrdersRequest,
-    DeepXSpotOrderBookRequest, DeepXSpotOrderByIdRequest, DeepXSpotOrderSide,
-    DeepXSpotTradesRequest, DeepXSpotVolumePeriod, DeepXSpotVolumeRequest,
-    DeepXSpotWalletOrdersRequest, DeepXSpotWalletTradesRequest, DeepXWalletFundingFeeRequest,
 };
 pub use retry::{deepx_http_retry_config, should_retry_http_error};

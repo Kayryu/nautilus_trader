@@ -132,35 +132,11 @@ pub async fn observe_finalized_spot_margin_evidence(
     )
     .await?;
     let client = DeepXRpcClient::new(watch_url.to_string());
-    let enabled = observe_spot_margin_with_client(
+    let enabled = get_spot_margin_at_block(
         &client,
-        observation.checkpoint(),
+        observation.checkpoint().block_hash(),
+        observation.checkpoint().block_number(),
         observation.snapshot().metadata(),
-        subaccount,
-        expected_authority,
-    )
-    .await?;
-    Ok(DeepXFinalizedSpotMarginEvidence {
-        checkpoint: observation.checkpoint(),
-        runtime_identity: observation.snapshot().identity().clone(),
-        subaccount,
-        authority: expected_authority,
-        enabled,
-    })
-}
-
-async fn observe_spot_margin_with_client(
-    client: &DeepXRpcClient,
-    checkpoint: DeepXFinalizedCheckpoint,
-    metadata: &subxt_core::Metadata,
-    subaccount: [u8; 20],
-    expected_authority: [u8; 20],
-) -> Result<bool, DeepXFinalizedSpotMarginError> {
-    get_spot_margin_at_block(
-        client,
-        checkpoint.block_hash(),
-        checkpoint.block_number(),
-        metadata,
         subaccount,
         expected_authority,
     )
@@ -174,135 +150,12 @@ async fn observe_spot_margin_with_client(
         DeepXSpotMarginQueryError::CanonicalHashMismatch => {
             DeepXFinalizedSpotMarginError::CanonicalHashMismatch
         }
+    })?;
+    Ok(DeepXFinalizedSpotMarginEvidence {
+        checkpoint: observation.checkpoint(),
+        runtime_identity: observation.snapshot().identity().clone(),
+        subaccount,
+        authority: expected_authority,
+        enabled,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{Json, Router, routing::post};
-    use deepx_rust_sdk::rpc::spot_margin::subaccount_info_storage_key;
-    use nautilus_core::hex;
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    use super::*;
-    use crate::DeepXReadOnlyRuntimeSnapshot;
-
-    const WALLET: [u8; 20] = [
-        0x78, 0x1e, 0xd3, 0x5b, 0x16, 0x70, 0x68, 0xc9, 0x3d, 0xfa, 0xda, 0xb4, 0x1d, 0xfb, 0x68,
-        0x0e, 0xda, 0xca, 0x4e, 0x50,
-    ];
-    const SUBACCOUNT: [u8; 20] = [
-        0x4d, 0xed, 0x31, 0xcb, 0x63, 0x94, 0x9b, 0x52, 0xf9, 0xdf, 0xc9, 0xbc, 0xfa, 0xde, 0x4e,
-        0xab, 0x70, 0x17, 0xea, 0xdc,
-    ];
-    const STORAGE: &str = "0x781ed35b167068c93dfadab41dfb680edaca4e504ded31cb63949b52f9dfc9bcfade4eab7017eadc146b617a656501000100000000000100000000";
-    const BLOCK_HASH: &str = "0xbb48406ad92b4a214f64b71b9ac95052df793113ef82b5e7df744dd44546f0e4";
-    const BLOCK_NUMBER: u32 = 217_394_490;
-
-    fn metadata() -> subxt_core::Metadata {
-        let response: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/deepx-rust-sdk/test_data/runtime/testnet/",
-            "genesis-87b3c185_metadata-57f1bedf_spec-376_tx-1_finalized-e38016d2/metadata.json",
-        )))
-        .unwrap();
-        let bytes = nautilus_core::hex::decode(
-            response["result"]
-                .as_str()
-                .unwrap()
-                .trim_start_matches("0x"),
-        )
-        .unwrap();
-        DeepXReadOnlyRuntimeSnapshot::approved_testnet(
-            &crate::common::DeepXEnvironment::Testnet,
-            nautilus_core::hex::decode_array(
-                "87b3c18538a2c969775ffbd81beb3d6d8c9cdb22ffd259915230e61124b0fdd7",
-            )
-            .unwrap(),
-            376,
-            1,
-            &bytes,
-        )
-        .unwrap()
-        .metadata()
-        .clone()
-    }
-
-    #[rstest::rstest]
-    #[case::consistent(Some(STORAGE), Some(BLOCK_HASH), None)]
-    #[case::changed_storage(Some("0x00"), Some(BLOCK_HASH), Some("storage"))]
-    #[case::missing_storage(None, Some(BLOCK_HASH), Some("storage"))]
-    #[case::missing_canonical_hash(Some(STORAGE), None, Some("canonical"))]
-    #[case::changed_canonical_hash(
-        Some(STORAGE),
-        Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
-        Some("canonical")
-    )]
-    #[tokio::test]
-    async fn finalized_spot_margin_reads_consistent_storage_at_one_hash(
-        #[case] direct_storage: Option<&str>,
-        #[case] canonical_hash: Option<&str>,
-        #[case] failure: Option<&str>,
-    ) {
-        let key = subaccount_info_storage_key(SUBACCOUNT);
-        let direct_storage = direct_storage.map(str::to_string);
-        let canonical_hash = canonical_hash.map(str::to_string);
-        let router = Router::new().route(
-            "/",
-            post(move |Json(request): Json<serde_json::Value>| {
-                let key = key.clone();
-                let direct_storage = direct_storage.clone();
-                let canonical_hash = canonical_hash.clone();
-                async move {
-                    assert_eq!(request["jsonrpc"], "2.0");
-                    assert_eq!(request["id"], 1);
-                    let result = match request["method"].as_str().unwrap() {
-                        "state_queryStorageAt" => {
-                            assert_eq!(request["params"], json!([[key], BLOCK_HASH]));
-                            json!([{
-                                "block": BLOCK_HASH,
-                                "changes": [[subaccount_info_storage_key(SUBACCOUNT), STORAGE]],
-                            }])
-                        }
-                        "state_getStorage" => {
-                            assert_eq!(request["params"], json!([key, BLOCK_HASH]));
-                            json!(direct_storage)
-                        }
-                        "chain_getBlockHash" => {
-                            assert_eq!(request["params"], json!([BLOCK_NUMBER]));
-                            json!(canonical_hash)
-                        }
-                        other => panic!("unexpected RPC method: {other}"),
-                    };
-                    Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = DeepXRpcClient::new(format!("http://{address}"));
-        let checkpoint = DeepXFinalizedCheckpoint {
-            block_hash: hex::decode_array(BLOCK_HASH.strip_prefix("0x").unwrap()).unwrap(),
-            block_number: BLOCK_NUMBER,
-        };
-
-        let result =
-            observe_spot_margin_with_client(&client, checkpoint, &metadata(), SUBACCOUNT, WALLET)
-                .await;
-        match failure {
-            None => assert!(!result.unwrap()),
-            Some("storage") => assert!(matches!(
-                result,
-                Err(DeepXFinalizedSpotMarginError::InconsistentStorage)
-            )),
-            Some("canonical") => assert!(matches!(
-                result,
-                Err(DeepXFinalizedSpotMarginError::CanonicalHashMismatch)
-            )),
-            _ => unreachable!(),
-        }
-        server.abort();
-    }
 }

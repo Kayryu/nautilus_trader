@@ -26,7 +26,7 @@ use nautilus_model::{
 use serde_json::Value;
 
 use crate::{
-    common::{DeepXProductType, format_instrument_id},
+    common::{DeepXProductType, format_instrument_id, scaled_i128_to_decimal},
     http::{DeepXPerpMarket, DeepXSpotMarket},
     rpc::{DeepXCurrentSpotMarketSpec, DeepXFinalizedSpotMarketSpecEvidence},
 };
@@ -216,10 +216,7 @@ fn parse_spot_instrument_with_spec(
 
 fn scaled_runtime_decimal(value: u128, scale: u8) -> Result<rust_decimal::Decimal> {
     let value = i128::try_from(value).context("runtime value exceeds Decimal integer range")?;
-    Ok(rust_decimal::Decimal::from_i128_with_scale(
-        value,
-        u32::from(scale),
-    ))
+    Ok(scaled_i128_to_decimal(value, u32::from(scale))?)
 }
 
 fn spot_info(market: &DeepXSpotMarket) -> Params {
@@ -265,9 +262,9 @@ mod tests {
     use crate::http::DeepXApiResponse;
 
     const PERP_RESPONSE: &str =
-        include_str!("../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
+        include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/perp_markets.json");
     const SPOT_RESPONSE: &str =
-        include_str!("../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
 
     #[rstest]
     fn parses_fixture_perpetual_without_losing_protocol_values() {

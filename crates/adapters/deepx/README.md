@@ -261,7 +261,7 @@ and return no partial result on empty/repeated cursors or budget exhaustion.
 The active-order raw and typed collectors apply the same explicit page-budget and failure-atomic
 rules while preserving that the changing result is not a snapshot. They additionally bind the
 requested side and enforce requested time order across page boundaries. Run
-`deepx-verify-rest-account-order --open <subaccount> <market-id>` for a credential-free bounded
+the SDK's `perp-open-orders --subaccount <subaccount> <market-id>` mode for a credential-free bounded
 check. The OpenAPI was re-read for this boundary on 2026-09-17. Read-only probes of the
 contributor-provided wallet resolved four testnet subaccounts; its active subaccount returned
 nonempty historical order, trade, and open/closed position pages for market 3, while the later
@@ -282,7 +282,7 @@ ordering, page sizes, and duplicate trade IDs. Captured history includes a zero-
 is retained as venue evidence rather than converted into a Nautilus fill report. A live read on
 2026-09-17 returned two markets, five market/subaccount groups, and 22 records for the contributor
 wallet; three groups advertised continuation through three distinct cursors. Run
-`deepx-verify-rest-wallet-trades <wallet-account-id20> [market-id [subaccount max-pages]]` to repeat
+the SDK's `wallet-trades <wallet-account-id20> [market-id [subaccount max-pages]]` mode to repeat
 the credential-free single-snapshot check or bounded selected-subaccount traversal.
 `get_perp_wallet_trade_pages_for_subaccount` follows one selected
 market/subaccount group's cursor within an explicit page budget, rejecting duplicate IDs,
@@ -303,34 +303,37 @@ without returning a partial collection. Legacy history includes a zero-sized fil
 retained as raw venue evidence but is not converted into a framework order report. The response
 still does not echo the requested wallet or prove a block-pinned snapshot, and it is not converted
 into mass status or external order reports.
-Run `deepx-verify-rest-wallet-orders <wallet-account-id20> [market-id]` for bounded credential-free
+Run the SDK's `wallet-orders <wallet-account-id20> [market-id]` mode for bounded credential-free
 validation.
 `get_perp_order_by_id` decodes and validates one exact decimal order identity, owner, market,
 financial fields, and timestamps. The optional `avgFillPrice` and `updatedTime` fields follow the
 nullable/omitted OpenAPI cancellation example. Run
-`deepx-verify-rest-account-order <subaccount> <market-id> <order-id>` for a credential-free live
+the SDK's `perp-order <subaccount> <market-id> <order-id>` mode for a credential-free live
 check. This typed read does not by itself construct a framework report or imply finality.
 `get_perp_order_by_tx` validates an exact 32-byte transaction hash and returns the single associated
-typed perpetual order. Run `deepx-verify-rest-account-order --tx <tx-hash>` for a credential-free
+typed perpetual order. Run the SDK's `perp-order-tx <tx-hash>` mode for a credential-free
 live check. This mutable REST association is not canonical inclusion or finality evidence. The
 position-order projection returned a fail-closed `503` for observed lifecycle IDs on 2026-09-17,
 so it remains disabled along with complete bulk order reconciliation.
-`deepx-verify-rest-account-snapshot <wallet-account-id20> [market-id]` performs credential-free
+The SDK's `snapshot <wallet-account-id20> [market-id]` mode performs credential-free
 validation for wallet statistics and every subaccount returned by the wallet directory, covering
 profile, exact asset balances, equity, margin ratio, quota summary, and invitation-bound status.
 When a market ID is supplied it also validates each nullable liquidation-price observation. It
 never submits transactions.
-`deepx-verify-rest-funding-fees <subaccount> [market-id]` validates bounded typed subaccount
-funding-fee history. Its `--wallet <address> [market-id]` mode validates the dedicated globally
-ordered wallet endpoint. Signed fees and rates, `isSettled`, and venue order remain observations;
+Run SDK account checks from `deepx-rust-sdk` with
+`cargo run --example deepx-sdk-verify-account -- <mode> [arguments]`.
+The `funding-fees subaccount <address> [market-id]` mode validates bounded typed subaccount
+funding-fee history. Its `funding-fees wallet <address> [market-id]` mode validates the dedicated
+globally ordered wallet endpoint. Signed fees and rates, `isSettled`, and venue order remain
+observations;
 the reader does not infer payment currency, settlement cadence, account state, or framework P&L
 events.
-`deepx-verify-rest-balance-changes <wallet|subaccount> <account-id20>` validates bounded typed
+The SDK's `balance-changes <wallet|subaccount> <account-id20>` mode validates bounded typed
 balance-change history without credentials. Signed deltas retain their venue sign and are not
 converted into current balances. Wallet-scoped pages can contain records for multiple subaccounts.
 The cursor-bounded reader observes mutable, non-block-pinned REST pages and does not prove complete
 account history, free/locked semantics, or framework account state.
-`deepx-verify-rest-liquidation-records <wallet|subaccount> <account-id20>` validates bounded typed
+The SDK's `liquidations <wallet|subaccount> <account-id20>` mode validates bounded typed
 liquidation history without credentials. The four chain variants are closed, and raw integer
 amounts, fees, and oracle values retain their protocol units without conversion through floating
 point. JSON-encoded liquidation details and canceled-order identities are structurally validated
@@ -342,7 +345,7 @@ venue candidate order without assigning rank semantics. Amounts remain strings w
 scale. `get_spot_adl_candidates_raw` remains available for unknown fields. The response item shape
 comes from a read-only testnet observation because OpenAPI defines only a generic envelope. Neither
 method establishes execution eligibility or submits an ADL.
-`deepx-verify-rest-spot-adl-candidates <target-subaccount> <asset> <liability>
+The SDK's `spot-adl <target-subaccount> <asset> <liability>
 <min-cover-raw-integer> [limit]` exercises the typed read against testnet without credentials. Its
 output keeps all amounts in the endpoint's raw integer unit.
 `get_liquidation_adl_records_raw` and `get_liquidation_adl_record_pages_raw` query wallet- or
@@ -352,7 +355,7 @@ metadata and request ranges are validated. These reads do not indicate that an o
 finalized chain state.
 `get_liquidation_keeper_state_raw` returns phase-dependent keeper state as uninterpreted JSON for
 one subaccount, optionally filtered by chain ID. Run
-`deepx-verify-rest-liquidation-keeper-state <subaccount> [chain-id]` for a credential-free read.
+the SDK's `liquidation-keeper <subaccount> [chain-id]` mode for a credential-free read.
 The endpoint has no stable OpenAPI item schema; its response does not establish liquidation
 execution or chain finality.
 `get_liquidation_execution_record_pages_raw`, `get_liquidation_cranker_record_pages_raw`, and
@@ -360,7 +363,7 @@ execution or chain finality.
 liquidation, cranker, and TP/SL execution history. The common request validates scope,
 hashes, time and trigger-block bounds, page size, and cursor progression; record payloads remain
 raw. Run
-`deepx-verify-rest-liquidation-execution-records <liquidation|cranker|tp-sl> <wallet|subaccount>
+the SDK's `liquidation-execution <liquidation|cranker|tp-sl> <wallet|subaccount>
 <account-id20>` for a credential-free read. These mutable API records do not establish chain
 inclusion or finality. The ordinary liquidation route has local mock coverage but no successful
 live response capture.
@@ -478,7 +481,7 @@ cursors, duplicate subaccount identities, invalid owner/subaccount addresses, ma
 times, descending-order violations, and page-size overruns without returning partial results. The
 captured live response uses RFC 3339 `createdAt` strings and null statuses, despite the OpenAPI
 example showing an integer timestamp. The typed model deliberately follows the observed wire form.
-Run `deepx-verify-rest-subaccount-directory` for a credential-free single-page check. This mutable
+Run the SDK's `directory` mode for a credential-free single-page check. This mutable
 directory does not prove current key control, completeness, or a block-pinned ownership snapshot.
 
 `get_balance_changes` and `get_balance_change_pages` expose exact signed account deltas for one
@@ -510,7 +513,7 @@ liquidation methodology, price units, freshness, position state, or framework ri
 boolean although OpenAPI shows an object; the reader accepts both forms and checks wallet identity
 when the object form is returned. `get_invitation_codes(wallet)` reads associated code strings
 without inferring a code format. Run
-`deepx-verify-rest-invitation-codes <wallet-account-id20>` for a credential-free read. These
+the SDK's `invitation-codes <wallet-account-id20>` mode for a credential-free read. These
 methods do not perform invitation mutations.
 On 2026-09-16, the read-only verifier observed four current and four created subaccounts, an IF
 staked quote amount of zero, and a null `ETH-USDC` liquidation price for all four subaccounts.
@@ -705,30 +708,10 @@ Watch block. Timestamp storage must agree with the block's inherent. A separate 
 retained only as the pre-submission boundary for durable recovery scans; it does not select the
 runtime metadata or timestamp used for signing.
 
-`bin/verify_sdk_signing.py` independently checks complete signed regression bytes using the
-reviewed DeepX Python SDK `_native_py.py` blob `0108f89d79366f13e747ef59c75ce73a543dc404`,
-`_runtime_compat.py` blob `06b2e9fc84cc36c647452027b9c5b2cbbfcafb8c`, and the captured
-spec366/tx1, spec369/tx1, or spec371/tx1 runtime (`--spec-version 371`). It uses
-`substrate-interface` and takes both raw Python sources or GitHub contents API JSON responses;
-no RPC requests leave its offline fixture transport. It checks
-System remark, Subaccount no-op, perpetual Limit GTC/IOC, Market IOC, ordinary perpetual and Spot
-cancellation, fast perpetual cancellation, plus a sell-side reduce-only `MustPostOnly` placement
-and subaccount renaming on all three snapshots. Subaccount Spot margin enablement and Lending quota
-purchase signing, with and without a source subaccount, are also checked under all three snapshots.
-Spot Buy Limit IOC and Buy Market without a slippage price are checked under
-spec369 and spec371. Spec371
-also checks fast Spot cancellation, Spot Limit GTC, Sell IOC, and Sell Market with a 50 bps slippage
-bound, plus perpetual close, profit/loss point management, Subaccount initialization/deletion, and
-delegate setup, mode update, and removal. Run the Rust signing tests to verify the implementation
-against those bytes.
-These limited vectors do not prove every operation, authorization, financial scaling, live IOC
-behavior, or the SDK compatibility helper's
-`CheckNonceEra` branch.
-Pallet signing explicitly uses an immortal era, matching these SDK vectors. Mortal signing has no
-independent SDK vector and is not exposed by this adapter.
-On 2026-10-09, the signing tests and the pinned SDK's offline spec 366, 369, and 371 vector
-checks passed. The approved fixture metadata uses `CheckMortality` and `CheckNonce`, so this run
-still does not exercise the compatibility helper's `CheckNonceEra` branch.
+The SDK owns offline signing regression vectors, including complete spec376 extrinsic bytes and
+argument and nonce binding checks. The adapter tests verify that its signed transaction wrapper
+preserves the SDK result. These offline vectors do not establish authorization, financial scaling,
+live order behavior, or support for unlisted runtimes.
 
 `sign_offline_evm_transaction` signs explicit EIP-1559 and legacy EVM envelopes with the pinned
 SDK's zero-fee fields. `sign_offline_evm_transact_extrinsic` binds the testnet chain ID and active
@@ -1041,8 +1024,10 @@ repeats the previous bucket, while the minute at `end` is excluded. The collecto
 bounds to preserve inclusive caller bounds and advances to the next minute on continuation. It
 rejects changed pair, overlapping or invalid buckets, and budget exhaustion without returning
 partial history. A range containing no minute bucket rejects before HTTP because an empty page
-cannot carry a verified market pair. `deepx-verify-rest-open-interest-history 3 1788251280000 1788251460000 2 3`
-returned four exact historical ETH-USDC buckets across two public testnet pages on 2026-10-10.
+cannot carry a verified market pair. An adapter check returned four exact historical ETH-USDC
+buckets across two public testnet pages on 2026-10-10. Run the equivalent SDK check from its
+directory with
+`cargo run --example deepx-sdk-verify-rest -- open-interest 3 1788251280000 1788251460000 2 3`.
 `deepx-verify-ws-open-interest 3` observes one acknowledged public `open_interest` update, binds
 market 3 and `ETH-USDC` to the validated REST directory, and retains exact decimals and original
 JSON. A 2026-10-10 read-only run observed bucket `1791632940000`, total open interest `3332.231`,
@@ -1129,7 +1114,8 @@ time. The optional positive aggregation tick is serialized as exact decimal text
 snapshot remains separate from the framework WebSocket book pipeline and does not establish full
 exchange depth, freshness, or atomic agreement with a stream. A spec-369 fixture preserves the
 observed zero `latestPrice` and exact `midPrice`; backend float artifacts are never quantized.
-Run `deepx-verify-rest-perp-order-book <market-id>` for a credential-free live check.
+Run `cargo run --example deepx-sdk-verify-rest -- perp-book <market-id>` from the SDK directory
+for a credential-free live check.
 
 `get_spot_trades` exposes one globally ordered raw Spot execution page selected by optional market
 name or bytes32 pair, wallet, inclusive millisecond bounds, sort order, and cursor. Financial JSON
@@ -1141,8 +1127,9 @@ violations across pages without returning a partial collection. Mutable totals a
 remain constant across pages. The raw reader itself does not infer fee assets, Spot quantity
 precision, framework aggressor semantics, or `TradeTick` conversion.
 
-`deepx-verify-rest-spot-trades <market-name> [wallet-account-id20]` validates one credential-free
-page. A public `ETH/USDC` run on 2026-09-17 returned 100 exact records and reported a continuation
+`cargo run --example deepx-sdk-verify-rest -- spot-trades <market-name> [wallet-account-id20]`
+from the SDK directory validates one credential-free page. A public `ETH/USDC` adapter run on
+2026-09-17 returned 100 exact records and reported a continuation
 against more than 11 million matching rows. Direct probes with the contributor wallet filter
 returned API code `10012` (`Service temporarily unavailable`); the adapter verifier exhausted its
 retry path with HTTP 504. Successful wallet-filtered Spot history therefore remains unverified,
@@ -1163,7 +1150,7 @@ run on 2026-09-17 validated recent candles, last price, one-hour volume, and a 2
 current raw `ETH/USDC` response contains aggregated volumes such as `7.381581525662676`, which
 the exact framework converter rejects against the finalized four-decimal size precision. OHLC
 values and volume must also be exact multiples of finalized tick and step sizes. Run
-`deepx-verify-rest-spot-market <market-name>` to
+`cargo run --example deepx-sdk-verify-rest -- spot-market <market-name>` from the SDK directory to
 repeat the credential-free raw check. `deepx-verify-spot-instruments` verifies Spot construction,
 and `deepx-verify-spot-trade-history` verifies framework trade conversion.
 
@@ -1188,7 +1175,7 @@ market name or bytes32 pair. Historical orders may omit both selectors for all m
 bounded history collector rejects stalled cursors or budget exhaustion without returning a partial
 collection. Venue status, price type, post-only, transaction-hash type, fee ownership, and lifecycle
 semantics remain uninterpreted, so these readers do not construct framework order reports. Run
-`deepx-verify-rest-spot-orders <subaccount> <market-name>` for a credential-free live check. Typed
+the SDK's `spot-orders <subaccount> <market-name>` mode for a credential-free live check. Typed
 Spot wallet-group reads use the dedicated order and trade endpoints. Both validate exact market
 and subaccount groups, per-group time ordering, one global cursor across nonempty groups, requested
 global page size, and duplicate identities across bounded pages. Order makers must match their
@@ -1197,7 +1184,7 @@ wallet, so the adapter preserves grouping without independently rebinding wallet
 terminal groups observed for the contributor wallet remain valid. Wallet orders may omit both the
 wallet and market selectors for the venue's all-wallet view; wallet trades require an exact wallet
 and exactly one name or pair because a read-only selector-free probe returned API code `10011`.
-Run `deepx-verify-rest-spot-wallet <wallet-account-id20> <market-name>` for a credential-free
+Run the SDK's `spot-wallet <wallet-account-id20> <market-name>` mode for a credential-free
 single-page live check; empty terminal pages are reported as zero records, while empty pages that
 advertise continuation fail. Venue order, taker, side, and fee semantics remain uninterpreted, and
 no framework order or fill report is constructed.
@@ -1209,7 +1196,7 @@ echo it exactly. Both validate the shared order record without assigning lifecyc
 semantics. A captured order changed from `Open` in the earlier history fixture to `Canceled` in the
 lookup, with `UserCanceled` and a cancellation height; this directly demonstrates mutable REST
 state rather than canonical transaction finality. Run
-`deepx-verify-rest-spot-order-lookup <subaccount> <market-name> <order-id> <Buy|Sell> <tx-hash>` to
+the SDK's `spot-order <subaccount> <market-name> <order-id> <Buy|Sell> <tx-hash>` mode to
 cross-check that both lookup paths currently return the same record.
 
 `get_spot_account_trades_raw` preserves one subaccount-selected execution page without interpreting
@@ -1221,7 +1208,7 @@ trade IDs, cursor progress, and page budgets. The observed maker rebate is negat
 fee semantics. The response does not echo the requested subaccount on its records and therefore
 cannot independently rebind ownership. Taker and
 order-side labels remain uninterpreted, and no fill report is constructed. Run
-`deepx-verify-rest-spot-account-trades <subaccount> <market-name>` for a credential-free live check.
+the SDK's `spot-trades <subaccount> <market-name>` mode for a credential-free live check.
 
 `request_funding_rates` returns exact chronological historical minute-bucket samples through
 `DataResponse::FundingRates`. Its bounded descending REST reader retains the range across cursor
@@ -1476,9 +1463,9 @@ nonempty chain-confirmed purchase record, enabling `get_quota_history` and its b
 They bind owner and optional buyer/type filters, validate closed history and buyer classifications,
 chain identities, transaction hashes, descending timestamps, duplicates, limits, and cursor
 progress. Purchase, activate, and free values remain venue records rather than claim authority.
-Run `deepx-verify-rest-quota-history <wallet-account-id20>` for a credential-free nonempty
+Run the SDK's `quota-history <wallet-account-id20>` mode for a credential-free nonempty
 single-page check.
-Run `deepx-verify-rest-quota-summary <wallet-account-id20>` for a credential-free aggregate check.
+Run the SDK's `quota <wallet-account-id20>` mode for a credential-free aggregate check.
 Python `get_deepx_quota_summary(wallet, config=None)` returns the same validated aggregate as a
 read-only result with exact USD decimal strings. It blocks the caller during the HTTP request.
 Python `get_deepx_quota_history` returns one validated page of confirmed operations with its
@@ -1500,8 +1487,9 @@ claim is enabled by this helper.
 The Rust HTTP client also exposes public lending asset identities, exact borrow-rate curves, and
 bounded APR and pool-status histories. It validates market/asset scope, curve ordering, requested
 time order and bounds, duplicate buckets, and exact nonnegative financial values. Run
-`cargo run -p nautilus-deepx --bin deepx-verify-rest-lending-markets` for a credential-free live
-check. These raw observations do not establish asset precision or units, directory completeness,
+`cargo run --example deepx-sdk-verify-rest -- lending` from the SDK directory for a
+credential-free live check. These raw observations do not establish asset precision or units,
+directory completeness,
 freshness, interest compounding, or framework instrument/event semantics. No lending balance,
 yield, or transaction capability is inferred or enabled.
 `deepx-verify-ws-lending-rates` subscribes to the public `lending_interest_rate` channel and

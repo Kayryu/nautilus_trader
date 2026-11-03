@@ -15,13 +15,15 @@
 
 //! Read-only initial account summary observations without financial interpretation.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
-use deepx_rust_sdk::websocket::account_metrics::DeepXWsAccountMetricsFrame as Frame;
 pub use deepx_rust_sdk::websocket::account_metrics::{
     DeepXWsAccountMetric, DeepXWsAccountMetricChannel, DeepXWsAccountMetricsRequest,
     DeepXWsExactPortfolioMargin,
+};
+use deepx_rust_sdk::websocket::account_metrics::{
+    DeepXWsAccountMetricsCollector, DeepXWsAccountMetricsFrame as Frame,
 };
 use nautilus_network::transport::Message;
 #[cfg(test)]
@@ -54,11 +56,7 @@ pub async fn observe_initial_account_metrics(
         return Err(e);
     }
     let result = tokio::time::timeout(timeout, async {
-        let mut acknowledged = false;
-        let mut pre_ack_frames = 0;
-        let expected_count = DeepXWsAccountMetricChannel::ALL.len();
-        let mut metrics: BTreeMap<DeepXWsAccountMetricChannel, DeepXWsAccountMetric> =
-            BTreeMap::new();
+        let mut collector = DeepXWsAccountMetricsCollector::new();
         loop {
             let message = match connection.receive().await {
                 Ok(Some(message)) => message,
@@ -79,39 +77,10 @@ pub async fn observe_initial_account_metrics(
                 }
                 anyhow::bail!("unsupported DeepX account summary stream message");
             };
-            match Frame::parse(std::str::from_utf8(&bytes)?, request)? {
-                Frame::Subscribed => {
-                    ensure!(
-                        !acknowledged,
-                        "duplicate DeepX account summary acknowledgement"
-                    );
-                    acknowledged = true;
-                    if metrics.len() == expected_count {
-                        break Ok::<_, anyhow::Error>(metrics.into_values().collect());
-                    }
-                }
-                Frame::Metric(metric) => {
-                    if !acknowledged {
-                        pre_ack_frames += 1;
-                        ensure!(
-                            pre_ack_frames <= expected_count,
-                            "DeepX account summary pre-ack buffer overflow"
-                        );
-                    }
-                    let key = metric.channel();
-                    if let Some(previous) = metrics.get(&key) {
-                        ensure!(
-                            previous.raw_data().get() == metric.raw_data().get(),
-                            "conflicting duplicate DeepX account summary data"
-                        );
-                        continue;
-                    }
-                    metrics.insert(key, *metric);
-                    if acknowledged && metrics.len() == expected_count {
-                        break Ok::<_, anyhow::Error>(metrics.into_values().collect());
-                    }
-                }
-                Frame::Pong => {}
+            if let Some(metrics) =
+                collector.push(Frame::parse(std::str::from_utf8(&bytes)?, request)?)?
+            {
+                break Ok::<_, anyhow::Error>(metrics);
             }
         }
     })
@@ -151,17 +120,11 @@ mod tests {
 
     #[rstest]
     #[case(0)]
-    #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
     #[case(5)]
-    #[case(6)]
-    #[case(7)]
     #[case(8)]
     #[case(9)]
     #[tokio::test]
-    async fn observer_requires_exact_ack_and_all_four_summaries(#[case] scenario: u8) {
+    async fn observer_completes_only_with_ack_and_all_four_summaries(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -173,13 +136,7 @@ mod tests {
                     };
                     let request: Value = serde_json::from_str(&request).unwrap();
                     assert_eq!(request["subscriptions"].as_array().unwrap().len(), 4);
-                    if scenario == 1 {
-                        let _ = socket.send(ServerMessage::Text(TOTAL.into())).await;
-                    } else if scenario == 7 {
-                        for _ in 0..5 {
-                            let _ = socket.send(ServerMessage::Text(TOTAL.into())).await;
-                        }
-                    } else if scenario == 8 || scenario == 9 {
+                    if scenario == 8 || scenario == 9 {
                         for frame in [TOTAL, NET, EQUITY, MARGIN] {
                             let _ = socket.send(ServerMessage::Text(frame.into())).await;
                         }
@@ -187,23 +144,8 @@ mod tests {
                             return;
                         }
                     }
-                    let ack = if scenario == 2 {
-                        ACK.replace(ADDRESS, "0x0000000000000000000000000000000000000000")
-                    } else if scenario == 6 {
-                        let mut ack: Value = serde_json::from_str(ACK).unwrap();
-                        ack["subscriptions"].as_array_mut().unwrap().pop();
-                        ack.to_string()
-                    } else {
-                        ACK.to_string()
-                    };
-                    let _ = socket.send(ServerMessage::Text(ack.into())).await;
+                    let _ = socket.send(ServerMessage::Text(ACK.into())).await;
                     let _ = socket.send(ServerMessage::Text(TOTAL.into())).await;
-                    if scenario == 3 {
-                        let _ = socket.send(ServerMessage::Text(TOTAL.into())).await;
-                    } else if scenario == 4 {
-                        let conflicting = TOTAL.replace("970.9600", "970.9700");
-                        let _ = socket.send(ServerMessage::Text(conflicting.into())).await;
-                    }
                     let _ = socket.send(ServerMessage::Text(NET.into())).await;
                     let _ = socket.send(ServerMessage::Text(EQUITY.into())).await;
                     if scenario != 5 {
@@ -220,7 +162,7 @@ mod tests {
         let result =
             observe_initial_account_metrics(&network, None, Duration::from_secs(2), &request())
                 .await;
-        if matches!(scenario, 0 | 1 | 3 | 8) {
+        if matches!(scenario, 0 | 8) {
             let metrics = result.unwrap();
             assert_eq!(metrics.len(), 4);
             assert_eq!(

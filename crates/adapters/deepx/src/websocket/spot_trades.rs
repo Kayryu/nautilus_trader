@@ -14,8 +14,9 @@
 
 //! Acknowledged public Spot trade subscriptions and observed trade-page envelopes.
 
-use std::{collections::VecDeque, num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
 
+use deepx_rust_sdk::websocket::spot_trades::DeepXWsSpotTradeSession;
 pub(crate) use deepx_rust_sdk::websocket::spot_trades::{
     DeepXWsSpotTradeFrame, DeepXWsSpotTradeRequest,
 };
@@ -26,11 +27,8 @@ use crate::{config::DeepXNetworkConfig, http::DeepXSpotMarket};
 #[derive(Debug)]
 pub(crate) struct DeepXWsSpotTradeConnection {
     transport: super::transport::DeepXWsReadConnection,
-    request: DeepXWsSpotTradeRequest,
-    buffered: VecDeque<DeepXWsSpotTradeFrame>,
-    buffer_capacity: NonZeroUsize,
+    session: DeepXWsSpotTradeSession,
     timeout: Duration,
-    subscribed: bool,
     poisoned: bool,
 }
 
@@ -53,11 +51,8 @@ impl DeepXWsSpotTradeConnection {
                 network, proxy_url, timeout,
             )
             .await?,
-            request,
-            buffered: VecDeque::new(),
-            buffer_capacity,
+            session: DeepXWsSpotTradeSession::new(request, buffer_capacity),
             timeout,
-            subscribed: false,
             poisoned: false,
         };
         connection.subscribe().await?;
@@ -66,35 +61,13 @@ impl DeepXWsSpotTradeConnection {
 
     async fn subscribe(&mut self) -> anyhow::Result<()> {
         self.transport
-            .send_spot_trade_request(&self.request)
+            .send_spot_trade_request(self.session.request())
             .await?;
         let result = tokio::time::timeout(self.timeout, async {
             loop {
                 let frame = self.read_frame().await?;
-                match &frame {
-                    DeepXWsSpotTradeFrame::Subscribed {
-                        market,
-                        subscriptions,
-                    } => {
-                        self.request.validate_ack(market, subscriptions)?;
-                        self.subscribed = true;
-                        return Ok(());
-                    }
-                    DeepXWsSpotTradeFrame::Data { market, .. } => {
-                        anyhow::ensure!(
-                            self.request.matches_market(market),
-                            "DeepX Spot pre-ack trade identity mismatch"
-                        );
-                        anyhow::ensure!(
-                            self.buffered.len() < self.buffer_capacity.get(),
-                            "DeepX Spot pre-ack trade buffer overflow"
-                        );
-                        self.buffered.push_back(frame);
-                    }
-                    DeepXWsSpotTradeFrame::Pong => {}
-                    DeepXWsSpotTradeFrame::Error { code, message } => {
-                        anyhow::bail!("DeepX Spot WebSocket error {code}: {message}");
-                    }
+                if self.session.accept_before_ack(frame)? {
+                    return Ok(());
                 }
             }
         })
@@ -103,12 +76,12 @@ impl DeepXWsSpotTradeConnection {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.session.clear();
                 Err(e)
             }
             Err(_) => {
                 self.poisoned = true;
-                self.buffered.clear();
+                self.session.clear();
                 anyhow::bail!("DeepX Spot trade acknowledgement timed out");
             }
         }
@@ -121,29 +94,18 @@ impl DeepXWsSpotTradeConnection {
     /// Returns an error for a foreign frame or bounded transport failure.
     pub(crate) async fn next_frame(&mut self) -> anyhow::Result<DeepXWsSpotTradeFrame> {
         anyhow::ensure!(
-            self.subscribed && !self.poisoned,
+            self.session.is_subscribed() && !self.poisoned,
             "DeepX Spot trade connection is terminal"
         );
-        if let Some(frame) = self.buffered.pop_front() {
+        if let Some(frame) = self.session.pop_buffered() {
             return Ok(frame);
         }
         let frame = self.read_frame().await?;
-        match &frame {
-            DeepXWsSpotTradeFrame::Data { market, .. } => {
-                anyhow::ensure!(
-                    self.request.matches_market(market),
-                    "DeepX Spot trade market mismatch"
-                );
-            }
-            DeepXWsSpotTradeFrame::Pong => {}
-            DeepXWsSpotTradeFrame::Error { code, message } => {
+        if let Err(e) = self.session.validate_live_frame(&frame) {
+            if !matches!(frame, DeepXWsSpotTradeFrame::Data { .. }) {
                 self.poisoned = true;
-                anyhow::bail!("DeepX Spot WebSocket error {code}: {message}");
             }
-            DeepXWsSpotTradeFrame::Subscribed { .. } => {
-                self.poisoned = true;
-                anyhow::bail!("unexpected DeepX Spot subscription acknowledgement");
-            }
+            return Err(e);
         }
         Ok(frame)
     }
@@ -167,7 +129,7 @@ impl DeepXWsSpotTradeConnection {
     /// Returns an error if the bounded transport close fails.
     pub(crate) async fn close(&mut self) -> anyhow::Result<()> {
         self.poisoned = true;
-        self.buffered.clear();
+        self.session.clear();
         self.transport.close().await
     }
 
@@ -184,5 +146,87 @@ impl DeepXWsSpotTradeConnection {
                 _ => anyhow::bail!("DeepX Spot WebSocket closed or sent unsupported data"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        Router,
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::get,
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    const MARKET_RESPONSE: &str = include_str!(
+        "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_market_eth_usdc_by_pair.json"
+    );
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn connection_releases_only_acknowledged_market_data(#[case] foreign: bool) {
+        let response: serde_json::Value = serde_json::from_str(MARKET_RESPONSE).unwrap();
+        let market: DeepXSpotMarket = serde_json::from_value(response["data"].clone()).unwrap();
+        let pair = if foreign {
+            format!("0x{}", "0".repeat(64))
+        } else {
+            market.pair.clone()
+        };
+        let data = format!(
+            r#"{{"type":"data","market":{{"type":"spot","name":"ETH/USDC","pair":"{pair}"}},"channel":"trades","data":{{"items":[]}},"timestamp":1}}"#
+        );
+        let ack = format!(
+            r#"{{"type":"subscribed","market":{{"type":"spot","name":"ETH/USDC","pair":"{}"}},"subscriptions":["trades"],"message":"Subscribed"}}"#,
+            market.pair
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/internal/v1/ws",
+            get(move |upgrade: WebSocketUpgrade| {
+                let data = data.clone();
+                let ack = ack.clone();
+                async move {
+                    upgrade.on_upgrade(move |mut socket| async move {
+                        let Some(Ok(Message::Text(_))) = socket.recv().await else {
+                            panic!("expected Spot trade subscription");
+                        };
+                        socket.send(Message::Text(data.into())).await.unwrap();
+                        if !foreign {
+                            socket.send(Message::Text(ack.into())).await.unwrap();
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(1), socket.recv()).await;
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let network = DeepXNetworkConfig {
+            base_url_ws: Some(format!("ws://{address}")),
+            ..Default::default()
+        };
+        let connection = DeepXWsSpotTradeConnection::connect(
+            &network,
+            None,
+            Duration::from_secs(1),
+            NonZeroUsize::new(1).unwrap(),
+            market,
+        )
+        .await;
+        if foreign {
+            assert!(connection.is_err());
+        } else {
+            let mut connection = connection.unwrap();
+            assert!(matches!(
+                connection.next_frame().await.unwrap(),
+                DeepXWsSpotTradeFrame::Data { .. }
+            ));
+            connection.close().await.unwrap();
+        }
+        server.abort();
     }
 }

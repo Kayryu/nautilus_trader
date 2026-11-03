@@ -99,7 +99,7 @@ macro_rules! impl_wire_deref {
     };
 }
 
-fn wrap_account_page<T, U: From<T>>(page: DeepXAccountPage<T>) -> DeepXAccountPage<U> {
+pub(super) fn wrap_account_page<T, U: From<T>>(page: DeepXAccountPage<T>) -> DeepXAccountPage<U> {
     DeepXAccountPage {
         items: page.items.into_iter().map(Into::into).collect(),
         next_cursor: page.next_cursor,
@@ -943,7 +943,7 @@ mod tests {
     fn sdk_wallet_pages_preserve_records_and_cursors_in_adapter_wrappers() {
         let spot_orders: DeepXApiResponse<Vec<DeepXSpotWalletOrderMarketWire>> =
             serde_json::from_str(include_str!(
-                "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_orders_eth_usdc_page_1.json"
+                "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_orders_eth_usdc_page_1.json"
             ))
             .unwrap();
         let cursor = spot_orders.data[0].subaccounts[0]
@@ -965,7 +965,7 @@ mod tests {
 
         let spot_trades: DeepXApiResponse<Vec<DeepXSpotWalletTradeMarketWire>> =
             serde_json::from_str(include_str!(
-                "../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
+                "../../../../../deepx-rust-sdk/test_data/http/testnet/spot_wallet_trades_eth_usdc_page_1.json"
             ))
             .unwrap();
         let cursor = spot_trades.data[0].subaccounts[0]
@@ -987,7 +987,7 @@ mod tests {
 
         let perp_orders: DeepXApiResponse<Vec<DeepXPerpWalletOrderMarketWire>> =
             serde_json::from_str(include_str!(
-                "../../deepx-rust-sdk/test_data/http/testnet/perp_wallet_orders_page_1.json"
+                "../../../../../deepx-rust-sdk/test_data/http/testnet/perp_wallet_orders_page_1.json"
             ))
             .unwrap();
         let cursor = perp_orders.data[0].subaccounts[0]

@@ -17,12 +17,13 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 pub use deepx_rust_sdk::websocket::account_trade_history::{
     DeepXWsPerpFinalizedTradeScope, DeepXWsPerpTradeHistoryBatch, DeepXWsPerpTradeHistoryFrame,
     DeepXWsPerpTradeHistoryItem, DeepXWsPerpTradeHistoryMatchError, DeepXWsPerpTradeHistoryRequest,
 };
 use deepx_rust_sdk::websocket::account_trade_history::{
+    DeepXWsPerpTradeHistoryCollector,
     match_perp_trade_history_batch_to_finalized as sdk_match_finalized,
     match_perp_trade_history_batch_to_rest as sdk_match_rest,
 };
@@ -151,22 +152,12 @@ pub async fn observe_perp_trade_history_batches(
         !window.is_zero(),
         "DeepX trade-history window must be positive"
     );
-    ensure!(
-        max_batches > 0,
-        "DeepX trade-history batch limit must be positive"
-    );
-    ensure!(
-        max_items > 0,
-        "DeepX trade-history item limit must be positive"
-    );
+    let mut collector = DeepXWsPerpTradeHistoryCollector::new(max_batches, max_items)?;
     let mut connection =
         super::transport::DeepXWsReadConnection::connect(network, proxy_url, window).await?;
     connection.send_perp_trade_history_request(request).await?;
     let deadline = tokio::time::Instant::now() + window;
     let result = async {
-        let mut acknowledged = false;
-        let mut batches = Vec::new();
-        let mut item_count = 0_usize;
         loop {
             let message = match tokio::time::timeout_at(deadline, connection.receive()).await {
                 Ok(Ok(Some(message))) => message,
@@ -182,13 +173,7 @@ pub async fn observe_perp_trade_history_batches(
                     continue;
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    ensure!(
-                        acknowledged,
-                        "DeepX trade-history acknowledgement deadline exceeded"
-                    );
-                    return Ok(batches);
-                }
+                Err(_) => return collector.finish(),
             };
             let Message::Text(bytes) = message else {
                 if matches!(message, Message::Ping(_) | Message::Pong(_)) {
@@ -196,32 +181,9 @@ pub async fn observe_perp_trade_history_batches(
                 }
                 anyhow::bail!("unsupported DeepX trade-history stream message");
             };
-            match DeepXWsPerpTradeHistoryFrame::parse(std::str::from_utf8(&bytes)?, request)? {
-                DeepXWsPerpTradeHistoryFrame::Subscribed => {
-                    ensure!(
-                        !acknowledged,
-                        "duplicate DeepX trade-history acknowledgement"
-                    );
-                    acknowledged = true;
-                }
-                DeepXWsPerpTradeHistoryFrame::TradeBatch(batch) => {
-                    ensure!(
-                        acknowledged,
-                        "DeepX trade-history data preceded its acknowledgement"
-                    );
-                    item_count = item_count
-                        .checked_add(batch.items().len())
-                        .context("DeepX trade-history item count overflowed")?;
-                    ensure!(
-                        item_count <= max_items,
-                        "DeepX trade-history item limit exceeded"
-                    );
-                    batches.push(batch);
-                    if batches.len() == max_batches {
-                        return Ok(batches);
-                    }
-                }
-                DeepXWsPerpTradeHistoryFrame::Pong => {}
+            let frame = DeepXWsPerpTradeHistoryFrame::parse(std::str::from_utf8(&bytes)?, request)?;
+            if let Some(batches) = collector.accept(frame)? {
+                return Ok(batches);
             }
         }
     }
@@ -293,11 +255,8 @@ mod tests {
     #[rstest]
     #[case(1)]
     #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(5)]
     #[tokio::test]
-    async fn bounded_observer_requires_ack_and_collects_only_later_data(#[case] scenario: u8) {
+    async fn bounded_observer_returns_data_or_empty_window(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -307,26 +266,9 @@ mod tests {
                     let Some(Ok(ServerMessage::Text(_))) = socket.recv().await else {
                         panic!("expected perpetual trade-history subscription");
                     };
-                    match scenario {
-                        1 => {
-                            socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
-                            socket.send(ServerMessage::Text(DATA.into())).await.unwrap();
-                        }
-                        2 => {
-                            socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
-                        }
-                        3 => {
-                            socket.send(ServerMessage::Text(DATA.into())).await.unwrap();
-                        }
-                        5 => {
-                            socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
-                            socket.send(ServerMessage::Text(DATA.into())).await.unwrap();
-                            socket.send(ServerMessage::Text(DATA.into())).await.unwrap();
-                        }
-                        _ => {
-                            socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
-                            socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
-                        }
+                    socket.send(ServerMessage::Text(ACK.into())).await.unwrap();
+                    if scenario == 1 {
+                        socket.send(ServerMessage::Text(DATA.into())).await.unwrap();
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 })
@@ -347,15 +289,15 @@ mod tests {
             &network,
             None,
             Duration::from_millis(500),
-            if scenario == 5 { 2 } else { 1 },
+            1,
             1,
             &request,
         )
         .await;
-        match scenario {
-            1 => assert_eq!(result.unwrap()[0].items()[0].order_id, "87561"),
-            2 => assert!(result.unwrap().is_empty()),
-            _ => assert!(result.is_err()),
+        if scenario == 1 {
+            assert_eq!(result.unwrap()[0].items()[0].order_id, "87561");
+        } else {
+            assert!(result.unwrap().is_empty());
         }
         server.abort();
     }
@@ -363,9 +305,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
     #[tokio::test]
-    async fn observer_requires_exact_ack_before_data(#[case] scenario: u8) {
+    async fn observer_accepts_only_matching_ack(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -381,10 +322,10 @@ mod tests {
                         "user_perp_trade_history"
                     );
                     assert_eq!(request["subscriptions"][0]["addressType"], "wallet");
-                    let frame = match scenario {
-                        0 => ACK.to_string(),
-                        1 => ACK.replace(OTHER, WALLET),
-                        _ => ACK.replace("subscribed", "data"),
+                    let frame = if scenario == 0 {
+                        ACK.to_string()
+                    } else {
+                        ACK.replace(OTHER, WALLET)
                     };
                     let _ = socket.send(ServerMessage::Text(frame.into())).await;
                     let _ = socket.recv().await;

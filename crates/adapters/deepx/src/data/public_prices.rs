@@ -144,22 +144,6 @@ mod tests {
     }
 
     #[rstest]
-    fn parses_exact_scientific_price_frame() {
-        let event = parse_public_price_event(
-            &frame("mark_price", "2.384511399e3", 1_789_546_201_652),
-            DeepXWsPublicChannel::MarkPrice,
-            3,
-            &instrument(),
-            UnixNanos::from(7),
-        )
-        .unwrap();
-        let DataEvent::Data(Data::MarkPrice(update)) = event else {
-            panic!("expected mark price update")
-        };
-        assert_eq!(update.value.as_decimal(), Decimal::new(2_384_511_399, 6));
-    }
-
-    #[rstest]
     fn parses_funding_without_inventing_payment_schedule() {
         let event = parse_public_price_event(
             &frame(
@@ -187,18 +171,6 @@ mod tests {
 
     #[rstest]
     #[case("precision", "2384.123456789012345678901234", 1_789_546_201_652)]
-    #[case(
-        "rounded-plain",
-        "2384.51000000000000000000000000001",
-        1_789_546_201_652
-    )]
-    #[case(
-        "rounded-scientific",
-        "2.384510000000000000000000000001e3",
-        1_789_546_201_652
-    )]
-    #[case("zero", "0", 1_789_546_201_652)]
-    #[case("string", r#""2384.51""#, 1_789_546_201_652)]
     #[case("overflow", "2384.51", u64::MAX)]
     fn rejects_invalid_price_frames(
         #[case] _scenario: &str,

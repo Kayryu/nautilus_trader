@@ -36,7 +36,6 @@ pub mod providers;
 pub mod python;
 pub mod rpc;
 pub mod signing;
-pub mod spot;
 pub mod transaction;
 pub mod websocket;
 
@@ -54,6 +53,9 @@ pub use config::{
     validate_rpc_endpoint_identities,
 };
 pub use data::DeepXDataClient;
+pub use deepx_rust_sdk::rpc::spot_market_spec::{
+    DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError,
+};
 pub use execution::{
     DeepXAccountOwnershipStartupError, DeepXAccountStreamReadError, DeepXAccountStreamStartupError,
     DeepXBackendPerpOrderObservationError, DeepXExecutionClient, DeepXExecutionStartupError,
@@ -121,7 +123,6 @@ pub use signing::{
     SnapshotError, sign_dynamic_pallet_call, sign_no_op, sign_perp_cancel, sign_perp_modify_order,
     sign_spot_cancel, sign_spot_place_order,
 };
-pub use spot::{DeepXSpotMarketSpec, DeepXSpotMarketSpecClient, DeepXSpotMarketSpecError};
 pub use transaction::{
     DEEPX_TRANSACTION_CACHE_KEY_PREFIX, DEEPX_TRANSACTION_RECORD_VERSION, DeepXAbsenceEvidence,
     DeepXAutomaticReplayDecision, DeepXBackendOrderEvidence, DeepXBusinessCallBindingError,

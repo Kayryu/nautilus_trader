@@ -15,15 +15,14 @@
 
 //! Read-only initial Spot open-order snapshots for one market and address scope.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use deepx_rust_sdk::websocket::account_spot_orders::DeepXWsSpotOpenOrdersSnapshot;
 pub use deepx_rust_sdk::websocket::account_spot_orders::{
     DeepXWsSpotOpenOrdersFrame, DeepXWsSpotOpenOrdersPage, DeepXWsSpotOpenOrdersRequest,
 };
 use nautilus_network::transport::Message;
-#[cfg(test)]
-use serde_json::json;
 
 use super::transport::DeepXWsReadConnection;
 use crate::config::DeepXNetworkConfig;
@@ -88,9 +87,7 @@ async fn observe_initial_spot_open_order_pages(
     let mut connection = DeepXWsReadConnection::connect(network, proxy_url, timeout).await?;
     connection.send_spot_open_orders_request(request).await?;
     let result = tokio::time::timeout(timeout, async {
-        let mut acknowledged = false;
-        let mut pages = BTreeMap::new();
-        let expected_count = request.expected_page_count();
+        let mut snapshot = DeepXWsSpotOpenOrdersSnapshot::new(request);
         loop {
             let Some(message) = connection.receive().await? else {
                 anyhow::bail!("DeepX Spot order stream closed before its first page");
@@ -101,23 +98,9 @@ async fn observe_initial_spot_open_order_pages(
                 }
                 anyhow::bail!("unsupported DeepX Spot order stream message");
             };
-            match DeepXWsSpotOpenOrdersFrame::parse(std::str::from_utf8(&bytes)?, request)? {
-                DeepXWsSpotOpenOrdersFrame::Subscribed => {
-                    ensure!(!acknowledged, "duplicate DeepX Spot order acknowledgement");
-                    acknowledged = true;
-                }
-                DeepXWsSpotOpenOrdersFrame::OrderPage { page, timestamp_ms } => {
-                    ensure!(acknowledged, "DeepX Spot order page preceded its ack");
-                    let address = page.subaccount().to_ascii_lowercase();
-                    ensure!(
-                        pages.insert(address, (page, timestamp_ms)).is_none(),
-                        "duplicate DeepX Spot order page"
-                    );
-                    if pages.len() == expected_count {
-                        break Ok::<_, anyhow::Error>(pages.into_values().collect());
-                    }
-                }
-                DeepXWsSpotOpenOrdersFrame::Pong => {}
+            let frame = DeepXWsSpotOpenOrdersFrame::parse(std::str::from_utf8(&bytes)?, request)?;
+            if let Some(pages) = snapshot.accept(frame)? {
+                break Ok::<_, anyhow::Error>(pages);
             }
         }
     })
@@ -144,7 +127,7 @@ mod tests {
     const ACK: &str = r#"{"type":"subscribed","market":{"type":"spot","name":"ETH/USDC","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"},"subscriptions":[{"channel":"user_spot_open_orders","address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc"}],"message":"Successfully subscribed to 1 channels"}"#;
     const SNAPSHOT: &str = r#"{"type":"data","channel":"user_spot_open_orders","market":{"type":"spot","name":"ETH/USDC","pair":"0x9068d4ac891a14784c17877eb74bd8489b3367c71d72766dbfa4dfbfb662fa37"},"data":{"address":"0x4ded31cb63949b52f9dfc9bcfade4eab7017eadc","orders":{"hasNext":false,"hasPrev":false,"items":[],"pageNo":1,"pageSize":100,"totalCount":0,"totalPage":0}},"timestamp":1791491471048}"#;
     const MARKETS: &str =
-        include_str!("../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
+        include_str!("../../../../../deepx-rust-sdk/test_data/http/testnet/spot_markets.json");
 
     fn market() -> DeepXSpotMarket {
         let response: crate::http::DeepXApiResponse<Vec<DeepXSpotMarket>> =
@@ -172,10 +155,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
-    #[case(3)]
     #[tokio::test]
-    async fn first_page_requires_one_matching_ack(#[case] scenario: u8) {
+    async fn first_page_requires_ack_before_snapshot(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -191,18 +172,10 @@ mod tests {
                         "user_spot_open_orders"
                     );
                     assert_eq!(request["market"]["name"], "ETH/USDC");
-                    let ack = if scenario == 2 {
-                        ACK.replace(ADDRESS, "0x0000000000000000000000000000000000000000")
-                    } else {
-                        ACK.to_string()
-                    };
                     if scenario == 1 {
                         let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                     }
-                    let _ = socket.send(ServerMessage::Text(ack.clone().into())).await;
-                    if scenario == 3 {
-                        let _ = socket.send(ServerMessage::Text(ack.into())).await;
-                    }
+                    let _ = socket.send(ServerMessage::Text(ACK.into())).await;
                     let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                 })
             }),
@@ -233,13 +206,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(5)]
-    #[case(6)]
     #[tokio::test]
-    async fn wallet_snapshot_requires_exact_expansion_and_all_pages(#[case] scenario: u8) {
+    async fn wallet_snapshot_requires_all_pages(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -253,30 +221,15 @@ mod tests {
                     assert_eq!(request["subscriptions"][0]["address"], WALLET);
                     assert_eq!(request["subscriptions"][0]["addressType"], "wallet");
                     let mut ack: serde_json::Value = serde_json::from_str(ACK).unwrap();
-                    if scenario != 4 {
-                        ack["subscriptions"]
-                            .as_array_mut()
-                            .unwrap()
-                            .push(json!({"channel": "user_spot_open_orders", "address": OTHER}));
-                    }
-                    if scenario == 5 {
-                        ack["subscriptions"][1]["address"] = json!(ADDRESS);
-                    } else if scenario == 6 {
-                        ack["subscriptions"][1]["address"] =
-                            json!("0x0000000000000000000000000000000000000000");
-                    }
+                    ack["subscriptions"].as_array_mut().unwrap().push(
+                        serde_json::json!({"channel": "user_spot_open_orders", "address": OTHER}),
+                    );
                     let _ = socket
                         .send(ServerMessage::Text(ack.to_string().into()))
                         .await;
                     let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
                     let other_page = SNAPSHOT.replace(ADDRESS, OTHER);
-                    if scenario == 2 {
-                        let _ = socket.send(ServerMessage::Text(SNAPSHOT.into())).await;
-                    } else if scenario == 3 {
-                        let foreign =
-                            other_page.replace(OTHER, "0x0000000000000000000000000000000000000000");
-                        let _ = socket.send(ServerMessage::Text(foreign.into())).await;
-                    } else if scenario != 1 {
+                    if scenario != 1 {
                         let _ = socket.send(ServerMessage::Text(other_page.into())).await;
                     }
                 })

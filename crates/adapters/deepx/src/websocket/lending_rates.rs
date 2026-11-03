@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
-use deepx_rust_sdk::websocket::lending_rates::DeepXWsLendingRatesFrame;
+use deepx_rust_sdk::websocket::lending_rates::DeepXWsLendingRatesCollector;
 pub use deepx_rust_sdk::websocket::lending_rates::{
     DeepXWsLendingRate, DeepXWsLendingRatesBatch, DeepXWsLendingRatesRequest,
     match_lending_rate_batch_to_rest,
@@ -50,7 +50,7 @@ pub async fn observe_first_lending_rates(
         return Err(e);
     }
     let result = tokio::time::timeout(timeout, async {
-        let mut acknowledged = false;
+        let mut collector = DeepXWsLendingRatesCollector::new();
         loop {
             let message = match connection.receive().await {
                 Ok(Some(message)) => message,
@@ -68,23 +68,12 @@ pub async fn observe_first_lending_rates(
                 Err(e) => return Err(e),
             };
             match message {
-                Message::Text(bytes) => match request.parse(std::str::from_utf8(&bytes)?)? {
-                    DeepXWsLendingRatesFrame::Subscribed => {
-                        ensure!(
-                            !acknowledged,
-                            "duplicate DeepX lending-rate acknowledgement"
-                        );
-                        acknowledged = true;
-                    }
-                    DeepXWsLendingRatesFrame::Rates(batch) => {
-                        ensure!(
-                            acknowledged,
-                            "DeepX lending rates preceded their acknowledgement"
-                        );
+                Message::Text(bytes) => {
+                    let frame = request.parse(std::str::from_utf8(&bytes)?)?;
+                    if let Some(batch) = collector.accept(frame)? {
                         break Ok::<_, anyhow::Error>(batch);
                     }
-                    DeepXWsLendingRatesFrame::Pong => {}
-                },
+                }
                 Message::Ping(_) | Message::Pong(_) => {}
                 _ => anyhow::bail!("unsupported DeepX lending-rate stream message"),
             }
@@ -109,6 +98,7 @@ mod tests {
         extract::ws::{Message as ServerMessage, WebSocketUpgrade},
         routing::get,
     };
+    use deepx_rust_sdk::websocket::lending_rates::DeepXWsLendingRatesFrame;
     use rstest::rstest;
 
     use super::*;

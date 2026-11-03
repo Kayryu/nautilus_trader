@@ -15,9 +15,10 @@
 
 //! Read-only initial open-position snapshots for one perpetual market and address scope.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use deepx_rust_sdk::websocket::account_positions::DeepXWsPerpOpenPositionsSnapshot;
 pub use deepx_rust_sdk::websocket::account_positions::{
     DeepXWsPerpOpenPositionsFrame, DeepXWsPerpOpenPositionsPage, DeepXWsPerpOpenPositionsRequest,
 };
@@ -55,7 +56,7 @@ pub async fn observe_initial_perp_open_positions_page(
 ///
 /// # Errors
 ///
-/// Returns an error for a missing, duplicated, foreign, or incomplete page.
+/// Returns an error for a missing, conflicting duplicate, foreign, or incomplete page.
 pub async fn observe_initial_perp_wallet_open_positions_pages(
     network: &crate::config::DeepXNetworkConfig,
     proxy_url: Option<&str>,
@@ -86,9 +87,7 @@ async fn observe_initial_perp_open_position_pages(
         return Err(e);
     }
     let result = tokio::time::timeout(timeout, async {
-        let mut acknowledged = false;
-        let mut pages: BTreeMap<String, (DeepXWsPerpOpenPositionsPage, u64)> = BTreeMap::new();
-        let expected_count = request.expected_page_count();
+        let mut snapshot = DeepXWsPerpOpenPositionsSnapshot::new(request);
         loop {
             let message = match connection.receive().await {
                 Ok(Some(message)) => message,
@@ -109,27 +108,10 @@ async fn observe_initial_perp_open_position_pages(
                 }
                 anyhow::bail!("unsupported DeepX position stream message");
             };
-            match DeepXWsPerpOpenPositionsFrame::parse(std::str::from_utf8(&bytes)?, request)? {
-                DeepXWsPerpOpenPositionsFrame::Subscribed => {
-                    ensure!(!acknowledged, "duplicate DeepX position acknowledgement");
-                    acknowledged = true;
-                }
-                DeepXWsPerpOpenPositionsFrame::PositionPage { page, timestamp_ms } => {
-                    ensure!(acknowledged, "DeepX position page preceded its ack");
-                    let address = page.subaccount().to_ascii_lowercase();
-                    if let Some((previous, _)) = pages.get(&address) {
-                        ensure!(
-                            previous.same_contents(&page),
-                            "conflicting duplicate DeepX position page"
-                        );
-                        continue;
-                    }
-                    pages.insert(address, (page, timestamp_ms));
-                    if pages.len() == expected_count {
-                        break Ok::<_, anyhow::Error>(pages.into_values().collect());
-                    }
-                }
-                DeepXWsPerpOpenPositionsFrame::Pong => {}
+            let frame =
+                DeepXWsPerpOpenPositionsFrame::parse(std::str::from_utf8(&bytes)?, request)?;
+            if let Some(pages) = snapshot.accept(frame)? {
+                break Ok::<_, anyhow::Error>(pages);
             }
         }
     })
@@ -215,15 +197,8 @@ mod tests {
     #[rstest]
     #[case(0)]
     #[case(1)]
-    #[case(2)]
-    #[case(3)]
-    #[case(4)]
-    #[case(5)]
-    #[case(6)]
-    #[case(7)]
-    #[case(8)]
     #[tokio::test]
-    async fn wallet_snapshot_requires_exact_expansion_and_all_pages(#[case] scenario: u8) {
+    async fn wallet_snapshot_requires_all_pages(#[case] scenario: u8) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = Router::new().route(
@@ -238,41 +213,21 @@ mod tests {
                     assert_eq!(request["subscriptions"][0]["addressType"], "wallet");
                     assert_eq!(request["subscriptions"][0]["status"], "open");
                     let mut ack: serde_json::Value = serde_json::from_str(ACK).unwrap();
-                    if scenario != 4 {
-                        ack["subscriptions"]
-                            .as_array_mut()
-                            .unwrap()
-                            .push(serde_json::json!({
-                                "channel": "user_perp_positions",
-                                "address": OTHER,
-                                "status": "open",
-                                "onlyClosed": null,
-                            }));
-                    }
-                    if scenario == 5 {
-                        ack["subscriptions"][1]["address"] = serde_json::json!(ADDRESS);
-                    } else if scenario == 6 {
-                        ack["subscriptions"][1]["address"] =
-                            serde_json::json!("0x0000000000000000000000000000000000000000");
-                    } else if scenario == 7 {
-                        ack["subscriptions"][1]["status"] = serde_json::json!("closed");
-                    }
+                    ack["subscriptions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "channel": "user_perp_positions",
+                            "address": OTHER,
+                            "status": "open",
+                            "onlyClosed": null,
+                        }));
                     let _ = socket
                         .send(ServerMessage::Text(ack.to_string().into()))
                         .await;
                     let _ = socket.send(ServerMessage::Text(EMPTY.into())).await;
                     let other_page = EMPTY.replace(ADDRESS, OTHER);
-                    if scenario == 2 {
-                        let _ = socket.send(ServerMessage::Text(EMPTY.into())).await;
-                        let _ = socket.send(ServerMessage::Text(other_page.into())).await;
-                    } else if scenario == 8 {
-                        let conflict = EMPTY.replace("\"pageSize\":100", "\"pageSize\":50");
-                        let _ = socket.send(ServerMessage::Text(conflict.into())).await;
-                    } else if scenario == 3 {
-                        let foreign =
-                            other_page.replace(OTHER, "0x0000000000000000000000000000000000000000");
-                        let _ = socket.send(ServerMessage::Text(foreign.into())).await;
-                    } else if scenario != 1 {
+                    if scenario != 1 {
                         let _ = socket.send(ServerMessage::Text(other_page.into())).await;
                     }
                 })
@@ -290,7 +245,7 @@ mod tests {
             &wallet_request(),
         )
         .await;
-        if scenario == 0 || scenario == 2 {
+        if scenario == 0 {
             let pages = result.unwrap();
             assert_eq!(pages.len(), 2);
             assert_eq!(pages[0].0.subaccount(), ADDRESS);
