@@ -21,6 +21,7 @@ name = "nautilus_deepx"
 crate-type = ["rlib"]
 
 [features]
+defi = ["nautilus-model/defi"]
 extension-module = [
 	"nautilus-common/extension-module",
 	"nautilus-core/extension-module",

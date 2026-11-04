@@ -4,6 +4,30 @@ The DeepX adapter is under development and restricted to testnet. Framework trad
 require the validated direct-pallet startup gates. Account support is limited to validated startup
 state and current-epoch cache replay.
 
+## Multi-asset account ledger
+
+`DeepXExecutionClient::observe_owned_finalized_account_ledger` reads native lending claims,
+liabilities, positions, orders, and aggregate margin at one approved finalized checkpoint.
+`map_finalized_account_ledger` converts deposits, borrowing, and withdrawal capacities exactly
+using each lending pool's native precision. Asset entries are sorted by normalized symbol.
+Settled perpetual PnL and funding are already reflected in lending claims; cumulative position
+history is not added again. Initial and maintenance weighted collateral remain separate from
+native balances and from signed economic equity. Empty and debt-only ledgers are supported.
+
+This is a Rust read-only accounting interface, not a framework trading-balance conversion.
+DeepX cross margin has no unique per-asset margin allocation. Per-asset withdrawal maxima are
+alternative outflow scenarios against shared collateral, not additive free balances or order
+buying power. Do not construct `free = max_withdrawal` or count aggregate margin once per leg.
+Order sizing requires the venue's market-specific capacity checks and a shared reservation budget.
+
+Automatic startup and account refresh retain their existing flat-account restrictions. This
+ledger does not enable non-flat startup, two-leg execution coordination, or position recovery.
+The supplied node testnet source declares spec 381, while the existing captured runtime evidence
+uses spec 376. The ledger does not add spec 381 approval or assert accounting compatibility
+between those versions; runtime fixtures and interface verification must precede that change.
+
+## Transport and subscriptions
+
 `DeepXNetworkConfig::ws_connection_url` resolves the documented `/internal/v1/ws` upgrade
 path from a base URL while preserving explicit endpoint paths. `DeepXWsReadConnection` owns
 read-only socket halves, receives raw frames, answers protocol Ping, and performs bounded close
@@ -683,16 +707,22 @@ normal ingress. Execution clients are temporarily detached from the engine durin
 connect futures and restored on completion, timeout, or cancellation. This prevents durable
 startup outbox replay from waiting on an event buffered behind its own connection future.
 
-REST and WebSocket observations remain mutable. The autonomous account-state path accepts one
-positive USDC deposit only when exact backend collateral agrees with current-chain collateral,
-both margin requirements are zero, borrowing is absent, and validated position and open-order
+REST and WebSocket observations remain mutable. The autonomous account-state path maps native
+multiasset deposits from hash-pinned current-chain lending evidence only when each deposit is
+exactly representable and fully withdrawable, both margin requirements are zero, borrowing is
+absent, and validated position and open-order
 pages contain no open exposure for every current market. Historical `Closed` positions are accepted
 only when their closing block, time, and event index are present; other position statuses fail
 closed. It rechecks authority, market coverage, balances, margin,
 and runtime identity before publishing. These REST reads are not an atomic venue snapshot and do
-not prove pool liquidity for withdrawal. Any non-flat account fails closed.
-The before-and-after balance check compares mapped USDC money and margin evidence; changing
-market-price or rounded USD display fields do not invalidate an otherwise stable flat account.
+not guarantee a later withdrawal. Per-asset withdrawal capacities are alternative scenarios, not
+additive trading collateral. Any non-flat account fails closed.
+The before-and-after stability check compares exact lending shares, asset identities, and pool
+decimals. Independently validated native amounts may accrue interest across blocks; publication
+uses the final snapshot. Same-block lending evidence must remain identical. Backend exact
+collateral must be nonnegative, but has no block binding and is not ordered against independently
+sampled chain valuations. Changing asset prices or rounded USD displays do not define native
+balances or invalidate an otherwise stable flat account.
 An ignored, read-only testnet test exercised the complete market-scoped account observation for
 `0xa4676ec9a5600686234b8d9d413d04bc2d8fda70` and
 `0x492da9b1c5ccb8099562be29c2f3ce536161eb74` without a private key. The former retained a

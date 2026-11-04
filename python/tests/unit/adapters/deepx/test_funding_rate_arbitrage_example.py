@@ -14,7 +14,9 @@
 # -------------------------------------------------------------------------------------------------
 """Test the DeepX funding example's order sequencing and exposure accounting."""
 
+import json
 from decimal import Decimal
+from pathlib import Path
 from types import MethodType
 from types import SimpleNamespace
 
@@ -50,9 +52,13 @@ def make_strategy() -> tuple[SimpleNamespace, list[tuple[str, Decimal]]]:
             max_combined_notional=Decimal(5),
             max_age_ns=10_000_000_000,
             max_hold_ns=60_000_000_000,
+            max_slippage_bps=Decimal(0),
+            holding_cost_bps=Decimal(0),
+            exit_basis_risk_bps=Decimal(0),
             trade_enabled=True,
         ),
-        _funding=SimpleNamespace(rate=Decimal("0.0000125"), ts_event=100_000_000_000),
+        _funding=SimpleNamespace(rate=Decimal("0.01"), ts_event=100_000_000_000),
+        _mark=SimpleNamespace(value=number("2250"), ts_event=100_000_000_000),
         _quantity=object(),
         _spot_qty=Decimal(0),
         _perp_short_qty=Decimal(0),
@@ -66,13 +72,26 @@ def make_strategy() -> tuple[SimpleNamespace, list[tuple[str, Decimal]]]:
         _finished=False,
         _hold_start_ns=None,
         _last_attempt_ns=None,
-        clock=SimpleNamespace(timestamp_ns=lambda: 100_000_000_000),
+        _state=arb.CycleState.FLAT,
+        _persist=lambda: None,
+        _depth_available=lambda *_: Decimal(1),
+        clock=SimpleNamespace(
+            timestamp_ns=lambda: 100_000_000_000,
+            cancel_timer=lambda _: None,
+            set_time_alert_ns=lambda *_, **__: None,
+        ),
         log=SimpleNamespace(info=lambda _: None, warning=lambda _: None, error=lambda _: None),
         cache=SimpleNamespace(
             instrument=lambda _: SimpleNamespace(
                 min_quantity=number("0.001"),
                 min_notional=number("1"),
                 size_increment=number("0.001"),
+                multiplier=number("1"),
+                taker_fee=Decimal(0),
+                price_increment=number("0.01"),
+                price_precision=2,
+                size_precision=3,
+                base_currency=object(),
             )
         ),
         _fresh=lambda instrument_id: quote if instrument_id in (SPOT_ID, PERP_ID) else None,
@@ -126,6 +145,12 @@ def test_unwind_below_spot_minimum_stops_with_residual_exposure() -> None:
         size_increment=number("0.001"),
         min_quantity=number("0.001"),
         min_notional=None,
+        price_increment=number("0.01"),
+        price_precision=2,
+        base_currency=object(),
+    )
+    strategy.portfolio = SimpleNamespace(
+        account=lambda _: SimpleNamespace(balance_free=lambda _: number("0.0007"))
     )
 
     FundingArbitrage._submit(strategy, "spot_exit", Decimal("0.0007"), strategy._fresh(SPOT_ID))
@@ -237,6 +262,7 @@ def test_entry_respects_perpetual_minimum_notional() -> None:
         size_increment=number("0.001"),
         min_quantity=number("0.001"),
         min_notional=number("3"),
+        multiplier=number("1"),
     )
 
     strategy._advance()
@@ -335,3 +361,202 @@ def test_post_run_audit_rejects_open_perpetual_position(
 
     with pytest.raises(RuntimeError, match="not verified flat"):
         arb.verify_trade_result("0xabc", 1)
+
+
+def test_entry_edge_covers_round_trip_fees_slippage_and_holding_cost() -> None:
+    """A small positive funding sample cannot clear bounded round-trip costs."""
+    base = Decimal("0.001")
+    assert (
+        arb.entry_edge(
+            base,
+            Decimal("0.001"),
+            Decimal(2000),
+            Decimal(2000),
+            Decimal(2000),
+            Decimal("0.0004"),
+            Decimal("0.0002"),
+            Decimal(2),
+            Decimal(1),
+            Decimal(5),
+        )
+        < 0
+    )
+    assert (
+        arb.entry_edge(
+            base,
+            Decimal("0.01"),
+            Decimal(2000),
+            Decimal(2000),
+            Decimal(2000),
+            Decimal("0.0004"),
+            Decimal("0.0002"),
+            Decimal(2),
+            Decimal(1),
+            Decimal(5),
+        )
+        > 0
+    )
+
+
+def test_partial_spot_fill_uses_contract_multiplier() -> None:
+    """The short order quantity is contracts rather than spot base units."""
+    strategy, orders = make_strategy()
+    strategy._entry_started = True
+    strategy._spot_qty = Decimal("0.002")
+    instrument = strategy.cache.instrument(PERP_ID)
+    instrument.multiplier = number("2")
+    instrument.size_increment = number("0.001")
+    strategy.cache.instrument = lambda _: instrument
+
+    strategy._advance()
+    assert orders == [("perp_entry", Decimal("0.001"))]
+
+
+@pytest.mark.parametrize(
+    ("journal_spot", "venue_spot", "expected"),
+    [("0.001", "0.001", True), ("0.001", "0.002", False)],
+)
+def test_restart_reconciles_journal_with_venue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    journal_spot: str,
+    venue_spot: str,
+    expected: bool,
+) -> None:
+    """Recovery closes a matched prior pair and rejects inconsistent venue exposure."""
+    strategy, _ = make_strategy()
+    journal = tmp_path / "cycle.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "subaccount": "0xabc",
+                "state": "holding",
+                "spot_base": journal_spot,
+                "perp_contracts": "0.001",
+            }
+        )
+    )
+    strategy._config.journal_path = journal
+    strategy._config.subaccount = "0xabc"
+    strategy._recover = MethodType(FundingArbitrage._recover, strategy)
+    strategy.cache.orders_open = lambda **_: []
+    monkeypatch.setattr(
+        arb,
+        "get_deepx_wallet_account_snapshot",
+        lambda _: SimpleNamespace(
+            subaccounts=[
+                SimpleNamespace(
+                    profile=SimpleNamespace(address="0xabc", status="Active"),
+                    balances=SimpleNamespace(
+                        assets=[
+                            SimpleNamespace(
+                                symbol="ETH",
+                                balance=venue_spot,
+                                balance_borrowed="0",
+                            )
+                        ]
+                    ),
+                )
+            ]
+        ),
+    )
+    empty = SimpleNamespace(items=[], has_next=False)
+    monkeypatch.setattr(arb, "get_deepx_spot_open_orders", lambda *_, **__: empty)
+    monkeypatch.setattr(arb, "get_deepx_perp_open_orders", lambda *_, **__: empty)
+    monkeypatch.setattr(
+        arb,
+        "get_deepx_perp_positions",
+        lambda *_, **__: SimpleNamespace(
+            items=[SimpleNamespace(status="Open", is_long=False, base_asset_amount="0.001")],
+            has_next=False,
+        ),
+    )
+
+    assert strategy._recover() is expected
+    if expected:
+        assert strategy._exiting
+        assert strategy._spot_qty == strategy._perp_short_qty == Decimal("0.001")
+        assert strategy._state == arb.CycleState.EXITING
+    else:
+        assert strategy._state == arb.CycleState.HALTED
+
+
+def test_spot_ioc_and_perpetual_close_order_flags() -> None:
+    """Spot uses a bounded limit and only the perpetual close requests reduce-only."""
+    strategy, _ = make_strategy()
+    submitted: list[dict] = []
+    strategy._config.max_slippage_bps = Decimal(10)
+    strategy.order_factory = SimpleNamespace(
+        limit=lambda **kwargs: SimpleNamespace(
+            client_order_id="order-1",
+            args=kwargs,
+        )
+    )
+    strategy.submit_order = lambda order: submitted.append(order.args)
+    strategy.clock.set_time_alert_ns = lambda *_, **__: None
+    strategy._submit = MethodType(FundingArbitrage._submit, strategy)
+    quote = strategy._fresh(SPOT_ID)
+
+    strategy._submit("spot_entry", Decimal("0.001"), quote)
+    assert submitted[0]["time_in_force"] == arb.TimeInForce.IOC
+    assert submitted[0]["price"].as_decimal() <= Decimal("2252.25")
+    assert "reduce_only" not in submitted[0]
+
+    strategy._pending = None
+    strategy._submit("perp_exit", Decimal("0.001"), quote)
+    assert submitted[1]["order_side"] == arb.OrderSide.BUY
+    assert submitted[1]["reduce_only"] is True
+
+
+def test_spot_exit_is_capped_by_reconciled_free_inventory() -> None:
+    """A spot sale never exceeds the account's available base balance."""
+    strategy, _ = make_strategy()
+    submitted: list[dict] = []
+    strategy.order_factory = SimpleNamespace(
+        limit=lambda **kwargs: SimpleNamespace(client_order_id="order-1", args=kwargs)
+    )
+    strategy.submit_order = lambda order: submitted.append(order.args)
+    strategy.clock.set_time_alert_ns = lambda *_, **__: None
+    strategy.portfolio = SimpleNamespace(
+        account=lambda _: SimpleNamespace(balance_free=lambda _: number("0.001"))
+    )
+    strategy._submit = MethodType(FundingArbitrage._submit, strategy)
+    strategy._submit("spot_exit", Decimal("0.002"), strategy._fresh(SPOT_ID))
+
+    assert submitted[0]["quantity"].as_decimal() == Decimal("0.001")
+    assert "reduce_only" not in submitted[0]
+
+
+def test_order_timeout_cancels_then_halts_without_confirmation() -> None:
+    """Unconfirmed cancellation stops further order submissions."""
+    strategy, _ = make_strategy()
+    calls: list[str] = []
+    order = SimpleNamespace(client_order_id="order-1", is_closed=False)
+    strategy._pending = ("spot_entry", order.client_order_id)
+    strategy.cache.order = lambda _: order
+    strategy.cancel_order = lambda _: calls.append("cancel")
+    strategy.clock.set_time_alert_ns = lambda *_, **__: calls.append("timer")
+    strategy._order_timeout = MethodType(FundingArbitrage._order_timeout, strategy)
+    strategy._cancel_timeout = MethodType(FundingArbitrage._cancel_timeout, strategy)
+    strategy._stop_cycle = lambda: calls.append("stop")
+
+    strategy._order_timeout(order.client_order_id)
+    assert calls == ["cancel", "timer"]
+    strategy._cancel_timeout(order.client_order_id)
+    assert calls == ["cancel", "timer", "stop"]
+    assert strategy._state == arb.CycleState.HALTED
+
+
+def test_hold_timeout_starts_exit_without_a_new_market_event() -> None:
+    """The maximum holding time independently advances the exit state."""
+    strategy, orders = make_strategy()
+    strategy._entry_started = True
+    strategy._spot_qty = Decimal("0.001")
+    strategy._perp_short_qty = Decimal("0.001")
+    strategy._hold_start_ns = 1
+    strategy._hold_timeout = MethodType(FundingArbitrage._hold_timeout, strategy)
+
+    strategy._hold_timeout()
+    assert strategy._state == arb.CycleState.EXITING
+    assert orders == [("perp_exit", Decimal("0.001"))]

@@ -112,6 +112,7 @@ use deepx_rust_sdk::rpc::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use nautilus_core::hex;
+use nautilus_model::types::AccountBalance;
 #[cfg(test)]
 use parity_scale_codec::Compact;
 use parity_scale_codec::{Decode, Encode};
@@ -124,6 +125,7 @@ pub use spot_margin::{
 use thiserror::Error;
 
 use crate::{
+    account::map_flat_lending_balances,
     common::{DeepXEnvironment, DeepXError},
     config::{
         DeepXNetworkConfig, DeepXObservedRpcEndpoint, DeepXRpcEndpointValidationError,
@@ -515,6 +517,34 @@ impl DeepXCurrentMarginEvidence {
     #[must_use]
     pub const fn maintenance(&self) -> DeepXMarginRequirement {
         self.maintenance
+    }
+
+    /// Validates a later flat-account observation without constraining market valuations.
+    pub(crate) fn validate_flat_successor(&self, next: &Self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.subaccount == next.subaccount,
+            "DeepX current margin account changed during observation",
+        );
+        anyhow::ensure!(
+            self.initial.total_margin_required() == 0
+                && self.maintenance.total_margin_required() == 0
+                && next.initial.total_margin_required() == 0
+                && next.maintenance.total_margin_required() == 0,
+            "DeepX flat account has a margin requirement during observation",
+        );
+
+        // Quote collateral can fall with asset prices even when native balances are unchanged
+        anyhow::ensure!(
+            self.block_number <= next.block_number
+                && (self.block_number != next.block_number || self.block_hash == next.block_hash),
+            "DeepX chain head regressed or changed at the same height during observation: \
+             first_block={}, final_block={}, first_hash=0x{}, final_hash=0x{}",
+            self.block_number,
+            next.block_number,
+            hex::encode(self.block_hash),
+            hex::encode(next.block_hash),
+        );
+        Ok(())
     }
 }
 
@@ -2253,6 +2283,95 @@ pub async fn observe_current_margin_evidence(
     })
 }
 
+/// Current canonical native balances with the lending claims supporting them.
+#[derive(Clone, Debug)]
+pub(crate) struct DeepXCurrentFlatAccountObservation {
+    pub(crate) margin: DeepXCurrentMarginEvidence,
+    pub(crate) positions: Vec<DeepXLendingPositionEvidence>,
+    pub(crate) balances: Vec<AccountBalance>,
+}
+
+impl DeepXCurrentFlatAccountObservation {
+    pub(crate) fn validate_flat_successor(&self, next: &Self) -> anyhow::Result<()> {
+        self.margin.validate_flat_successor(&next.margin)?;
+        anyhow::ensure!(
+            self.margin.block_hash() != next.margin.block_hash()
+                || (self.positions == next.positions && self.balances == next.balances),
+            "DeepX lending evidence changed at the same block",
+        );
+        Ok(())
+    }
+
+    pub(crate) fn has_same_lending_claims(&self, next: &Self) -> bool {
+        self.positions.len() == next.positions.len()
+            && self
+                .positions
+                .iter()
+                .zip(&next.positions)
+                .all(|(first, last)| {
+                    first.market_id == last.market_id
+                        && first.asset == last.asset
+                        && first.scaled_deposit == last.scaled_deposit
+                        && first.scaled_borrow == last.scaled_borrow
+                        && first.pool.market_id() == last.pool.market_id()
+                        && first.pool.asset() == last.pool.asset()
+                        && first.pool.decimal() == last.pool.decimal()
+                })
+    }
+}
+
+/// Observes fully withdrawable native balances at the current margin observation's block.
+///
+/// The checkpoint is internal read plumbing only, not evidence of finality. The canonical hash is
+/// rechecked after number-pinned withdrawal reads. This does not prove the absence of open orders
+/// or positions; callers retain responsibility for those startup gates and publication freshness.
+///
+/// # Errors
+///
+/// Returns an error for unsupported capabilities, required margin, invalid lending evidence,
+/// borrowing, restricted or inexact deposits, or a block removed from the canonical chain.
+pub(crate) async fn observe_current_flat_account_balances(
+    endpoints: &DeepXValidatedRpcEndpoints,
+    capabilities: &DeepXValidatedRpcMethodCapabilities,
+    subaccount: [u8; 20],
+) -> anyhow::Result<DeepXCurrentFlatAccountObservation> {
+    let watch_url = endpoints.url_for(DeepXRpcRole::Watch);
+    let watch = capabilities.for_role(DeepXRpcRole::Watch);
+    anyhow::ensure!(
+        watch.role() == DeepXRpcRole::Watch
+            && watch.endpoint_url() == watch_url
+            && watch.methods().contains("eth_call"),
+        "DeepX Watch RPC capabilities do not authorize current lending reads",
+    );
+    let current = observe_current_margin_evidence(endpoints, capabilities, subaccount).await?;
+    anyhow::ensure!(
+        current.initial().total_margin_required() == 0
+            && current.maintenance().total_margin_required() == 0,
+        "DeepX current flat account has a margin requirement",
+    );
+    let client = DeepXRpcClient::new(watch_url.to_string());
+
+    // Reuse the lending collector without exposing a finalized observation
+    let checkpoint = DeepXFinalizedCheckpoint {
+        block_hash: current.block_hash(),
+        block_number: current.block_number(),
+    };
+    let positions = observe_finalized_lending_with_client(&client, checkpoint, subaccount).await?;
+    let canonical_hash = client
+        .get_block_hash_required_with_retry(u64::from(current.block_number()))
+        .await?;
+    anyhow::ensure!(
+        decode_prefixed_hash(&canonical_hash, "canonical current balance block hash")?
+            == current.block_hash(),
+        "DeepX current balance block is no longer canonical",
+    );
+    Ok(DeepXCurrentFlatAccountObservation {
+        margin: current,
+        balances: map_flat_lending_balances(&positions)?,
+        positions,
+    })
+}
+
 /// Observes raw Spot market constraints at one approved finalized Watch checkpoint.
 ///
 /// The call reads metadata-typed `SpotMarket.SpotMarkets` at one finalized block hash. The result
@@ -3761,7 +3880,11 @@ mod tests {
         },
     };
     use nautilus_core::UnixNanos;
-    use nautilus_model::{enums::AccountType, identifiers::AccountId, types::Money};
+    use nautilus_model::{
+        enums::AccountType,
+        identifiers::AccountId,
+        types::{Currency, Money},
+    };
     use parity_scale_codec::DecodeAll;
     use rstest::rstest;
     use serde_json::Value;
@@ -3902,6 +4025,109 @@ mod tests {
         }
     }
 
+    #[rstest]
+    fn finalized_account_ledger_preserves_two_markets_and_native_claims() {
+        let mut evidence = flat_account_evidence();
+        let mut eth = evidence.lending.positions[0].clone();
+        eth.asset = b"eth".to_vec();
+        eth.pool = lending_pool(1, b"eth");
+        eth.pool.0.decimal = 18;
+        eth.scaled_deposit = 1_000_000_000_000_000_000;
+        eth.effective_deposit = Some(1_000_000_000_000_000_000);
+        eth.max_withdraw_amount = Some(500_000_000_000_000_000);
+        evidence.lending.positions.push(eth);
+        evidence.perp_positions.positions = vec![
+            perp_position(evidence.subaccount, 3),
+            perp_position(evidence.subaccount, 4),
+        ];
+        evidence.perp_orders.orders = vec![perp_order(evidence.subaccount, 4, 42)];
+        evidence.margin.initial.0.total_margin_required = 500_000;
+        evidence.margin.maintenance.0.total_margin_required = 250_000;
+        evidence.margin.maintenance.0.total_collateral = 1_100_000;
+
+        let ledger = crate::account::map_finalized_account_ledger(&evidence).unwrap();
+        assert_eq!(ledger.evidence().checkpoint(), evidence.checkpoint());
+        assert_eq!(ledger.evidence().perp_positions().positions().len(), 2);
+        assert_eq!(ledger.evidence().perp_orders().orders().len(), 1);
+        assert_eq!(ledger.assets().len(), 2);
+        assert_eq!(ledger.assets()[0].asset(), "ETH");
+        assert_eq!(ledger.assets()[0].decimals(), 18);
+        assert_eq!(ledger.assets()[0].deposit(), rust_decimal::Decimal::ONE);
+        assert_eq!(ledger.assets()[0].net(), rust_decimal::Decimal::ONE);
+        assert_eq!(
+            ledger.assets()[0].max_withdrawal(),
+            rust_decimal::Decimal::new(5, 1)
+        );
+        assert_eq!(ledger.assets()[1].asset(), "USDC");
+        assert_eq!(
+            ledger.assets()[1].deposit(),
+            rust_decimal::Decimal::new(1_234_567, 6)
+        );
+        assert_eq!(
+            ledger.initial_collateral(),
+            rust_decimal::Decimal::new(1_234_567, 6)
+        );
+        assert_eq!(
+            ledger.maintenance_collateral(),
+            rust_decimal::Decimal::new(11, 1)
+        );
+        assert_eq!(
+            ledger.margin().margin().initial,
+            Money::from_decimal(rust_decimal::Decimal::new(5, 1), Currency::USDC(),).unwrap()
+        );
+        assert!(ledger.margin().margin().instrument_id.is_none());
+        assert!(map_finalized_flat_account_balances(&evidence).is_err());
+    }
+
+    #[rstest]
+    fn finalized_account_ledger_preserves_borrow_and_empty_accounts() {
+        let mut evidence = flat_account_evidence();
+        let position = &mut evidence.lending.positions[0];
+        position.scaled_deposit = 0;
+        position.effective_deposit = None;
+        position.scaled_borrow = 1_000_000;
+        position.effective_borrow = Some(1_100_000);
+        position.max_withdraw_amount = None;
+        let ledger = crate::account::map_finalized_account_ledger(&evidence).unwrap();
+        assert_eq!(
+            ledger.assets()[0].borrow(),
+            rust_decimal::Decimal::new(11, 1)
+        );
+        assert_eq!(ledger.assets()[0].net(), rust_decimal::Decimal::new(-11, 1));
+        evidence.lending.positions.clear();
+        assert!(
+            crate::account::map_finalized_account_ledger(&evidence)
+                .unwrap()
+                .assets()
+                .is_empty()
+        );
+    }
+
+    #[rstest]
+    fn finalized_account_ledger_rejects_inconsistent_or_inexact_evidence() {
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].effective_deposit = None;
+        assert!(crate::account::map_finalized_account_ledger(&evidence).is_err());
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].max_withdraw_amount = Some(1_234_568);
+        assert!(crate::account::map_finalized_account_ledger(&evidence).is_err());
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].scaled_borrow = 1;
+        evidence.lending.positions[0].effective_borrow = Some(1);
+        assert!(crate::account::map_finalized_account_ledger(&evidence).is_err());
+        let mut evidence = flat_account_evidence();
+        let mut duplicate = evidence.lending.positions[0].clone();
+        duplicate.asset = b"USDC".to_vec();
+        evidence.lending.positions.push(duplicate);
+        assert!(crate::account::map_finalized_account_ledger(&evidence).is_err());
+        let mut evidence = flat_account_evidence();
+        evidence.lending.positions[0].effective_deposit = Some(u128::MAX);
+        assert!(matches!(
+            crate::account::map_finalized_account_ledger(&evidence),
+            Err(crate::account::DeepXAccountLedgerError::AmountConversion(_)),
+        ));
+    }
+
     #[test]
     fn finalized_flat_account_maps_only_fully_withdrawable_deposits() {
         let evidence = flat_account_evidence();
@@ -4015,7 +4241,7 @@ mod tests {
         let mut evidence = flat_account_evidence();
         evidence.lending.positions[0].effective_deposit = Some(1);
         evidence.lending.positions[0].max_withdraw_amount = Some(1);
-        evidence.lending.positions[0].pool.0.decimal = 18;
+        evidence.lending.positions[0].pool.0.decimal = 29;
         assert!(matches!(
             map_finalized_flat_account_balances(&evidence),
             Err(DeepXFlatAccountBalanceError::InexactAmount { .. }),
@@ -4032,6 +4258,308 @@ mod tests {
             ),
             Err(DeepXFlatAccountBalanceError::TimestampOutOfRange(u64::MAX)),
         ));
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn flat_account_lending_preserves_eighteen_decimal_eth_claims() {
+        let mut positions = flat_account_evidence().lending.positions;
+        let mut eth = positions[0].clone();
+        eth.asset = b"eth".to_vec();
+        eth.pool.0.decimal = 18;
+        let atomic = 1_234_567_890_123_456_789_u128;
+        eth.effective_deposit = Some(atomic);
+        eth.max_withdraw_amount = Some(atomic);
+        positions.push(eth);
+        let original_precision = Currency::get_or_create_crypto("ETH").precision;
+        let balances = map_flat_lending_balances(&positions).unwrap();
+        let balance = balances
+            .iter()
+            .find(|balance| balance.currency.code.as_str() == "ETH")
+            .unwrap();
+        assert_eq!(balance.currency.precision, 18);
+        assert_eq!(balance.total.raw, atomic as i128);
+        assert_eq!(balance.total, balance.free);
+        assert_eq!(balance.locked.raw, 0);
+        assert_eq!(
+            Currency::get_or_create_crypto("ETH").precision,
+            original_precision
+        );
+    }
+
+    #[rstest]
+    fn flat_account_lending_helper_maps_native_assets_without_usdc_in_symbol_order() {
+        let mut positions = flat_account_evidence().lending.positions;
+        positions[0].asset = b"eth".to_vec();
+        let mut second = positions[0].clone();
+        second.asset = b"btc".to_vec();
+        positions.push(second);
+
+        let balances = map_flat_lending_balances(&positions).unwrap();
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code.as_str(), "BTC");
+        assert_eq!(balances[1].currency.code.as_str(), "ETH");
+        for balance in &balances {
+            assert_eq!(balance.total, balance.free);
+            assert_eq!(balance.locked, Money::zero(balance.currency));
+            assert_eq!(
+                balance.total,
+                Money::from_decimal(rust_decimal::Decimal::new(1_234_567, 6), balance.currency)
+                    .unwrap(),
+            );
+        }
+        positions.reverse();
+        assert_eq!(map_flat_lending_balances(&positions).unwrap(), balances);
+    }
+
+    #[rstest]
+    #[case("borrow")]
+    #[case("withdrawal")]
+    #[case("inexact")]
+    fn flat_account_lending_helper_rejects_invalid_second_asset(#[case] failure: &str) {
+        let mut positions = flat_account_evidence().lending.positions;
+        let mut second = positions[0].clone();
+        second.asset = b"eth".to_vec();
+        match failure {
+            "borrow" => {
+                second.scaled_borrow = 1;
+                second.effective_borrow = Some(1);
+            }
+            "withdrawal" => second.max_withdraw_amount = Some(1),
+            "inexact" => {
+                second.effective_deposit = Some(1);
+                second.max_withdraw_amount = Some(1);
+                second.pool.0.decimal = 29;
+            }
+            _ => unreachable!(),
+        }
+        positions.push(second);
+        let error = map_flat_lending_balances(&positions).unwrap_err();
+        assert!(match error {
+            DeepXFlatAccountBalanceError::BorrowLiability { asset } =>
+                failure == "borrow" && asset == "ETH",
+            DeepXFlatAccountBalanceError::WithdrawalRestricted { asset } =>
+                failure == "withdrawal" && asset == "ETH",
+            DeepXFlatAccountBalanceError::InexactAmount { asset, .. } =>
+                failure == "inexact" && asset == "ETH",
+            _ => false,
+        });
+    }
+
+    #[rstest]
+    #[case("ok")]
+    #[case("reorg")]
+    #[case("malformed_hash")]
+    #[case("initial_margin")]
+    #[case("maintenance_margin")]
+    #[case("borrow")]
+    #[case("withdrawal")]
+    #[case("inexact")]
+    #[case("capabilities")]
+    #[tokio::test]
+    async fn current_flat_account_observation_pins_multiasset_reads(
+        #[case] scenario: &'static str,
+    ) {
+        let subaccount = [0x11; 20];
+        let withdrawals = Arc::new(AtomicUsize::new(0));
+        let checked_after_withdrawals = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/",
+            post({
+                let withdrawals = Arc::clone(&withdrawals);
+                let checked = Arc::clone(&checked_after_withdrawals);
+                move |Json(request): Json<Value>| {
+                    let withdrawals = Arc::clone(&withdrawals);
+                    let checked = Arc::clone(&checked);
+                    async move {
+                        let hash = format!("0x{}", "22".repeat(32));
+                        let result = match request["method"].as_str().unwrap() {
+                            "chain_getBlockHash" => {
+                                if withdrawals.load(Ordering::SeqCst) == 2 {
+                                    assert_eq!(request["params"], json!([42]));
+                                    checked.fetch_add(1, Ordering::SeqCst);
+                                    match scenario {
+                                        "reorg" => json!(format!("0x{}", "33".repeat(32))),
+                                        "malformed_hash" => json!("0xzz"),
+                                        _ => json!(hash),
+                                    }
+                                } else {
+                                    json!(hash)
+                                }
+                            }
+                            "chain_getHeader" => json!({"number": "0x2a"}),
+                            "eth_call" => {
+                                assert_eq!(request["params"][1], "0x2a");
+                                assert_eq!(
+                                    request["params"][0]["to"],
+                                    DEEPX_LENDING_PRECOMPILE_ADDRESS.to_string()
+                                );
+                                let encoded = request["params"][0]["data"].as_str().unwrap();
+                                let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                                let asset =
+                                    if bytes == encode_max_withdraw_call(subaccount, 1, b"eth") {
+                                        b"eth"
+                                    } else {
+                                        assert_eq!(
+                                            bytes,
+                                            encode_max_withdraw_call(subaccount, 1, b"btc")
+                                        );
+                                        b"btc"
+                                    };
+                                withdrawals.fetch_add(1, Ordering::SeqCst);
+                                let amount = if asset == b"eth"
+                                    && matches!(scenario, "withdrawal" | "inexact")
+                                {
+                                    1_u128
+                                } else {
+                                    1_234_567_u128
+                                };
+                                json!(format!("0x{amount:064x}"))
+                            }
+                            "state_call" => {
+                                if request["params"][2] == format!("0x{}", "00".repeat(32)) {
+                                    return Json(json!({"jsonrpc": "2.0", "id": 1,
+                                        "error": {"code": -32000, "message": "unknown block"}}));
+                                }
+                                assert_eq!(request["params"][2], hash);
+                                let method = request["params"][0].as_str().unwrap();
+                                let encoded = request["params"][1].as_str().unwrap();
+                                let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+                                let result = match method {
+                                    DEEPX_MARGIN_RUNTIME_API_METHOD => {
+                                        let (accounts, direction) =
+                                            <(Vec<[u8; 20]>, u8)>::decode(&mut bytes.as_slice())
+                                                .unwrap();
+                                        assert_eq!(accounts, vec![subaccount]);
+                                        let required = u128::from(
+                                            (scenario == "initial_margin" && direction == 0)
+                                                || (scenario == "maintenance_margin"
+                                                    && direction == 1),
+                                        );
+                                        BTreeMap::from([(subaccount, (10_000_000_u128, required))])
+                                            .encode()
+                                    }
+                                    DEEPX_LENDING_POSITIONS_RUNTIME_API_METHOD => {
+                                        let (accounts, markets) =
+                                            <(Vec<[u8; 20]>, Vec<u8>)>::decode(
+                                                &mut bytes.as_slice(),
+                                            )
+                                            .unwrap();
+                                        assert_eq!(accounts, vec![subaccount]);
+                                        assert_eq!(
+                                            markets,
+                                            (u8::MIN..=u8::MAX).collect::<Vec<_>>()
+                                        );
+                                        BTreeMap::from([(
+                                            subaccount,
+                                            BTreeMap::from([(
+                                                1_u8,
+                                                EncodedLendingPosition {
+                                                    positions: BTreeMap::from([
+                                                        (b"btc".to_vec(), (1_200_000_u128, 0_u128)),
+                                                        (
+                                                            b"eth".to_vec(),
+                                                            (
+                                                                1_200_000_u128,
+                                                                u128::from(scenario == "borrow"),
+                                                            ),
+                                                        ),
+                                                    ]),
+                                                },
+                                            )]),
+                                        )])
+                                        .encode()
+                                    }
+                                    DEEPX_LENDING_POOL_RUNTIME_API_METHOD => {
+                                        let (market, asset) =
+                                            <(u8, Vec<u8>)>::decode(&mut bytes.as_slice()).unwrap();
+                                        assert_eq!(market, 1);
+                                        let mut pool = lending_pool(market, &asset);
+                                        if scenario == "inexact" && asset == b"eth" {
+                                            pool.0.decimal = 29;
+                                        }
+                                        Some(pool).encode()
+                                    }
+                                    DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD
+                                    | DEEPX_LENDING_BORROW_RUNTIME_API_METHOD => {
+                                        let (account, market, asset) =
+                                            <([u8; 20], u8, Vec<u8>)>::decode(
+                                                &mut bytes.as_slice(),
+                                            )
+                                            .unwrap();
+                                        assert_eq!((account, market), (subaccount, 1));
+                                        if method == DEEPX_LENDING_DEPOSIT_RUNTIME_API_METHOD {
+                                            Some(if scenario == "inexact" && asset == b"eth" {
+                                                1_u128
+                                            } else {
+                                                1_234_567_u128
+                                            })
+                                            .encode()
+                                        } else {
+                                            (if scenario == "borrow" && asset == b"eth" {
+                                                Some(1_u128)
+                                            } else {
+                                                None
+                                            })
+                                            .encode()
+                                        }
+                                    }
+                                    _ => panic!("unexpected runtime API: {method}"),
+                                };
+                                json!(format!("0x{}", hex::encode(result)))
+                            }
+                            method => panic!("unexpected current balance RPC: {method}"),
+                        };
+                        Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                    }
+                }
+            }),
+        );
+        let url = spawn_server(router).await;
+        let endpoints = validated_role_endpoints("http://127.0.0.1:1", &url, "http://127.0.0.1:2");
+        let mut capabilities = validated_capabilities(&endpoints);
+        if scenario == "capabilities" {
+            capabilities.watch.methods.remove("eth_call");
+        }
+        let result =
+            observe_current_flat_account_balances(&endpoints, &capabilities, subaccount).await;
+        if scenario == "ok" {
+            let observation = result.unwrap();
+            let current = observation.margin;
+            let balances = observation.balances;
+            assert_eq!(current.block_hash(), [0x22; 32]);
+            assert_eq!(current.block_number(), 42);
+            assert_eq!(current.subaccount(), subaccount);
+            assert_eq!(balances.len(), 2);
+            assert_eq!(balances[0].currency.code.as_str(), "BTC");
+            assert_eq!(balances[1].currency.code.as_str(), "ETH");
+            for balance in balances {
+                assert_eq!(balance.total, balance.free);
+                assert_eq!(balance.locked, Money::zero(balance.currency));
+            }
+        } else {
+            let error = result.unwrap_err().to_string();
+            let expected = match scenario {
+                "reorg" => "no longer canonical",
+                "malformed_hash" => "hash",
+                "initial_margin" | "maintenance_margin" => "margin requirement",
+                "borrow" => "borrow liability",
+                "withdrawal" => "not fully withdrawable",
+                "inexact" => "cannot be represented exactly",
+                "capabilities" => "capabilities",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        if matches!(
+            scenario,
+            "initial_margin" | "maintenance_margin" | "capabilities"
+        ) {
+            assert_eq!(withdrawals.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(withdrawals.load(Ordering::SeqCst), 2);
+            assert_eq!(checked_after_withdrawals.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn perp_position(subaccount: [u8; 20], market_id: u16) -> DeepXPerpPositionStorageEvidence {
@@ -6863,14 +7391,17 @@ mod tests {
         spawn_server(router).await
     }
 
-    #[rstest]
-    fn current_flat_usdc_balance_requires_backend_exact_collateral_and_chain_coverage() {
-        use crate::{
-            account::map_current_flat_usdc_balance,
-            http::{DeepXSubaccountBalances, DeepXSubaccountMarginRatio, models::DeepXExactMargin},
+    fn current_flat_backend_evidence() -> (
+        crate::http::DeepXSubaccountBalances,
+        crate::http::DeepXSubaccountMarginRatio,
+        DeepXCurrentMarginEvidence,
+    ) {
+        use crate::http::{
+            DeepXSubaccountBalances, DeepXSubaccountMarginRatio, models::DeepXExactMargin,
         };
 
         let amount = rust_decimal::Decimal::new(10_000_000, 6);
+        let collateral = rust_decimal::Decimal::new(20, 0);
         let zero = rust_decimal::Decimal::ZERO;
         let mut balances =
             DeepXSubaccountBalances(deepx_rust_sdk::rest::models::DeepXSubaccountBalances {
@@ -6887,62 +7418,293 @@ mod tests {
                     borrow_interest_usd: zero,
                 }],
             });
-        let mut margin =
+        let mut eth = balances.assets[0].clone();
+        eth.symbol = "ETH".to_string();
+        eth.decimals = 18;
+        eth.balance = rust_decimal::Decimal::ONE;
+        eth.price = rust_decimal::Decimal::new(3_000, 0);
+        eth.balance_usd = eth.price;
+        balances.assets.push(eth);
+        let margin =
             DeepXSubaccountMarginRatio(deepx_rust_sdk::rest::models::DeepXSubaccountMarginRatio {
-                collateral: amount,
+                collateral,
                 margin_required: zero,
                 margin_ratio: None,
                 exact_margin: Some(DeepXExactMargin {
-                    total_collateral: amount,
+                    total_collateral: collateral,
                     maint_margin_req: zero,
                     uni_mmr: None,
                 }),
             });
-        let mut current = DeepXCurrentMarginEvidence {
+        let current = DeepXCurrentMarginEvidence {
             block_hash: [0x22; 32],
             block_number: 42,
             subaccount: [0x11; 20],
             initial: DeepXMarginRequirement(DeepXRawMarginRequirement {
-                total_collateral: 10_000_000,
+                total_collateral: 20_000_000,
                 total_margin_required: 0,
             }),
             maintenance: DeepXMarginRequirement(DeepXRawMarginRequirement {
-                total_collateral: 10_000_000,
+                total_collateral: 20_000_000,
                 total_margin_required: 0,
             }),
         };
-        let mapped = map_current_flat_usdc_balance(&balances, &margin, &current).unwrap();
+        (balances, margin, current)
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn current_flat_observation_preserves_exact_eth_accrual() {
+        let (_, _, margin) = current_flat_backend_evidence();
+        let mut positions = flat_account_evidence().lending.positions;
+        let mut eth = positions[0].clone();
+        eth.asset = b"eth".to_vec();
+        eth.pool.0.asset = eth.asset.clone();
+        eth.pool.0.decimal = 18;
+        eth.effective_deposit = Some(29_988_638_658_206_185);
+        eth.max_withdraw_amount = eth.effective_deposit;
+        positions.insert(0, eth);
+        let first = DeepXCurrentFlatAccountObservation {
+            margin,
+            balances: map_flat_lending_balances(&positions).unwrap(),
+            positions,
+        };
+        let mut next = first.clone();
+        next.margin.block_number += 1;
+        next.margin.block_hash = [0x33; 32];
+        next.positions[0].effective_deposit = Some(29_988_638_669_531_953);
+        next.positions[0].max_withdraw_amount = next.positions[0].effective_deposit;
+        next.positions[0].pool.0.deposit_index += 1_000_000_000;
+        next.balances = map_flat_lending_balances(&next.positions).unwrap();
+        first.validate_flat_successor(&next).unwrap();
+        assert!(first.has_same_lending_claims(&next));
+        assert_eq!(next.balances[0].total.raw, 29_988_638_669_531_953);
+        assert_eq!(first.balances[1], next.balances[1]);
+        next.positions[0].max_withdraw_amount = Some(29_988_638_669_531_952);
+        assert!(map_flat_lending_balances(&next.positions).is_err());
+    }
+
+    #[rstest]
+    #[case("interest", true)]
+    #[case("shares", false)]
+    #[case("borrow", false)]
+    #[case("market", false)]
+    #[case("asset", false)]
+    #[case("precision", false)]
+    #[case("removed", false)]
+    #[case("added", false)]
+    fn current_flat_observation_compares_exact_lending_claims(
+        #[case] change: &str,
+        #[case] accepted: bool,
+    ) {
+        let (_, _, margin) = current_flat_backend_evidence();
+        let positions = flat_account_evidence().lending.positions;
+        let first = DeepXCurrentFlatAccountObservation {
+            margin,
+            balances: map_flat_lending_balances(&positions).unwrap(),
+            positions,
+        };
+        let mut next = first.clone();
+        next.margin.block_number += 1;
+        next.margin.block_hash = [0x33; 32];
+        match change {
+            "interest" => {
+                let position = &mut next.positions[0];
+                position.effective_deposit = Some(1_234_568);
+                position.max_withdraw_amount = position.effective_deposit;
+                position.pool.0.deposit_index += 1_000_000_000_000;
+                next.balances = map_flat_lending_balances(&next.positions).unwrap();
+                assert_ne!(first.balances, next.balances);
+            }
+            "shares" => next.positions[0].scaled_deposit += 1,
+            "borrow" => next.positions[0].scaled_borrow = 1,
+            "market" => next.positions[0].market_id += 1,
+            "asset" => next.positions[0].asset = b"eth".to_vec(),
+            "precision" => next.positions[0].pool.0.decimal += 1,
+            "removed" => next.positions.clear(),
+            "added" => next.positions.push(next.positions[0].clone()),
+            _ => unreachable!(),
+        }
+        first.validate_flat_successor(&next).unwrap();
+        assert_eq!(first.has_same_lending_claims(&next), accepted);
+    }
+
+    #[rstest]
+    fn current_flat_observation_rejects_same_block_lending_changes() {
+        let (_, _, margin) = current_flat_backend_evidence();
+        let positions = flat_account_evidence().lending.positions;
+        let first = DeepXCurrentFlatAccountObservation {
+            margin,
+            balances: map_flat_lending_balances(&positions).unwrap(),
+            positions,
+        };
+        first.validate_flat_successor(&first).unwrap();
+        let mut next = first.clone();
+        next.positions[0].pool.0.deposit_index += 1;
+        assert!(first.validate_flat_successor(&next).is_err());
+    }
+
+    #[rstest]
+    #[case(19_000_000, 18_000_000)]
+    #[case(20_000_000, 20_000_000)]
+    #[case(21_000_000, 22_000_000)]
+    fn current_flat_margin_successor_accepts_market_valuation_changes(
+        #[case] initial: u128,
+        #[case] maintenance: u128,
+    ) {
+        let (_, _, first) = current_flat_backend_evidence();
+        let mut next = first;
+        next.block_number += 1;
+        next.block_hash = [0x33; 32];
+        next.initial.0.total_collateral = initial;
+        next.maintenance.0.total_collateral = maintenance;
+        first.validate_flat_successor(&next).unwrap();
+        first.validate_flat_successor(&first).unwrap();
+    }
+
+    #[rstest]
+    #[case("head_regressed", "chain head regressed")]
+    #[case("same_height_hash_changed", "chain head regressed")]
+    #[case("account_changed", "margin account changed")]
+    #[case("first_initial_margin", "margin requirement")]
+    #[case("first_maintenance_margin", "margin requirement")]
+    #[case("next_initial_margin", "margin requirement")]
+    #[case("next_maintenance_margin", "margin requirement")]
+    #[case("equal_nonzero_margin", "margin requirement")]
+    fn current_flat_margin_successor_rejects_unsafe_transitions(
+        #[case] failure: &str,
+        #[case] expected: &str,
+    ) {
+        let (_, _, mut first) = current_flat_backend_evidence();
+        let mut next = first;
+        next.block_number += 1;
+        next.block_hash = [0x33; 32];
+        match failure {
+            "head_regressed" => next.block_number = first.block_number - 1,
+            "same_height_hash_changed" => next.block_number = first.block_number,
+            "account_changed" => next.subaccount = [0x44; 20],
+            "first_initial_margin" => first.initial.0.total_margin_required = 1,
+            "first_maintenance_margin" => first.maintenance.0.total_margin_required = 1,
+            "next_initial_margin" => next.initial.0.total_margin_required = 1,
+            "next_maintenance_margin" => next.maintenance.0.total_margin_required = 1,
+            "equal_nonzero_margin" => {
+                first.initial.0.total_margin_required = 1;
+                next.initial.0.total_margin_required = 1;
+            }
+            _ => unreachable!(),
+        }
+        let message = first
+            .validate_flat_successor(&next)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(expected), "{message}");
+        if failure == "head_regressed" || failure == "same_height_hash_changed" {
+            assert!(message.contains("first_block=42"));
+            assert!(message.contains("first_hash=0x"));
+            assert!(message.contains("final_hash=0x"));
+        }
+    }
+
+    #[rstest]
+    fn current_flat_backend_accepts_multiasset_collateral_independent_of_native_amounts() {
+        use crate::account::validate_current_flat_account_backend;
+
+        let (mut balances, mut margin, mut current) = current_flat_backend_evidence();
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
+
+        // Neither per-asset USD values nor the rounded backend aggregate define native balances
         balances.assets[0].price = rust_decimal::Decimal::new(2, 0);
         balances.assets[0].balance_usd = rust_decimal::Decimal::new(9, 0);
-        assert_eq!(
-            map_current_flat_usdc_balance(&balances, &margin, &current).unwrap(),
-            mapped,
-        );
+        margin.collateral = rust_decimal::Decimal::new(99, 0);
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
 
-        balances.assets[0].balance_borrowed = rust_decimal::Decimal::new(1, 6);
-        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        balances.assets[0].balance_borrowed = zero;
+        // No USDC deposit is required; the chain mapper owns native asset validation
+        balances.assets.remove(0);
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
 
-        current.initial.0.total_margin_required = 1;
-        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        current.initial.0.total_margin_required = 0;
+        current.initial.0.total_collateral += 1;
+        current.maintenance.0.total_collateral += 2;
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
 
+        margin.exact_margin.as_mut().unwrap().total_collateral = rust_decimal::Decimal::ZERO;
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
+    }
+
+    #[rstest]
+    #[case(282_640_172, 286_086_067, 286_086_637)]
+    #[case(282_480_928, 285_917_977, 285_914_487)]
+    #[case(80_000_000, 90_000_000, 90_000_000)]
+    #[case(80_000_000, 90_000_000, 89_999_999)]
+    #[case(80_000_000, 90_000_000, 90_000_001)]
+    #[case(100_000_000, 90_000_000, 90_000_001)]
+    #[case(80_000_000, 90_000_000, 900_000_000)]
+    #[case(80_000_000, 90_000_000, 0)]
+    fn current_flat_backend_does_not_order_independent_collateral_valuations(
+        #[case] initial: u128,
+        #[case] maintenance: u128,
+        #[case] backend: i64,
+    ) {
+        use crate::account::validate_current_flat_account_backend;
+
+        let (balances, mut margin, mut current) = current_flat_backend_evidence();
+        current.initial.0.total_collateral = initial;
+        current.maintenance.0.total_collateral = maintenance;
         margin.exact_margin.as_mut().unwrap().total_collateral =
-            rust_decimal::Decimal::new(9_999_999, 6);
-        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        margin.exact_margin.as_mut().unwrap().total_collateral = amount;
+            rust_decimal::Decimal::new(backend, 6);
+        validate_current_flat_account_backend(&balances, &margin, &current).unwrap();
+    }
 
-        current.initial.0.total_collateral = 10_000_001;
-        current.maintenance.0.total_collateral = 10_000_001;
-        assert_eq!(
-            map_current_flat_usdc_balance(&balances, &margin, &current).unwrap(),
-            mapped,
-        );
-        current.initial.0.total_collateral = 9_999_999;
-        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
-        current.initial.0.total_collateral = 10_000_000;
+    #[rstest]
+    #[case("invalid_account")]
+    #[case("foreign_account")]
+    #[case("backend_margin")]
+    #[case("exact_margin")]
+    #[case("missing_exact")]
+    #[case("initial_margin")]
+    #[case("maintenance_margin")]
+    #[case("negative_collateral")]
+    fn current_flat_backend_rejects_invalid_evidence(#[case] failure: &str) {
+        use crate::account::validate_current_flat_account_backend;
 
-        current.maintenance.0.total_collateral = 9_999_999;
-        assert!(map_current_flat_usdc_balance(&balances, &margin, &current).is_err());
+        let (mut balances, mut margin, mut current) = current_flat_backend_evidence();
+        let one = rust_decimal::Decimal::ONE;
+        match failure {
+            "invalid_account" => balances.address = "invalid".to_string(),
+            "foreign_account" => balances.address = format!("0x{}", hex::encode([0x33; 20])),
+            "backend_margin" => margin.margin_required = one,
+            "exact_margin" => margin.exact_margin.as_mut().unwrap().maint_margin_req = one,
+            "missing_exact" => margin.exact_margin = None,
+            "initial_margin" => current.initial.0.total_margin_required = 1,
+            "maintenance_margin" => current.maintenance.0.total_margin_required = 1,
+            "negative_collateral" => {
+                margin.exact_margin.as_mut().unwrap().total_collateral = -one;
+            }
+            _ => unreachable!(),
+        }
+        assert!(validate_current_flat_account_backend(&balances, &margin, &current).is_err());
+    }
+
+    #[rstest]
+    #[case("balance_borrowed")]
+    #[case("balance_borrowed_usd")]
+    #[case("borrow_interest")]
+    #[case("borrow_interest_usd")]
+    fn current_flat_backend_rejects_liabilities_on_every_asset(#[case] field: &str) {
+        use crate::account::validate_current_flat_account_backend;
+
+        let (balances, margin, current) = current_flat_backend_evidence();
+        for index in 0..balances.assets.len() {
+            let mut balances = balances.clone();
+            let asset = &mut balances.assets[index];
+            let liability = match field {
+                "balance_borrowed" => &mut asset.balance_borrowed,
+                "balance_borrowed_usd" => &mut asset.balance_borrowed_usd,
+                "borrow_interest" => &mut asset.borrow_interest,
+                "borrow_interest_usd" => &mut asset.borrow_interest_usd,
+                _ => unreachable!(),
+            };
+            *liability = rust_decimal::Decimal::new(1, 6);
+            assert!(validate_current_flat_account_backend(&balances, &margin, &current).is_err());
+        }
     }
 }

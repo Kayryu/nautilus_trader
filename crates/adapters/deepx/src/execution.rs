@@ -81,8 +81,8 @@ use thiserror::Error;
 use crate::{
     account::{
         DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedMarginBalance,
-        DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_current_flat_usdc_balance,
-        map_finalized_flat_account_balances, map_finalized_margin_balance_with_evidence,
+        DeepXFlatAccountBalanceError, DeepXMarginBalanceError, map_finalized_flat_account_balances,
+        map_finalized_margin_balance_with_evidence, validate_current_flat_account_backend,
     },
     common::{
         DeepXEnvironment, DeepXPrivateKey, consts::DEEPX_VENUE, parse::decimal_to_scaled_i128,
@@ -118,7 +118,7 @@ use crate::{
         observe_and_apply_finalized_perp_positions_evidence,
         observe_and_apply_finalized_spot_orders_by_id_evidence,
         observe_and_validate_rpc_endpoint_identities, observe_and_validate_rpc_method_capabilities,
-        observe_current_margin_evidence, observe_current_runtime_snapshot_for_endpoints,
+        observe_current_flat_account_balances, observe_current_runtime_snapshot_for_endpoints,
     },
     signing::{
         DeepXPerpCancelParams, DeepXPerpModifyParams, DeepXPerpOrderType, DeepXPerpPlaceParams,
@@ -196,8 +196,8 @@ fn account_stream_reconnect_delay(attempt: u32) -> Duration {
     "DeepX account balance changed during observation: initial={initial:?}, final={final_balance:?}"
 )]
 struct DeepXAccountBalanceChangedError {
-    initial: AccountBalance,
-    final_balance: AccountBalance,
+    initial: Vec<AccountBalance>,
+    final_balance: Vec<AccountBalance>,
 }
 
 fn should_retry_account_balance_observation(error: &anyhow::Error, attempt: usize) -> bool {
@@ -5796,6 +5796,21 @@ impl DeepXExecutionClient {
         Ok(evidence)
     }
 
+    /// Observes the owned multi-asset ledger without inferring per-asset trading balances.
+    ///
+    /// Positions, orders, lending claims, and aggregate margin share one finalized checkpoint.
+    /// This read does not authorize execution or advance the startup gates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if runtime or ownership verification, observation, or exact mapping fails.
+    pub async fn observe_owned_finalized_account_ledger(
+        &self,
+    ) -> anyhow::Result<crate::account::DeepXFinalizedAccountLedger> {
+        let evidence = self.observe_owned_finalized_account_evidence().await?;
+        Ok(crate::account::map_finalized_account_ledger(&evidence)?)
+    }
+
     /// Observes both margin directions using only evidence owned by this execution client.
     ///
     /// The result is pinned to one fixture-approved finalized Watch checkpoint and remains in raw
@@ -7463,7 +7478,7 @@ impl DeepXExecutionClient {
         let state = AccountState::new(
             self.core.account_id,
             self.core.account_type,
-            vec![balance],
+            balance,
             Vec::new(),
             true,
             UUID4::new(),
@@ -7831,6 +7846,13 @@ impl DeepXExecutionClient {
     }
 
     fn schedule_current_account_refresh(&self) -> anyhow::Result<()> {
+        let previous_currencies: Vec<_> = self
+            .core
+            .try_cache()
+            .map_err(|_| anyhow::anyhow!("DeepX account refresh cache is already borrowed"))?
+            .account(&self.core.account_id)
+            .map(|account| account.balances().keys().copied().collect())
+            .unwrap_or_default();
         let (Some(endpoints), Some(capabilities), Some(ownership), Some(snapshot)) = (
             self.runtime_rpc_endpoints.clone(),
             self.runtime_rpc_capabilities.clone(),
@@ -7856,7 +7878,7 @@ impl DeepXExecutionClient {
         let account_live = self.account_monitor_live.as_ref().map(Arc::clone);
         self.query_tasks.spawn(async move {
             let state = async {
-                let balance = observe_current_flat_account_balance(
+                let mut balance = observe_current_flat_account_balance(
                     &http,
                     &credential,
                     ownership,
@@ -7867,11 +7889,12 @@ impl DeepXExecutionClient {
                     &spot_pairs,
                 )
                 .await?;
+                clear_missing_account_balances(&mut balance, &previous_currencies);
                 let now = get_atomic_clock_realtime().get_time_ns();
                 Ok::<AccountState, anyhow::Error>(AccountState::new(
                     account_id,
                     account_type,
-                    vec![balance],
+                    balance,
                     Vec::new(),
                     true,
                     UUID4::new(),
@@ -7903,6 +7926,16 @@ impl DeepXExecutionClient {
     }
 }
 
+fn clear_missing_account_balances(balances: &mut Vec<AccountBalance>, previous: &[Currency]) {
+    for currency in previous {
+        if !balances.iter().any(|balance| balance.currency == *currency) {
+            let zero = Money::zero(*currency);
+            balances.push(AccountBalance::new(zero, zero, zero));
+        }
+    }
+    balances.sort_unstable_by_key(|balance| balance.currency.code);
+}
+
 fn sort_recovery_outboxes(restored: &mut [DeepXRestoredTransactionRecord]) {
     restored.sort_by(|left, right| {
         recovery_outbox_order(left.record())
@@ -7929,7 +7962,7 @@ async fn observe_current_flat_account_balance(
     snapshot: &RuntimeSnapshot,
     expected_perp_markets: &HashSet<u64>,
     expected_spot_pairs: &HashSet<String>,
-) -> anyhow::Result<AccountBalance> {
+) -> anyhow::Result<Vec<AccountBalance>> {
     let subaccount = format!("0x{}", nautilus_core::hex::encode(ownership.subaccount()));
     for attempt in 1..=ACCOUNT_BALANCE_OBSERVATION_ATTEMPTS {
         anyhow::ensure!(
@@ -7975,7 +8008,7 @@ async fn observe_current_flat_account_balance_unowned(
     snapshot: &RuntimeSnapshot,
     expected_perp_markets: &HashSet<u64>,
     expected_spot_pairs: &HashSet<String>,
-) -> anyhow::Result<AccountBalance> {
+) -> anyhow::Result<Vec<AccountBalance>> {
     let subaccount = format!("0x{}", nautilus_core::hex::encode(subaccount_id));
     let perp_markets = http.get_perp_markets().await?;
     let spot_markets = http.get_spot_markets().await?;
@@ -7995,8 +8028,9 @@ async fn observe_current_flat_account_balance_unowned(
     );
     let balances = http.get_subaccount_balances(&subaccount).await?;
     let margin = http.get_subaccount_margin_ratio(&subaccount).await?;
-    let first = observe_current_margin_evidence(endpoints, capabilities, subaccount_id).await?;
-    let balance = map_current_flat_usdc_balance(&balances, &margin, &first)?;
+    let first =
+        observe_current_flat_account_balances(endpoints, capabilities, subaccount_id).await?;
+    validate_current_flat_account_backend(&balances, &margin, &first.margin)?;
 
     for market_id in perp_ids {
         let positions = http
@@ -8060,25 +8094,13 @@ async fn observe_current_flat_account_balance_unowned(
     let final_balances = http.get_subaccount_balances(&subaccount).await?;
     let final_margin = http.get_subaccount_margin_ratio(&subaccount).await?;
     let final_chain =
-        observe_current_margin_evidence(endpoints, capabilities, subaccount_id).await?;
-    anyhow::ensure!(
-        first.initial().total_margin_required() == final_chain.initial().total_margin_required()
-            && first.maintenance().total_margin_required()
-                == final_chain.maintenance().total_margin_required()
-            && first.initial().total_collateral() <= final_chain.initial().total_collateral()
-            && first.maintenance().total_collateral()
-                <= final_chain.maintenance().total_collateral()
-            && first.block_number() <= final_chain.block_number()
-            && (first.block_number() != final_chain.block_number()
-                || first.block_hash() == final_chain.block_hash()),
-        "DeepX current margin changed or chain head regressed during observation",
-    );
-    let final_balance =
-        map_current_flat_usdc_balance(&final_balances, &final_margin, &final_chain)?;
-    if balance != final_balance {
+        observe_current_flat_account_balances(endpoints, capabilities, subaccount_id).await?;
+    first.validate_flat_successor(&final_chain)?;
+    validate_current_flat_account_backend(&final_balances, &final_margin, &final_chain.margin)?;
+    if !first.has_same_lending_claims(&final_chain) {
         return Err(DeepXAccountBalanceChangedError {
-            initial: balance,
-            final_balance,
+            initial: first.balances,
+            final_balance: final_chain.balances,
         }
         .into());
     }
@@ -8103,7 +8125,7 @@ async fn observe_current_flat_account_balance_unowned(
         current_runtime.identity() == snapshot.identity(),
         "DeepX runtime changed during account observation",
     );
-    Ok(balance)
+    Ok(final_chain.balances)
 }
 
 fn is_verified_closed_perp_position(position: &DeepXPerpPositionRecord) -> bool {
@@ -11828,8 +11850,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(balance.total, balance.free);
-        assert_eq!(balance.locked, Money::zero(balance.currency));
+        assert!(!balance.is_empty());
+        for asset in balance {
+            assert_eq!(asset.total, asset.free);
+            assert_eq!(asset.locked, Money::zero(asset.currency));
+        }
     }
 
     #[rstest]
@@ -11844,6 +11869,25 @@ mod tests {
         let mut incomplete = closed.clone();
         incomplete.close_event_idx = None;
         assert!(!is_verified_closed_perp_position(&incomplete));
+    }
+
+    #[rstest]
+    fn flat_account_refresh_clears_assets_removed_since_startup() {
+        let usdc = Currency::USDC();
+        let eth = Currency::ETH();
+        let total = Money::from("10 USDC");
+        let mut balances = vec![AccountBalance::new(total, Money::zero(usdc), total)];
+        clear_missing_account_balances(&mut balances, &[usdc, eth]);
+        assert_eq!(balances.len(), 2);
+        let removed = balances
+            .iter()
+            .find(|balance| balance.currency == eth)
+            .unwrap();
+        assert_eq!(removed.total, Money::zero(eth));
+        assert_eq!(removed.free, Money::zero(eth));
+        assert_eq!(removed.locked, Money::zero(eth));
+        clear_missing_account_balances(&mut balances, &[usdc, eth]);
+        assert_eq!(balances.len(), 2);
     }
 
     #[rstest]
@@ -11862,8 +11906,8 @@ mod tests {
         )
         .unwrap();
         let changed = anyhow::Error::new(DeepXAccountBalanceChangedError {
-            initial,
-            final_balance,
+            initial: vec![initial],
+            final_balance: vec![final_balance],
         })
         .context("full account observation failed");
         let unrelated = anyhow::anyhow!("DeepX flat account has an open perpetual order");

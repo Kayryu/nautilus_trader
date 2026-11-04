@@ -40,10 +40,11 @@ pub mod transaction;
 pub mod websocket;
 
 pub use account::{
-    DeepXAccountOwnershipError, DeepXAccountOwnershipProof, DeepXFinalizedFlatAccountBalances,
+    DeepXAccountLedgerError, DeepXAccountOwnershipError, DeepXAccountOwnershipProof,
+    DeepXAssetLedger, DeepXFinalizedAccountLedger, DeepXFinalizedFlatAccountBalances,
     DeepXFinalizedMarginBalance, DeepXFlatAccountBalanceError, DeepXMarginBalanceError,
-    map_finalized_flat_account_balances, map_finalized_margin_balance,
-    map_finalized_margin_balance_with_evidence,
+    map_finalized_account_ledger, map_finalized_flat_account_balances,
+    map_finalized_margin_balance, map_finalized_margin_balance_with_evidence,
 };
 pub use common::{DeepXEnvironment, DeepXError, DeepXKeyScheme, DeepXPrivateKey, DeepXProductType};
 pub use config::{

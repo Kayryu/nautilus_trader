@@ -29,7 +29,7 @@ use deepx_rust_sdk::{
 use nautilus_core::hex;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    enums::AccountType,
+    enums::{AccountType, CurrencyType},
     events::AccountState,
     identifiers::AccountId,
     types::{AccountBalance, Currency, MarginBalance, Money},
@@ -44,25 +44,216 @@ use crate::{
     },
     rpc::{
         DeepXCurrentMarginEvidence, DeepXFinalizedAccountEvidence, DeepXFinalizedCheckpoint,
-        DeepXFinalizedMarginEvidence,
+        DeepXFinalizedMarginEvidence, DeepXLendingPositionEvidence,
     },
     signing::{ApprovedRuntimeIdentity, SigningError, derive_signer_account_id},
 };
 
 const DEEPX_QUOTE_PRECISION: u32 = 6;
 
-pub(crate) fn map_current_flat_usdc_balance(
+/// Native asset claims and liabilities at one finalized account checkpoint.
+///
+/// Withdrawal capacity is an alternative, asset-specific outflow scenario. Capacities across
+/// assets are not additive and are not trading balances or allocations of cross margin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeepXAssetLedger {
+    asset: String,
+    decimals: u32,
+    deposit: rust_decimal::Decimal,
+    borrow: rust_decimal::Decimal,
+    max_withdrawal: rust_decimal::Decimal,
+}
+
+impl DeepXAssetLedger {
+    /// Returns the normalized native asset symbol.
+    #[must_use]
+    pub fn asset(&self) -> &str {
+        &self.asset
+    }
+
+    /// Returns the native token precision from the lending pool.
+    #[must_use]
+    pub const fn decimals(&self) -> u32 {
+        self.decimals
+    }
+
+    /// Returns the effective deposit, including accrued lending interest.
+    #[must_use]
+    pub const fn deposit(&self) -> rust_decimal::Decimal {
+        self.deposit
+    }
+
+    /// Returns the effective borrowing liability, including accrued interest.
+    #[must_use]
+    pub const fn borrow(&self) -> rust_decimal::Decimal {
+        self.borrow
+    }
+
+    /// Returns the signed native ledger claim, excluding floating perpetual PnL and funding.
+    #[must_use]
+    pub fn net(&self) -> rust_decimal::Decimal {
+        self.deposit - self.borrow
+    }
+
+    /// Returns external withdrawal capacity, not order buying power or a free balance.
+    #[must_use]
+    pub const fn max_withdrawal(&self) -> rust_decimal::Decimal {
+        self.max_withdrawal
+    }
+}
+
+/// Multi-asset ledger and aggregate margin supported by one finalized account observation.
+///
+/// Unlike a flat-account balance, this accepts positions, orders, and borrowing. It deliberately
+/// does not construct `AccountBalance` or `AccountState`: cross margin does not define a unique
+/// per-asset free/locked allocation. Effective deposits already include settled perpetual cash
+/// flows; cumulative position PnL and funding must not be added again.
+#[derive(Clone, Debug)]
+pub struct DeepXFinalizedAccountLedger {
+    evidence: DeepXFinalizedAccountEvidence,
+    assets: Vec<DeepXAssetLedger>,
+    margin: DeepXFinalizedMarginBalance,
+    initial_collateral: rust_decimal::Decimal,
+    maintenance_collateral: rust_decimal::Decimal,
+}
+
+impl DeepXFinalizedAccountLedger {
+    /// Returns the account, runtime, orders, positions, and checkpoint supporting this ledger.
+    #[must_use]
+    pub const fn evidence(&self) -> &DeepXFinalizedAccountEvidence {
+        &self.evidence
+    }
+
+    /// Returns native asset claims sorted by normalized symbol.
+    #[must_use]
+    pub fn assets(&self) -> &[DeepXAssetLedger] {
+        &self.assets
+    }
+
+    /// Returns one account-wide USDC-quoted margin requirement, not one requirement per leg.
+    #[must_use]
+    pub const fn margin(&self) -> &DeepXFinalizedMarginBalance {
+        &self.margin
+    }
+
+    /// Returns initial weighted quote collateral, not a native USDC balance or signed equity.
+    #[must_use]
+    pub const fn initial_collateral(&self) -> rust_decimal::Decimal {
+        self.initial_collateral
+    }
+
+    /// Returns maintenance weighted quote collateral, not signed economic equity.
+    #[must_use]
+    pub const fn maintenance_collateral(&self) -> rust_decimal::Decimal {
+        self.maintenance_collateral
+    }
+}
+
+/// Errors raised while mapping a finalized multi-asset ledger.
+#[derive(Debug, Error)]
+pub enum DeepXAccountLedgerError {
+    /// The symbol is invalid or aliases another lending asset.
+    #[error("DeepX finalized ledger has an invalid or duplicate asset symbol")]
+    InvalidAsset,
+    /// Effective balances contradict the scaled position or withdrawal bound.
+    #[error("DeepX finalized ledger asset {0} has inconsistent balance evidence")]
+    InvalidBalance(String),
+    /// An amount exceeds the exact decimal representation.
+    #[error("DeepX finalized ledger amount cannot be represented exactly: {0}")]
+    AmountConversion(String),
+    /// Aggregate margin cannot be represented in framework money.
+    #[error(transparent)]
+    Margin(#[from] DeepXMarginBalanceError),
+}
+
+/// Maps native deposits, debts, withdrawal scenarios, and aggregate cross margin independently.
+///
+/// Open positions and orders are retained as evidence, never revalued or counted as additional
+/// deposits. This mapping does not authorize orders or relax account startup and recovery gates.
+///
+/// # Errors
+///
+/// Returns an error for invalid or duplicate symbols, inconsistent balances, or inexact amounts.
+pub fn map_finalized_account_ledger(
+    evidence: &DeepXFinalizedAccountEvidence,
+) -> Result<DeepXFinalizedAccountLedger, DeepXAccountLedgerError> {
+    fn amount(
+        value: u128,
+        decimals: u32,
+    ) -> Result<rust_decimal::Decimal, DeepXAccountLedgerError> {
+        let value = i128::try_from(value)
+            .map_err(|e| DeepXAccountLedgerError::AmountConversion(e.to_string()))?;
+        scaled_i128_to_decimal(value, decimals)
+            .map_err(|e| DeepXAccountLedgerError::AmountConversion(e.to_string()))
+    }
+
+    let mut observed = HashSet::new();
+    let mut assets = Vec::with_capacity(evidence.lending().positions().len());
+    for position in evidence.lending().positions() {
+        let asset = std::str::from_utf8(position.asset())
+            .ok()
+            .filter(|value| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or(DeepXAccountLedgerError::InvalidAsset)?
+            .to_ascii_uppercase();
+        if !observed.insert(asset.clone()) {
+            return Err(DeepXAccountLedgerError::InvalidAsset);
+        }
+        let deposit = position.effective_deposit().unwrap_or(0);
+        let borrow = position.effective_borrow().unwrap_or(0);
+        let withdrawal = match (position.scaled_deposit(), position.max_withdraw_amount()) {
+            (0, None) => 0,
+            (0, Some(_)) | (_, None) => {
+                return Err(DeepXAccountLedgerError::InvalidBalance(asset));
+            }
+            (_, Some(value)) => value,
+        };
+        if (position.scaled_deposit() == 0) != (deposit == 0)
+            || (position.scaled_borrow() == 0) != (borrow == 0)
+            || (deposit != 0 && borrow != 0)
+            || withdrawal > deposit
+        {
+            return Err(DeepXAccountLedgerError::InvalidBalance(asset));
+        }
+        let decimals = position.pool().decimal();
+        assets.push(DeepXAssetLedger {
+            asset,
+            decimals,
+            deposit: amount(deposit, decimals)?,
+            borrow: amount(borrow, decimals)?,
+            max_withdrawal: amount(withdrawal, decimals)?,
+        });
+    }
+    assets.sort_unstable_by(|left, right| left.asset.cmp(&right.asset));
+
+    Ok(DeepXFinalizedAccountLedger {
+        evidence: evidence.clone(),
+        assets,
+        margin: map_finalized_margin_balance_with_evidence(evidence.margin())?,
+        initial_collateral: amount(
+            evidence.margin().initial().total_collateral(),
+            DEEPX_QUOTE_PRECISION,
+        )?,
+        maintenance_collateral: amount(
+            evidence.margin().maintenance().total_collateral(),
+            DEEPX_QUOTE_PRECISION,
+        )?,
+    })
+}
+
+/// Validates backend flat-account safety without deriving native balances from quote collateral.
+pub(crate) fn validate_current_flat_account_backend(
     balances: &DeepXSubaccountBalances,
     margin: &DeepXSubaccountMarginRatio,
     current: &DeepXCurrentMarginEvidence,
-) -> anyhow::Result<AccountBalance> {
+) -> anyhow::Result<()> {
     let observed = decode_account_id20(&balances.address)
         .ok_or_else(|| anyhow::anyhow!("invalid DeepX backend balance account address"))?;
     anyhow::ensure!(
         observed == current.subaccount(),
         "DeepX backend and current-chain balance accounts differ",
     );
-    let mut deposit = None;
     for asset in &balances.assets {
         anyhow::ensure!(
             asset.balance_borrowed.is_zero()
@@ -71,37 +262,11 @@ pub(crate) fn map_current_flat_usdc_balance(
                 && asset.borrow_interest_usd.is_zero(),
             "DeepX backend flat account has a borrow liability",
         );
-        if asset.symbol.eq_ignore_ascii_case("USDC") {
-            anyhow::ensure!(
-                asset.decimals == DEEPX_QUOTE_PRECISION as u8
-                    && deposit.replace(asset.balance).is_none(),
-                "DeepX backend flat account has invalid USDC identity",
-            );
-        } else {
-            anyhow::ensure!(
-                asset.balance.is_zero(),
-                "DeepX backend flat account has another deposited asset",
-            );
-        }
     }
-    let deposit = deposit.ok_or_else(|| anyhow::anyhow!("DeepX backend USDC balance is absent"))?;
-    anyhow::ensure!(
-        deposit > rust_decimal::Decimal::ZERO
-            && deposit.normalize().scale() <= DEEPX_QUOTE_PRECISION,
-        "DeepX backend USDC balance is invalid or inexact",
-    );
     let exact = margin
         .exact_margin
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("DeepX backend exact margin is absent"))?;
-    let initial_collateral = scaled_i128_to_decimal(
-        i128::try_from(current.initial().total_collateral())?,
-        DEEPX_QUOTE_PRECISION,
-    )?;
-    let maintenance_collateral = scaled_i128_to_decimal(
-        i128::try_from(current.maintenance().total_collateral())?,
-        DEEPX_QUOTE_PRECISION,
-    )?;
     anyhow::ensure!(
         current.initial().total_margin_required() == 0
             && current.maintenance().total_margin_required() == 0
@@ -110,20 +275,14 @@ pub(crate) fn map_current_flat_usdc_balance(
         "DeepX flat account has a margin requirement",
     );
 
-    // Current collateral can accrue after the backend balance observation
+    // REST collateral has no block binding and cannot bound an independent chain valuation
+    // Native balances and withdrawal capacity are validated separately against chain evidence
     anyhow::ensure!(
-        deposit == exact.total_collateral
-            && deposit <= initial_collateral
-            && deposit <= maintenance_collateral,
-        "DeepX backend deposit exceeds current-chain collateral or exact backend collateral differs",
+        exact.total_collateral >= rust_decimal::Decimal::ZERO,
+        "DeepX backend exact collateral is negative: {}",
+        exact.total_collateral,
     );
-    let currency = Currency::USDC();
-    let total = Money::from_decimal(deposit, currency)?;
-    Ok(AccountBalance::new_checked(
-        total,
-        Money::zero(currency),
-        total,
-    )?)
+    Ok(())
 }
 
 /// Finalized framework margin with the chain observation that supports it.
@@ -353,9 +512,22 @@ pub fn map_finalized_flat_account_balances(
         return Err(DeepXFlatAccountBalanceError::SpotOrderActive);
     }
 
+    Ok(DeepXFinalizedFlatAccountBalances {
+        checkpoint: evidence.checkpoint(),
+        runtime_identity: evidence.runtime_identity().clone(),
+        subaccount: evidence.subaccount(),
+        timestamp_ms: evidence.timestamp_ms(),
+        balances: map_flat_lending_balances(evidence.lending().positions())?,
+    })
+}
+
+/// Maps native deposits only when each asset is exactly representable and fully withdrawable.
+pub(crate) fn map_flat_lending_balances(
+    positions: &[DeepXLendingPositionEvidence],
+) -> Result<Vec<AccountBalance>, DeepXFlatAccountBalanceError> {
     let mut observed_assets = HashSet::new();
-    let mut balances = Vec::with_capacity(evidence.lending().positions().len());
-    for position in evidence.lending().positions() {
+    let mut balances = Vec::with_capacity(positions.len());
+    for position in positions {
         let asset = std::str::from_utf8(position.asset())
             .ok()
             .filter(|value| {
@@ -394,7 +566,25 @@ pub fn map_finalized_flat_account_balances(
                     }
                 })
             })?;
-        let currency = Currency::get_or_create_crypto(&asset);
+        let registered = Currency::get_or_create_crypto(&asset);
+        let currency = if position.pool().decimal() > u32::from(registered.precision) {
+            let precision = u8::try_from(position.pool().decimal()).map_err(|e| {
+                DeepXFlatAccountBalanceError::InexactAmount {
+                    asset: asset.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+            // Native lending claims can require more precision than trading currencies
+            Currency::new_checked(&asset, precision, 0, &asset, CurrencyType::Crypto).map_err(
+                |e| DeepXFlatAccountBalanceError::InexactAmount {
+                    asset: asset.clone(),
+                    reason: format!("native pool precision {precision} is unsupported: {e}"),
+                },
+            )?
+        } else {
+            registered
+        };
         if amount.normalize().scale() > u32::from(currency.precision) {
             return Err(DeepXFlatAccountBalanceError::InexactAmount {
                 asset,
@@ -425,13 +615,7 @@ pub fn map_finalized_flat_account_balances(
     }
     balances.sort_unstable_by_key(|balance| balance.currency.code);
 
-    Ok(DeepXFinalizedFlatAccountBalances {
-        checkpoint: evidence.checkpoint(),
-        runtime_identity: evidence.runtime_identity().clone(),
-        subaccount: evidence.subaccount(),
-        timestamp_ms: evidence.timestamp_ms(),
-        balances,
-    })
+    Ok(balances)
 }
 
 /// Errors raised while proving signer ownership of a configured subaccount.
