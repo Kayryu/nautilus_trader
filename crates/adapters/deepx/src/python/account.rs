@@ -15,6 +15,8 @@
 
 //! Read-only Python wallet account observations.
 
+use std::{future::Future, io, thread};
+
 use nautilus_core::python::to_pyvalue_err;
 use pyo3::prelude::*;
 
@@ -343,12 +345,11 @@ pub(super) fn py_get_deepx_wallet_subaccounts(
         config.proxy_url,
     )
     .map_err(to_pyvalue_err)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(to_pyvalue_err)?;
-    py.detach(move || runtime.block_on(client.get_wallet_subaccounts(&wallet)))
-        .map_err(to_pyvalue_err)
+    py.detach(move || {
+        run_account_query(async move { client.get_wallet_subaccounts(&wallet).await })
+    })
+    .map_err(to_pyvalue_err)?
+    .map_err(to_pyvalue_err)
 }
 
 /// Returns the validated directory statistics for one wallet.
@@ -368,11 +369,8 @@ pub(super) fn py_get_deepx_user_stats(
         config.proxy_url,
     )
     .map_err(to_pyvalue_err)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(to_pyvalue_err)?;
-    py.detach(move || runtime.block_on(client.get_user_stats(&wallet)))
+    py.detach(move || run_account_query(async move { client.get_user_stats(&wallet).await }))
+        .map_err(to_pyvalue_err)?
         .map_err(to_pyvalue_err)
 }
 
@@ -400,12 +398,11 @@ pub(super) fn py_get_deepx_perp_liquidation_price(
         market_name,
         market_id,
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(to_pyvalue_err)?;
-    py.detach(move || runtime.block_on(client.get_perp_liquidation_price(&request)))
-        .map_err(to_pyvalue_err)
+    py.detach(move || {
+        run_account_query(async move { client.get_perp_liquidation_price(&request).await })
+    })
+    .map_err(to_pyvalue_err)?
+    .map_err(to_pyvalue_err)
 }
 
 /// Returns all validated account REST observations for one wallet.
@@ -425,10 +422,69 @@ pub(super) fn py_get_deepx_wallet_account_snapshot(
         config.proxy_url,
     )
     .map_err(to_pyvalue_err)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(to_pyvalue_err)?;
-    py.detach(move || runtime.block_on(client.get_wallet_account_snapshot(&wallet)))
-        .map_err(to_pyvalue_err)
+    py.detach(move || {
+        run_account_query(async move { client.get_wallet_account_snapshot(&wallet).await })
+    })
+    .map_err(to_pyvalue_err)?
+    .map_err(to_pyvalue_err)
+}
+
+pub(super) fn run_account_query<F>(future: F) -> io::Result<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // Python strategy callbacks can already be running on a Tokio runtime thread
+    thread::Builder::new()
+        .name("deepx-account-query".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            Ok(runtime.block_on(future))
+        })?
+        .join()
+        .map_err(|_| io::Error::other("DeepX account query worker panicked"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn account_query_works_without_runtime() {
+        assert_eq!(run_account_query(async { 42 }).unwrap(), 42);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn account_query_works_inside_runtime(#[case] multi_thread: bool) {
+        let mut builder = if multi_thread {
+            tokio::runtime::Builder::new_multi_thread()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
+        let runtime = builder.enable_all().build().unwrap();
+        runtime.block_on(async {
+            let caller = thread::current().id();
+            let result = run_account_query(async move {
+                tokio::task::yield_now().await;
+                assert_ne!(thread::current().id(), caller);
+                tokio::time::timeout(std::time::Duration::from_secs(1), async { 42 })
+                    .await
+                    .unwrap()
+            })
+            .unwrap();
+            assert_eq!(result, 42);
+        });
+    }
+
+    #[rstest]
+    fn account_query_preserves_request_error() {
+        let result = run_account_query(async { Err::<(), _>("request failed") }).unwrap();
+        assert_eq!(result, Err("request failed"));
+    }
 }

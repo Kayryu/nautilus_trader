@@ -475,10 +475,22 @@ pub(super) fn py_get_deepx_spot_open_orders(
     config: Option<DeepXDataClientConfig>,
 ) -> PyResult<DeepXSpotOpenOrdersPage> {
     let request = open_orders_request(subaccount, name, pair, order_side, cursor, sort, page_size)?;
-    let (client, runtime) = client_and_runtime(config)?;
-    py.detach(move || runtime.block_on(client.get_spot_open_orders(&request)))
-        .map(Into::into)
-        .map_err(to_pyvalue_err)
+    let config = config.unwrap_or_default();
+    config.validate().map_err(to_pyvalue_err)?;
+    let client = DeepXHttpClient::from_network_config(
+        &config.network,
+        Some(config.http_timeout_secs),
+        config.proxy_url,
+    )
+    .map_err(to_pyvalue_err)?;
+    py.detach(move || {
+        super::account::run_account_query(
+            async move { client.get_spot_open_orders(&request).await },
+        )
+    })
+    .map_err(to_pyvalue_err)?
+    .map(Into::into)
+    .map_err(to_pyvalue_err)
 }
 
 /// Returns validated Spot open-order pages within an explicit page budget.

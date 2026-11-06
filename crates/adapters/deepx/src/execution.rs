@@ -661,13 +661,13 @@ pub(crate) enum DeepXFillReportError {
     /// The venue fill-direction value is outside the chain enum.
     #[error("unsupported DeepX fill report direction: {0}")]
     UnsupportedFilledDirection(String),
-    /// The trade quantity is not an exact multiple of the startup instrument increment.
-    #[error("DeepX fill report quantity does not align with instrument increment")]
-    QuantityIncrementMismatch,
-    /// The trade quantity could not be represented exactly by the startup instrument precision.
+    /// The trade quantity is not strictly positive.
+    #[error("DeepX fill report quantity must be positive")]
+    NonPositiveQuantity,
+    /// The trade quantity could not be represented by the model quantity type.
     #[error("invalid DeepX fill report quantity: {0}")]
     QuantityConversion(String),
-    /// The trade quantity would be rounded at the startup instrument precision.
+    /// The trade quantity would be rounded by the model quantity conversion.
     #[error("DeepX fill report quantity loses precision")]
     QuantityPrecisionLoss,
     /// The trade price is not an exact multiple of the startup instrument increment.
@@ -3544,12 +3544,15 @@ impl DeepXExecutionClient {
             LiquiditySide::Maker
         };
 
-        if record.size <= rust_decimal::Decimal::ZERO
-            || record.size % metadata.size_increment != rust_decimal::Decimal::ZERO
-        {
-            return Err(DeepXFillReportError::QuantityIncrementMismatch);
+        if record.size <= rust_decimal::Decimal::ZERO {
+            return Err(DeepXFillReportError::NonPositiveQuantity);
         }
-        let last_qty = Quantity::from_decimal_dp(record.size, metadata.size_precision)
+
+        // Executed quantities can be finer than the current order-size increment
+        let size_precision = metadata
+            .size_precision
+            .max(record.size.normalize().scale() as u8);
+        let last_qty = Quantity::from_decimal_dp(record.size, size_precision)
             .map_err(|e| DeepXFillReportError::QuantityConversion(e.to_string()))?;
         if last_qty.as_decimal() != record.size {
             return Err(DeepXFillReportError::QuantityPrecisionLoss);
@@ -3713,13 +3716,15 @@ impl DeepXExecutionClient {
             return Err(DeepXFillReportError::FeeSignMismatch);
         }
 
-        if record.base_amount <= rust_decimal::Decimal::ZERO
-            || record.base_amount % instrument.size_increment().as_decimal()
-                != rust_decimal::Decimal::ZERO
-        {
-            return Err(DeepXFillReportError::QuantityIncrementMismatch);
+        if record.base_amount <= rust_decimal::Decimal::ZERO {
+            return Err(DeepXFillReportError::NonPositiveQuantity);
         }
-        let last_qty = Quantity::from_decimal_dp(record.base_amount, instrument.size_precision())
+
+        // Quote-budget matching can produce fills below the order-size increment
+        let size_precision = instrument
+            .size_precision()
+            .max(record.base_amount.normalize().scale() as u8);
+        let last_qty = Quantity::from_decimal_dp(record.base_amount, size_precision)
             .map_err(|e| DeepXFillReportError::QuantityConversion(e.to_string()))?;
         if last_qty.as_decimal() != record.base_amount {
             return Err(DeepXFillReportError::QuantityPrecisionLoss);
@@ -20821,6 +20826,33 @@ mod tests {
         assert_eq!(reports[0].last_qty, Quantity::from("0.1209"));
         assert_eq!(reports[0].last_px, Price::from("2443.05"));
         assert_eq!(reports[0].commission, Money::from("0.118145 USDC"));
+        let response: Value = serde_json::from_str(include_str!(
+            "../../../../deepx-rust-sdk/test_data/http/testnet/spot_account_trades_eth_usdc_page_1.json"
+        ))
+        .unwrap();
+        let mut record: DeepXSpotAccountTradeRecord =
+            serde_json::from_value(response["data"]["items"][2].clone()).unwrap();
+        let market = client.spot_report_markets.get(&instrument_id).unwrap();
+        for size in ["0.12091", "0.1209100000000000000000000000"] {
+            record.base_amount = size.parse().unwrap();
+            let report = client
+                .build_spot_fill_report(&record, instrument_id, market, UnixNanos::default())
+                .unwrap();
+            assert_eq!(report.last_qty.as_decimal(), record.base_amount);
+            assert_eq!(report.last_qty.precision, 5);
+        }
+        for size in ["0", "-0.1209"] {
+            record.base_amount = size.parse().unwrap();
+            assert_eq!(
+                client.build_spot_fill_report(&record, instrument_id, market, UnixNanos::default()),
+                Err(DeepXFillReportError::NonPositiveQuantity),
+            );
+        }
+        record.base_amount = "0.0000000000000000001".parse().unwrap();
+        assert!(matches!(
+            client.build_spot_fill_report(&record, instrument_id, market, UnixNanos::default()),
+            Err(DeepXFillReportError::QuantityConversion(_)),
+        ));
         if !all_markets {
             let budget_cmd = GenerateFillReports::new(
                 UUID4::new(),
@@ -20917,6 +20949,78 @@ mod tests {
         assert_eq!(reports[1].trade_id, TradeId::from("185971191000008"));
         assert_eq!(reports[1].order_side, OrderSide::Sell);
         assert_eq!(reports[2].trade_id, TradeId::from("185971383000008"));
+    }
+
+    #[rstest]
+    #[case("0.3001")]
+    #[case("0.30001")]
+    #[case("0.3000100000000000000000000000")]
+    #[tokio::test]
+    async fn fill_report_conversion_preserves_off_increment_quantity(#[case] size: &str) {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let client = fill_report_test_client(response).await;
+        let mut response: DeepXApiResponse<DeepXAccountPage<DeepXPerpAccountTradeRecord>> =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let record = &mut response.data.items[0];
+        record.size = size.parse().unwrap();
+
+        let report = client
+            .build_fill_report(record, UnixNanos::default())
+            .unwrap();
+
+        assert_eq!(report.last_qty.as_decimal(), record.size);
+        assert_eq!(
+            report.last_qty.precision,
+            record.size.normalize().scale() as u8
+        );
+    }
+
+    #[rstest]
+    #[case("0.0000000000000000001")]
+    #[case("79228162514264337593543950335")]
+    #[tokio::test]
+    async fn fill_report_conversion_rejects_unrepresentable_quantity(#[case] size: &str) {
+        let response = serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let client = fill_report_test_client(response).await;
+        let mut response: DeepXApiResponse<DeepXAccountPage<DeepXPerpAccountTradeRecord>> =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let record = &mut response.data.items[0];
+        record.size = size.parse().unwrap();
+
+        assert!(matches!(
+            client.build_fill_report(record, UnixNanos::default()),
+            Err(DeepXFillReportError::QuantityConversion(_)),
+        ));
+    }
+
+    #[tokio::test]
+    async fn fill_report_generation_preserves_off_increment_quantity() {
+        let mut response: Value =
+            serde_json::from_str(PERP_ACCOUNT_TRADES_ACCOUNT_RESPONSE).unwrap();
+        let trade_id = response["data"]["items"][0]["id"].as_u64().unwrap();
+        response["data"]["items"][0]["size"] = json!(0.30001);
+        let client = fill_report_test_client(response).await;
+        let command = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let reports = ExecutionClient::generate_fill_reports(&client, command)
+            .await
+            .unwrap();
+
+        assert_eq!(reports.len(), 3);
+        let report = reports
+            .iter()
+            .find(|report| report.trade_id == TradeId::new(trade_id.to_string()))
+            .unwrap();
+        assert_eq!(report.last_qty, Quantity::from("0.30001"));
     }
 
     #[tokio::test]
@@ -21150,19 +21254,12 @@ mod tests {
             Err(DeepXFillReportError::PriceIncrementMismatch),
         );
 
-        invalid = record.clone();
-        invalid.size = rust_decimal::Decimal::new(3_001, 4);
-        assert_eq!(
-            client.build_fill_report(&invalid, UnixNanos::default()),
-            Err(DeepXFillReportError::QuantityIncrementMismatch),
-        );
-
         for size in ["0", "-0.3"] {
             invalid = record.clone();
             invalid.size = size.parse().unwrap();
             assert_eq!(
                 client.build_fill_report(&invalid, UnixNanos::default()),
-                Err(DeepXFillReportError::QuantityIncrementMismatch),
+                Err(DeepXFillReportError::NonPositiveQuantity),
             );
         }
         for price in ["0", "-2499.05"] {

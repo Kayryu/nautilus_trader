@@ -144,11 +144,18 @@ mod tests {
     }
 
     #[rstest]
-    fn parses_funding_without_inventing_payment_schedule() {
+    #[case(1_789_542_862_949, 1_789_546_196_629)]
+    #[case(1_789_546_196_629, 1_789_542_862_949)]
+    fn parses_funding_without_inventing_payment_schedule(
+        #[case] cumulative_ms: u64,
+        #[case] rate_ms: u64,
+    ) {
         let event = parse_public_price_event(
             &frame(
                 "funding_rate",
-                r#"{"funding_rate":0.000108085430235316,"last_cacl_funding_rate_time":1789542862949,"last_funding_rate_time":1789546196629}"#,
+                &format!(
+                    r#"{{"funding_rate":0.000108085430235316,"last_cacl_funding_rate_time":{cumulative_ms},"last_funding_rate_time":{rate_ms}}}"#,
+                ),
                 1_789_546_201_652,
             ),
             DeepXWsPublicChannel::FundingRate,

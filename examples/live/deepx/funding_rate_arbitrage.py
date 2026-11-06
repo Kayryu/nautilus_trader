@@ -16,6 +16,16 @@
 """Run one DeepX testnet spot-long/perpetual-short funding cycle.
 
 The observed funding rate is a sample, not a guaranteed payment or a payment schedule.
+
+Add --debug to enable strategy diagnostics (INFO lines prefixed with [DEBUG]).
+Use --debug-interval-seconds 5 to change the per-category throttle (default: 10s).
+Diagnostics work without --trade and do not enable order submission. RUST_LOG=DEBUG
+is separate: it enables framework/adapter logging, not these strategy diagnostics.
+
+Trading records pre-existing ETH as a protected baseline in the journal. Only newly
+bought ETH belongs to the cycle. Do not trade or transfer assets in the same subaccount
+while the cycle is running. Recovery and final verification require the exact baseline;
+external balance changes (including lending yield) require manual reconciliation.
 """
 
 import argparse
@@ -50,6 +60,8 @@ from nautilus_trader.model import (
     FundingRateUpdate,
     InstrumentId,
     MarkPriceUpdate,
+    OrderBook,
+    OrderBookDeltas,
     OrderFilled,
     OrderSide,
     Price,
@@ -164,6 +176,8 @@ class FundingArbitrageConfig(StrategyConfig):
         "journal_path",
         "subaccount",
         "trade_enabled",
+        "debug",
+        "debug_interval_seconds",
     )
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
@@ -185,6 +199,8 @@ class FundingArbitrageConfig(StrategyConfig):
         journal_path: Path | None,
         subaccount: str | None,
         trade_enabled: bool,
+        debug: bool = False,
+        debug_interval_seconds: int = 10,
         **_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -200,6 +216,8 @@ class FundingArbitrageConfig(StrategyConfig):
         self.journal_path = journal_path
         self.subaccount = subaccount
         self.trade_enabled = trade_enabled
+        self.debug = debug
+        self.debug_interval_ns = debug_interval_seconds * NS_PER_SECOND
 
 
 class FundingArbitrage(Strategy):
@@ -213,9 +231,11 @@ class FundingArbitrage(Strategy):
         self._funding: FundingRateUpdate | None = None
         self._mark: MarkPriceUpdate | None = None
         self._depth: dict[InstrumentId, Any] = {}
+        self._spot_book = OrderBook(SPOT_ID, BookType.L2_MBP)
         self._state = CycleState.FLAT
         self._quantity: Quantity | None = None
         self._spot_qty = Decimal(0)
+        self._spot_baseline = Decimal(0)
         self._perp_short_qty = Decimal(0)
         self._pending: tuple[str, Any] | None = None
         self._pending_filled = Decimal(0)
@@ -227,14 +247,30 @@ class FundingArbitrage(Strategy):
         self._finished = False
         self._hold_start_ns: int | None = None
         self._last_attempt_ns: int | None = None
+        self._debug_last_ns: dict[str, int] = {}
+
+    def _debug(self, category: str, message: str) -> None:
+        if not self._config.debug:
+            return
+        now = self.clock.timestamp_ns()
+        previous = self._debug_last_ns.get(category)
+        if previous is not None and 0 <= now - previous < self._config.debug_interval_ns:
+            return
+        self._debug_last_ns[category] = now
+        self.log.info(f"[DEBUG] {category}: {message}")
 
     def on_start(self) -> None:
+        self._debug(
+            "startup",
+            f"trade_enabled={self._config.trade_enabled} quantity={self._config.quantity} "
+            f"max_age_ns={self._config.max_age_ns} "
+            f"max_combined_notional={self._config.max_combined_notional} "
+            f"min_funding_rate={self._config.min_funding_rate}",
+        )
         spot = self.cache.instrument(SPOT_ID)
         perp = self.cache.instrument(PERP_ID)
         if spot is None or perp is None:
-            self.log.error("DeepX spot and perpetual instruments are required")
-            self._stop_cycle()
-            return
+            raise RuntimeError("DeepX spot and perpetual instruments are required")
         quantity = Quantity.from_decimal_dp(self._config.quantity, spot.size_precision)
         perp_quantity = contracts_for_base(self._config.quantity, perp)
         if (
@@ -246,18 +282,15 @@ class FundingArbitrage(Strategy):
             or perp.min_quantity is not None
             and perp_quantity < perp.min_quantity.as_decimal()
         ):
-            self.log.error(
+            raise RuntimeError(
                 "Quantity must satisfy both DeepX market increments and minimums"
             )
-            self._stop_cycle()
-            return
         self._quantity = quantity
         if self._config.trade_enabled and not self._recover():
-            self._stop_cycle()
-            return
+            raise RuntimeError("DeepX recovery refused startup; see Recovery stopped log")
         self.subscribe_quotes(SPOT_ID)
         self.subscribe_quotes(PERP_ID)
-        self.subscribe_book_depth10(SPOT_ID, BookType.L2_MBP)
+        self.subscribe_book_deltas(SPOT_ID, BookType.L2_MBP, depth=10)
         self.subscribe_book_depth10(PERP_ID, BookType.L2_MBP)
         self.subscribe_funding_rates(PERP_ID)
         self.subscribe_mark_prices(PERP_ID)
@@ -285,14 +318,20 @@ class FundingArbitrage(Strategy):
             self._depth[depth.instrument_id] = depth
             self._advance()
 
+    def on_book_deltas(self, deltas: OrderBookDeltas) -> None:
+        if deltas.instrument_id == SPOT_ID:
+            self._spot_book.apply_deltas(deltas)
+            self._advance()
+
     def _persist(self) -> None:
         path = self._config.journal_path
         if path is None:
             return
         record = {
-            "version": 1,
+            "version": 2,
             "subaccount": self._config.subaccount,
             "state": self._state.value,
+            "spot_baseline": str(self._spot_baseline),
             "spot_base": str(self._spot_qty),
             "perp_contracts": str(self._perp_short_qty),
             "updated_ns": self.clock.timestamp_ns(),
@@ -325,6 +364,7 @@ class FundingArbitrage(Strategy):
         if path is None or subaccount is None:
             self.log.error("Trading requires a journal and subaccount")
             return False
+        self._debug("recovery", f"starting reconciliation; journal_exists={path.exists()}")
         try:
             snapshot = get_deepx_wallet_account_snapshot(WALLET)
             account = next(
@@ -361,6 +401,8 @@ class FundingArbitrage(Strategy):
                 ),
                 Decimal(0),
             )
+            if not spot.is_finite() or spot < 0:
+                raise ValueError("invalid venue ETH balance")
             short_base = sum(
                 (
                     Decimal(x.base_asset_amount)
@@ -373,32 +415,48 @@ class FundingArbitrage(Strategy):
                 raise ValueError("unexpected long perpetual position")
             multiplier = contract_multiplier(self.cache.instrument(PERP_ID))
             short_contracts = short_base / multiplier
+            self._debug(
+                "recovery_exposure",
+                f"spot_base={spot} short_contracts={short_contracts} "
+                f"spot_orders={len(spot_orders.items)} perp_orders={len(perp_orders.items)}",
+            )
             if path.exists():
                 record = json.loads(path.read_text(encoding="utf-8"))
                 if (
-                    record["version"] != 1
+                    record["version"] not in (1, 2)
                     or record["subaccount"].lower() != subaccount.lower()
                 ):
                     raise ValueError("journal identity mismatch")
                 self._state = CycleState(record["state"])
+                # Version 1 only supported accounts with a zero starting ETH balance
+                self._spot_baseline = (
+                    Decimal(record["spot_baseline"])
+                    if record["version"] == 2
+                    else Decimal(0)
+                )
                 self._spot_qty = Decimal(record["spot_base"])
                 self._perp_short_qty = Decimal(record["perp_contracts"])
                 if any(
                     not value.is_finite() or value < 0
-                    for value in (self._spot_qty, self._perp_short_qty)
+                    for value in (
+                        self._spot_baseline, self._spot_qty, self._perp_short_qty,
+                    )
                 ):
                     raise ValueError("invalid journal exposure")
-                if self._spot_qty != spot or self._perp_short_qty != short_contracts:
+                if (
+                    self._spot_baseline + self._spot_qty != spot
+                    or self._perp_short_qty != short_contracts
+                ):
                     raise ValueError("journal and venue exposure disagree")
                 if self._state in (CycleState.COMPLETE, CycleState.HALTED):
                     raise ValueError("prior cycle is complete or halted")
-                if spot or short_contracts:
+                if self._spot_qty or short_contracts:
                     self._entry_started = True
                     self._hedge_attempted = True
                     self._exiting = True
                     self._state = (
                         CycleState.SINGLE_LEG
-                        if spot != short_base
+                        if self._spot_qty != short_base
                         else CycleState.EXITING
                     )
                     self._persist()
@@ -406,14 +464,20 @@ class FundingArbitrage(Strategy):
                     raise ValueError(
                         "prior cycle ended flat; new entry requires a new journal"
                     )
-            elif spot or short_contracts:
-                raise ValueError("unrecorded venue exposure")
+            elif short_contracts:
+                raise ValueError("unrecorded perpetual exposure")
             else:
+                self._spot_baseline = spot
                 self._persist()
         except (OSError, ValueError, InvalidOperation, KeyError, StopIteration) as e:
             self._state = CycleState.HALTED
-            self.log.error(f"Recovery stopped: {e}")
+            self.log.error(f"Recovery stopped: {type(e).__name__}: {e}")
             return False
+        self.log.info(
+            f"Protected ETH baseline={self._spot_baseline}; cycle spot={self._spot_qty} "
+            f"perpetual short={self._perp_short_qty}"
+        )
+        self._debug("recovery_complete", f"state={self._state.value} exiting={self._exiting}")
         return True
 
     def on_order_filled(self, event: OrderFilled) -> None:
@@ -422,14 +486,19 @@ class FundingArbitrage(Strategy):
         role = self._pending[0]
         amount = event.last_qty.as_decimal()
         self._pending_filled += amount
+        base_fee = Decimal(0)
+        if role.startswith("spot") and event.commission is not None:
+            instrument = self.cache.instrument(SPOT_ID)
+            if event.commission.currency == instrument.base_currency:
+                base_fee = event.commission.as_decimal()
         if role == "spot_entry":
-            self._spot_qty += amount
+            self._spot_qty += amount - base_fee
         elif role == "perp_entry":
             self._perp_short_qty += amount
         elif role == "perp_exit":
             self._perp_short_qty -= amount
         else:
-            self._spot_qty -= amount
+            self._spot_qty -= amount + base_fee
         self.log.info(
             f"{role} fill={amount} spot={self._spot_qty} perp_short={self._perp_short_qty}"
         )
@@ -526,6 +595,24 @@ class FundingArbitrage(Strategy):
     def _depth_available(
         self, instrument_id: InstrumentId, side: OrderSide, limit: Decimal
     ) -> Decimal:
+        if instrument_id == SPOT_ID:
+            if not 0 <= (
+                self.clock.timestamp_ns() - self._spot_book.ts_last
+            ) <= self._config.max_age_ns:
+                return Decimal(0)
+            levels = (
+                self._spot_book.asks_to_dict(depth=10)
+                if side == OrderSide.BUY
+                else self._spot_book.bids_to_dict(depth=10)
+            )
+            return sum(
+                (
+                    size
+                    for price, size in levels.items()
+                    if (price <= limit if side == OrderSide.BUY else price >= limit)
+                ),
+                Decimal(0),
+            )
         depth = self._depth.get(instrument_id)
         if (
             depth is None
@@ -557,6 +644,11 @@ class FundingArbitrage(Strategy):
 
     def _advance(self) -> None:
         if self._finished or self._pending is not None or self._quantity is None:
+            self._debug(
+                "waiting",
+                f"finished={self._finished} pending={self._pending} "
+                f"quantity_ready={self._quantity is not None}",
+            )
             return
         now = self.clock.timestamp_ns()
         if self._last_attempt_ns is not None and now - self._last_attempt_ns < RETRY_NS:
@@ -564,9 +656,15 @@ class FundingArbitrage(Strategy):
         spot = self._fresh(SPOT_ID)
         perp = self._fresh(PERP_ID)
         if spot is None or perp is None:
+            self._debug(
+                "quotes",
+                f"missing/stale quotes: spot_ready={spot is not None} perp_ready={perp is not None}; "
+                f"ages_ns={ {str(key): now - value.ts_event for key, value in self._quotes.items()} }",
+            )
             return
         perp_instrument = self.cache.instrument(PERP_ID)
         if perp_instrument is None:
+            self._debug("instrument", "perpetual instrument unavailable")
             return
         multiplier = contract_multiplier(perp_instrument)
         short_base = self._perp_short_qty * multiplier
@@ -640,10 +738,18 @@ class FundingArbitrage(Strategy):
             funding is None
             or not 0 <= now - funding.ts_event <= self._config.max_age_ns
         ):
+            self._debug(
+                "funding",
+                f"missing/stale funding: age_ns={None if funding is None else now - funding.ts_event}",
+            )
             return
         rate = Decimal(str(funding.rate))
         mark = self._mark
         if mark is None or not 0 <= now - mark.ts_event <= self._config.max_age_ns:
+            self._debug(
+                "mark",
+                f"missing/stale mark: age_ns={None if mark is None else now - mark.ts_event}",
+            )
             return
         mark_price = mark.value.as_decimal()
         spot_ask = spot.ask_price.as_decimal()
@@ -651,6 +757,28 @@ class FundingArbitrage(Strategy):
         spot_instrument = self.cache.instrument(SPOT_ID)
         contracts = contracts_for_base(self._config.quantity, perp_instrument)
         slippage = self._config.max_slippage_bps / Decimal(10_000)
+        if self._config.debug and spot_instrument is not None:
+            estimated_edge = entry_edge(
+                self._config.quantity, rate, mark_price, spot_ask, perp_bid,
+                spot_instrument.taker_fee, perp_instrument.taker_fee,
+                self._config.max_slippage_bps, self._config.holding_cost_bps,
+                self._config.exit_basis_risk_bps,
+            )
+            self._debug(
+                "entry_checks",
+                f"state={self._state.value} rate={rate} required_rate>{self._config.min_funding_rate} "
+                f"spot_ask={spot_ask} perp_bid={perp_bid} mark={mark_price} "
+                f"basis_floor={spot_ask * (1 - self._config.max_entry_basis_bps / Decimal(10_000))} "
+                f"combined_notional={self._config.quantity * (spot_ask + perp_bid)} "
+                f"notional_limit={self._config.max_combined_notional} "
+                f"spot_depth={self._depth_available(SPOT_ID, OrderSide.BUY, spot_ask * (1 + slippage))} "
+                f"required_spot={self._config.quantity} "
+                f"perp_depth={self._depth_available(PERP_ID, OrderSide.SELL, perp_bid * (1 - slippage))} "
+                f"required_contracts={contracts} "
+                f"spot_minimum_ok={meets_market_minimums(spot_instrument, self._config.quantity, spot_ask)} "
+                f"perp_minimum_ok={meets_market_minimums(perp_instrument, contracts, perp_bid)} "
+                f"edge={estimated_edge} required_edge>0",
+            )
         if (
             rate <= self._config.min_funding_rate
             or spot_ask <= 0
@@ -731,7 +859,8 @@ class FundingArbitrage(Strategy):
                 self._persist()
                 self._stop_cycle()
                 return
-            amount = min(amount, free.as_decimal())
+            available = max(Decimal(0), free.as_decimal() - self._spot_baseline)
+            amount = min(amount, self._spot_qty, available)
             amount = (
                 amount / instrument.size_increment.as_decimal()
             ).to_integral_value(
@@ -809,11 +938,6 @@ def select_subaccount(
         raise ValueError("subaccount has existing margin exposure")
     if any(Decimal(asset.balance_borrowed) != 0 for asset in account.balances.assets):
         raise ValueError("subaccount has outstanding borrowing")
-    # if any(
-    #     asset.symbol == "ETH" and Decimal(asset.balance) != 0
-    #     for asset in account.balances.assets
-    # ):
-    #     raise ValueError("subaccount already owns ETH")
     usdc = next(
         (asset for asset in account.balances.assets if asset.symbol == "USDC"), None
     )
@@ -821,8 +945,12 @@ def select_subaccount(
         raise ValueError("subaccount USDC balance is below the combined notional limit")
 
 
-def verify_trade_result(subaccount: str, start_ms: int) -> Decimal:
-    """Verify the account is flat and total settled short funding since startup."""
+def verify_trade_result(
+    subaccount: str, start_ms: int, spot_baseline: Decimal = Decimal(0),
+) -> Decimal:
+    """Verify cycle exposure is flat, baseline ETH remains, and total short funding."""
+    if not spot_baseline.is_finite() or spot_baseline < 0:
+        raise ValueError("invalid ETH baseline")
     snapshot = get_deepx_wallet_account_snapshot(WALLET)
     if subaccount.lower() not in [
         address.lower() for address in snapshot.directory.addresses
@@ -856,7 +984,7 @@ def verify_trade_result(subaccount: str, start_ms: int) -> Decimal:
     )
     if (
         eth_balance is None
-        or eth_balance != 0
+        or eth_balance != spot_baseline
         or account.margin_ratio.exact_maintenance_margin_required is None
         or Decimal(account.margin_ratio.exact_maintenance_margin_required) != 0
         or Decimal(account.margin_ratio.margin_required) != 0
@@ -869,6 +997,7 @@ def verify_trade_result(subaccount: str, start_ms: int) -> Decimal:
     ):
         raise RuntimeError(
             f"DeepX account is not verified flat: ETH={eth_balance}, "
+            f"expected_baseline={spot_baseline}, "
             f"margin={account.margin_ratio.margin_required}, "
             f"spot_orders={len(spot_orders.items)}, perp_orders={len(perp_orders.items)}, "
             f"perp_positions={len(perp_positions.items)}"
@@ -887,7 +1016,8 @@ def verify_trade_result(subaccount: str, start_ms: int) -> Decimal:
     ]
     net_funding = sum(settled_short_fees, Decimal(0))
     print(
-        f"Verified flat account; settled short funding records={len(settled_short_fees)} "
+        f"Verified flat cycle with protected ETH baseline={spot_baseline}; "
+        f"settled short funding records={len(settled_short_fees)} "
         f"net={net_funding} USDC"
     )
     return net_funding
@@ -949,6 +1079,14 @@ def main() -> None:
     )
     parser.add_argument("--max-age-seconds", type=positive_int, default=10)
     parser.add_argument("--max-hold-seconds", type=positive_int, default=3600)
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="enable throttled strategy diagnostics at INFO level; does not enable trading",
+    )
+    parser.add_argument(
+        "--debug-interval-seconds", type=positive_int, default=10,
+        help="minimum interval per strategy diagnostic category (default: 10 seconds)",
+    )
     args = parser.parse_args()
 
     builder = (
@@ -1010,6 +1148,8 @@ def main() -> None:
             journal_path=args.journal,
             subaccount=args.subaccount,
             trade_enabled=args.trade,
+            debug=args.debug,
+            debug_interval_seconds=args.debug_interval_seconds,
         )
     )
     strategy._node_handle = node.handle()
@@ -1017,7 +1157,7 @@ def main() -> None:
     start_ms = time.time_ns() // 1_000_000
     node.run()
     if args.trade:
-        verify_trade_result(args.subaccount, start_ms)
+        verify_trade_result(args.subaccount, start_ms, strategy._spot_baseline)
 
 
 if __name__ == "__main__":

@@ -266,13 +266,12 @@ pub(super) fn py_get_deepx_perp_positions(
         cursor,
         page_size,
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(to_pyvalue_err)?;
-    py.detach(move || runtime.block_on(client.get_perp_positions(&request)))
-        .map(Into::into)
-        .map_err(to_pyvalue_err)
+    py.detach(move || {
+        super::account::run_account_query(async move { client.get_perp_positions(&request).await })
+    })
+    .map_err(to_pyvalue_err)?
+    .map(Into::into)
+    .map_err(to_pyvalue_err)
 }
 
 /// Returns all validated position-lifecycle pages within an explicit page budget.
