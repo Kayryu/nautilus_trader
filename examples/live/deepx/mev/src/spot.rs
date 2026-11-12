@@ -61,13 +61,48 @@ struct RawLevel {
 
 #[derive(Debug)]
 pub(super) struct Plan {
+    /// True when the target sells, so the entry sells inventory and the exit buys it back.
+    pub(super) entry_is_sell: bool,
     pub(super) front_size: u128,
     pub(super) front_price: u128,
+    /// Maximum spend of a buy entry, or minimum gross proceeds of a sell entry.
     pub(super) front_quote_budget: u128,
     pub(super) back_size: u128,
     pub(super) back_price: u128,
-    pub(super) minimum_back_proceeds: u128,
+    /// Minimum net proceeds of a sell exit, or maximum cost of a buy exit.
+    pub(super) back_quote_bound: u128,
     minimum_profit: u128,
+}
+
+impl Plan {
+    /// Whether this fresh plan still covers an entry already signed with `entry_quote`.
+    pub(super) fn covers_entry(
+        &self,
+        entry_quote: u128,
+        taker_fee: u128,
+        cost_budget: u128,
+        minimum_profit: u128,
+    ) -> anyhow::Result<bool> {
+        let margin = cost_budget
+            .checked_add(minimum_profit)
+            .context("entry profit bound overflow")?;
+        if self.entry_is_sell {
+            let fee = multiply_divide_ceil(entry_quote, taker_fee, FEE_SCALE)?;
+            let net = entry_quote
+                .checked_sub(fee)
+                .context("entry fee exceeds proceeds")?;
+            let required = self
+                .back_quote_bound
+                .checked_add(margin)
+                .context("entry profit bound overflow")?;
+            Ok(self.front_quote_budget >= entry_quote && net >= required)
+        } else {
+            let required = entry_quote
+                .checked_add(margin)
+                .context("entry profit bound overflow")?;
+            Ok(self.back_quote_bound >= required && self.front_quote_budget <= entry_quote)
+        }
+    }
 }
 
 impl Snapshot {
@@ -75,10 +110,39 @@ impl Snapshot {
         aligned_size(size, self.tick, self.base_scale, self.step)
     }
 
+    /// Gross buy size whose net base after the taker fee bound covers `net`, rounded up to an exact lot.
+    pub(super) fn buy_back_size(&self, net: u128) -> anyhow::Result<u128> {
+        anyhow::ensure!(
+            net > 0 && self.taker_fee < FEE_SCALE,
+            "invalid buy-back quantity or fee"
+        );
+        let mut gross = multiply_divide_ceil(net, FEE_SCALE, FEE_SCALE - self.taker_fee)?;
+        while gross
+            .checked_sub(multiply_divide_ceil(gross, self.taker_fee, FEE_SCALE)?)
+            .context("buy-back fee exceeds size")?
+            < net
+        {
+            gross = gross.checked_add(1).context("buy-back size overflow")?;
+        }
+        let lot = exact_lot(self.tick, self.base_scale, self.step)?;
+        let round_up = |size: u128| -> anyhow::Result<u128> {
+            size.div_ceil(lot)
+                .checked_mul(lot)
+                .context("buy-back lot overflow")
+        };
+        Ok(round_up(gross)?.max(round_up(self.minimum_size)?))
+    }
+
     pub(super) fn has_bid(&self, minimum_price: u128) -> bool {
         self.bids
             .first()
             .is_some_and(|bid| bid.price >= minimum_price)
+    }
+
+    pub(super) fn has_ask(&self, maximum_price: u128) -> bool {
+        self.asks
+            .first()
+            .is_some_and(|ask| ask.price <= maximum_price)
     }
 
     pub(super) fn analyze(
@@ -88,18 +152,27 @@ impl Snapshot {
     ) -> serde_json::Value {
         let result = self.plan(order, settings);
         match result {
-            Ok(plan) => json!({
-                "conditional_opportunity": true,
-                "execution_ready": false,
-                "front_raw_base_size": plan.front_size.to_string(),
-                "front_raw_limit_price": plan.front_price.to_string(),
-                "front_raw_quote_budget": plan.front_quote_budget.to_string(),
-                "back_raw_base_size": plan.back_size.to_string(),
-                "back_raw_limit_price": plan.back_price.to_string(),
-                "minimum_back_quote_proceeds": plan.minimum_back_proceeds.to_string(),
-                "conditional_minimum_profit_quote": plan.minimum_profit.to_string(),
-                "requires": "front fill before target, target residual bid, unchanged execution state",
-            }),
+            Ok(plan) => {
+                let bound_key = if plan.entry_is_sell {
+                    "maximum_back_quote_cost"
+                } else {
+                    "minimum_back_quote_proceeds"
+                };
+                let mut analysis = json!({
+                    "conditional_opportunity": true,
+                    "execution_ready": false,
+                    "entry_side": if plan.entry_is_sell { "sell" } else { "buy" },
+                    "front_raw_base_size": plan.front_size.to_string(),
+                    "front_raw_limit_price": plan.front_price.to_string(),
+                    "front_raw_quote_budget": plan.front_quote_budget.to_string(),
+                    "back_raw_base_size": plan.back_size.to_string(),
+                    "back_raw_limit_price": plan.back_price.to_string(),
+                    "conditional_minimum_profit_quote": plan.minimum_profit.to_string(),
+                    "requires": "front fill before target, target residual opposite quote, unchanged execution state",
+                });
+                analysis[bound_key] = json!(plan.back_quote_bound.to_string());
+                analysis
+            }
             Err(e) => json!({"conditional_opportunity": false, "execution_ready": false,
                 "reason": e.to_string(),
                 "best_ask_raw_price": self.asks.first().map(|level| level.price.to_string()),
@@ -113,13 +186,14 @@ impl Snapshot {
         order: &serde_json::Value,
         settings: &Settings,
     ) -> anyhow::Result<Plan> {
+        let target_is_sell = order["side"] == "sell";
         anyhow::ensure!(
-            order["side"] == "buy"
+            (order["side"] == "buy" || target_is_sell)
                 && order["order_type"] == "Limit"
                 && order["time_in_force"] == "GTC"
                 && order["post_only"] == "None"
                 && order["reduce_only"] == false,
-            "target must be an unrestricted GTC limit buy with a possible residual bid"
+            "target must be an unrestricted GTC limit order with a possible residual quote"
         );
         let base: u128 = order["raw_base_size"]
             .as_str()
@@ -147,6 +221,9 @@ impl Snapshot {
             target_price > 0 && target_price % self.tick == 0,
             "target price requires runtime normalization"
         );
+        if target_is_sell {
+            return self.plan_sell(base, target_price, settings);
+        }
         anyhow::ensure!(
             self.asks.len() < DEPTH as usize
                 || self
@@ -224,12 +301,114 @@ impl Snapshot {
                     .is_none_or(|best| minimum_profit > best.minimum_profit)
             {
                 best = Some(Plan {
+                    entry_is_sell: false,
                     front_size,
                     front_price: level.price,
                     front_quote_budget,
                     back_size,
                     back_price: target_price,
-                    minimum_back_proceeds,
+                    back_quote_bound: minimum_back_proceeds,
+                    minimum_profit,
+                });
+            }
+            if available >= maximum {
+                break;
+            }
+        }
+        best.context("no positive conditional profit after fee and cost bounds")
+    }
+
+    /// Sell target: sell into bids at or above its limit, then buy back from its residual ask.
+    fn plan_sell(
+        &self,
+        base: u128,
+        target_price: u128,
+        settings: &Settings,
+    ) -> anyhow::Result<Plan> {
+        anyhow::ensure!(
+            self.bids.len() < DEPTH as usize
+                || self
+                    .bids
+                    .last()
+                    .is_some_and(|level| level.price < target_price),
+            "order-book depth is truncated at the target price"
+        );
+        let consumed = self
+            .bids
+            .iter()
+            .take_while(|level| level.price >= target_price)
+            .try_fold(0_u128, |sum, level| {
+                sum.checked_add(level.size)
+                    .context("depth quantity overflow")
+            })?;
+        anyhow::ensure!(
+            consumed > 0,
+            "target limit price {target_price} does not cross visible bids"
+        );
+        anyhow::ensure!(
+            base >= consumed,
+            "target raw base {base} is below visible bid quantity {consumed} at or above limit price {target_price}"
+        );
+        let maximum = settings.maximum_front_size.min(consumed);
+        let mut available = 0_u128;
+        let mut best: Option<Plan> = None;
+
+        for level in self
+            .bids
+            .iter()
+            .take_while(|level| level.price >= target_price)
+        {
+            available = available
+                .checked_add(level.size)
+                .context("depth quantity overflow")?;
+            let front_size = aligned_size(
+                available.min(maximum),
+                level.price,
+                self.base_scale,
+                self.step,
+            )?;
+            if front_size < self.minimum_size {
+                continue;
+            }
+
+            // The entry fills at or above this level; the fee is charged in received quote
+            let front_quote = multiply_divide_floor(front_size, level.price, self.base_scale)?;
+            let quote_fee_bound = multiply_divide_ceil(front_quote, self.taker_fee, FEE_SCALE)?;
+            let net_proceeds = front_quote
+                .checked_sub(quote_fee_bound)
+                .context("entry fee exceeds proceeds")?;
+
+            // Buying pays fees in received base, so the gross buy exceeds the sold size
+            let back_size = self.buy_back_size(front_size)?;
+            // After the entry and the target consume the bids, the target rests with this ask size
+            let residual = base
+                .checked_sub(consumed - front_size)
+                .context("target residual underflow")?;
+            if back_size > residual {
+                continue;
+            }
+            let back_cost = multiply_divide_ceil(back_size, target_price, self.base_scale)?;
+            if front_quote < self.minimum_notional || back_cost < self.minimum_notional {
+                continue;
+            }
+            let costs = back_cost
+                .checked_add(settings.cost_budget)
+                .context("cost budget overflow")?;
+            if let Some(minimum_profit) = net_proceeds.checked_sub(costs)
+                && minimum_profit > 0
+                && minimum_profit >= settings.minimum_profit
+                && best
+                    .as_ref()
+                    .is_none_or(|best| minimum_profit > best.minimum_profit)
+            {
+                best = Some(Plan {
+                    entry_is_sell: true,
+                    front_size,
+                    front_price: level.price,
+                    front_quote_budget: front_quote,
+                    back_size,
+                    back_price: target_price,
+                    back_quote_bound: back_cost,
                     minimum_profit,
                 });
             }
@@ -382,6 +561,11 @@ fn multiply_divide_floor(left: u128, right: u128, divisor: u128) -> anyhow::Resu
 }
 
 fn aligned_size(size: u128, price: u128, scale: u128, step: u128) -> anyhow::Result<u128> {
+    let lot = exact_lot(price, scale, step)?;
+    Ok(size / lot * lot)
+}
+
+fn exact_lot(price: u128, scale: u128, step: u128) -> anyhow::Result<u128> {
     anyhow::ensure!(price > 0 && scale > 0 && step > 0, "invalid order units");
     let gcd = |mut a: u128, mut b: u128| {
         while b != 0 {
@@ -390,10 +574,9 @@ fn aligned_size(size: u128, price: u128, scale: u128, step: u128) -> anyhow::Res
         a
     };
     let denominator = scale / gcd(price, scale);
-    let lot = (step / gcd(step, denominator))
+    (step / gcd(step, denominator))
         .checked_mul(denominator)
-        .context("exact order lot overflow")?;
-    Ok(size / lot * lot)
+        .context("exact order lot overflow")
 }
 
 fn multiply_divide_ceil(left: u128, right: u128, divisor: u128) -> anyhow::Result<u128> {
@@ -462,7 +645,7 @@ mod tests {
         book.taker_fee = 1_000;
         let plan = book.plan(&target(), &settings()).unwrap();
         assert_eq!(plan.back_size, 990);
-        assert_eq!(plan.minimum_back_proceeds, 108_791_100);
+        assert_eq!(plan.back_quote_bound, 108_791_100);
         assert_eq!(plan.minimum_profit, 8_791_100);
     }
 
@@ -539,6 +722,105 @@ mod tests {
         assert_eq!(aligned_size(999, 1_000, 1_000, 10).unwrap(), 990);
         assert_eq!(aligned_size(1_000, 250, 1_000, 6).unwrap(), 996);
         assert!(aligned_size(1, 0, 1_000, 1).is_err());
+    }
+
+    fn bid_snapshot() -> Snapshot {
+        let mut book = snapshot();
+        book.asks = Vec::new();
+        book.bids = vec![
+            Level {
+                price: 105_000_000,
+                size: 5_000,
+            },
+            Level {
+                price: 100_000_000,
+                size: 5_000,
+            },
+        ];
+        book
+    }
+
+    fn sell_target() -> serde_json::Value {
+        let mut order = target();
+        order["side"] = json!("sell");
+        order["raw_quote_amount"] = json!("1000000000");
+        order
+    }
+
+    #[rstest]
+    fn sell_target_supports_a_sell_then_buy_back_round_trip() {
+        let plan = bid_snapshot().plan(&sell_target(), &settings()).unwrap();
+        assert!(plan.entry_is_sell);
+        assert_eq!(plan.front_size, 1_000);
+        assert_eq!(plan.front_price, 105_000_000);
+        assert_eq!(plan.front_quote_budget, 105_000_000);
+        assert_eq!(plan.back_size, 1_000);
+        assert_eq!(plan.back_price, 100_000_000);
+        assert_eq!(plan.back_quote_bound, 100_000_000);
+        assert_eq!(plan.minimum_profit, 5_000_000);
+    }
+
+    #[rstest]
+    fn sell_fees_reduce_proceeds_and_enlarge_the_buy_back() {
+        let mut book = bid_snapshot();
+        book.taker_fee = 1_000;
+        let mut order = sell_target();
+        order["raw_base_size"] = json!("11000");
+        order["raw_quote_amount"] = json!("1100000000");
+        let plan = book.plan(&order, &settings()).unwrap();
+        assert_eq!(plan.back_size, 1_010);
+        assert_eq!(plan.back_quote_bound, 101_000_000);
+        assert_eq!(plan.minimum_profit, 3_895_000);
+    }
+
+    #[rstest]
+    fn sell_target_needs_residual_ask_for_the_gross_buy_back() {
+        let mut book = bid_snapshot();
+        book.taker_fee = 1_000;
+        assert!(book.plan(&sell_target(), &settings()).is_err());
+    }
+
+    #[rstest]
+    fn sell_target_above_the_best_bid_is_rejected_as_not_crossing() {
+        let mut order = sell_target();
+        order["raw_quote_amount"] = json!("1100000000");
+        let error = bid_snapshot().plan(&order, &settings()).unwrap_err();
+        assert!(error.to_string().ends_with("does not cross visible bids"));
+    }
+
+    #[rstest]
+    fn sell_plan_applies_cost_and_minimum_profit_budgets() {
+        let mut config = settings();
+        config.cost_budget = 5_000_000;
+        assert!(bid_snapshot().plan(&sell_target(), &config).is_err());
+        config.cost_budget = 0;
+        config.minimum_profit = 5_000_001;
+        assert!(bid_snapshot().plan(&sell_target(), &config).is_err());
+    }
+
+    #[rstest]
+    fn buy_back_size_covers_net_base_and_rounds_up_to_an_exact_lot() {
+        let mut book = snapshot();
+        assert_eq!(book.buy_back_size(1_000).unwrap(), 1_000);
+        assert_eq!(book.buy_back_size(1).unwrap(), 10);
+        book.taker_fee = 1_000;
+        assert_eq!(book.buy_back_size(1_000).unwrap(), 1_010);
+        book.taker_fee = FEE_SCALE;
+        assert!(book.buy_back_size(1_000).is_err());
+    }
+
+    #[rstest]
+    fn signed_entry_coverage_is_checked_for_both_directions() {
+        let book = bid_snapshot();
+        let plan = book.plan(&sell_target(), &settings()).unwrap();
+        assert!(plan.covers_entry(105_000_000, 0, 0, 5_000_000).unwrap());
+        assert!(!plan.covers_entry(105_000_000, 0, 0, 5_000_001).unwrap());
+        // A signed limit above the now-supported bid would not fill completely
+        assert!(!plan.covers_entry(106_000_000, 0, 0, 1).unwrap());
+        let plan = snapshot().plan(&target(), &settings()).unwrap();
+        assert!(plan.covers_entry(100_000_000, 0, 0, 10_000_000).unwrap());
+        assert!(!plan.covers_entry(100_000_000, 0, 0, 10_000_001).unwrap());
+        assert!(!plan.covers_entry(99_000_000, 0, 0, 1).unwrap());
     }
 
     #[rstest]

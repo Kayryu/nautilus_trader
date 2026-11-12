@@ -323,9 +323,19 @@ impl Execution {
         poll_ms: u64,
     ) -> anyhow::Result<bool> {
         if order["spot_plan"]["conditional_opportunity"] != true {
+            // A passive order cannot move the opposite side, so it is an expected non-opportunity
+            let reason = match order["spot_plan"]["reason"].as_str() {
+                Some(text)
+                    if text.ends_with("does not cross visible asks")
+                        || text.ends_with("does not cross visible bids") =>
+                {
+                    "target_not_crossing"
+                }
+                _ => "spot_plan_rejected",
+            };
             eprintln!(
                 "{}",
-                json!({"event":"candidate_skipped", "reason":"spot_plan_rejected",
+                json!({"event":"candidate_skipped", "reason":reason,
                 "spot_plan":order["spot_plan"]})
             );
             return Ok(false);
@@ -469,11 +479,24 @@ impl Execution {
         let (base_symbol, quote_symbol) = market_symbols(rpc, metadata, &head, self.pair).await?;
         let checkpoint = observe_finalized_checkpoint(rpc).await?;
         let quote = exact_quote(plan.front_size, plan.front_price, book.base_scale)?;
-        anyhow::ensure!(
-            quote <= plan.front_quote_budget,
-            "entry mapping exceeds quote budget"
-        );
-        let entry = self.sign(snapshot, true, plan.front_size, quote, nonces.front)?;
+        if plan.entry_is_sell {
+            anyhow::ensure!(
+                quote >= plan.front_quote_budget,
+                "entry mapping is below the minimum proceeds"
+            );
+        } else {
+            anyhow::ensure!(
+                quote <= plan.front_quote_budget,
+                "entry mapping exceeds quote budget"
+            );
+        }
+        let entry = self.sign(
+            snapshot,
+            !plan.entry_is_sell,
+            plan.front_size,
+            quote,
+            nonces.front,
+        )?;
         let state = State {
             version: 1,
             genesis: encoded(self.genesis),
@@ -486,6 +509,7 @@ impl Execution {
             target_hash: text_field(&fresh_order, "transaction_hash")?.to_owned(),
             target_nonce,
             target_subaccount: text_field(&fresh_order, "subaccount")?.to_owned(),
+            entry_is_sell: plan.entry_is_sell,
             target_outcome: None,
             target_first_trade: None,
             entry_first_trade: None,
@@ -639,8 +663,9 @@ impl Execution {
                     .find(|(_, op)| !op.settled())
                     .map(|(i, _)| (false, i))
             };
-            if let Some((is_buy, index)) = outstanding {
-                let operation = if is_buy {
+            if let Some((is_entry, index)) = outstanding {
+                let is_buy = is_entry != state.entry_is_sell;
+                let operation = if is_entry {
                     &state.entry
                 } else {
                     &state.exits[index]
@@ -654,7 +679,7 @@ impl Execution {
                             == state.runtime_code_hash,
                         "runtime changed before submission"
                     );
-                    if is_buy {
+                    if is_entry {
                         let pending = rpc.get_pending_extrinsics().await?;
                         if !pending
                             .iter()
@@ -687,7 +712,7 @@ impl Execution {
                     }
 
                     // A crash after this checkpoint is ambiguous; recovery never blindly resends
-                    if is_buy {
+                    if is_entry {
                         state.entry.attempted = true;
                     } else {
                         state.exits[index].attempted = true;
@@ -708,7 +733,7 @@ impl Execution {
                     if let Err(e) = result {
                         let message = e.to_string();
                         eprintln!("Submission requires finalized reconciliation: {message}");
-                        if is_buy {
+                        if is_entry {
                             state.entry.submission_error = Some(message);
                         } else {
                             state.exits[index].submission_error = Some(message);
@@ -755,14 +780,28 @@ impl Execution {
             book.base_scale == amount(&state.base_scale)?,
             "base units changed"
         );
-        let base = book.executable_exit_size(state.remaining()?)?;
-        if base < book.minimum_size {
-            state.complete = true;
-            state.result = Some("residual_below_executable_lot".into());
-            self.journal.store(state)?;
-            return Ok(());
-        }
-        let price = if emergency {
+        let short = state.entry_is_sell;
+        let base = if short {
+            book.buy_back_size(state.remaining()?)?
+        } else {
+            let base = book.executable_exit_size(state.remaining()?)?;
+            if base < book.minimum_size {
+                state.complete = true;
+                state.result = Some("residual_below_executable_lot".into());
+                self.journal.store(state)?;
+                return Ok(());
+            }
+            base
+        };
+        let price = if emergency && short {
+            // Spending is capped so realized loss stays within the configured budget
+            let allowed = amount(&state.received_quote)?
+                .checked_add(amount(&state.maximum_loss)?)
+                .context("exit budget overflow")?
+                .saturating_sub(amount(&state.cost_budget)?)
+                .saturating_sub(amount(&state.spent_quote)?);
+            loss_ceiling(allowed, base, book.base_scale, book.tick)?
+        } else if emergency {
             let allowed_loss = amount(&state.maximum_loss)?;
             let costs = amount(&state.spent_quote)?
                 .checked_add(amount(&state.cost_budget)?)
@@ -783,12 +822,16 @@ impl Execution {
         } else {
             amount(&state.exit_price)?
         };
-        if base < book.minimum_size || price == 0 {
+        if base < book.minimum_size || (price == 0 && !short) {
             anyhow::bail!(
                 "remaining inventory is below the executable lot; journal retained for recovery"
             );
         }
-        if !book.has_bid(price) {
+        if short {
+            if price == 0 || !book.has_ask(price) {
+                return Ok(());
+            }
+        } else if !book.has_bid(price) {
             return Ok(());
         }
         let quote = exact_quote(base, price, book.base_scale)?;
@@ -809,7 +852,7 @@ impl Execution {
             .allocate_exit(anchor)?;
         state
             .exits
-            .push(self.sign(snapshot, false, base, quote, nonce)?);
+            .push(self.sign(snapshot, short, base, quote, nonce)?);
         self.journal.store(state)?;
         println!(
             "{}",
@@ -847,13 +890,14 @@ impl Execution {
             Ok(plan) => plan,
             Err(_) => return Ok(false),
         };
-        let required = amount(&state.entry.quote)?
-            .checked_add(settings.cost_budget)
-            .and_then(|n| n.checked_add(settings.minimum_profit))
-            .context("entry profit bound overflow")?;
         if plan.front_size != settings.maximum_front_size
-            || plan.minimum_back_proceeds < required
-            || plan.front_quote_budget > amount(&state.entry.quote)?
+            || plan.entry_is_sell != state.entry_is_sell
+            || !plan.covers_entry(
+                amount(&state.entry.quote)?,
+                book.taker_fee,
+                settings.cost_budget,
+                settings.minimum_profit,
+            )?
             || book.base_scale != amount(&state.base_scale)?
         {
             return Ok(false);
@@ -946,11 +990,13 @@ impl Execution {
                 )
                 .await?;
                 let entry_nonce = next.entry.nonce;
+                let entry_is_sell = next.entry_is_sell;
                 for op in std::iter::once(&mut next.entry).chain(next.exits.iter_mut()) {
                     if pending_ids.contains(&op.nonce) {
                         if let Some(is_buy) = active.get(&op.nonce) {
+                            // The entry sells for a sell target and every exit takes the opposite side
                             anyhow::ensure!(
-                                *is_buy == (op.nonce == entry_nonce),
+                                *is_buy == ((op.nonce == entry_nonce) != entry_is_sell),
                                 "active IOC side mismatch"
                             );
                         } else {
@@ -998,6 +1044,7 @@ impl Execution {
         number: u64,
         hash: &str,
     ) -> anyhow::Result<()> {
+        let entry_is_sell = state.entry_is_sell;
         for (index, encoded) in extrinsics.iter().enumerate() {
             let index = u32::try_from(index)?;
             if encoded.eq_ignore_ascii_case(&state.target_bytes) {
@@ -1007,8 +1054,8 @@ impl Execution {
                 );
                 state.target_outcome = Some(dispatch_success(snapshot.metadata(), events, index)?);
             }
-            for (is_buy, operation) in std::iter::once((true, &mut state.entry))
-                .chain(state.exits.iter_mut().map(|op| (false, op)))
+            for (is_buy, operation) in std::iter::once((!entry_is_sell, &mut state.entry))
+                .chain(state.exits.iter_mut().map(|op| (entry_is_sell, op)))
             {
                 if encoded.eq_ignore_ascii_case(&operation.bytes) {
                     anyhow::ensure!(
@@ -1043,12 +1090,25 @@ fn apply_trade(state: &mut State, trade: &DeepXFinalizedSpotTrade) -> anyhow::Re
         return Ok(());
     }
     let position = (trade.block_number, trade.event_index);
-    if encoded(trade.buyer) == state.target_subaccount && trade.buy_id == state.target_nonce {
+    let (target_side, entry_side, exit_side) = if state.entry_is_sell {
+        (
+            (trade.seller, trade.sell_id),
+            (trade.seller, trade.sell_id),
+            (trade.buyer, trade.buy_id),
+        )
+    } else {
+        (
+            (trade.buyer, trade.buy_id),
+            (trade.buyer, trade.buy_id),
+            (trade.seller, trade.sell_id),
+        )
+    };
+    if encoded(target_side.0) == state.target_subaccount && target_side.1 == state.target_nonce {
         state.target_first_trade.get_or_insert(position);
     }
-    let entry_fill = encoded(trade.buyer) == state.subaccount && trade.buy_id == state.entry.nonce;
-    let exit_fill = encoded(trade.seller) == state.subaccount
-        && state.exits.iter().any(|op| op.nonce == trade.sell_id);
+    let entry_fill = encoded(entry_side.0) == state.subaccount && entry_side.1 == state.entry.nonce;
+    let exit_fill = encoded(exit_side.0) == state.subaccount
+        && state.exits.iter().any(|op| op.nonce == exit_side.1);
     anyhow::ensure!(
         !(entry_fill && exit_fill),
         "self trade in execution evidence"
@@ -1063,13 +1123,23 @@ fn apply_trade(state: &mut State, trade: &DeepXFinalizedSpotTrade) -> anyhow::Re
             state.entry.included.as_ref().is_some_and(|i| i.success),
             "entry fill without successful inclusion"
         );
-        let fee = received_fee(trade, true, &state.base_symbol)?;
-        add(&mut state.acquired_base, net_received(base, fee)?)?;
-        add(&mut state.spent_quote, quote)?;
-        anyhow::ensure!(
-            amount(&state.spent_quote)? <= amount(&state.entry.quote)?,
-            "entry exceeds signed quote budget"
-        );
+        if state.entry_is_sell {
+            let fee = received_fee(trade, false, &state.quote_symbol)?;
+            add(&mut state.sold_base, base)?;
+            add(&mut state.received_quote, net_received(quote, fee)?)?;
+            anyhow::ensure!(
+                amount(&state.sold_base)? <= amount(&state.entry.base)?,
+                "entry exceeds signed base size"
+            );
+        } else {
+            let fee = received_fee(trade, true, &state.base_symbol)?;
+            add(&mut state.acquired_base, net_received(base, fee)?)?;
+            add(&mut state.spent_quote, quote)?;
+            anyhow::ensure!(
+                amount(&state.spent_quote)? <= amount(&state.entry.quote)?,
+                "entry exceeds signed quote budget"
+            );
+        }
         state.entry_first_trade.get_or_insert(position);
         state.entry_last_trade = Some(position);
     }
@@ -1078,14 +1148,20 @@ fn apply_trade(state: &mut State, trade: &DeepXFinalizedSpotTrade) -> anyhow::Re
             state
                 .exits
                 .iter()
-                .any(|op| op.nonce == trade.sell_id
+                .any(|op| op.nonce == exit_side.1
                     && op.included.as_ref().is_some_and(|i| i.success)),
             "exit fill without successful inclusion"
         );
-        let fee = received_fee(trade, false, &state.quote_symbol)?;
-        add(&mut state.sold_base, base)?;
-        add(&mut state.received_quote, net_received(quote, fee)?)?;
-        state.remaining()?;
+        if state.entry_is_sell {
+            let fee = received_fee(trade, true, &state.base_symbol)?;
+            add(&mut state.acquired_base, net_received(base, fee)?)?;
+            add(&mut state.spent_quote, quote)?;
+        } else {
+            let fee = received_fee(trade, false, &state.quote_symbol)?;
+            add(&mut state.sold_base, base)?;
+            add(&mut state.received_quote, net_received(quote, fee)?)?;
+            state.remaining()?;
+        }
     }
     Ok(())
 }
@@ -1185,6 +1261,18 @@ fn loss_floor(required_quote: u128, base: u128, scale: u128, tick: u128) -> anyh
             .checked_mul(U256::from(tick))
             .context("exit floor overflow")?,
     )
+}
+
+/// Highest tick-aligned price at which buying `base` costs at most `allowed_quote`; zero if none.
+fn loss_ceiling(
+    allowed_quote: u128,
+    base: u128,
+    scale: u128,
+    tick: u128,
+) -> anyhow::Result<u128> {
+    anyhow::ensure!(base > 0 && tick > 0, "zero exit lot or tick");
+    let price = U256::from(allowed_quote) * U256::from(scale) / U256::from(base);
+    narrow(price / U256::from(tick) * U256::from(tick))
 }
 
 fn narrow(value: U256) -> anyhow::Result<u128> {

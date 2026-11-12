@@ -36,6 +36,10 @@ fn checksum(state: &State) -> anyhow::Result<String> {
     Ok(hex::encode(BlakeTwo256.hash(&serde_json::to_vec(state)?)))
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct State {
@@ -51,6 +55,9 @@ pub(super) struct State {
     pub(super) target_hash: String,
     pub(super) target_nonce: u64,
     pub(super) target_subaccount: String,
+    /// Target and entry sell inventory and the exit buys it back; absent for buy targets.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) entry_is_sell: bool,
     pub(super) target_outcome: Option<bool>,
     pub(super) target_first_trade: Option<(u64, u32)>,
     pub(super) entry_first_trade: Option<(u64, u32)>,
@@ -110,10 +117,18 @@ impl Operation {
 }
 
 impl State {
+    /// Net base still to unload (buy entry) or still owed back (sell entry).
     pub(super) fn remaining(&self) -> anyhow::Result<u128> {
-        amount(&self.acquired_base)?
-            .checked_sub(amount(&self.sold_base)?)
-            .context("exit fills exceed acquired base")
+        let acquired = amount(&self.acquired_base)?;
+        let sold = amount(&self.sold_base)?;
+        if self.entry_is_sell {
+            // Fee-rounded buy-backs may overshoot the sold size
+            Ok(sold.saturating_sub(acquired))
+        } else {
+            acquired
+                .checked_sub(sold)
+                .context("exit fills exceed acquired base")
+        }
     }
 
     pub(super) fn profit(&self) -> anyhow::Result<String> {

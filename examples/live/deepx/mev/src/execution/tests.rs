@@ -242,6 +242,7 @@ fn fixture_for(directory: &Directory, modern: bool) -> (Execution, State) {
         target_hash: encoded(target.extrinsic_hash()),
         target_nonce: entry.nonce + 1,
         target_subaccount: encoded([2; 20]),
+        entry_is_sell: false,
         target_outcome: None,
         target_first_trade: None,
         entry_first_trade: None,
@@ -582,6 +583,145 @@ fn financial_bounds_and_signed_fee_extremes_are_exact() {
     assert_eq!(net_received(1_000, -10).unwrap(), 1_010);
     assert!(net_received(9, 10).is_err());
     assert!(net_received(u128::MAX, i128::MIN).is_err());
+}
+
+fn short_trade(
+    state: &State,
+    entry: bool,
+    base: u128,
+    quote: u128,
+    fee: i128,
+    index: u32,
+) -> DeepXFinalizedSpotTrade {
+    DeepXFinalizedSpotTrade {
+        block_hash: [101; 32],
+        block_number: 101,
+        event_index: index,
+        pair: [3; 32],
+        buyer: if entry { [4; 20] } else { [1; 20] },
+        buy_id: if entry {
+            40
+        } else {
+            state.exits.last().unwrap().nonce
+        },
+        seller: if entry { [1; 20] } else { [2; 20] },
+        sell_id: if entry {
+            state.entry.nonce
+        } else {
+            state.target_nonce
+        },
+        trade_amount_u: U256::from(quote).to_le_bytes(),
+        trade_amount_b: U256::from(base).to_le_bytes(),
+        taker: if entry { "Seller" } else { "Buyer" }.into(),
+        taker_fee: fee,
+        taker_fee_asset: if entry {
+            b"USDC".to_vec()
+        } else {
+            b"ETH".to_vec()
+        },
+        maker_fee: 0,
+        maker_fee_asset: if entry {
+            b"ETH".to_vec()
+        } else {
+            b"USDC".to_vec()
+        },
+        price: U256::from(105_000).to_le_bytes(),
+    }
+}
+
+fn sell_entry_state(execution: &Execution, mut state: State) -> State {
+    state.entry_is_sell = true;
+    state.entry = execution
+        .sign(runtime(), false, 1_000, 105_000, state.entry.nonce)
+        .unwrap();
+    state.entry.included = Some(inclusion(true));
+    state
+}
+
+#[rstest]
+fn sell_entry_fills_track_owed_base_and_buy_back_net_of_base_fees() {
+    let directory = Directory::new();
+    let (execution, state) = fixture(&directory);
+    let mut state = sell_entry_state(&execution, state);
+    for (base, quote, fee, index) in [(400, 42_000, 42, 4), (600, 63_000, 63, 5)] {
+        let fill = short_trade(&state, true, base, quote, fee, index);
+        apply_trade(&mut state, &fill).unwrap();
+    }
+    assert_eq!(state.sold_base, "1000");
+    assert_eq!(state.received_quote, "104895");
+    assert_eq!(state.remaining().unwrap(), 1_000);
+    state.exits.push(
+        execution
+            .sign(runtime(), true, 1_010, 101_000, state.target_nonce + 1)
+            .unwrap(),
+    );
+    state.exits[0].included = Some(inclusion(true));
+    let fill = short_trade(&state, false, 1_010, 101_000, 10, 6);
+    apply_trade(&mut state, &fill).unwrap();
+    assert_eq!(state.acquired_base, "1000");
+    assert_eq!(state.spent_quote, "101000");
+    assert_eq!(state.remaining().unwrap(), 0);
+    assert_eq!(state.profit().unwrap(), "3795");
+    assert_eq!(state.entry_first_trade, Some((101, 4)));
+    assert_eq!(state.target_first_trade, Some((101, 6)));
+}
+
+#[rstest]
+fn buy_back_overshoot_leaves_no_owed_base_and_sell_entry_rejects_oversize_fills() {
+    let directory = Directory::new();
+    let (execution, state) = fixture(&directory);
+    let mut state = sell_entry_state(&execution, state);
+    let oversize = short_trade(&state, true, 1_001, 105_105, 0, 4);
+    assert!(apply_trade(&mut state.clone(), &oversize).is_err());
+    let fill = short_trade(&state, true, 1_000, 105_000, 0, 4);
+    apply_trade(&mut state, &fill).unwrap();
+    state.exits.push(
+        execution
+            .sign(runtime(), true, 1_010, 101_000, state.target_nonce + 1)
+            .unwrap(),
+    );
+    state.exits[0].included = Some(inclusion(true));
+    let fill = short_trade(&state, false, 1_010, 101_000, 0, 5);
+    apply_trade(&mut state, &fill).unwrap();
+    assert_eq!(state.acquired_base, "1010");
+    assert_eq!(state.remaining().unwrap(), 0);
+}
+
+#[rstest]
+fn sell_entry_fee_assets_and_inclusion_are_enforced() {
+    let directory = Directory::new();
+    let (execution, state) = fixture(&directory);
+    let mut state = sell_entry_state(&execution, state);
+    let mut wrong_fee_asset = short_trade(&state, true, 100, 10_500, 1, 4);
+    wrong_fee_asset.taker_fee_asset = b"ETH".to_vec();
+    assert!(apply_trade(&mut state, &wrong_fee_asset).is_err());
+    state.entry.included = None;
+    let fill = short_trade(&state, true, 100, 10_500, 1, 4);
+    assert!(apply_trade(&mut state, &fill).is_err());
+}
+
+#[rstest]
+fn journal_omits_the_entry_side_for_buy_targets_and_records_sell_targets() {
+    let directory = Directory::new();
+    let (execution, state) = fixture(&directory);
+    assert!(
+        !serde_json::to_string(&state)
+            .unwrap()
+            .contains("entry_is_sell")
+    );
+    let state = sell_entry_state(&execution, state);
+    assert!(
+        serde_json::to_string(&state)
+            .unwrap()
+            .contains("\"entry_is_sell\":true")
+    );
+}
+
+#[rstest]
+fn loss_ceiling_caps_the_buy_back_price_at_a_tick() {
+    assert_eq!(loss_ceiling(101, 30, 1_000, 100).unwrap(), 3_300);
+    assert_eq!(loss_ceiling(0, 30, 1_000, 100).unwrap(), 0);
+    assert!(loss_ceiling(1, 0, 1_000, 100).is_err());
 }
 
 #[rstest]
