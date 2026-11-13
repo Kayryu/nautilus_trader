@@ -232,6 +232,15 @@ impl Journal {
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result.context("execution checkpoint was not durably committed")
+        result.context("execution checkpoint was not durably committed")?;
+        log::debug!(
+            "{}",
+            serde_json::json!({
+                "event": "journal_checkpoint_committed",
+                "cursor_number": state.cursor_number,
+                "complete": state.complete
+            })
+        );
+        Ok(())
     }
 }

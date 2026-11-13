@@ -304,10 +304,14 @@ impl Execution {
     pub(super) async fn resume(&self, rpc: &DeepXRpcClient, poll_ms: u64) -> anyhow::Result<bool> {
         if let Some(state) = self.journal.load()? {
             self.validate_identity(&state)?;
-            eprintln!(
+            log::info!(
                 "{}",
-                json!({"event":"execution_resuming", "target_hash":state.target_hash,
-                "entry_hash":state.entry.hash, "cursor_number":state.cursor_number})
+                json!({
+                    "event": "execution_resuming",
+                    "target_hash": state.target_hash,
+                    "entry_hash": state.entry.hash,
+                    "cursor_number": state.cursor_number
+                })
             );
             self.run(rpc, state, poll_ms).await?;
             return Ok(true);
@@ -333,16 +337,19 @@ impl Execution {
                 }
                 _ => "spot_plan_rejected",
             };
-            eprintln!(
+            log::info!(
                 "{}",
-                json!({"event":"candidate_skipped", "reason":reason,
-                "spot_plan":order["spot_plan"]})
+                json!({
+                    "event": "candidate_skipped",
+                    "reason": reason,
+                    "spot_plan": order["spot_plan"]
+                })
             );
             return Ok(false);
         }
-        eprintln!(
+        log::info!(
             "{}",
-            json!({"event":"candidate_rechecking", "observed_head":order["observed_head"]})
+            json!({"event": "candidate_rechecking", "observed_head": order["observed_head"]})
         );
         anyhow::ensure!(
             self.journal.load()?.is_none(),
@@ -371,9 +378,9 @@ impl Execution {
         }
         let Some((target_bytes, fresh_order)) = find_target(metadata, &pending, self.pair, order)?
         else {
-            eprintln!(
+            log::info!(
                 "{}",
-                json!({"event":"candidate_skipped", "reason":"target_left_pool"})
+                json!({"event": "candidate_skipped", "reason": "target_left_pool"})
             );
             return Ok(false);
         };
@@ -389,10 +396,27 @@ impl Execution {
         let plan = match book.plan(&fresh_order, settings) {
             Ok(plan) => plan,
             Err(e) => {
-                eprintln!("Opportunity no longer meets entry bounds: {e}");
+                log::info!(
+                    "{}",
+                    json!({
+                        "event": "candidate_skipped",
+                        "reason": "entry_bounds_changed",
+                        "error": format!("{e:#}")
+                    })
+                );
                 return Ok(false);
             }
         };
+        log::debug!(
+            "{}",
+            json!({
+                "event": "entry_plan_computed",
+                "entry_is_sell": plan.entry_is_sell,
+                "raw_front_size": plan.front_size.to_string(),
+                "raw_front_price": plan.front_price.to_string(),
+                "raw_back_price": plan.back_price.to_string()
+            })
+        );
         let target_nonce: u64 = text_field(&fresh_order, "nonce")?.parse()?;
         let nonces = ordering::observe(rpc, metadata, &head, self.wallet(), &pending)
             .await?
@@ -536,11 +560,16 @@ impl Execution {
 
         // Reserve exact signed bytes before any network write, including a possible crash
         self.journal.store(&state)?;
-        eprintln!(
+        log::info!(
             "{}",
-            json!({"event":"entry_prepared", "target_hash":state.target_hash,
-            "entry_hash":state.entry.hash, "raw_base":state.entry.base,
-            "raw_quote":state.entry.quote, "nonce":state.entry.nonce})
+            json!({
+                "event": "entry_prepared",
+                "target_hash": state.target_hash,
+                "entry_hash": state.entry.hash,
+                "raw_base": state.entry.base,
+                "raw_quote": state.entry.quote,
+                "nonce": state.entry.nonce
+            })
         );
         self.run(rpc, state, poll_ms).await?;
         Ok(true)
@@ -576,6 +605,17 @@ impl Execution {
         let signed =
             sign_spot_place_order(&permit, &self.key, self.params(is_buy, base, quote), nonce)?;
         permit.ensure_active()?;
+        log::debug!(
+            "{}",
+            json!({
+                "event": "operation_signed",
+                "is_buy": is_buy,
+                "nonce": nonce,
+                "raw_base": base.to_string(),
+                "raw_quote": quote.to_string(),
+                "extrinsic_hash": encoded(signed.extrinsic_hash())
+            })
+        );
         Ok(Operation {
             nonce,
             bytes: encoded(signed.bytes()),
@@ -626,6 +666,16 @@ impl Execution {
     ) -> anyhow::Result<()> {
         loop {
             self.validate_identity(state)?;
+            log::debug!(
+                "{}",
+                json!({
+                    "event": "execution_step",
+                    "entry_settled": state.entry.settled(),
+                    "entry_attempted": state.entry.attempted,
+                    "exit_count": state.exits.len(),
+                    "cursor_number": state.cursor_number
+                })
+            );
             if state.complete {
                 println!(
                     "{}",
@@ -685,12 +735,26 @@ impl Execution {
                             .iter()
                             .any(|item| item.eq_ignore_ascii_case(&state.target_bytes))
                         {
+                            log::info!(
+                                "{}",
+                                json!({
+                                    "event": "entry_precheck_failed",
+                                    "result": "target_left_pool_before_entry"
+                                })
+                            );
                             state.complete = true;
                             state.result = Some("target_left_pool_before_entry".into());
                             self.journal.store(state)?;
                             continue;
                         }
                         if !self.revalidate_entry(rpc, state, &head, &pending).await? {
+                            log::info!(
+                                "{}",
+                                json!({
+                                    "event": "entry_precheck_failed",
+                                    "result": "entry_bounds_changed"
+                                })
+                            );
                             state.complete = true;
                             state.result = Some("entry_bounds_changed".into());
                             self.journal.store(state)?;
@@ -718,21 +782,35 @@ impl Execution {
                         state.exits[index].attempted = true;
                     }
                     self.journal.store(state)?;
-                    eprintln!(
+                    log::info!(
                         "{}",
-                        json!({"event":"submission_started", "is_buy":is_buy,
-                        "extrinsic_hash":encoded(hash)})
+                        json!({
+                            "event": "submission_started",
+                            "is_buy": is_buy,
+                            "extrinsic_hash": encoded(hash)
+                        })
                     );
                     let result = rpc.submit_verified_extrinsic_once(&bytes, hash).await;
-                    eprintln!(
+                    log::info!(
                         "{}",
-                        json!({"event":"submission_returned", "is_buy":is_buy,
-                        "extrinsic_hash":encoded(hash), "rpc_accepted":result.is_ok(),
-                        "requires_finalized_reconciliation":true})
+                        json!({
+                            "event": "submission_returned",
+                            "is_buy": is_buy,
+                            "extrinsic_hash": encoded(hash),
+                            "rpc_accepted": result.is_ok(),
+                            "requires_finalized_reconciliation": true
+                        })
                     );
                     if let Err(e) = result {
                         let message = e.to_string();
-                        eprintln!("Submission requires finalized reconciliation: {message}");
+                        log::warn!(
+                            "{}",
+                            json!({
+                                "event": "submission_error",
+                                "error": message,
+                                "requires_finalized_reconciliation": true
+                            })
+                        );
                         if is_entry {
                             state.entry.submission_error = Some(message);
                         } else {
@@ -765,8 +843,27 @@ impl Execution {
                 .zip(state.entry_last_trade)
                 .is_some_and(|(target, entry)| target <= entry);
         if state.target_outcome != Some(true) && !emergency {
+            log::debug!(
+                "{}",
+                json!({
+                    "event": "exit_waiting",
+                    "target_outcome": state.target_outcome,
+                    "cursor_number": state.cursor_number,
+                    "deadline": deadline
+                })
+            );
             return Ok(());
         }
+        log::debug!(
+            "{}",
+            json!({
+                "event": "exit_evaluating",
+                "emergency": emergency,
+                "target_outcome": state.target_outcome,
+                "cursor_number": state.cursor_number,
+                "deadline": deadline
+            })
+        );
         let observed =
             observe_current_runtime_snapshot(rpc, &DeepXEnvironment::Testnet, self.genesis).await?;
         let head = encoded(observed.block_hash());
@@ -829,9 +926,25 @@ impl Execution {
         }
         if short {
             if price == 0 || !book.has_ask(price) {
+                log::debug!(
+                    "{}",
+                    json!({
+                        "event": "exit_waiting_for_liquidity",
+                        "exit_side": "buy",
+                        "raw_limit_price": price.to_string()
+                    })
+                );
                 return Ok(());
             }
         } else if !book.has_bid(price) {
+            log::debug!(
+                "{}",
+                json!({
+                    "event": "exit_waiting_for_liquidity",
+                    "exit_side": "sell",
+                    "raw_limit_price": price.to_string()
+                })
+            );
             return Ok(());
         }
         let quote = exact_quote(base, price, book.base_scale)?;
@@ -888,7 +1001,13 @@ impl Execution {
         };
         let plan = match book.plan(&target, &settings) {
             Ok(plan) => plan,
-            Err(_) => return Ok(false),
+            Err(e) => {
+                log::debug!(
+                    "{}",
+                    json!({"event": "entry_revalidation_failed", "error": format!("{e:#}")})
+                );
+                return Ok(false);
+            }
         };
         if plan.front_size != settings.maximum_front_size
             || plan.entry_is_sell != state.entry_is_sell
@@ -913,6 +1032,14 @@ impl Execution {
 
     async fn reconcile(&self, rpc: &DeepXRpcClient, state: &mut State) -> anyhow::Result<()> {
         let finalized = observe_finalized_checkpoint(rpc).await?;
+        log::debug!(
+            "{}",
+            json!({
+                "event": "reconcile_started",
+                "cursor_number": state.cursor_number,
+                "finalized_number": u64::from(finalized.block_number())
+            })
+        );
         anyhow::ensure!(
             u64::from(finalized.block_number()) >= state.cursor_number,
             "finality regressed"
@@ -965,6 +1092,15 @@ impl Execution {
                 number,
                 &hash,
             )?;
+            log::debug!(
+                "{}",
+                json!({
+                    "event": "finalized_block_scanned",
+                    "number": number,
+                    "extrinsics": response.block.extrinsics.len(),
+                    "event_bytes": events.len()
+                })
+            );
             for trade in decode_finalized_spot_trade_events(
                 snapshot.interfaces(),
                 snapshot.metadata(),
@@ -1020,12 +1156,17 @@ impl Execution {
             next.cursor_hash = hash;
             self.journal.store(&next)?;
             *state = next;
-            eprintln!(
+            log::info!(
                 "{}",
-                json!({"event":"finalized_reconciled", "number":state.cursor_number,
-                "hash":state.cursor_hash, "entry_terminal":state.entry.settled(),
-                "target_outcome":state.target_outcome, "acquired_raw_base":state.acquired_base,
-                "sold_raw_base":state.sold_base})
+                json!({
+                    "event": "finalized_reconciled",
+                    "number": state.cursor_number,
+                    "hash": state.cursor_hash,
+                    "entry_terminal": state.entry.settled(),
+                    "target_outcome": state.target_outcome,
+                    "acquired_raw_base": state.acquired_base,
+                    "sold_raw_base": state.sold_base
+                })
             );
         }
         anyhow::ensure!(
@@ -1118,6 +1259,18 @@ fn apply_trade(state: &mut State, trade: &DeepXFinalizedSpotTrade) -> anyhow::Re
     }
     let base = narrow(U256::from_le_bytes(trade.trade_amount_b))?;
     let quote = narrow(U256::from_le_bytes(trade.trade_amount_u))?;
+    log::debug!(
+        "{}",
+        json!({
+            "event": "fill_matched",
+            "block_number": trade.block_number,
+            "event_index": trade.event_index,
+            "entry_fill": entry_fill,
+            "exit_fill": exit_fill,
+            "raw_base": base.to_string(),
+            "raw_quote": quote.to_string()
+        })
+    );
     if entry_fill {
         anyhow::ensure!(
             state.entry.included.as_ref().is_some_and(|i| i.success),
@@ -1145,11 +1298,9 @@ fn apply_trade(state: &mut State, trade: &DeepXFinalizedSpotTrade) -> anyhow::Re
     }
     if exit_fill {
         anyhow::ensure!(
-            state
-                .exits
-                .iter()
-                .any(|op| op.nonce == exit_side.1
-                    && op.included.as_ref().is_some_and(|i| i.success)),
+            state.exits.iter().any(
+                |op| op.nonce == exit_side.1 && op.included.as_ref().is_some_and(|i| i.success)
+            ),
             "exit fill without successful inclusion"
         );
         if state.entry_is_sell {
@@ -1264,12 +1415,7 @@ fn loss_floor(required_quote: u128, base: u128, scale: u128, tick: u128) -> anyh
 }
 
 /// Highest tick-aligned price at which buying `base` costs at most `allowed_quote`; zero if none.
-fn loss_ceiling(
-    allowed_quote: u128,
-    base: u128,
-    scale: u128,
-    tick: u128,
-) -> anyhow::Result<u128> {
+fn loss_ceiling(allowed_quote: u128, base: u128, scale: u128, tick: u128) -> anyhow::Result<u128> {
     anyhow::ensure!(base > 0 && tick > 0, "zero exit lot or tick");
     let price = U256::from(allowed_quote) * U256::from(scale) / U256::from(base);
     narrow(price / U256::from(tick) * U256::from(tick))

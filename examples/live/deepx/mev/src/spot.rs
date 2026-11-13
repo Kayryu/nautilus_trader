@@ -496,6 +496,19 @@ pub(super) async fn observe(
             .is_none_or(|(bid, ask)| bid.price < ask.price),
         "crossed Spot snapshot requires matching simulation"
     );
+    log::debug!(
+        "{}",
+        json!({
+            "event": "spot_book_observed",
+            "observed_head": head,
+            "bids": bids.len(),
+            "asks": asks.len(),
+            "best_bid_raw_price": bids.first().map(|level| level.price.to_string()),
+            "best_ask_raw_price": asks.first().map(|level| level.price.to_string()),
+            "base_scale": base_scale.to_string(),
+            "taker_fee": taker_fee.to_string()
+        })
+    );
     Ok(Snapshot {
         base_scale,
         minimum_size,

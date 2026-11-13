@@ -222,6 +222,17 @@ pub(super) async fn observe(
         }
     }
 
+    log::debug!(
+        "{}",
+        serde_json::json!({
+            "event": "nonce_evidence_observed",
+            "observed_head": head,
+            "chain_time_ms": chain_time_ms,
+            "quota": quota,
+            "used_nonces": used.len(),
+            "unavailable_nonces": unavailable.len()
+        })
+    );
     Ok(NonceEvidence {
         chain_time_ms,
         used,

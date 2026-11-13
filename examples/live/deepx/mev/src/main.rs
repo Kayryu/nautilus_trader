@@ -45,8 +45,9 @@ async fn main() -> anyhow::Result<()> {
              [--front-size RAW_BASE --minimum-profit RAW_QUOTE --cost-budget RAW_QUOTE]\n\
              [--execute|--check-account --subaccount 0xAccountId20 --journal PATH\n\
               --maximum-loss RAW_QUOTE --exit-after-blocks N [--wallet 0xAccountId20]]\n\
+             [--log-level error|warn|info|debug|trace]\n\
              MARKET: perp:<u16>, spot:<pair hash>, or spot-quote:<pair hash>\n\
-             Output: JSON lines; --execute enables one Spot opportunity and journal recovery."
+             Output: JSON lines on stdout; diagnostics on stderr (default level: info)."
         );
         anyhow::ensure!(
             args.first().is_some_and(|arg| arg == "--help"),
@@ -69,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let mut journal_path = None;
     let mut maximum_loss = None;
     let mut exit_after_blocks = None;
+    let mut log_level = None;
     let mut options = args[5..].iter();
     while let Some(option) = options.next() {
         match option.as_str() {
@@ -156,10 +158,22 @@ async fn main() -> anyhow::Result<()> {
             "--cost-budget" => {
                 cost_budget = options.next().context("missing cost budget")?.parse()?;
             }
+            "--log-level" => {
+                anyhow::ensure!(log_level.is_none(), "duplicate log level");
+                log_level = Some(
+                    options
+                        .next()
+                        .context("missing log level")?
+                        .parse::<log::LevelFilter>()?,
+                );
+            }
             _ => anyhow::bail!("unknown option: {option}"),
         }
     }
 
+    env_logger::Builder::new()
+        .filter_level(log_level.unwrap_or(log::LevelFilter::Info))
+        .init();
     let expected_genesis = parse_hash(&args[1])?;
     let market = Market::parse(&args[2])?;
     anyhow::ensure!(
@@ -230,18 +244,22 @@ async fn main() -> anyhow::Result<()> {
         "size and poll interval must be positive"
     );
     let rpc = DeepXRpcClient::new_with_proxy(args[0].clone(), None)?;
-    eprintln!(
+    log::info!(
         "{}",
-        json!({"event":"connecting", "execute":execute,
-        "minimum_raw_size":minimum.to_string(), "poll_ms":poll_ms,
-        "maximum_front_size":maximum_front_size.map(|size| size.to_string())})
+        json!({
+            "event": "connecting",
+            "execute": execute,
+            "minimum_raw_size": minimum.to_string(),
+            "poll_ms": poll_ms,
+            "maximum_front_size": maximum_front_size.map(|size| size.to_string())
+        })
     );
     let genesis = rpc.get_block_hash_required_once(0).await?;
     anyhow::ensure!(
         parse_hash(&genesis)? == expected_genesis,
         "chain genesis mismatch"
     );
-    eprintln!("{}", json!({"event":"chain_verified", "genesis":genesis}));
+    log::info!("{}", json!({"event": "chain_verified", "genesis": genesis}));
     if let Some(wallet) = inspect_wallet {
         execution::inspect_wallet(&rpc, wallet).await?;
         return Ok(());
@@ -286,12 +304,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                eprintln!("{}", json!({"event":"observer_stopped"}));
+                log::info!("{}", json!({"event": "observer_stopped"}));
                 return Ok(());
             }
             result = poll(&rpc, &market, minimum, &mut previous, &mut cached, ordering_account, spot_settings.as_ref()) => {
                 let result = result.inspect_err(|e| {
-                    eprintln!("{}", json!({"event":"poll_failed", "error":format!("{e:#}")}));
+                    log::error!("{}", json!({"event": "poll_failed", "error": format!("{e:#}")}));
                 })?;
                 if let Some(orders) = result {
                     let count = orders.len();
@@ -303,7 +321,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     if once {
-                        eprintln!("Completed pool observation; matching orders: {count}");
+                        log::info!("{}", json!({"event": "pool_observation_completed", "matching_orders": count}));
                         return Ok(());
                     }
                 }
@@ -313,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                eprintln!("{}", json!({"event":"observer_stopped"}));
+                log::info!("{}", json!({"event": "observer_stopped"}));
                 return Ok(());
             }
             () = tokio::time::sleep(Duration::from_millis(poll_ms)) => {}
@@ -354,9 +372,9 @@ async fn poll(
         .as_ref()
         .is_none_or(|runtime| runtime.code_hash != code_hash)
     {
-        eprintln!(
+        log::info!(
             "{}",
-            json!({"event":"runtime_metadata_loading", "observed_head":head})
+            json!({"event": "runtime_metadata_loading", "observed_head": head})
         );
         let encoded = get_metadata(rpc, &head).await?;
         let bytes = decode_runtime_metadata(&encoded).context("invalid runtime metadata hex")?;
@@ -364,6 +382,11 @@ async fn poll(
             code_hash,
             metadata: subxt_core::metadata::decode_from(&bytes[..])?,
         });
+    } else {
+        log::debug!(
+            "{}",
+            json!({"event": "runtime_metadata_cached", "observed_head": head})
+        );
     }
 
     let pending = rpc.get_pending_extrinsics().await?;
@@ -373,6 +396,15 @@ async fn poll(
 
     // A new block can reuse metadata, but a changed runtime requires another observation
     if latest_head != head && runtime_code_hash(rpc, &latest_head).await? != code_hash {
+        log::info!(
+            "{}",
+            json!({
+                "event": "poll_discarded",
+                "observed_head": head,
+                "latest_head": latest_head,
+                "reason": "runtime_changed"
+            })
+        );
         return Ok(None);
     }
     let metadata = &cached
@@ -395,7 +427,7 @@ async fn poll(
     let mut output = Vec::new();
     let mut previously_seen = 0_usize;
 
-    for encoded in pending {
+    for (index, encoded) in pending.into_iter().enumerate() {
         let bytes = hex::decode(
             encoded
                 .strip_prefix("0x")
@@ -409,6 +441,10 @@ async fn poll(
 
         if previous.contains(&normalized) {
             previously_seen += 1;
+            log::trace!(
+                "{}",
+                json!({"event": "pending_extrinsic_previously_seen", "index": index})
+            );
             continue;
         }
 
@@ -433,6 +469,11 @@ async fn poll(
                 order["spot_plan"] = snapshot.analyze(&order, settings);
             }
             output.push(order);
+        } else {
+            log::trace!(
+                "{}",
+                json!({"event": "pending_extrinsic_filtered", "index": index})
+            );
         }
     }
 
@@ -440,12 +481,16 @@ async fn poll(
         order["observed_head"] = json!(head);
     }
 
-    eprintln!(
+    log::info!(
         "{}",
-        json!({"event":"pool_observed", "observed_head":head,
-        "pending":pending_count, "previously_seen":previously_seen,
-        "new_matching_orders":output.len(),
-        "new_nonmatching_orders":pending_count - previously_seen - output.len()})
+        json!({
+            "event": "pool_observed",
+            "observed_head": head,
+            "pending": pending_count,
+            "previously_seen": previously_seen,
+            "new_matching_orders": output.len(),
+            "new_nonmatching_orders": pending_count - previously_seen - output.len()
+        })
     );
     *previous = current;
     Ok(Some(output))

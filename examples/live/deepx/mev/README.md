@@ -22,6 +22,11 @@
 `finalized_reconciled` 和 `execution_complete` 的链上证据为准。
 可用 `>orders.jsonl 2>runtime.jsonl` 分别保存两类输出。
 
+`--log-level error|warn|info|debug|trace` 控制 stderr 诊断级别，默认 `info`，与原有事件一致。
+`debug` 额外输出运行时元数据缓存命中、nonce 证据、盘口摘要、签名、journal 提交、
+退出等待与原因、每个最终区块的扫描以及成交匹配；`trace` 再输出交易池条目的过滤结果。
+每行包含 `event`、`level` 和毫秒时间戳 `ts_ms`。stdout 的结果不受级别影响。
+
 ## 构建与只读观察
 
 从仓库根目录运行，使用已有依赖缓存时可追加 `--offline`：
