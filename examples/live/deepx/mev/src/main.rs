@@ -41,13 +41,12 @@ async fn main() -> anyhow::Result<()> {
     if args.len() < 5 || args[0] == "--help" {
         println!(
             "Usage: deepx-mev RPC_URL EXPECTED_GENESIS_HASH MARKET MINIMUM_RAW_SIZE POLL_MS\n\
-             [--once] [--check-runtime] [--inspect-wallet 0xAccountId20] [--ordering-account 0xAccountId20]\n\
+             [--once] [--inspect-wallet 0xAccountId20] [--ordering-account 0xAccountId20]\n\
              [--front-size RAW_BASE --minimum-profit RAW_QUOTE --cost-budget RAW_QUOTE]\n\
              [--execute|--check-account --subaccount 0xAccountId20 --journal PATH\n\
               --maximum-loss RAW_QUOTE --exit-after-blocks N [--wallet 0xAccountId20]]\n\
-             [--log-level error|warn|info|debug|trace]\n\
              MARKET: perp:<u16>, spot:<pair hash>, or spot-quote:<pair hash>\n\
-             Output: JSON lines on stdout; diagnostics on stderr (default level: info)."
+             Output: JSON lines on stdout; diagnostics on stderr (RUST_LOG, default: info)."
         );
         anyhow::ensure!(
             args.first().is_some_and(|arg| arg == "--help"),
@@ -57,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut once = false;
-    let mut check_runtime = false;
     let mut inspect_wallet = None;
     let mut ordering_account = None;
     let mut maximum_front_size = None;
@@ -70,7 +68,6 @@ async fn main() -> anyhow::Result<()> {
     let mut journal_path = None;
     let mut maximum_loss = None;
     let mut exit_after_blocks = None;
-    let mut log_level = None;
     let mut options = args[5..].iter();
     while let Some(option) = options.next() {
         match option.as_str() {
@@ -89,10 +86,6 @@ async fn main() -> anyhow::Result<()> {
                 inspect_wallet = Some(execution::parse_account(
                     options.next().context("missing wallet")?,
                 )?);
-            }
-            "--check-runtime" => {
-                anyhow::ensure!(!check_runtime, "duplicate runtime check");
-                check_runtime = true;
             }
             "--execute" => {
                 anyhow::ensure!(!execute, "duplicate --execute option");
@@ -158,22 +151,11 @@ async fn main() -> anyhow::Result<()> {
             "--cost-budget" => {
                 cost_budget = options.next().context("missing cost budget")?.parse()?;
             }
-            "--log-level" => {
-                anyhow::ensure!(log_level.is_none(), "duplicate log level");
-                log_level = Some(
-                    options
-                        .next()
-                        .context("missing log level")?
-                        .parse::<log::LevelFilter>()?,
-                );
-            }
             _ => anyhow::bail!("unknown option: {option}"),
         }
     }
 
-    env_logger::Builder::new()
-        .filter_level(log_level.unwrap_or(log::LevelFilter::Info))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let expected_genesis = parse_hash(&args[1])?;
     let market = Market::parse(&args[2])?;
     anyhow::ensure!(
@@ -186,11 +168,7 @@ async fn main() -> anyhow::Result<()> {
         cost_budget,
     });
     anyhow::ensure!(
-        !check_runtime || (!execute && !check_account),
-        "runtime check is a read-only mode"
-    );
-    anyhow::ensure!(
-        inspect_wallet.is_none() || (!execute && !check_runtime && !check_account),
+        inspect_wallet.is_none() || (!execute && !check_account),
         "wallet inspection is a separate read-only mode"
     );
     anyhow::ensure!(
@@ -272,24 +250,6 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         return Ok(());
     }
-    if check_runtime {
-        let observed = deepx_rust_sdk::rpc::runtime_snapshot::observe_current_runtime_snapshot(
-            &rpc,
-            &deepx_rust_sdk::enums::DeepXEnvironment::Testnet,
-            expected_genesis,
-        )
-        .await?;
-        let block_hash = observed.block_hash();
-        let snapshot = observed.into_snapshot();
-        execution::validate_storage_interface(snapshot.metadata())?;
-        println!(
-            "{}",
-            json!({"event":"execution_runtime_checked","spec_version":snapshot.identity().spec_version,
-            "transaction_version":snapshot.identity().transaction_version,"observed_head":format!("0x{}",hex::encode(block_hash)),
-            "metadata_sha256":format!("0x{}",hex::encode(snapshot.identity().metadata_sha256))})
-        );
-        return Ok(());
-    }
     if let Some(execution) = &execution
         && execution.resume(&rpc, poll_ms).await?
     {
@@ -314,7 +274,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(orders) = result {
                     let count = orders.len();
                     for order in orders {
-                        println!("{order}");
                         if let (Some(execution), Some(settings)) = (&execution, &spot_settings)
                             && execution.consider(&rpc, &order, settings, poll_ms).await? {
                             return Ok(());
@@ -340,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct CachedRuntime {
+    head: String,
     code_hash: [u8; 32],
     metadata: Metadata,
 }
@@ -366,7 +326,10 @@ async fn poll(
     spot_settings: Option<&spot::Settings>,
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
     let head = rpc.get_best_block_hash_once().await?;
-    let code_hash = runtime_code_hash(rpc, &head).await?;
+    let code_hash = match cached.as_ref().filter(|runtime| runtime.head == head) {
+        Some(runtime) => runtime.code_hash,
+        None => runtime_code_hash(rpc, &head).await?,
+    };
 
     if cached
         .as_ref()
@@ -379,10 +342,12 @@ async fn poll(
         let encoded = get_metadata(rpc, &head).await?;
         let bytes = decode_runtime_metadata(&encoded).context("invalid runtime metadata hex")?;
         *cached = Some(CachedRuntime {
+            head: head.clone(),
             code_hash,
             metadata: subxt_core::metadata::decode_from(&bytes[..])?,
         });
     } else {
+        cached.as_mut().context("missing runtime metadata")?.head = head.clone();
         log::debug!(
             "{}",
             json!({"event": "runtime_metadata_cached", "observed_head": head})
@@ -411,23 +376,15 @@ async fn poll(
         .as_ref()
         .context("missing runtime metadata")?
         .metadata;
-    let nonce_evidence = if let Some(account) = ordering_account {
-        Some(ordering::observe(rpc, metadata, &head, account, &pending).await?)
-    } else {
-        None
-    };
-    let spot_snapshot = match (spot_settings, market) {
-        (Some(_), Market::Spot(pair) | Market::SpotQuote(pair)) => {
-            Some(spot::observe(rpc, metadata, &head, *pair).await?)
-        }
-        (None, _) => None,
-        (Some(_), _) => anyhow::bail!("Spot analysis requires a Spot market"),
-    };
+    anyhow::ensure!(
+        spot_settings.is_none() || matches!(market, Market::Spot(_) | Market::SpotQuote(_)),
+        "Spot analysis requires a Spot market"
+    );
     let mut current = HashSet::new();
     let mut output = Vec::new();
     let mut previously_seen = 0_usize;
 
-    for (index, encoded) in pending.into_iter().enumerate() {
+    for (index, encoded) in pending.iter().enumerate() {
         let bytes = hex::decode(
             encoded
                 .strip_prefix("0x")
@@ -441,14 +398,47 @@ async fn poll(
 
         if previous.contains(&normalized) {
             previously_seen += 1;
-            log::trace!(
+            log::warn!(
                 "{}",
                 json!({"event": "pending_extrinsic_previously_seen", "index": index})
             );
             continue;
         }
 
-        if let Some(mut order) = decode_order(metadata, bytes, market, minimum)? {
+        let decoded = decode_order(metadata, bytes, market, minimum).inspect_err(|e| {
+            log::error!(
+                "{}",
+                json!({
+                    "event": "pending_order_decode_failed",
+                    "index": index,
+                    "error": format!("{e:#}")
+                })
+            );
+        })?;
+
+        if let Some(order) = decoded {
+            output.push(order);
+        } else {
+            log::debug!(
+                "{}",
+                json!({"event": "pending_extrinsic_filtered", "index": index})
+            );
+        }
+    }
+
+    if !output.is_empty() {
+        let nonce_evidence = if let Some(account) = ordering_account {
+            Some(ordering::observe(rpc, metadata, &head, account, &pending).await?)
+        } else {
+            None
+        };
+        let spot_snapshot = match (spot_settings, market) {
+            (Some(_), Market::Spot(pair) | Market::SpotQuote(pair)) => {
+                Some(spot::observe(rpc, metadata, &head, *pair).await?)
+            }
+            _ => None,
+        };
+        for order in &mut output {
             if let Some(evidence) = &nonce_evidence {
                 let target = order["nonce"]
                     .as_str()
@@ -466,14 +456,8 @@ async fn poll(
                 };
             }
             if let (Some(snapshot), Some(settings)) = (&spot_snapshot, spot_settings) {
-                order["spot_plan"] = snapshot.analyze(&order, settings);
+                order["spot_plan"] = snapshot.analyze(order, settings);
             }
-            output.push(order);
-        } else {
-            log::trace!(
-                "{}",
-                json!({"event": "pending_extrinsic_filtered", "index": index})
-            );
         }
     }
 
@@ -552,6 +536,7 @@ fn decode_order(
                 | (Market::Perp(_), "PerpMarket")
         )
     {
+        log::debug!(target:"order", "skipping non-place_order extrinsic or mismatched variant {}, pallet: {}, market: {:?}", details.variant_name()?, pallet, market);
         return Ok(None);
     }
 
@@ -562,6 +547,7 @@ fn decode_order(
             let actual = fixed_bytes::<32>(params.at("pair").context("missing pair")?)?;
 
             if actual != *pair {
+                log::debug!(target:"order", "skipping order due to mismatched pair: expected 0x{}, got 0x{}", hex::encode(pair), hex::encode(actual));
                 return Ok(None);
             }
 
@@ -603,6 +589,8 @@ fn decode_order(
     };
 
     if threshold_size < minimum {
+        // Skip orders that do not meet the minimum threshold size
+        log::warn!("order below minimum threshold size: {}", threshold_size);
         return Ok(None);
     }
 
@@ -939,24 +927,30 @@ mod tests {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
         let mut script = Vec::new();
-        for pool in [
+        for (index, pool) in [
             json!([encoded]),
             json!([encoded]),
             json!([]),
             json!([encoded]),
-        ] {
-            script.extend([
-                ("chain_getBlockHash", json!("head")),
-                (
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            script.push(("chain_getBlockHash", json!("head")));
+            if index == 0 {
+                script.push((
                     "state_getStorageHash",
                     json!(format!("0x{}", "11".repeat(32))),
-                ),
+                ));
+            }
+            script.extend([
                 ("author_pendingExtrinsics", pool),
                 ("chain_getBlockHash", json!("head")),
             ]);
         }
         let (rpc, server) = mock_rpc(script).await;
         let mut cached = Some(CachedRuntime {
+            head: "old_head".into(),
             code_hash: [0x11; 32],
             metadata: runtime.metadata().clone(),
         });
@@ -983,6 +977,111 @@ mod tests {
     }
 
     #[rstest]
+    #[case("empty")]
+    #[case("filtered")]
+    #[case("seen")]
+    #[tokio::test]
+    async fn no_new_matching_orders_skip_nonce_and_book_reads(#[case] pool_kind: &str) {
+        let runtime = runtime();
+        let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
+        let pool = if pool_kind == "empty" {
+            json!([])
+        } else {
+            json!([encoded])
+        };
+        let (rpc, server) = mock_rpc(vec![
+            ("chain_getBlockHash", json!("head")),
+            ("author_pendingExtrinsics", pool),
+            ("chain_getBlockHash", json!("head")),
+        ])
+        .await;
+        let mut cached = Some(CachedRuntime {
+            head: "head".into(),
+            code_hash: [0x11; 32],
+            metadata: runtime.metadata().clone(),
+        });
+        let mut previous = if pool_kind == "seen" {
+            HashSet::from([encoded.strip_prefix("0x").unwrap().to_string()])
+        } else {
+            HashSet::new()
+        };
+        let settings = spot::Settings {
+            maximum_front_size: 100,
+            minimum_profit: 0,
+            cost_budget: 0,
+        };
+        let orders = poll(
+            &rpc,
+            &Market::Spot([3; 32]),
+            100,
+            &mut previous,
+            &mut cached,
+            Some([1; 20]),
+            Some(&settings),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(orders.is_empty());
+        assert_eq!(previous.len(), usize::from(pool_kind != "empty"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_evidence_does_not_update_seen_pool() {
+        let runtime = runtime();
+        let bytes = signed(
+            &runtime,
+            DeepXOfflinePalletCall::SpotPlaceOrder(DeepXSpotPlaceParams {
+                subaccount: [2; 20],
+                pair: [3; 32],
+                is_buy: true,
+                quote_amount: [0; 32],
+                base_amount: {
+                    let mut amount = [0; 32];
+                    amount[0] = 100;
+                    amount
+                },
+                order_type: DeepXSpotOrderType::Market(Some(50)),
+                post_only: DeepXPostOnlyParam::None,
+                reduce_only: false,
+            }),
+        );
+        let head = format!("0x{}", "11".repeat(32));
+        let (rpc, server) = mock_rpc(vec![
+            ("chain_getBlockHash", json!(head)),
+            (
+                "author_pendingExtrinsics",
+                json!([format!("0x{}", hex::encode(bytes))]),
+            ),
+            ("chain_getBlockHash", json!(head)),
+            ("state_queryStorageAt", json!([])),
+        ])
+        .await;
+        let mut cached = Some(CachedRuntime {
+            head,
+            code_hash: [0x11; 32],
+            metadata: runtime.metadata().clone(),
+        });
+        let mut previous = HashSet::new();
+        assert!(
+            poll(
+                &rpc,
+                &Market::Spot([3; 32]),
+                100,
+                &mut previous,
+                &mut cached,
+                Some([1; 20]),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(previous.is_empty());
+        server.abort();
+    }
+
+    #[rstest]
     #[case(false)]
     #[case(true)]
     #[tokio::test]
@@ -1001,6 +1100,7 @@ mod tests {
         ])
         .await;
         let mut cached = cached_old_runtime.then(|| CachedRuntime {
+            head: "old_head".into(),
             code_hash: [0x22; 32],
             metadata: runtime.metadata().clone(),
         });
@@ -1049,6 +1149,7 @@ mod tests {
         ])
         .await;
         let mut cached = Some(CachedRuntime {
+            head: "old_head".into(),
             code_hash: [0x11; 32],
             metadata: runtime.metadata().clone(),
         });
@@ -1097,6 +1198,7 @@ mod tests {
         ])
         .await;
         let mut cached = Some(CachedRuntime {
+            head: "old_head".into(),
             code_hash: [0x11; 32],
             metadata: runtime.metadata().clone(),
         });

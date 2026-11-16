@@ -766,20 +766,34 @@ struct Mock {
 
 async fn rpc_handler(RpcState(mock): RpcState<Mock>, Json(request): Json<Value>) -> Json<Value> {
     if mock.outcome.starts_with("idle_") {
-        assert_eq!(request["method"], "state_getStorage");
         let snapshot = runtime_for(mock.modern);
         let metadata = snapshot.metadata();
         let directory = dynamic::storage("SpotMarket", "PairList", Vec::<ScaleValue>::new());
-        let result = if request["params"][0]
-            == encoded(storage::get_address_bytes(&directory, metadata).unwrap())
-        {
-            let value = ScaleValue::unnamed_composite([ScaleValue::named_composite([
-                ("pair", ScaleValue::from_bytes([3; 32])),
-                ("base_market_id", ScaleValue::u128(1)),
-                ("base_symbol", ScaleValue::from_bytes(b"ETH")),
-                ("quote_market_id", ScaleValue::u128(2)),
-                ("quote_symbol", ScaleValue::from_bytes(b"USDC")),
-            ])]);
+        let result = if request["method"] == "state_getStorage" {
+            assert_eq!(
+                request["params"][0],
+                encoded(storage::get_address_bytes(&directory, metadata).unwrap())
+            );
+            let pairs: Vec<[u8; 32]> = if mock.outcome == "idle_many" {
+                (0..129)
+                    .map(|i| {
+                        let mut pair = [0; 32];
+                        pair[..2].copy_from_slice(&(i as u16).to_le_bytes());
+                        pair
+                    })
+                    .collect()
+            } else {
+                vec![[3; 32], [4; 32]]
+            };
+            let value = ScaleValue::unnamed_composite(pairs.into_iter().map(|pair| {
+                ScaleValue::named_composite([
+                    ("pair", ScaleValue::from_bytes(pair)),
+                    ("base_market_id", ScaleValue::u128(1)),
+                    ("base_symbol", ScaleValue::from_bytes(b"ETH")),
+                    ("quote_market_id", ScaleValue::u128(2)),
+                    ("quote_symbol", ScaleValue::from_bytes(b"USDC")),
+                ])
+            }));
             let ty = metadata
                 .pallet_by_name("SpotMarket")
                 .unwrap()
@@ -793,13 +807,43 @@ async fn rpc_handler(RpcState(mock): RpcState<Mock>, Json(request): Json<Value>)
             encode_as_type(&value, ty, metadata.types(), &mut bytes).unwrap();
             json!(encoded(bytes))
         } else {
-            assert_eq!(request["params"][0], native_order_key(metadata));
-            match mock.outcome {
+            assert_eq!(request["method"], "state_queryStorageAt");
+            let keys = request["params"][0].as_array().unwrap();
+            assert_eq!(request["params"][1], encoded([100; 32]));
+            if mock.outcome == "idle_many" {
+                assert!(keys.len() == 128 || keys.len() == 1);
+            } else {
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], native_order_key(metadata));
+            }
+            let value = match mock.outcome {
                 "idle_absent" => Value::Null,
                 "idle_empty" => json!("0x00"),
                 "idle_existing" => json!(native_active_storage(&mock.state, mock.modern)),
-                _ => panic!("unexpected idle outcome"),
+                _ => Value::Null,
+            };
+            let mut changes: Vec<_> = keys.iter().rev().map(|key| json!([key, value])).collect();
+            match mock.outcome {
+                "idle_missing" => {
+                    changes.pop();
+                }
+                "idle_duplicate" => {
+                    changes[1] = changes[0].clone();
+                }
+                "idle_unknown" => {
+                    changes[1] = json!(["0x1234", null]);
+                }
+                "idle_mixed" => {
+                    changes[0][1] = json!("0x00");
+                }
+                _ => {}
             }
+            let block = if mock.outcome == "idle_wrong_block" {
+                json!(encoded([99; 32]))
+            } else {
+                request["params"][1].clone()
+            };
+            json!([{"block":block,"changes":changes}])
         };
         return Json(json!({"jsonrpc":"2.0","id":1,"result":result}));
     }
@@ -950,7 +994,13 @@ async fn disappeared_target_aborts_before_submission() {
 #[rstest]
 #[case("idle_absent", true)]
 #[case("idle_empty", true)]
+#[case("idle_mixed", true)]
+#[case("idle_many", true)]
 #[case("idle_existing", false)]
+#[case("idle_missing", false)]
+#[case("idle_duplicate", false)]
+#[case("idle_unknown", false)]
+#[case("idle_wrong_block", false)]
 #[tokio::test]
 async fn native_pair_directory_checks_orders_independently_of_legacy_positions(
     #[case] outcome: &'static str,

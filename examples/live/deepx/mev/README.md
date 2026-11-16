@@ -20,9 +20,11 @@
 执行日志包含准备、提交返回及逐个最终区块核对，使用交易哈希关联，
 不会打印私钥或签名原文。`rpc_accepted` 只表示提交 RPC 成功返回，最终成交以
 `finalized_reconciled` 和 `execution_complete` 的链上证据为准。
-可用 `>orders.jsonl 2>runtime.jsonl` 分别保存两类输出。
+可用 `RUST_LOG=debug target/debug/deepx-mev ...` 启用调试日志；也可用
+`RUST_LOG=deepx_mev=debug` 按模块过滤。可用 `>orders.jsonl 2>runtime.jsonl`
+分别保存两类输出。
 
-`--log-level error|warn|info|debug|trace` 控制 stderr 诊断级别，默认 `info`，与原有事件一致。
+通过 `RUST_LOG=error|warn|info|debug|trace` 控制 stderr 诊断级别，默认 `info`，与原有事件一致。
 `debug` 额外输出运行时元数据缓存命中、nonce 证据、盘口摘要、签名、journal 提交、
 退出等待与原因、每个最终区块的扫描以及成交匹配；`trace` 再输出交易池条目的过滤结果。
 每行包含 `event`、`level` 和毫秒时间戳 `ts_ms`。stdout 的结果不受级别影响。
@@ -54,12 +56,11 @@ target/debug/deepx-mev \
 `--cost-budget` 为额外报价资产成本预算，默认 0。
 `--ordering-account <0xAccountId20>` 读取账户配额、已用 nonce 窗口和该签名者全部待处理交易，
 输出目标前后的可用时间 nonce。只读计划不是 nonce 预留，`execution_ready` 保持 false。
-`--check-runtime` 单独校验当前测试网元数据与 SDK 签名接口，输出运行时身份后退出，
-不加载密钥；不能与 `--execute` 同时使用。
-
 输出为 JSON Lines；金融整数输出为十进制字符串。
 同一交易在连续交易池快照中仅输出一次，离开后重新进入会再次输出。
 按区块绑定的 `:code` 哈希缓存运行时元数据；读取期间运行时代码变化时丢弃观察。
+同一区块内复用代码哈希；仅在发现新的匹配订单时读取 nonce 和盘口，因此没有新候选时
+不会检测这些附加读取的错误。执行前仍会独立复核最新数据。
 畸形或重复交易池数据使整轮失败，不输出部分成功结果。
 仅解析顶层原生现货和永续下单，不解包代理、批量或 EVM 调用。
 
@@ -101,7 +102,8 @@ target/debug/deepx-mev "$RPC_URL" "$GENESIS_HASH" "spot:$PAIR" \
 主钱包 nonce/配额、子账户状态、全现货交易对的原生活动订单和 Lending 借款，
 输出 `execution_account_checked` 后退出；不签名、提交或恢复旧 journal。
 它仍需密钥环境变量以及上述子账户、journal 和风险参数；无需 `--front-size`。
-它与 `--execute`、`--check-runtime` 和 `--inspect-wallet` 互斥。
+它与 `--execute` 和 `--inspect-wallet` 互斥。
+原生活动订单按固定区块分批查询，并验证返回的区块和全部存储键。
 检查通过不是 nonce 预留，也不证明未来某个数量的订单可以成交。
 
 `--execute` 不会因启动而立即下单；程序等待满足约束的机会，然后处理一个生命周期并退出。
@@ -198,8 +200,8 @@ IOC 的阶段顺序才能使其先买到现有卖盘。
 
 ### 指定钱包的最终状态检查
 
-`--inspect-wallet` 是独立只读模式，不加载签名密钥，也不能与 `--execute` 或
-`--check-runtime` 同时使用。它从同一最终区块读取链上钱包目录、每个子账户的所有权与
+`--inspect-wallet` 是独立只读模式，不加载签名密钥，也不能与 `--execute` 同时使用。
+它从同一最终区块读取链上钱包目录、每个子账户的所有权与
 完整账户字段、Lending 全部市场的 scaled 资产头寸、委托记录以及主账户 nonce/配额。
 读取后重新核对该高度的区块哈希，避免混用不同检查点的数据。
 金额整数以字符串输出；`scaled_deposit` 需要结合池的存款指数与资产精度解释，不能直接当作

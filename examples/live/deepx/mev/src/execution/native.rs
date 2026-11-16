@@ -21,7 +21,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use deepx_rust_sdk::rpc::{DeepXRpcClient, spot_place::DeepXSpotPlaceExpected};
+use deepx_rust_sdk::rpc::{
+    DeepXRpcClient, DeepXRpcStorageChangeSet, spot_place::DeepXSpotPlaceExpected,
+};
 use subxt_core::{
     Metadata, dynamic,
     events::{Events, Phase},
@@ -198,19 +200,37 @@ pub(super) async fn require_idle(
         "Spot directory exceeds account inspection bound"
     );
     let mut seen = BTreeSet::new();
+    let mut keys = Vec::with_capacity(pairs.len());
     for pair in pairs.values() {
         let pair =
             crate::fixed_bytes::<32>(pair.at("pair").context("missing Spot directory pair")?)?;
         anyhow::ensure!(seen.insert(pair), "duplicate Spot pair directory entry");
-        if let Some(raw) = rpc
-            .get_storage(&key(metadata, account, pair)?, head)
-            .await?
-        {
-            // The validated value type is Vec<SpotOrder>. SCALE's only empty vector is 0x00.
+        keys.push(key(metadata, account, pair)?);
+    }
+    for batch in keys.chunks(128) {
+        let sets: Vec<DeepXRpcStorageChangeSet> = rpc.query_storage_at(batch, head).await?;
+        anyhow::ensure!(
+            sets.len() == 1 && sets[0].block == head,
+            "invalid native Spot storage block"
+        );
+        let changes = &sets[0].changes;
+        anyhow::ensure!(
+            changes.len() == batch.len(),
+            "incomplete native Spot storage"
+        );
+        let mut returned = BTreeSet::new();
+        for (key, raw) in changes {
             anyhow::ensure!(
-                super::decode_hex(&raw)? == [0],
-                "execution subaccount has existing native Spot orders"
+                batch.contains(key) && returned.insert(key),
+                "unexpected or duplicate native Spot storage key"
             );
+            if let Some(raw) = raw {
+                // The validated value type is Vec<SpotOrder>; its only empty encoding is 0x00
+                anyhow::ensure!(
+                    super::decode_hex(raw)? == [0],
+                    "execution subaccount has existing native Spot orders"
+                );
+            }
         }
     }
     Ok(())
