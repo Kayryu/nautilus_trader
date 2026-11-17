@@ -300,7 +300,6 @@ async fn main() -> anyhow::Result<()> {
 
 struct CachedRuntime {
     head: String,
-    code_hash: [u8; 32],
     metadata: Metadata,
 }
 
@@ -325,29 +324,74 @@ async fn poll(
     ordering_account: Option<[u8; 20]>,
     spot_settings: Option<&spot::Settings>,
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
-    let head = rpc.get_best_block_hash_once().await?;
-    let code_hash = match cached.as_ref().filter(|runtime| runtime.head == head) {
-        Some(runtime) => runtime.code_hash,
-        None => runtime_code_hash(rpc, &head).await?,
-    };
+    for attempt in 1..=3 {
+        match poll_once(
+            rpc,
+            market,
+            minimum,
+            previous,
+            cached,
+            ordering_account,
+            spot_settings,
+        )
+        .await
+        {
+            Err(e) if is_unknown_block(&e) && attempt < 3 => {
+                // Restart the whole observation rather than mixing state from different heads
+                *cached = None;
+                log::warn!(
+                    "{}",
+                    json!({
+                        "event": "poll_discarded",
+                        "reason": "state_block_unavailable",
+                        "attempt": attempt,
+                        "error": format!("{e:#}")
+                    })
+                );
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final polling attempt always returns")
+}
 
-    if cached
-        .as_ref()
-        .is_none_or(|runtime| runtime.code_hash != code_hash)
-    {
+fn is_unknown_block(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("RPC error -32000:") && message.contains("UnknownBlock:")
+    })
+}
+
+async fn poll_once(
+    rpc: &DeepXRpcClient,
+    market: &Market,
+    minimum: u128,
+    previous: &mut HashSet<String>,
+    cached: &mut Option<CachedRuntime>,
+    ordering_account: Option<[u8; 20]>,
+    spot_settings: Option<&spot::Settings>,
+) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    let head = rpc.get_best_block_hash_once().await?;
+
+    if cached.as_ref().is_none_or(|runtime| runtime.head != head) {
         log::info!(
             "{}",
             json!({"event": "runtime_metadata_loading", "observed_head": head})
         );
-        let encoded = get_metadata(rpc, &head).await?;
+        let encoded: String = rpc
+            .execute_rpc_call(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "state_getMetadata",
+                "params": [head],
+            }))
+            .await?;
         let bytes = decode_runtime_metadata(&encoded).context("invalid runtime metadata hex")?;
         *cached = Some(CachedRuntime {
             head: head.clone(),
-            code_hash,
             metadata: subxt_core::metadata::decode_from(&bytes[..])?,
         });
     } else {
-        cached.as_mut().context("missing runtime metadata")?.head = head.clone();
         log::debug!(
             "{}",
             json!({"event": "runtime_metadata_cached", "observed_head": head})
@@ -359,15 +403,15 @@ async fn poll(
 
     let latest_head = rpc.get_best_block_hash_once().await?;
 
-    // A new block can reuse metadata, but a changed runtime requires another observation
-    if latest_head != head && runtime_code_hash(rpc, &latest_head).await? != code_hash {
+    // Discard the pending pool before decoding if the observed head has changed
+    if latest_head != head {
         log::info!(
             "{}",
             json!({
                 "event": "poll_discarded",
                 "observed_head": head,
                 "latest_head": latest_head,
-                "reason": "runtime_changed"
+                "reason": "head_changed"
             })
         );
         return Ok(None);
@@ -398,7 +442,7 @@ async fn poll(
 
         if previous.contains(&normalized) {
             previously_seen += 1;
-            log::warn!(
+            log::debug!(
                 "{}",
                 json!({"event": "pending_extrinsic_previously_seen", "index": index})
             );
@@ -898,7 +942,20 @@ mod tests {
     async fn mock_rpc(
         script: Vec<(&'static str, serde_json::Value)>,
     ) -> (DeepXRpcClient, tokio::task::JoinHandle<()>) {
-        type Script = Arc<Mutex<VecDeque<(&'static str, serde_json::Value)>>>;
+        mock_rpc_responses(
+            script
+                .into_iter()
+                .map(|(method, value)| (method, Ok(value)))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn mock_rpc_responses(
+        script: Vec<(&'static str, Result<serde_json::Value, serde_json::Value>)>,
+    ) -> (DeepXRpcClient, tokio::task::JoinHandle<()>) {
+        type Script =
+            Arc<Mutex<VecDeque<(&'static str, Result<serde_json::Value, serde_json::Value>)>>>;
         async fn respond(
             State(script): State<Script>,
             Json(request): Json<serde_json::Value>,
@@ -909,7 +966,10 @@ mod tests {
                 .pop_front()
                 .expect("unexpected RPC call");
             assert_eq!(request["method"], method);
-            Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+            Json(match result {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+                Err(e) => json!({"jsonrpc": "2.0", "id": request["id"], "error": e}),
+            })
         }
         let app = Router::new()
             .route("/", post(respond))
@@ -922,27 +982,109 @@ mod tests {
         (DeepXRpcClient::new_with_proxy(url, None).unwrap(), server)
     }
 
+    fn unknown_block() -> serde_json::Value {
+        json!({
+            "code": -32000,
+            "message": "Client error: UnknownBlock: Can not pin MVCC state for block `old_head`. Block not found."
+        })
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn unavailable_metadata_restarts_observation_and_invalidates_cache(
+        #[case] already_cached: bool,
+    ) {
+        let runtime = runtime();
+        let mut script = vec![
+            ("chain_getBlockHash", Ok(json!("old_head"))),
+            ("state_getMetadata", Err(unknown_block())),
+        ];
+        let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
+        script.extend([
+            ("chain_getBlockHash", Ok(json!("fresh_head"))),
+            ("state_getMetadata", Ok(json!(encoded_metadata()))),
+            ("author_pendingExtrinsics", Ok(json!([encoded]))),
+            ("chain_getBlockHash", Ok(json!("fresh_head"))),
+        ]);
+        let (rpc, server) = mock_rpc_responses(script).await;
+        let mut previous = HashSet::from(["previous_pool_entry".to_string()]);
+        let mut cached = already_cached.then(|| CachedRuntime {
+            head: "fresh_head".into(),
+            metadata: runtime.metadata().clone(),
+        });
+        let orders = poll(
+            &rpc,
+            &Market::Perp(7),
+            100,
+            &mut previous,
+            &mut cached,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0]["observed_head"], "fresh_head");
+        assert_eq!(cached.unwrap().head, "fresh_head");
+        assert_eq!(previous, HashSet::from([encoded[2..].to_string()]));
+        server.abort();
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn polling_retries_only_unknown_blocks_and_stops_after_three_attempts(
+        #[case] unavailable: bool,
+    ) {
+        let attempts = if unavailable { 3 } else { 1 };
+        let error = if unavailable {
+            unknown_block()
+        } else {
+            json!({"code": -32000, "message": "Client error: invalid storage"})
+        };
+        let mut script = Vec::new();
+        for _ in 0..attempts {
+            script.extend([
+                ("chain_getBlockHash", Ok(json!("head"))),
+                ("state_getMetadata", Err(error.clone())),
+            ]);
+        }
+        let (rpc, server) = mock_rpc_responses(script).await;
+        let mut previous = HashSet::from(["previous_pool_entry".to_string()]);
+        let mut cached = None;
+        let e = poll(
+            &rpc,
+            &Market::Perp(7),
+            100,
+            &mut previous,
+            &mut cached,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(is_unknown_block(&e), unavailable);
+        assert!(cached.is_none());
+        assert_eq!(previous, HashSet::from(["previous_pool_entry".to_string()]));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn pool_observations_deduplicate_and_report_reappearance() {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
         let mut script = Vec::new();
-        for (index, pool) in [
+        for pool in [
             json!([encoded]),
             json!([encoded]),
             json!([]),
             json!([encoded]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ] {
             script.push(("chain_getBlockHash", json!("head")));
-            if index == 0 {
-                script.push((
-                    "state_getStorageHash",
-                    json!(format!("0x{}", "11".repeat(32))),
-                ));
-            }
             script.extend([
                 ("author_pendingExtrinsics", pool),
                 ("chain_getBlockHash", json!("head")),
@@ -950,8 +1092,7 @@ mod tests {
         }
         let (rpc, server) = mock_rpc(script).await;
         let mut cached = Some(CachedRuntime {
-            head: "old_head".into(),
-            code_hash: [0x11; 32],
+            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -997,7 +1138,6 @@ mod tests {
         .await;
         let mut cached = Some(CachedRuntime {
             head: "head".into(),
-            code_hash: [0x11; 32],
             metadata: runtime.metadata().clone(),
         });
         let mut previous = if pool_kind == "seen" {
@@ -1060,7 +1200,6 @@ mod tests {
         .await;
         let mut cached = Some(CachedRuntime {
             head,
-            code_hash: [0x11; 32],
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -1085,23 +1224,18 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn metadata_is_loaded_for_initial_or_changed_runtime(#[case] cached_old_runtime: bool) {
+    async fn metadata_is_loaded_for_initial_or_changed_head(#[case] cached_old_head: bool) {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
         let (rpc, server) = mock_rpc(vec![
             ("chain_getBlockHash", json!("head")),
-            (
-                "state_getStorageHash",
-                json!(format!("0x{}", "11".repeat(32))),
-            ),
             ("state_getMetadata", json!(encoded_metadata())),
             ("author_pendingExtrinsics", json!([encoded])),
             ("chain_getBlockHash", json!("head")),
         ])
         .await;
-        let mut cached = cached_old_runtime.then(|| CachedRuntime {
+        let mut cached = cached_old_head.then(|| CachedRuntime {
             head: "old_head".into(),
-            code_hash: [0x22; 32],
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -1118,7 +1252,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(cached.unwrap().code_hash, [0x11; 32]);
+        assert_eq!(cached.unwrap().head, "head");
         server.abort();
     }
 
@@ -1126,34 +1260,25 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn pool_observation_accepts_head_changes_only_with_unchanged_runtime(
-        #[case] upgraded: bool,
+    async fn pool_observation_discards_changed_head_before_consuming_pending(
+        #[case] invalid_pending: bool,
     ) {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
         let (rpc, server) = mock_rpc(vec![
             ("chain_getBlockHash", json!("head")),
             (
-                "state_getStorageHash",
-                json!(format!("0x{}", "11".repeat(32))),
+                "author_pendingExtrinsics",
+                json!([if invalid_pending { "invalid" } else { &encoded }]),
             ),
-            ("author_pendingExtrinsics", json!([encoded])),
             ("chain_getBlockHash", json!("new_head")),
-            (
-                "state_getStorageHash",
-                json!(format!(
-                    "0x{}",
-                    if upgraded { "22" } else { "11" }.repeat(32)
-                )),
-            ),
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head: "old_head".into(),
-            code_hash: [0x11; 32],
+            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
-        let mut previous = HashSet::new();
+        let mut previous = HashSet::from(["previous_pool_entry".to_string()]);
         let result = poll(
             &rpc,
             &Market::Perp(7),
@@ -1165,13 +1290,9 @@ mod tests {
         )
         .await
         .unwrap();
-        if upgraded {
-            assert!(result.is_none());
-            assert!(previous.is_empty());
-        } else {
-            assert_eq!(result.unwrap().len(), 1);
-            assert_eq!(previous.len(), 1);
-        }
+        assert!(result.is_none());
+        assert_eq!(previous, HashSet::from(["previous_pool_entry".to_string()]));
+        assert_eq!(cached.unwrap().head, "head");
         server.abort();
     }
 
@@ -1189,17 +1310,12 @@ mod tests {
         };
         let (rpc, server) = mock_rpc(vec![
             ("chain_getBlockHash", json!("head")),
-            (
-                "state_getStorageHash",
-                json!(format!("0x{}", "11".repeat(32))),
-            ),
             ("author_pendingExtrinsics", json!([encoded, invalid])),
             ("chain_getBlockHash", json!("head")),
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head: "old_head".into(),
-            code_hash: [0x11; 32],
+            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
