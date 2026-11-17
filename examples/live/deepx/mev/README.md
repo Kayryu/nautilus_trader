@@ -31,6 +31,52 @@
 
 ## 构建与只读观察
 
+### 构建独立 Docker 镜像
+
+镜像只包含 native 环境预先编译的 `deepx-mev`、运行时证书和非 root 用户，
+不在 Docker build 阶段安装 Rust 或编译源码，也不包含私钥、配置文件或源码。
+必须从仓库根目录先编译二进制，再构建镜像：
+
+```bash
+cargo build --release --locked \
+  --manifest-path examples/live/deepx/mev/Cargo.toml --target-dir target
+
+docker build -f examples/live/deepx/mev/Dockerfile -t deepx-mev .
+```
+
+如果 native 构建使用了其他 `--target-dir`，请同步修改 Dockerfile 中的二进制复制路径。
+同时更新同目录的 Dockerfile.dockerignore；它仅允许该二进制进入构建上下文。
+native 产物必须是与目标镜像 CPU 架构一致的 Linux 二进制，并兼容 Debian Trixie
+的 glibc 2.41。使用更新发行版构建时应检查 glibc 版本要求，必要时调整运行时基础镜像。
+
+只读观察可以直接运行。将 `EXPECTED_GENESIS_HASH`、`MARKET` 等占位符替换为实际参数：
+
+```bash
+docker run --rm --init deepx-mev \
+  "$RPC_URL" "$EXPECTED_GENESIS_HASH" "$MARKET" \
+  "$MINIMUM_RAW_SIZE" "$POLL_MS" --once
+```
+
+执行模式需要把 journal 目录挂载到 `/var/lib/deepx-mev`，并通过环境变量注入密钥；不要把
+私钥写入镜像、命令行参数或日志：
+
+```bash
+docker run --rm --init \
+  --env DEEPX_TESTNET_PRIVATE_KEY \
+  --volume "$PWD/.deepx-mev:/var/lib/deepx-mev" \
+  deepx-mev \
+  "$RPC_URL" "$EXPECTED_GENESIS_HASH" "spot:$PAIR" \
+  "$MINIMUM_RAW_SIZE" "$POLL_MS" \
+  --front-size "$MAXIMUM_FRONT_RAW_BASE" \
+  --minimum-profit "$MINIMUM_PROFIT_RAW_QUOTE" \
+  --cost-budget "$COST_BUDGET_RAW_QUOTE" \
+  --execute --subaccount "$SUBACCOUNT" --journal /var/lib/deepx-mev/run.journal \
+  --maximum-loss "$MAXIMUM_LOSS_RAW_QUOTE" --exit-after-blocks "$EXIT_AFTER_BLOCKS"
+```
+
+容器默认以非 root 用户运行，`/var/lib/deepx-mev` 是持久化 journal 的唯一数据卷。
+镜像的默认 `RUST_LOG` 为 `info`，可用 `--env RUST_LOG=debug` 覆盖。
+
 从仓库根目录运行，使用已有依赖缓存时可追加 `--offline`：
 
 ```bash

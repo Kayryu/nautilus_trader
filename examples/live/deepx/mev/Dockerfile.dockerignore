@@ -1,0 +1,5 @@
+# Only the native release binary is needed by this runtime image.
+**
+!target/
+!target/release/
+!target/release/deepx-mev
