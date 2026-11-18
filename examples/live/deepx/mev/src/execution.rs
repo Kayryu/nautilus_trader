@@ -165,6 +165,7 @@ pub(super) struct Execution {
     journal: Journal,
     settings: Settings,
     key: DeepXPrivateKey,
+    runtime: RuntimeSnapshot,
     signer: [u8; 20],
     genesis: [u8; 32],
     pair: [u8; 32],
@@ -173,12 +174,21 @@ pub(super) struct Execution {
 }
 
 impl Execution {
-    pub(super) fn open(
+    pub(super) async fn open(
+        rpc: &DeepXRpcClient,
         settings: Settings,
         genesis: [u8; 32],
         pair: [u8; 32],
     ) -> anyhow::Result<Self> {
         let journal = Journal::open(&settings.journal)?;
+        let runtime = observe_current_runtime_snapshot(
+            rpc,
+            &DeepXEnvironment::Testnet,
+            genesis,
+        )
+        .await?
+        .into_snapshot();
+        validate_storage_interface(runtime.metadata())?;
         let key =
             DeepXPrivateKey::from_env(&DeepXEnvironment::Testnet, &DeepXKeyScheme::Secp256k1)?;
         let signer = derive_signer_account_id(&key)?;
@@ -205,6 +215,7 @@ impl Execution {
             journal,
             settings,
             key,
+            runtime,
             signer,
             genesis,
             pair,
@@ -219,10 +230,8 @@ impl Execution {
 
     /// Validate signing identity and cash-account prerequisites without signing or submitting.
     pub(super) async fn check_account(&self, rpc: &DeepXRpcClient) -> anyhow::Result<()> {
-        let observed =
-            observe_current_runtime_snapshot(rpc, &DeepXEnvironment::Testnet, self.genesis).await?;
-        let head = encoded(observed.block_hash());
-        let snapshot = observed.into_snapshot();
+        let head = rpc.get_best_block_hash_once().await?;
+        let snapshot = self.runtime.clone();
         validate_storage_interface(snapshot.metadata())?;
         let account = read_storage(
             rpc,
@@ -355,10 +364,8 @@ impl Execution {
             self.journal.load()?.is_none(),
             "journal already contains an opportunity"
         );
-        let observed =
-            observe_current_runtime_snapshot(rpc, &DeepXEnvironment::Testnet, self.genesis).await?;
-        let head = encoded(observed.block_hash());
-        let snapshot = observed.into_snapshot();
+        let head = rpc.get_best_block_hash_once().await?;
+        let snapshot = self.runtime.clone();
         let metadata = snapshot.metadata();
         validate_storage_interface(metadata)?;
         let pending = rpc.get_pending_extrinsics().await?;
@@ -864,14 +871,13 @@ impl Execution {
                 "deadline": deadline
             })
         );
-        let observed =
-            observe_current_runtime_snapshot(rpc, &DeepXEnvironment::Testnet, self.genesis).await?;
-        let head = encoded(observed.block_hash());
         anyhow::ensure!(
-            encoded(super::runtime_code_hash(rpc, &head).await?) == state.runtime_code_hash,
+            encoded(super::runtime_code_hash(rpc, &state.cursor_hash).await?)
+                == state.runtime_code_hash,
             "runtime changed with outstanding inventory"
         );
-        let snapshot = observed.into_snapshot();
+        let head = rpc.get_best_block_hash_once().await?;
+        let snapshot = self.runtime.clone();
         let book = spot::observe(rpc, snapshot.metadata(), &head, self.pair).await?;
         anyhow::ensure!(
             book.base_scale == amount(&state.base_scale)?,
@@ -1071,17 +1077,7 @@ impl Execution {
                     == state.runtime_code_hash,
                 "runtime changed during recovery; journal retained"
             );
-            let observed = super::get_metadata(rpc, &state.cursor_hash).await?;
-            let metadata_bytes =
-                super::decode_runtime_metadata(&observed).context("invalid recovery metadata")?;
-            let version: deepx_rust_sdk::rpc::DeepXRpcRuntimeVersion = rpc.execute_rpc_call(json!({"jsonrpc":"2.0","id":1,"method":"state_getRuntimeVersion","params":[state.cursor_hash]})).await?;
-            let snapshot = RuntimeSnapshot::approved_testnet(
-                &DeepXEnvironment::Testnet,
-                self.genesis,
-                version.spec_version,
-                version.transaction_version,
-                &metadata_bytes,
-            )?;
+            let snapshot = self.runtime.clone();
             let events = get_system_events(rpc, &hash, number).await?;
             let mut next = state.clone();
             self.bind_inclusions(

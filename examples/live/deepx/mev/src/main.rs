@@ -185,6 +185,13 @@ async fn main() -> anyhow::Result<()> {
         !execute || !check_account,
         "account check cannot execute trades"
     );
+    let rpc = DeepXRpcClient::new_with_proxy(args[0].clone(), None)?;
+    let genesis = rpc.get_block_hash_required_once(0).await?;
+    anyhow::ensure!(
+        parse_hash(&genesis)? == expected_genesis,
+        "chain genesis mismatch"
+    );
+    log::info!("{}", json!({"event": "chain_verified", "genesis": genesis}));
     let execution = if execute || check_account {
         anyhow::ensure!(
             !execute || spot_settings.is_some(),
@@ -195,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
             Market::Perp(_) => anyhow::bail!("execution currently supports Spot markets"),
         };
         let execution = execution::Execution::open(
+            &rpc,
             execution::Settings {
                 journal: journal_path.context("execution requires --journal")?,
                 subaccount: execution_subaccount.context("execution requires --subaccount")?,
@@ -205,7 +213,8 @@ async fn main() -> anyhow::Result<()> {
             },
             expected_genesis,
             pair,
-        )?;
+        )
+        .await?;
         anyhow::ensure!(
             ordering_account.is_none_or(|account| account == execution.wallet()),
             "ordering account must match execution wallet"
@@ -221,7 +230,6 @@ async fn main() -> anyhow::Result<()> {
         minimum > 0 && poll_ms > 0,
         "size and poll interval must be positive"
     );
-    let rpc = DeepXRpcClient::new_with_proxy(args[0].clone(), None)?;
     log::info!(
         "{}",
         json!({
@@ -232,12 +240,6 @@ async fn main() -> anyhow::Result<()> {
             "maximum_front_size": maximum_front_size.map(|size| size.to_string())
         })
     );
-    let genesis = rpc.get_block_hash_required_once(0).await?;
-    anyhow::ensure!(
-        parse_hash(&genesis)? == expected_genesis,
-        "chain genesis mismatch"
-    );
-    log::info!("{}", json!({"event": "chain_verified", "genesis": genesis}));
     if let Some(wallet) = inspect_wallet {
         execution::inspect_wallet(&rpc, wallet).await?;
         return Ok(());
@@ -299,7 +301,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct CachedRuntime {
-    head: String,
     metadata: Metadata,
 }
 
@@ -338,7 +339,6 @@ async fn poll(
         {
             Err(e) if is_unknown_block(&e) && attempt < 3 => {
                 // Restart the whole observation rather than mixing state from different heads
-                *cached = None;
                 log::warn!(
                     "{}",
                     json!({
@@ -373,7 +373,7 @@ async fn poll_once(
 ) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
     let head = rpc.get_best_block_hash_once().await?;
 
-    if cached.as_ref().is_none_or(|runtime| runtime.head != head) {
+    if cached.is_none() {
         log::info!(
             "{}",
             json!({"event": "runtime_metadata_loading", "observed_head": head})
@@ -388,7 +388,6 @@ async fn poll_once(
             .await?;
         let bytes = decode_runtime_metadata(&encoded).context("invalid runtime metadata hex")?;
         *cached = Some(CachedRuntime {
-            head: head.clone(),
             metadata: subxt_core::metadata::decode_from(&bytes[..])?,
         });
     } else {
@@ -401,21 +400,6 @@ async fn poll_once(
     let pending = rpc.get_pending_extrinsics().await?;
     let pending_count = pending.len();
 
-    let latest_head = rpc.get_best_block_hash_once().await?;
-
-    // Discard the pending pool before decoding if the observed head has changed
-    if latest_head != head {
-        log::info!(
-            "{}",
-            json!({
-                "event": "poll_discarded",
-                "observed_head": head,
-                "latest_head": latest_head,
-                "reason": "head_changed"
-            })
-        );
-        return Ok(None);
-    }
     let metadata = &cached
         .as_ref()
         .context("missing runtime metadata")?
@@ -989,13 +973,8 @@ mod tests {
         })
     }
 
-    #[rstest]
-    #[case(false)]
-    #[case(true)]
     #[tokio::test]
-    async fn unavailable_metadata_restarts_observation_and_invalidates_cache(
-        #[case] already_cached: bool,
-    ) {
+    async fn unavailable_metadata_restarts_observation() {
         let runtime = runtime();
         let mut script = vec![
             ("chain_getBlockHash", Ok(json!("old_head"))),
@@ -1010,10 +989,7 @@ mod tests {
         ]);
         let (rpc, server) = mock_rpc_responses(script).await;
         let mut previous = HashSet::from(["previous_pool_entry".to_string()]);
-        let mut cached = already_cached.then(|| CachedRuntime {
-            head: "fresh_head".into(),
-            metadata: runtime.metadata().clone(),
-        });
+        let mut cached = None;
         let orders = poll(
             &rpc,
             &Market::Perp(7),
@@ -1028,7 +1004,7 @@ mod tests {
         .unwrap();
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0]["observed_head"], "fresh_head");
-        assert_eq!(cached.unwrap().head, "fresh_head");
+        assert!(cached.is_some());
         assert_eq!(previous, HashSet::from([encoded[2..].to_string()]));
         server.abort();
     }
@@ -1085,14 +1061,10 @@ mod tests {
             json!([encoded]),
         ] {
             script.push(("chain_getBlockHash", json!("head")));
-            script.extend([
-                ("author_pendingExtrinsics", pool),
-                ("chain_getBlockHash", json!("head")),
-            ]);
+            script.push(("author_pendingExtrinsics", pool));
         }
         let (rpc, server) = mock_rpc(script).await;
         let mut cached = Some(CachedRuntime {
-            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -1137,7 +1109,6 @@ mod tests {
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = if pool_kind == "seen" {
@@ -1199,7 +1170,6 @@ mod tests {
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head,
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -1224,18 +1194,25 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn metadata_is_loaded_for_initial_or_changed_head(#[case] cached_old_head: bool) {
+    async fn metadata_is_loaded_only_for_empty_cache(#[case] already_cached: bool) {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
-        let (rpc, server) = mock_rpc(vec![
-            ("chain_getBlockHash", json!("head")),
-            ("state_getMetadata", json!(encoded_metadata())),
-            ("author_pendingExtrinsics", json!([encoded])),
-            ("chain_getBlockHash", json!("head")),
-        ])
-        .await;
-        let mut cached = cached_old_head.then(|| CachedRuntime {
-            head: "old_head".into(),
+        let script = if already_cached {
+            vec![
+                ("chain_getBlockHash", json!("head")),
+                ("author_pendingExtrinsics", json!([encoded])),
+                ("chain_getBlockHash", json!("head")),
+            ]
+        } else {
+            vec![
+                ("chain_getBlockHash", json!("head")),
+                ("state_getMetadata", json!(encoded_metadata())),
+                ("author_pendingExtrinsics", json!([encoded])),
+                ("chain_getBlockHash", json!("head")),
+            ]
+        };
+        let (rpc, server) = mock_rpc(script).await;
+        let mut cached = already_cached.then(|| CachedRuntime {
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();
@@ -1252,7 +1229,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(cached.unwrap().head, "head");
+        assert!(cached.is_some());
         server.abort();
     }
 
@@ -1260,9 +1237,7 @@ mod tests {
     #[case(false)]
     #[case(true)]
     #[tokio::test]
-    async fn pool_observation_discards_changed_head_before_consuming_pending(
-        #[case] invalid_pending: bool,
-    ) {
+    async fn pool_observation_continues_when_head_changes(#[case] invalid_pending: bool) {
         let runtime = runtime();
         let encoded = format!("0x{}", hex::encode(signed(&runtime, perp(true, 100))));
         let (rpc, server) = mock_rpc(vec![
@@ -1271,11 +1246,9 @@ mod tests {
                 "author_pendingExtrinsics",
                 json!([if invalid_pending { "invalid" } else { &encoded }]),
             ),
-            ("chain_getBlockHash", json!("new_head")),
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::from(["previous_pool_entry".to_string()]);
@@ -1288,11 +1261,17 @@ mod tests {
             None,
             None,
         )
-        .await
-        .unwrap();
-        assert!(result.is_none());
-        assert_eq!(previous, HashSet::from(["previous_pool_entry".to_string()]));
-        assert_eq!(cached.unwrap().head, "head");
+        .await;
+        if invalid_pending {
+            assert!(result.is_err());
+            assert_eq!(previous, HashSet::from(["previous_pool_entry".to_string()]));
+        } else {
+            let orders = result.unwrap().unwrap();
+            assert_eq!(orders.len(), 1);
+            assert_eq!(orders[0]["observed_head"], "head");
+            assert_eq!(previous.len(), 1);
+        }
+        assert!(cached.is_some());
         server.abort();
     }
 
@@ -1315,7 +1294,6 @@ mod tests {
         ])
         .await;
         let mut cached = Some(CachedRuntime {
-            head: "head".into(),
             metadata: runtime.metadata().clone(),
         });
         let mut previous = HashSet::new();

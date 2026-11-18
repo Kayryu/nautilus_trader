@@ -209,6 +209,7 @@ fn fixture_for(directory: &Directory, modern: bool) -> (Execution, State) {
             exit_after_blocks: 3,
         },
         key,
+        runtime: runtime(),
         signer,
         genesis: runtime().identity().genesis_hash,
         pair: [3; 32],
