@@ -258,33 +258,8 @@ impl Execution {
             "execution requires Spot margin disabled"
         );
         let pending = rpc.get_pending_extrinsics().await?;
-        if self.wallet() != self.signer {
-            self.check_delegation(rpc, snapshot.metadata(), &head, &pending)
-                .await?;
-        } else {
-            delegation::require_no_shared_pending(
-                snapshot.metadata(),
-                &pending,
-                &std::collections::BTreeSet::from([self.signer]),
-            )?;
-            let address = dynamic::storage(
-                "Subaccount",
-                "DelegateAccountsFor",
-                vec![ScaleValue::from_bytes(self.signer)],
-            );
-            if let Some(raw) = rpc
-                .get_storage(
-                    &encoded(storage::get_address_bytes(&address, snapshot.metadata())?),
-                    &head,
-                )
-                .await?
-            {
-                anyhow::ensure!(
-                    decode_hex(&raw)? == [0],
-                    "execution account must have no configured delegates"
-                );
-            }
-        }
+        self.check_delegation(rpc, snapshot.metadata(), &head, &pending)
+            .await?;
         native::require_idle(rpc, snapshot.metadata(), &head, self.settings.subaccount).await?;
         let positions = deepx_rust_sdk::rpc::lending_positions::get_lending_positions_at_block(
             rpc,
@@ -472,23 +447,8 @@ impl Execution {
             positions.iter().all(|p| p.scaled_borrow == 0),
             "execution account has lending borrows"
         );
-        if self.wallet() != self.signer {
-            self.check_delegation(rpc, metadata, &head, &pending)
-                .await?;
-        } else {
-            let delegates = dynamic::storage(
-                "Subaccount",
-                "DelegateAccountsFor",
-                vec![dynamic::Value::from_bytes(self.signer)],
-            );
-            let delegates_key = encoded(storage::get_address_bytes(&delegates, metadata)?);
-            if let Some(raw) = rpc.get_storage(&delegates_key, &head).await? {
-                anyhow::ensure!(
-                    decode_hex(&raw)? == [0],
-                    "execution account must have no configured delegates"
-                );
-            }
-        }
+        self.check_delegation(rpc, metadata, &head, &pending)
+            .await?;
         let target_account = read_storage(
             rpc,
             metadata,
@@ -773,10 +733,8 @@ impl Execution {
                             .context("invalid exit metadata")?;
                         let metadata = subxt_core::metadata::decode_from(&bytes[..])?;
                         let pending = rpc.get_pending_extrinsics().await?;
-                        if self.wallet() != self.signer {
-                            self.check_delegation(rpc, &metadata, &head, &pending)
-                                .await?;
-                        }
+                        self.check_delegation(rpc, &metadata, &head, &pending)
+                            .await?;
                         ordering::observe(rpc, &metadata, &head, self.wallet(), &pending)
                             .await?
                             .require_available(operation.nonce)?;
@@ -962,10 +920,8 @@ impl Execution {
         let anchor = state
             .target_nonce
             .max(state.exits.last().map_or(state.entry.nonce, |op| op.nonce));
-        if self.wallet() != self.signer {
-            self.check_delegation(rpc, snapshot.metadata(), &head, &pending)
-                .await?;
-        }
+        self.check_delegation(rpc, snapshot.metadata(), &head, &pending)
+            .await?;
         let nonce = ordering::observe(rpc, snapshot.metadata(), &head, self.wallet(), &pending)
             .await?
             .allocate_exit(anchor)?;
@@ -1027,9 +983,7 @@ impl Execution {
         {
             return Ok(false);
         }
-        if self.wallet() != self.signer {
-            self.check_delegation(rpc, &metadata, head, pending).await?;
-        }
+        self.check_delegation(rpc, &metadata, head, pending).await?;
         let pair = ordering::observe(rpc, &metadata, head, self.wallet(), pending)
             .await?
             .allocate(state.target_nonce)?;
@@ -1488,12 +1442,24 @@ async fn read_storage(
     item: &str,
     key: [u8; 20],
 ) -> anyhow::Result<ScaleValue<u32>> {
+    read_optional_storage(rpc, metadata, head, pallet, item, key)
+        .await?
+        .context("required account storage unavailable")
+}
+
+async fn read_optional_storage(
+    rpc: &DeepXRpcClient,
+    metadata: &Metadata,
+    head: &str,
+    pallet: &str,
+    item: &str,
+    key: [u8; 20],
+) -> anyhow::Result<Option<ScaleValue<u32>>> {
     let address = dynamic::storage(pallet, item, vec![dynamic::Value::from_bytes(key)]);
     let key = encoded(storage::get_address_bytes(&address, metadata)?);
-    let raw = rpc
-        .get_storage(&key, head)
-        .await?
-        .context("required account storage unavailable")?;
+    let Some(raw) = rpc.get_storage(&key, head).await? else {
+        return Ok(None);
+    };
     let bytes = decode_hex(&raw)?;
     let ty = metadata
         .pallet_by_name(pallet)
@@ -1507,7 +1473,7 @@ async fn read_storage(
     let mut remaining = &bytes[..];
     let value = decode_as_type(&mut remaining, ty, metadata.types())?;
     anyhow::ensure!(remaining.is_empty(), "trailing storage bytes");
-    Ok(value)
+    Ok(Some(value))
 }
 
 async fn market_symbols(

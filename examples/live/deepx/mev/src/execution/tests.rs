@@ -870,7 +870,11 @@ async fn rpc_handler(RpcState(mock): RpcState<Mock>, Json(request): Json<Value>)
         }
         "state_getMetadata" => json!(metadata_hex()),
         "state_getStorage" => {
-            if request["params"][0]
+            if let Some(value) =
+                direct_delegation_storage(&mock, request["params"][0].as_str().unwrap())
+            {
+                value
+            } else if request["params"][0]
                 == deepx_rust_sdk::rpc::storage_decode::spot_market_storage_key([3; 32])
             {
                 json!(market_storage())
@@ -1078,6 +1082,56 @@ fn native_order_key(metadata: &Metadata) -> String {
     encoded(storage::get_address_bytes(&address, metadata).unwrap())
 }
 
+fn direct_delegation_storage(mock: &Mock, key: &str) -> Option<Value> {
+    if mock.state.wallet.is_some() {
+        return None;
+    }
+    let signer = parse_account(&mock.state.signer).unwrap();
+    let snapshot = runtime_for(mock.modern);
+    let metadata = snapshot.metadata();
+    let address = dynamic::storage(
+        "Subaccount",
+        "DelegateAccountsFor",
+        vec![ScaleValue::from_bytes(signer)],
+    );
+    if encoded(storage::get_address_bytes(&address, metadata).unwrap()) != key {
+        return None;
+    }
+    if mock.outcome == "direct_malformed" {
+        return Some(json!("0xff"));
+    }
+    if !matches!(
+        mock.outcome,
+        "direct_delegates" | "direct_delegate_pending_after_entry"
+    ) {
+        return Some(Value::Null);
+    }
+    let key = DeepXPrivateKey::new(&"33".repeat(32), &DeepXKeyScheme::Secp256k1).unwrap();
+    let delegate = derive_signer_account_id(&key).unwrap();
+    let value = ScaleValue::unnamed_composite([ScaleValue::named_composite([
+        ("delegate_address", ScaleValue::from_bytes(delegate)),
+        ("delegate_name", ScaleValue::from_bytes(b"test")),
+        ("valid_until", ScaleValue::u128(0)),
+        (
+            "mode",
+            ScaleValue::unnamed_variant("PlaceOrCancelOrder", []),
+        ),
+        ("create_time", ScaleValue::u128(1)),
+    ])]);
+    let ty = metadata
+        .pallet_by_name("Subaccount")
+        .unwrap()
+        .storage()
+        .unwrap()
+        .entry_by_name("DelegateAccountsFor")
+        .unwrap()
+        .entry_type()
+        .value_ty();
+    let mut bytes = Vec::new();
+    encode_as_type(&value, ty, metadata.types(), &mut bytes).unwrap();
+    Some(json!(encoded(bytes)))
+}
+
 fn delegation_storage(mock: &Mock, key: &str, after_entry: bool) -> Option<Value> {
     let wallet = parse_account(mock.state.wallet.as_deref()?).unwrap();
     let signer = parse_account(&mock.state.signer).unwrap();
@@ -1271,6 +1325,20 @@ async fn progressing_rpc(mock: Mock, request: Value) -> Json<Value> {
         "author_pendingExtrinsics" => {
             if stage == 0 {
                 json!([durable.target_bytes])
+            } else if mock.outcome == "direct_delegate_pending_after_entry" {
+                let directory = Directory::new();
+                let (execution, _) = fixture_for(&directory, mock.modern);
+                let key =
+                    DeepXPrivateKey::new(&"33".repeat(32), &DeepXKeyScheme::Secp256k1).unwrap();
+                let service = DeepXRuntimeSnapshotService::new(runtime_for(mock.modern));
+                let signed = sign_spot_place_order(
+                    &service.acquire().unwrap(),
+                    &key,
+                    execution.params(true, 1_000, 100_000),
+                    durable.entry.nonce + 20,
+                )
+                .unwrap();
+                json!([encoded(signed.bytes())])
             } else {
                 json!([])
             }
@@ -1278,7 +1346,9 @@ async fn progressing_rpc(mock: Mock, request: Value) -> Json<Value> {
         "state_call" => json!(depth(stage > 0)),
         "state_getStorage" => {
             let key = request["params"][0].as_str().unwrap();
-            if let Some(value) = delegation_storage(&mock, key, stage > 0) {
+            if let Some(value) = direct_delegation_storage(&mock, key) {
+                value
+            } else if let Some(value) = delegation_storage(&mock, key, stage > 0) {
                 value
             } else if key == deepx_rust_sdk::rpc::event_storage::SYSTEM_EVENTS_STORAGE_KEY {
                 let n = crate::parse_hash(request["params"][1].as_str().unwrap()).unwrap()[0];
@@ -1374,6 +1444,7 @@ async fn progressing_rpc(mock: Mock, request: Value) -> Json<Value> {
 #[case("partial_exit", "7712", true, false)]
 #[case("accepted", "7711", true, true)]
 #[case("partial_exit", "7712", true, true)]
+#[case("direct_delegates", "7711", true, false)]
 #[tokio::test]
 async fn execution_reconciles_both_finalized_legs_and_target_before_reporting_profit(
     #[case] outcome: &'static str,
@@ -1553,6 +1624,108 @@ fn shared_wallet_pending_check_rejects_owner_and_other_delegates() {
     }
     delegation::require_no_shared_pending(snapshot.metadata(), &[state.target_bytes], &related)
         .unwrap();
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn direct_wallet_checks_configured_delegates_and_pending_operations(#[case] modern: bool) {
+    let directory = Directory::new();
+    let (execution, state) = fixture_for(&directory, modern);
+    let snapshot = runtime_for(modern);
+    let mock = Mock {
+        state: state.clone(),
+        journal_path: execution.settings.journal.clone(),
+        submissions: Arc::new(AtomicUsize::new(0)),
+        outcome: "direct_delegates",
+        target_pending: false,
+        progress: None,
+        modern,
+    };
+    let (rpc, task) = mock_rpc(mock).await;
+    let head = encoded([100; 32]);
+    execution
+        .check_delegation(
+            &rpc,
+            snapshot.metadata(),
+            &head,
+            &[state.target_bytes.clone()],
+        )
+        .await
+        .unwrap();
+    let key = DeepXPrivateKey::new(&"33".repeat(32), &DeepXKeyScheme::Secp256k1).unwrap();
+    let service = DeepXRuntimeSnapshotService::new(runtime_for(modern));
+    let delegate = sign_spot_place_order(
+        &service.acquire().unwrap(),
+        &key,
+        execution.params(true, 1000, 100_000),
+        state.entry.nonce + 20,
+    )
+    .unwrap();
+    for pending in [state.entry.bytes, encoded(delegate.bytes())] {
+        let error = execution
+            .check_delegation(&rpc, snapshot.metadata(), &head, &[pending])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another pending operation"));
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn direct_wallet_rejects_malformed_delegate_storage() {
+    let directory = Directory::new();
+    let (execution, state) = fixture_for(&directory, true);
+    let mock = Mock {
+        state,
+        journal_path: execution.settings.journal.clone(),
+        submissions: Arc::new(AtomicUsize::new(0)),
+        outcome: "direct_malformed",
+        target_pending: false,
+        progress: None,
+        modern: true,
+    };
+    let (rpc, task) = mock_rpc(mock).await;
+    assert!(
+        execution
+            .check_delegation(&rpc, execution.runtime.metadata(), &encoded([100; 32]), &[])
+            .await
+            .is_err()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn direct_wallet_retains_inventory_if_delegate_becomes_pending_after_entry() {
+    let directory = Directory::new();
+    let (execution, mut state) = fixture_for(&directory, true);
+    execution.journal.store(&state).unwrap();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    let mock = Mock {
+        state: state.clone(),
+        journal_path: execution.settings.journal.clone(),
+        submissions: submissions.clone(),
+        outcome: "direct_delegate_pending_after_entry",
+        target_pending: true,
+        progress: Some(Arc::new(AtomicUsize::new(0))),
+        modern: true,
+    };
+    let (rpc, task) = mock_rpc(mock).await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        execution.run_inner(&rpc, &mut state, 1),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.to_string().contains("another pending operation"));
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    let saved = execution.journal.load().unwrap().unwrap();
+    assert!(!saved.complete);
+    assert_eq!(saved.remaining().unwrap(), 990);
+    assert!(saved.exits.iter().all(|exit| !exit.attempted));
+    task.abort();
 }
 
 #[rstest]

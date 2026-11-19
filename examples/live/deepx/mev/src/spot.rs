@@ -173,11 +173,36 @@ impl Snapshot {
                 analysis[bound_key] = json!(plan.back_quote_bound.to_string());
                 analysis
             }
-            Err(e) => json!({"conditional_opportunity": false, "execution_ready": false,
-                "reason": e.to_string(),
-                "best_ask_raw_price": self.asks.first().map(|level| level.price.to_string()),
-                "best_bid_raw_price": self.bids.first().map(|level| level.price.to_string()),
-                "base_scale": self.base_scale.to_string()}),
+            Err(e) => {
+                let target_price = order
+                    .get("raw_base_size")
+                    .and_then(|value| value.as_str())
+                    .and_then(|base| base.parse::<u128>().ok())
+                    .and_then(|base| {
+                        order
+                            .get("raw_quote_amount")
+                            .and_then(|value| value.as_str())
+                            .and_then(|quote| quote.parse::<u128>().ok())
+                            .and_then(|quote| {
+                                U256::from(quote)
+                                    .checked_mul(U256::from(self.base_scale))
+                                    .and_then(|value| value.checked_div(U256::from(base)))
+                                    .and_then(|price| u128::try_from(price).ok())
+                            })
+                    });
+                json!({
+                    "conditional_opportunity": false,
+                    "execution_ready": false,
+                    "reason": e.to_string(),
+                    "side": order.get("side"),
+                    "target_raw_base_size": order.get("raw_base_size"),
+                    "target_raw_quote_amount": order.get("raw_quote_amount"),
+                    "target_raw_price": target_price.map(|price| price.to_string()),
+                    "best_ask_raw_price": self.asks.first().map(|level| level.price.to_string()),
+                    "best_bid_raw_price": self.bids.first().map(|level| level.price.to_string()),
+                    "base_scale": self.base_scale.to_string()
+                })
+            }
         }
     }
 

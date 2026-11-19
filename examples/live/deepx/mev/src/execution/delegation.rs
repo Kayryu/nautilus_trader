@@ -30,6 +30,22 @@ impl Execution {
         pending: &[String],
     ) -> anyhow::Result<()> {
         let wallet = self.wallet();
+        if wallet == self.signer {
+            let delegates = read_optional_storage(
+                rpc,
+                metadata,
+                head,
+                "Subaccount",
+                "DelegateAccountsFor",
+                wallet,
+            )
+            .await?;
+            let related = match delegates {
+                Some(delegates) => related_signers(&delegates, wallet)?,
+                None => BTreeSet::from([wallet]),
+            };
+            return require_no_shared_pending(metadata, pending, &related);
+        }
         let account = read_storage(
             rpc,
             metadata,
@@ -91,16 +107,14 @@ fn authorized_signers(
     now: u64,
 ) -> anyhow::Result<BTreeSet<[u8; 20]>> {
     anyhow::ensure!(wallet != signer, "delegate signer must differ from wallet");
+    let related = related_signers(delegates, wallet)?;
     let ValueDef::Composite(records) = &delegates.value else {
         anyhow::bail!("invalid delegate records");
     };
     let ValueDef::Composite(owners) = &reverse.value else {
         anyhow::bail!("invalid delegator records");
     };
-    anyhow::ensure!(
-        records.len() <= 256 && owners.len() <= 256,
-        "delegation records exceed bound"
-    );
+    anyhow::ensure!(owners.len() <= 256, "delegation records exceed bound");
     let owners = owners
         .values()
         .map(super::super::fixed_bytes::<20>)
@@ -109,7 +123,6 @@ fn authorized_signers(
         owners.contains(&wallet),
         "delegate reverse wallet binding is missing"
     );
-    let mut related = BTreeSet::from([wallet]);
     let mut permitted = false;
     for record in records.values() {
         let address = super::super::fixed_bytes::<20>(
@@ -117,10 +130,6 @@ fn authorized_signers(
                 .at("delegate_address")
                 .context("missing delegate address")?,
         )?;
-        anyhow::ensure!(
-            address != [0; 20] && related.insert(address),
-            "invalid or duplicate delegate address"
-        );
         let deadline = record
             .at("valid_until")
             .and_then(ScaleValue::as_u128)
@@ -138,6 +147,29 @@ fn authorized_signers(
         permitted,
         "signer has no unexpired order delegation from wallet"
     );
+    Ok(related)
+}
+
+fn related_signers(
+    delegates: &ScaleValue<u32>,
+    wallet: [u8; 20],
+) -> anyhow::Result<BTreeSet<[u8; 20]>> {
+    let ValueDef::Composite(records) = &delegates.value else {
+        anyhow::bail!("invalid delegate records");
+    };
+    anyhow::ensure!(records.len() <= 256, "delegation records exceed bound");
+    let mut related = BTreeSet::from([wallet]);
+    for record in records.values() {
+        let address = super::super::fixed_bytes::<20>(
+            record
+                .at("delegate_address")
+                .context("missing delegate address")?,
+        )?;
+        anyhow::ensure!(
+            address != [0; 20] && related.insert(address),
+            "invalid or duplicate delegate address"
+        );
+    }
     Ok(related)
 }
 
@@ -186,6 +218,24 @@ mod tests {
                 ("mode", ScaleValue::unnamed_variant(mode, [])),
             ]),
         ]))
+    }
+
+    #[rstest::rstest]
+    fn direct_wallet_rejects_duplicate_or_invalid_delegate_addresses() {
+        let record = |address| {
+            ScaleValue::named_composite([("delegate_address", ScaleValue::from_bytes(address))])
+        };
+        for values in [
+            vec![record([2; 20]), record([2; 20])],
+            vec![record([0; 20])],
+            vec![record([1; 20])],
+            vec![ScaleValue::unnamed_composite([])],
+        ] {
+            assert!(
+                related_signers(&contextual(ScaleValue::unnamed_composite(values)), [1; 20])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
